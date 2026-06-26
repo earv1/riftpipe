@@ -381,7 +381,14 @@ write P2's health. Resolution:
 
 ---
 
-## 15. Editor bridges & the sync protocol (Unix decomposition — planned)
+## 15. Editor bridges & the sync protocol (Unix decomposition — IMPLEMENTED)
+
+**Status:** `--pipe` core is event-driven (no lockstep, idle = silent); the
+neovim bridge (`nvim/autoshare.lua`) is built and verified. Local→core uses
+snapshots (phase 1; core diffs them); core→local uses granular ops applied via
+`nvim_buf_set_text` (cursor-preserving). Phase 2 (granular local→core via
+`on_bytes`) is the remaining optimization.
+
 
 **Direction:** keep the sync core **editor-agnostic** and expose a **local
 edit-stream protocol**; editors connect via small, *separate* **bridge tools**.
