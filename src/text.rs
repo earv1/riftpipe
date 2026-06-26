@@ -12,7 +12,7 @@
 
 use std::ops::Range;
 
-use diamond_types::list::encoding::ENCODE_FULL;
+use diamond_types::list::encoding::{ENCODE_FULL, ENCODE_PATCH};
 use diamond_types::list::OpLog;
 use diamond_types::AgentId;
 use similar::{capture_diff_slices, Algorithm, DiffOp};
@@ -121,10 +121,13 @@ impl EgWalkerText {
         self.oplog.local_version_ref().to_vec()
     }
 
-    /// Encode operations since `since` for the wire (DESIGN.md §5). The receiver
-    /// must already hold `since`'s ancestors (e.g. a shared seed).
+    /// Encode operations since `since` for the wire (DESIGN.md §5). Uses
+    /// ENCODE_PATCH so the delta carries ONLY the new ops + their inserted text —
+    /// not the whole document (ENCODE_FULL stores the start-branch content, which
+    /// would bloat every delta with the full file). The receiver must already
+    /// hold `since`'s ancestors (a shared seed / prior deltas).
     pub fn encode_delta(&self, since: &[usize]) -> Vec<u8> {
-        self.oplog.encode_from(ENCODE_FULL, since)
+        self.oplog.encode_from(ENCODE_PATCH, since)
     }
 
     /// Encode the entire history — used to seed a brand-new peer.
@@ -173,6 +176,40 @@ mod tests {
         let merged = a.content();
         assert!(merged.contains("brave"), "lost alice's edit: {merged:?}");
         assert!(merged.contains("!!!"), "lost bob's edit: {merged:?}");
+    }
+
+    #[test]
+    fn delta_carries_only_the_change_not_the_whole_doc() {
+        // High-entropy content so it doesn't just compress away (the encoder has
+        // compress_content: true).
+        let mut s = String::with_capacity(2000);
+        let mut x: u32 = 0x9e3779b9;
+        for _ in 0..2000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            s.push(char::from(33 + (x % 94) as u8)); // printable ASCII
+        }
+        let mut d = EgWalkerText::new("a");
+        d.edit_to(&s);
+        let v = d.version();
+        let full = d.encode_full();
+        d.insert_at(2000, "Y"); // one tiny edit
+        let delta = d.encode_delta(&v);
+
+        assert!(
+            full.len() > 1000,
+            "sanity: a full encode of 2000 random chars should be large ({} bytes)",
+            full.len()
+        );
+        // The delta must be a tiny fraction of the document — it carries only the
+        // change, not the whole file (the ENCODE_FULL-vs-ENCODE_PATCH bug).
+        assert!(
+            delta.len() < full.len() / 10,
+            "delta should carry only the change: {} bytes vs full doc {} bytes",
+            delta.len(),
+            full.len()
+        );
     }
 
     #[test]
