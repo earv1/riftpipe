@@ -1,0 +1,30 @@
+[package]
+name = "autoshare"
+version = "0.0.0"
+edition = "2021"
+description = "A Unix-like terminal construct for live, peer-to-peer collaborative text (see DESIGN.md)"
+
+[dependencies]
+async-trait = "0.1.89"
+blake3 = "1.8.5"
+data-encoding = "2.11.0"
+diamond-types = "1.0.0"
+iroh = "1.0.0"
+postcard = { version = "1.1.3", features = ["alloc"] }
+rand = "0.10.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+similar = "3.1.1"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util", "rt", "sync", "time"] }
+# Real integrations to wire next — kept out of the scaffold so it builds offline.
+# See DESIGN.md §11 (stack):
+#   iroh           — QUIC transport, NAT hole-punching, tickets (1.0, Jun 2026)
+#   diamond-types  — eg-walker text CRDT (the optimized implementation)
+#   ed25519-dalek  — agent keypair / signed ops
+#   blake3         — doc ids, rule fingerprints, state hashes
+#   similar        — Myers diff for snapshot -> ops (DESIGN.md §3)
+#   ratatui + crossterm — TTY repaint mode (DESIGN.md §4)
+
+[[bin]]
+name = "autoshare"
+path = "src/main.rs"
