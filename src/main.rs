@@ -12,7 +12,8 @@ use autoshare::secure::{authenticate, Ticket};
 use autoshare::simulation::{Suite, Vector};
 use autoshare::text::EgWalkerText;
 use autoshare::textpipe::TextPeer;
-use autoshare::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr};
+use autoshare::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr, IrohLink};
+use iroh::{Endpoint, EndpointId};
 
 /// Parse `args[2..]` into positionals + flags. `--metrics <path>` takes a value.
 fn parse(args: &[String]) -> (Vec<String>, bool, Option<String>) {
@@ -99,12 +100,7 @@ async fn share(file: &str, pipe: bool, metrics: Option<String>) -> autoshare::ne
     let mut link = accept_link(&endpoint).await?;
     authenticate(&mut link, &secret).await?;
     let peer = link.remote_id();
-    let (mut counting, counters) = CountingLink::new(link);
-
-    if let Some(path) = metrics {
-        autoshare::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
-    }
-    run_frontend(file, pipe, &mut counting).await
+    run_frontend(link, &endpoint, peer, file, pipe, metrics).await
 }
 
 /// Join a shared file via its ticket: dial, authenticate with the secret, run.
@@ -114,22 +110,33 @@ async fn join(ticket: &str, file: &str, pipe: bool, metrics: Option<String>) -> 
     let mut link = connect_link(&endpoint, ticket.addr).await?;
     authenticate(&mut link, &ticket.secret).await?;
     let peer = link.remote_id();
-    let (mut counting, counters) = CountingLink::new(link);
-
-    if let Some(path) = metrics {
-        autoshare::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
-    }
-    run_frontend(file, pipe, &mut counting).await
+    run_frontend(link, &endpoint, peer, file, pipe, metrics).await
 }
 
-/// Pick the frontend: `--pipe` (editor-stream protocol on stdio) or the default
-/// file-mirror loop.
-async fn run_frontend(file: &str, pipe: bool, link: &mut dyn autoshare::net::Link) -> autoshare::net::Result<()> {
+/// Pick the frontend. `--pipe` is event-driven (split the link into send/recv
+/// halves, no lockstep); the default file-mirror loop polls the file.
+async fn run_frontend(
+    link: IrohLink,
+    endpoint: &Endpoint,
+    peer: EndpointId,
+    file: &str,
+    pipe: bool,
+    metrics: Option<String>,
+) -> autoshare::net::Result<()> {
     if pipe {
-        run_pipe(link).await
+        let counters = std::sync::Arc::new(autoshare::net::Counters::default());
+        let (sink, source) = link.into_halves(counters.clone());
+        if let Some(path) = metrics {
+            autoshare::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
+        }
+        run_pipe(sink, source).await
     } else {
+        let (mut counting, counters) = CountingLink::new(link);
+        if let Some(path) = metrics {
+            autoshare::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
+        }
         eprintln!("authenticated — live syncing {file} (end-to-end encrypted). ^C to stop.");
-        live_file_loop(file, link).await
+        live_file_loop(file, &mut counting).await
     }
 }
 

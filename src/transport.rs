@@ -5,12 +5,15 @@
 
 use std::time::Duration;
 
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use tokio::io::AsyncWriteExt;
 
-use crate::net::{anyerr, Link, Result};
+use crate::net::{anyerr, Counters, Link, Result};
 
 /// Application-layer protocol id — peers must agree on this to connect.
 pub const ALPN: &[u8] = b"autoshare/0";
@@ -73,6 +76,69 @@ impl IrohLink {
     /// The peer's endpoint id (for `connection_kind` lookups).
     pub fn remote_id(&self) -> EndpointId {
         self.conn.remote_id()
+    }
+
+    /// Split into independent send/recv halves for event-driven sync — so a peer
+    /// can push (on a local change) and pull (on arrival) concurrently, instead
+    /// of lockstep rounds. `counters` is shared with the metrics writer.
+    pub fn into_halves(self, counters: Arc<Counters>) -> (IrohSink, IrohSource) {
+        (
+            IrohSink {
+                _conn: self.conn,
+                send: self.send,
+                counters: counters.clone(),
+            },
+            IrohSource {
+                recv: self.recv,
+                counters,
+            },
+        )
+    }
+}
+
+/// Send half of a split iroh link.
+pub struct IrohSink {
+    _conn: Connection, // keep the connection alive while either half lives
+    send: SendStream,
+    counters: Arc<Counters>,
+}
+
+impl IrohSink {
+    pub async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
+        self.counters
+            .sent
+            .fetch_add(msg.len() as u64, Ordering::Relaxed);
+        let len = (msg.len() as u32).to_le_bytes();
+        self.send.write_all(&len).await.map_err(anyerr)?;
+        self.send.write_all(&msg).await.map_err(anyerr)?;
+        self.send.flush().await.map_err(anyerr)?;
+        Ok(())
+    }
+
+    /// Signal end-of-data so the last message is delivered before drop.
+    pub async fn finish(&mut self) {
+        let _ = self.send.finish();
+    }
+}
+
+/// Receive half of a split iroh link.
+pub struct IrohSource {
+    recv: RecvStream,
+    counters: Arc<Counters>,
+}
+
+impl IrohSource {
+    /// Await the next message — costs zero traffic/CPU while none arrives.
+    pub async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+        let mut len = [0u8; 4];
+        if self.recv.read_exact(&mut len).await.is_err() {
+            return Ok(None);
+        }
+        let n = u32::from_le_bytes(len) as usize;
+        let mut buf = vec![0u8; n];
+        self.recv.read_exact(&mut buf).await.map_err(anyerr)?;
+        self.counters.recv.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(Some(buf))
     }
 }
 

@@ -9,14 +9,13 @@
 //!   {"op":"insert","pos":N,"text":"..."}
 //!   {"op":"delete","pos":N,"len":M}
 
-use std::time::Duration;
-
 use serde::{Deserialize, Serialize};
 use similar::{capture_diff_slices, Algorithm, DiffOp};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::net::{anyerr, Link, Result};
+use crate::net::{anyerr, Result};
 use crate::text::EgWalkerText;
+use crate::transport::{IrohSink, IrohSource};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -78,7 +77,7 @@ impl PipePeer {
         PipePeer { doc, last_sent }
     }
 
-    fn apply_local(&mut self, op: &EditOp) {
+    pub fn apply_local(&mut self, op: &EditOp) {
         match op {
             EditOp::Snapshot { text } => self.doc.edit_to(text),
             EditOp::Insert { pos, text } => self.doc.insert_at(*pos, text),
@@ -90,74 +89,80 @@ impl PipePeer {
         self.doc.content()
     }
 
-    /// One round: apply local edit ops, sync with the peer, and return the edit
-    /// ops the *remote* peer caused (to be applied by the frontend). Local edits
-    /// are diffed in BEFORE merging remote ops, so the returned ops reflect only
-    /// the remote change (no echo of the frontend's own edits).
-    pub async fn round(
-        &mut self,
-        link: &mut dyn Link,
-        local: &[EditOp],
-    ) -> Result<Vec<EditOp>> {
-        for op in local {
-            self.apply_local(op);
-        }
-        let before = self.doc.content();
+    pub fn version(&self) -> Vec<usize> {
+        self.doc.version()
+    }
 
+    /// Encode the ops added since we last sent, and advance the sent watermark.
+    /// (Setting the watermark to the full version also means merged remote ops
+    /// are never echoed back.)
+    pub fn encode_since_sent(&mut self) -> Vec<u8> {
         let delta = self.doc.encode_delta(&self.last_sent);
-        link.send(delta).await?;
-        if let Some(bytes) = link.recv().await? {
-            self.doc.merge(&bytes);
-        }
         self.last_sent = self.doc.version();
+        delta
+    }
 
+    /// Merge a remote delta and return the edit ops the frontend should apply
+    /// (diffed BEFORE/AFTER, so they reflect only the remote change).
+    pub fn merge_remote(&mut self, bytes: &[u8]) -> Vec<EditOp> {
+        let before = self.doc.content();
+        self.doc.merge(bytes);
+        self.last_sent = self.doc.version();
         let after = self.doc.content();
-        Ok(diff_to_ops(&before, &after))
+        diff_to_ops(&before, &after)
     }
 }
 
-/// stdio driver: read local edit ops from stdin, emit remote edit ops to stdout,
-/// syncing over `link`. This is what `autoshare ... --pipe` runs.
-pub async fn run_pipe(link: &mut dyn Link) -> Result<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EditOp>();
+/// Event-driven stdio driver (`autoshare ... --pipe`). A single `select!` loop
+/// reacts to whichever happens: a local edit op on stdin (→ push a delta) or a
+/// remote delta on the link (→ emit edit ops to stdout). When idle, both arms
+/// park and **no traffic flows** — no lockstep, no polling.
+pub async fn run_pipe(mut sink: IrohSink, mut source: IrohSource) -> Result<()> {
+    let mut peer = PipePeer::new("pipe");
+    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    let mut out = tokio::io::stdout();
 
-    // Read stdin lines into the channel without blocking the sync loop.
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(tokio::io::stdin()).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+    loop {
+        tokio::select! {
+            line = stdin.next_line() => {
+                match line.map_err(anyerr)? {
+                    Some(line) => {
+                        let line = line.trim();
+                        if line.is_empty() { continue; }
+                        if let Ok(op) = serde_json::from_str::<EditOp>(line) {
+                            let before = peer.version();
+                            peer.apply_local(&op);
+                            // Send only when the op actually changed the doc.
+                            if peer.version() != before {
+                                sink.send(peer.encode_since_sent()).await?;
+                            }
+                        }
+                    }
+                    None => break, // stdin closed → frontend gone
+                }
             }
-            if let Ok(op) = serde_json::from_str::<EditOp>(line) {
-                if tx.send(op).is_err() {
-                    break;
+            msg = source.recv() => {
+                match msg? {
+                    Some(bytes) => {
+                        for op in peer.merge_remote(&bytes) {
+                            let mut line = serde_json::to_string(&op).map_err(anyerr)?;
+                            line.push('\n');
+                            out.write_all(line.as_bytes()).await.map_err(anyerr)?;
+                        }
+                        out.flush().await.map_err(anyerr)?;
+                    }
+                    None => break, // peer closed
                 }
             }
         }
-    });
-
-    let mut peer = PipePeer::new("pipe");
-    let mut out = tokio::io::stdout();
-    loop {
-        let mut local = Vec::new();
-        while let Ok(op) = rx.try_recv() {
-            local.push(op);
-        }
-        for op in peer.round(link, &local).await? {
-            let mut line = serde_json::to_string(&op).map_err(anyerr)?;
-            line.push('\n');
-            out.write_all(line.as_bytes()).await.map_err(anyerr)?;
-        }
-        out.flush().await.map_err(anyerr)?;
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    sink.finish().await;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::mock_pair;
 
     /// Apply edit ops to a naive "editor buffer" (char-offset based), exactly as
     /// a frontend would.
@@ -181,26 +186,29 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn two_pipe_peers_keep_editor_buffers_in_sync() {
-        let (mut la, mut lb) = mock_pair();
+    #[test]
+    fn event_driven_exchange_keeps_editor_buffers_in_sync() {
         let mut a = PipePeer::new("a");
         let mut b = PipePeer::new("b");
-
-        // Each "editor" applies its own local edit, then drives a round.
         let mut buf_a = String::new();
         let mut buf_b = String::new();
-        let local_a = vec![EditOp::Insert { pos: 0, text: "hello ".into() }];
-        let local_b = vec![EditOp::Insert { pos: 0, text: "world".into() }];
-        apply_ops(&mut buf_a, &local_a);
-        apply_ops(&mut buf_b, &local_b);
 
-        let (ra, rb) = tokio::join!(a.round(&mut la, &local_a), b.round(&mut lb, &local_b));
-        apply_ops(&mut buf_a, &ra.unwrap());
-        apply_ops(&mut buf_b, &rb.unwrap());
+        // Each "editor" applies its own local edit and pushes the resulting delta
+        // (what `run_pipe`'s stdin arm does).
+        let la = EditOp::Insert { pos: 0, text: "hello ".into() };
+        apply_ops(&mut buf_a, std::slice::from_ref(&la));
+        a.apply_local(&la);
+        let delta_a = a.encode_since_sent();
 
-        // The remote ops emitted to each frontend keep its buffer == the CRDT,
-        // and both frontends converge.
+        let lb = EditOp::Insert { pos: 0, text: "world".into() };
+        apply_ops(&mut buf_b, std::slice::from_ref(&lb));
+        b.apply_local(&lb);
+        let delta_b = b.encode_since_sent();
+
+        // Deltas arrive (the recv arm): merge and apply the emitted ops.
+        apply_ops(&mut buf_b, &b.merge_remote(&delta_a));
+        apply_ops(&mut buf_a, &a.merge_remote(&delta_b));
+
         assert_eq!(buf_a, a.content(), "editor A out of sync with its CRDT");
         assert_eq!(buf_b, b.content(), "editor B out of sync with its CRDT");
         assert_eq!(buf_a, buf_b, "editors diverged: {buf_a:?} vs {buf_b:?}");
