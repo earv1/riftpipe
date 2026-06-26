@@ -17,25 +17,27 @@
 
 set -euo pipefail
 command -v tmux >/dev/null || { echo "tmux is required (brew install tmux)"; exit 1; }
+command -v nvim >/dev/null || { echo "neovim is required (brew install neovim)"; exit 1; }
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 echo "building..."
 cargo build --quiet
 BIN="$ROOT/target/debug/autoshare"
-ED="${EDITOR:-vim}"
+LUA="$ROOT/nvim/autoshare.lua"
 
 WORK="$(mktemp -d)"
 A="$WORK/peer-a.txt"; B="$WORK/peer-b.txt"
 AM="$WORK/a.metrics"; BM="$WORK/b.metrics"
-printf 'Just type — it auto-saves and syncs.\n' > "$A"
+printf 'Just type — it syncs live (char by char).\n' > "$A"
 : > "$B"; : > "$AM"; : > "$BM"; rm -f "$A.ticket"
 
-# Editor that AUTO-SAVES on every change (no :w, push) and CONSTANTLY pulls remote
-# edits via a repeating timer running `checktime` ~4x/sec (not just when idle).
-# `noautocmd write` avoids re-triggering on the write itself.
+# nvim with the autoshare bridge loaded session-locally (no global install).
+# $1 = file, $2 = autoshare args (share/join ... --pipe --metrics ...)
+# `-u NONE` isolates the demo from your nvim config (reproducible). For real use,
+# just load the bridge in your normal nvim: nvim -c 'luafile .../autoshare.lua' file
 edcmd() {
-  printf "%s -c 'set autoread' -c 'au TextChanged,TextChangedI,InsertLeave * silent! noautocmd write' -c 'call timer_start(250, {-> execute(\"silent! checktime\")}, {\"repeat\": -1})' %q" "$ED" "$1"
+  printf "AUTOSHARE_BIN=%q AUTOSHARE_ARGS=%q nvim -u NONE -c 'luafile %q' %q" "$BIN" "$2" "$LUA" "$1"
 }
 # Portable "watch": redraw a file every 0.5s.
 viewer() { printf 'while :; do clear; cat %q 2>/dev/null; sleep 0.5; done' "$1"; }
@@ -49,10 +51,11 @@ PB=$(tmux split-window -h -t "$PA" -P -F '#{pane_id}')
 PAM=$(tmux split-window -v -l 4 -t "$PA" -P -F '#{pane_id}')
 PBM=$(tmux split-window -v -l 4 -t "$PB" -P -F '#{pane_id}')
 
-# Peer A: share in background (writes the ticket sidecar), then edit.
-tmux send-keys -t "$PA" "'$BIN' share '$A' --metrics '$AM' >/dev/null 2>'$WORK/a.log' & sleep 0.6; $(edcmd "$A")" C-m
-# Peer B: wait for the ticket, join in background, then edit.
-tmux send-keys -t "$PB" "while [ ! -s '$A.ticket' ]; do sleep 0.3; done; '$BIN' join \"\$(cat '$A.ticket')\" '$B' --metrics '$BM' >/dev/null 2>'$WORK/b.log' & sleep 0.6; $(edcmd "$B")" C-m
+# Peer A: nvim + bridge. The bridge spawns `autoshare share --pipe`, which writes
+# the ticket sidecar that peer B waits on.
+tmux send-keys -t "$PA" "$(edcmd "$A" "share $A --pipe --metrics $AM")" C-m
+# Peer B: wait for the ticket, then nvim + bridge joining with it.
+tmux send-keys -t "$PB" "while [ ! -s '$A.ticket' ]; do sleep 0.3; done; AUTOSHARE_BIN='$BIN' AUTOSHARE_ARGS=\"join \$(cat '$A.ticket') $B --pipe --metrics $BM\" nvim -u NONE -c 'luafile $LUA' '$B'" C-m
 # Metrics viewers.
 tmux send-keys -t "$PAM" "$(viewer "$AM")" C-m
 tmux send-keys -t "$PBM" "$(viewer "$BM")" C-m
@@ -67,8 +70,9 @@ cat <<EOF
   peer A: $A
   peer B: $B
 
-  Just type in a top pane — it auto-saves and syncs; the other peer's editor
-  reloads on idle. Bottom panes show live connection (direct/relay), bytes, rate.
+  Just type in a top pane (neovim) — edits sync live, char by char, via the
+  autoshare --pipe bridge (no :w, no file, no polling). Bottom panes show each
+  peer's live connection (direct/relay), bytes, and rate.
 
   Stop all:  tmux kill-session -t $SESSION
 
