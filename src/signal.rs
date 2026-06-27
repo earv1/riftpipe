@@ -29,6 +29,11 @@ type Rooms = Arc<Mutex<HashMap<String, Vec<(u64, Tx)>>>>;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Caps so a public, self-hostable instance can't be trivially exhausted by a
+/// client opening many unique rooms or a giant room id (room ids are caller-chosen).
+const MAX_ROOMS: usize = 50_000;
+const MAX_ROOM_ID_LEN: usize = 128;
+
 /// Serve the signaling server on `127.0.0.1:port`. Blocks (runs forever).
 pub async fn serve(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
@@ -69,31 +74,41 @@ async fn handle(stream: TcpStream, rooms: Rooms) -> Result<(), Box<dyn std::erro
     })
     .await?;
 
-    let room = room_cell.lock().unwrap().clone();
-    if room.is_empty() {
-        return Ok(()); // no room → nothing to do
+    let room = room_cell.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if room.is_empty() || room.len() > MAX_ROOM_ID_LEN {
+        return Ok(()); // no/oversized room → nothing to do
     }
 
     let (mut write, mut read) = ws.split();
     let (tx, mut rx) = unbounded_channel::<Message>();
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
-    // Join the room; assign roles once the pair is complete.
-    {
-        let mut guard = rooms.lock().unwrap();
-        let peers = guard.entry(room.clone()).or_default();
-        if peers.len() >= 2 {
-            let _ = tx.send(Message::text("{\"type\":\"error\",\"error\":\"room full\"}"));
-            // fall through: writer task will deliver, then we return below.
-        } else {
-            peers.push((id, tx.clone()));
-            if peers.len() == 2 {
-                // Newest joiner offers; the one already waiting answers.
-                let _ = peers[1].1.send(role_msg("offerer"));
-                let _ = peers[0].1.send(role_msg("answerer"));
+    // Join the room; assign roles once the pair is complete. `joined` gates the
+    // relay loop + leave logic so a *rejected* (room-full / over-capacity) peer can
+    // never inject into or tear down an established pair.
+    let joined = {
+        let mut guard = rooms.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.get(&room).map(Vec::len) {
+            Some(n) if n >= 2 => {
+                let _ = tx.send(err_msg("room full"));
+                false
+            }
+            None if guard.len() >= MAX_ROOMS => {
+                let _ = tx.send(err_msg("server at capacity"));
+                false
+            }
+            _ => {
+                let peers = guard.entry(room.clone()).or_default();
+                peers.push((id, tx.clone()));
+                if peers.len() == 2 {
+                    // Newest joiner offers; the one already waiting answers.
+                    let _ = peers[1].1.send(role_msg("offerer"));
+                    let _ = peers[0].1.send(role_msg("answerer"));
+                }
+                true
             }
         }
-    }
+    };
 
     // Pump outbound channel → socket.
     let writer = tokio::spawn(async move {
@@ -103,6 +118,14 @@ async fn handle(stream: TcpStream, rooms: Rooms) -> Result<(), Box<dyn std::erro
             }
         }
     });
+
+    // A rejected peer was never added to the room: deliver its error and leave,
+    // running NEITHER the relay loop nor the leave/peer-left logic.
+    if !joined {
+        drop(tx); // flush the queued error, then the writer task ends
+        let _ = writer.await;
+        return Ok(());
+    }
 
     // Relay everything this peer sends to the *other* peer in the room.
     while let Some(Ok(msg)) = read.next().await {
@@ -115,7 +138,7 @@ async fn handle(stream: TcpStream, rooms: Rooms) -> Result<(), Box<dyn std::erro
 
     // Leave the room.
     {
-        let mut guard = rooms.lock().unwrap();
+        let mut guard = rooms.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(peers) = guard.get_mut(&room) {
             peers.retain(|(pid, _)| *pid != id);
             // Tell a lingering peer the other side left.
@@ -135,9 +158,13 @@ fn role_msg(role: &str) -> Message {
     Message::text(format!("{{\"type\":\"role\",\"role\":\"{role}\"}}"))
 }
 
+fn err_msg(error: &str) -> Message {
+    Message::text(format!("{{\"type\":\"error\",\"error\":\"{error}\"}}"))
+}
+
 /// Forward `msg` to every peer in `room` other than `from`.
 fn relay(rooms: &Rooms, room: &str, from: u64, msg: Message) {
-    let guard = rooms.lock().unwrap();
+    let guard = rooms.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(peers) = guard.get(room) {
         for (pid, tx) in peers {
             if *pid != from {

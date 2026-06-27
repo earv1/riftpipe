@@ -337,13 +337,19 @@ async fn establish_over_signaling(we_offer: bool, sig: &mut Signaling) -> Result
         wait_open(&dc).await;
         Ok(WebrtcLink { dc, inbound, _pc: pc })
     } else {
-        let (dc_tx, dc_rx) = oneshot::channel::<RtcDataChannel>();
+        // Attach the inbound pump INSIDE `ondatachannel`, before any await — a
+        // channel can open and the offerer can send during the await gap, and
+        // RtcDataChannel does not buffer messages for a late `onmessage` listener.
+        type Inbound = futures_channel::mpsc::UnboundedReceiver<Vec<u8>>;
+        let (dc_tx, dc_rx) = oneshot::channel::<(RtcDataChannel, Inbound)>();
         let dc_tx = Rc::new(RefCell::new(Some(dc_tx)));
         let on_dc = {
             let dc_tx = dc_tx.clone();
             Closure::<dyn FnMut(RtcDataChannelEvent)>::new(move |ev: RtcDataChannelEvent| {
+                let dc = ev.channel();
+                let inbound = pipe_inbound(&dc);
                 if let Some(tx) = dc_tx.borrow_mut().take() {
-                    let _ = tx.send(ev.channel());
+                    let _ = tx.send((dc, inbound));
                 }
             })
         };
@@ -358,8 +364,7 @@ async fn establish_over_signaling(we_offer: bool, sig: &mut Signaling) -> Result
         let sdp = pc.local_description().ok_or_else(|| JsValue::from_str("no local sdp"))?.sdp();
         sig.send(&sdp_msg(&sdp))?;
 
-        let dc = dc_rx.await.map_err(|_| JsValue::from_str("no data channel"))?;
-        let inbound = pipe_inbound(&dc);
+        let (dc, inbound) = dc_rx.await.map_err(|_| JsValue::from_str("no data channel"))?;
         wait_open(&dc).await;
         Ok(WebrtcLink { dc, inbound, _pc: pc })
     }

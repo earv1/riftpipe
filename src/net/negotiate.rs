@@ -109,7 +109,10 @@ pub fn negotiate(local: &Caps, remote: &Caps) -> Outcome {
 
     Outcome {
         transport,
-        we_offer: local.tie_break < remote.tie_break,
+        // `<=` so an (astronomically rare) tie_break collision makes BOTH sides
+        // offer — which fails cleanly ("expected answer, got offer") rather than
+        // both answering and hanging forever waiting for an offer.
+        we_offer: local.tie_break <= remote.tie_break,
     }
 }
 

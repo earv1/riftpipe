@@ -106,13 +106,20 @@ async fn all_cards(root: &FileSystemDirectoryHandle, columns: &[String]) -> Vec<
     cards
 }
 
-async fn write_card_files(root: &FileSystemDirectoryHandle, id: &str, title: &str, description: &str, column: &str, position: i64, done: bool) -> Result<(), JsValue> {
+/// Ensure `tickets/<id>/` (and its `comments/`) exist; return the card dir.
+async fn ensure_card_dir(root: &FileSystemDirectoryHandle, id: &str) -> Result<FileSystemDirectoryHandle, JsValue> {
     let tickets = subdir(root, "tickets", true).await?;
     let cdir = subdir(&tickets, id, true).await?;
-    subdir(&cdir, "comments", true).await?; // ensure comments/ exists
-    write_text(&cdir, "card.md", &kb::card_md(title, description)).await?;
-    write_text(&cdir, "meta.toml", &kb::meta_toml(column, position, done)).await?;
-    Ok(())
+    subdir(&cdir, "comments", true).await?;
+    Ok(cdir)
+}
+
+async fn write_meta(cdir: &FileSystemDirectoryHandle, column: &str, position: i64, done: bool) -> Result<(), JsValue> {
+    write_text(cdir, "meta.toml", &kb::meta_toml(column, position, done)).await
+}
+
+async fn write_card(cdir: &FileSystemDirectoryHandle, title: &str, description: &str) -> Result<(), JsValue> {
+    write_text(cdir, "card.md", &kb::card_md(title, description)).await
 }
 
 fn new_id() -> String {
@@ -204,7 +211,9 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
             let existing = all_cards(&root, &columns).await;
             let max_pos = existing.iter().filter(|c| c.column == column).map(|c| c.position).max().unwrap_or(-1);
             let title = if title.is_empty() { id.clone() } else { title.to_string() };
-            write_card_files(&root, &id, &title, "", &column, max_pos + 1, false).await?;
+            let cdir = ensure_card_dir(&root, &id).await?;
+            write_card(&cdir, &title, "").await?;
+            write_meta(&cdir, &column, max_pos + 1, false).await?;
             Ok(json_resp(&summary(&Card { id, title, column, position: max_pos + 1, done: false })))
         }
 
@@ -224,9 +233,15 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
             if let Some(t) = body.get("title").and_then(|v| v.as_str()) {
                 card.title = if t.is_empty() { id.to_string() } else { t.to_string() };
             }
+            let touched_text = body.get("title").is_some() || body.get("description").is_some();
             if let Some(desc) = body.get("description").and_then(|v| v.as_str()) { description = desc.to_string(); }
 
-            write_card_files(&root, id, &card.title, &description, &card.column, card.position, card.done).await?;
+            // Always persist structural fields; only re-serialize card.md when the
+            // title/description actually changed (mirrors native; avoids prose drift).
+            write_meta(&cdir, &card.column, card.position, card.done).await?;
+            if touched_text {
+                write_card(&cdir, &card.title, &description).await?;
+            }
             Ok(json_resp(&summary(&card)))
         }
 

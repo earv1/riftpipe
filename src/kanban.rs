@@ -34,6 +34,9 @@ struct State {
     dist: PathBuf,
     /// SSE subscribers — each gets change frames; dead ones are pruned on send.
     clients: Arc<Mutex<Vec<Sender<Vec<u8>>>>>,
+    /// Serializes mutating requests so concurrent create/patch can't interleave
+    /// reads+writes of the same files (e.g. duplicate `position`).
+    writes: Arc<Mutex<()>>,
 }
 
 /// Serve the board `dir` on `127.0.0.1:port`, hosting the SPA from `dist`. Blocks.
@@ -42,6 +45,7 @@ pub fn serve(dir: &str, port: u16, dist: &str) -> Result<(), Box<dyn std::error:
         dir: PathBuf::from(dir),
         dist: PathBuf::from(dist),
         clients: Arc::new(Mutex::new(Vec::new())),
+        writes: Arc::new(Mutex::new(())),
     };
     std::fs::create_dir_all(&state.dir)?;
 
@@ -70,6 +74,9 @@ fn route(mut request: Request, state: &State) -> io::Result<()> {
     let path = url.split('?').next().unwrap_or("").to_string();
     let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     let method = request.method().clone();
+
+    // Serialize mutating requests (GET/SSE stay concurrent).
+    let _writes = (method != Method::Get).then(|| state.writes.lock().unwrap_or_else(|e| e.into_inner()));
 
     match (&method, segs.as_slice()) {
         (Method::Get, ["api", "board"]) => {
@@ -419,11 +426,15 @@ fn sse(request: Request, state: &State) -> io::Result<()> {
 fn serve_static(request: Request, state: &State, path: &str) -> io::Result<()> {
     let rel = path.trim_start_matches('/');
     let candidate = if rel.is_empty() { state.dist.join("index.html") } else { state.dist.join(rel) };
-    // Prevent path escapes; only serve within dist.
-    let target = if candidate.starts_with(&state.dist) && candidate.is_file() {
-        candidate
-    } else {
-        state.dist.join("index.html") // SPA fallback
+    // Resolve `..`/symlinks and confirm the result is STILL inside dist — a lexical
+    // `starts_with` is fooled by `..` (`dist/../../etc/passwd` lexically starts with
+    // `dist`), so canonicalize both and compare. A miss falls back to the SPA shell.
+    let safe = std::fs::canonicalize(&candidate).ok().filter(|c| {
+        c.is_file() && std::fs::canonicalize(&state.dist).map(|d| c.starts_with(d)).unwrap_or(false)
+    });
+    let target = match safe {
+        Some(c) => c,
+        None => state.dist.join("index.html"), // SPA fallback
     };
     match std::fs::read(&target) {
         Ok(bytes) => {
@@ -457,9 +468,12 @@ fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("valid header")
 }
 
+/// Cap a request body at 1 MiB so a client can't stream unbounded data into RAM.
+const MAX_BODY: u64 = 1 << 20;
+
 fn read_json(request: &mut Request) -> Value {
     let mut body = String::new();
-    let _ = request.as_reader().read_to_string(&mut body);
+    let _ = request.as_reader().take(MAX_BODY).read_to_string(&mut body);
     serde_json::from_str(&body).unwrap_or(Value::Null)
 }
 
@@ -472,9 +486,12 @@ fn respond(request: Request, status: u16, msg: &str) -> io::Result<()> {
     request.respond(Response::from_string(msg).with_status_code(status))
 }
 
-/// UTC ISO-8601 timestamp (no millis), e.g. `2026-06-27T18:37:19Z`.
+/// UTC ISO-8601 timestamp with millis, e.g. `2026-06-27T18:37:19.123Z`. Millis
+/// keep same-author comments from colliding on the same-second filename.
 fn iso_now() -> String {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    let millis = dur.subsec_millis();
     let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     // civil-from-days (Howard Hinnant's algorithm).
@@ -488,7 +505,7 @@ fn iso_now() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
 }
 
 #[cfg(test)]
@@ -502,7 +519,7 @@ mod tests {
         let id = new_id();
         assert!(id.starts_with("tk_") && id.len() == 11);
         let ts = iso_now();
-        assert_eq!(ts.len(), 20); // YYYY-MM-DDTHH:MM:SSZ
-        assert!(ts.ends_with('Z') && ts.contains('T'));
+        assert_eq!(ts.len(), 24); // YYYY-MM-DDTHH:MM:SS.mmmZ
+        assert!(ts.ends_with('Z') && ts.contains('T') && ts.contains('.'));
     }
 }

@@ -117,7 +117,7 @@ pub fn parse_meta(text: &str) -> Meta {
         let (k, v) = (k.trim(), v.trim());
         match k {
             "column" => {
-                let s = v.trim_matches('"').to_string();
+                let s = unquote(v);
                 meta.column = if s.is_empty() { None } else { Some(s) };
             }
             "position" => meta.position = v.parse().unwrap_or(0),
@@ -128,10 +128,29 @@ pub fn parse_meta(text: &str) -> Meta {
     meta
 }
 
-/// Serialize structural fields → `meta.toml` text (valid TOML).
+/// Strip surrounding quotes from a TOML basic string and unescape `\\` / `\"`
+/// (the only escapes [`meta_toml`] emits).
+fn unquote(v: &str) -> String {
+    let inner = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(v);
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(n) = chars.next() {
+                out.push(n); // \\ -> \, \" -> "
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Serialize structural fields → `meta.toml` text (valid TOML). Escapes `\` and `"`
+/// in the column name so [`parse_meta`] round-trips it exactly.
 pub fn meta_toml(column: &str, position: i64, done: bool) -> String {
-    // `{column:?}` yields a quoted, escaped string — a valid TOML basic string.
-    format!("column = {column:?}\nposition = {position}\ndone = {done}\n")
+    let esc = column.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("column = \"{esc}\"\nposition = {position}\ndone = {done}\n")
 }
 
 /// A card from its files' text (defaults for any missing/blank piece).
@@ -192,6 +211,11 @@ mod tests {
         assert_eq!((m.position, m.done), (7, true));
         let empty = parse_meta("");
         assert_eq!((empty.column, empty.position, empty.done), (None, 0, false));
+
+        // Columns containing quotes/backslashes round-trip exactly.
+        let weird = r#"a"b\c"#;
+        let m = parse_meta(&meta_toml(weird, 0, false));
+        assert_eq!(m.column.as_deref(), Some(weird));
     }
 
     #[test]
