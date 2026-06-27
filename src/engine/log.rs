@@ -4,8 +4,8 @@
 //! end to end until the eg-walker text document (diamond-types) replaces it
 //! behind the same `Document` trait.
 
-use crate::document::Document;
-use crate::op::{Action, Op};
+use crate::engine::document::Document;
+use crate::engine::op::{Action, Op};
 
 #[derive(Default)]
 pub struct AppendLog {

@@ -6,9 +6,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 
-use crate::document::Document;
-use crate::op::{Op, OpId};
-use crate::rules::{Rule, Verdict};
+use crate::engine::document::Document;
+use crate::engine::op::{Op, OpId};
+use crate::engine::rules::{Rule, Verdict};
 
 pub struct Engine<D: Document, R: Rule> {
     rule: R,
@@ -68,10 +68,10 @@ impl<D: Document, R: Rule> Engine<D, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::AgentId;
-    use crate::log::AppendLog;
-    use crate::op::Action;
-    use crate::rules::TwoPlayerTurns;
+    use crate::engine::identity::AgentId;
+    use crate::engine::log::AppendLog;
+    use crate::engine::op::Action;
+    use crate::engine::rules::TwoPlayerTurns;
 
     fn mv(agent: AgentId, seq: u64, lamport: u64, text: &str) -> Op {
         Op {

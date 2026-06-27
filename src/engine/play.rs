@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::game::{Action, ActionKind, Player, World, INPUT_DELAY};
+use crate::engine::game::{Action, ActionKind, Player, World, INPUT_DELAY};
 use crate::net::{anyerr, Link, Result};
 
 /// One tick's worth of input exchanged between peers (possibly empty).

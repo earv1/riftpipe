@@ -2,7 +2,7 @@
 //! DAG) and a Lamport timestamp; the engine replays them in a deterministic
 //! total order so every honest peer materializes the same state.
 
-use crate::identity::AgentId;
+use crate::engine::identity::AgentId;
 
 /// Unique identity of an op: author + per-author sequence number.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]

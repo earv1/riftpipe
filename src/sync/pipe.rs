@@ -17,8 +17,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{interval, sleep_until, Instant, MissedTickBehavior};
 
 use crate::net::{anyerr, Result};
-use crate::text::EgWalkerText;
-use crate::transport::{IrohSink, IrohSource};
+use crate::crdt::text::EgWalkerText;
+use crate::net::transport::{IrohSink, IrohSource};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "op", rename_all = "lowercase")]

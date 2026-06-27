@@ -4,8 +4,8 @@
 //! is pure, every honest peer computes the same verdict → convergence holds even
 //! when some ops are rejected.
 
-use crate::identity::{AgentId, RuleFingerprint};
-use crate::op::Op;
+use crate::engine::identity::{AgentId, RuleFingerprint};
+use crate::engine::op::Op;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {

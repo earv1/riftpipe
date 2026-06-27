@@ -7,10 +7,10 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::document::Document;
+use crate::engine::document::Document;
 use crate::engine::Engine;
-use crate::op::{Op, OpId};
-use crate::rules::Rule;
+use crate::engine::op::{Op, OpId};
+use crate::engine::rules::Rule;
 
 /// One golden vector.
 pub struct Vector {

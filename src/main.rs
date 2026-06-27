@@ -2,17 +2,17 @@
 //! and `join` do a real one-shot CRDT exchange over iroh (the live editing loop
 //! arrives with the demo app).
 
-use autoshare::identity::AgentId;
-use autoshare::log::AppendLog;
+use autoshare::engine::identity::AgentId;
+use autoshare::engine::log::AppendLog;
 use autoshare::net::CountingLink;
-use autoshare::op::{Action, Op, OpId};
-use autoshare::pipe::run_pipe;
-use autoshare::rules::TwoPlayerTurns;
-use autoshare::secure::{authenticate, Ticket};
-use autoshare::simulation::{Suite, Vector};
-use autoshare::text::EgWalkerText;
-use autoshare::textpipe::TextPeer;
-use autoshare::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr, IrohLink};
+use autoshare::engine::op::{Action, Op, OpId};
+use autoshare::sync::pipe::run_pipe;
+use autoshare::engine::rules::TwoPlayerTurns;
+use autoshare::net::secure::{authenticate, Ticket};
+use autoshare::engine::simulation::{Suite, Vector};
+use autoshare::crdt::text::EgWalkerText;
+use autoshare::sync::mirror::TextPeer;
+use autoshare::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr, IrohLink};
 use iroh::{Endpoint, EndpointId};
 
 /// Parse `args[2..]` into positionals + flags. `--metrics <path>` takes a value.
@@ -127,13 +127,13 @@ async fn run_frontend(
         let counters = std::sync::Arc::new(autoshare::net::Counters::default());
         let (sink, source) = link.into_halves(counters.clone());
         if let Some(path) = metrics {
-            autoshare::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
+            autoshare::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
         }
         run_pipe(sink, source).await
     } else {
         let (mut counting, counters) = CountingLink::new(link);
         if let Some(path) = metrics {
-            autoshare::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
+            autoshare::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
         }
         eprintln!("authenticated — live syncing {file} (end-to-end encrypted). ^C to stop.");
         live_file_loop(file, &mut counting).await
@@ -169,7 +169,7 @@ async fn live_file_loop(file: &str, link: &mut dyn autoshare::net::Link) -> auto
 /// Solo scripted preview of the tower-defense sim (no networking) — just to see
 /// the board render and confirm the deterministic core feels alive.
 fn demo_td() {
-    use autoshare::game::{Action, ActionKind, Player, World};
+    use autoshare::engine::game::{Action, ActionKind, Player, World};
 
     let script = [
         Action { tick: 2, seq: 0, player: Player::P1, kind: ActionKind::PlaceTower { tile: 4 } },
@@ -194,7 +194,7 @@ fn demo_td() {
             }
             w.step();
         }
-        print!("{}", autoshare::game::render(&w));
+        print!("{}", autoshare::engine::game::render(&w));
         println!();
     }
 }

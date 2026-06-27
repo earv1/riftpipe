@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::text::EgWalkerText;
+use crate::crdt::text::EgWalkerText;
 
 pub type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, BoxErr>;

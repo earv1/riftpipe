@@ -2,7 +2,7 @@
 //! simulation transcript is ALWAYS compared — mandatory, not a fallback — so
 //! incompatible or heterogeneous rule-sets are caught before any data syncs.
 
-use crate::identity::{AgentId, DocId, RuleFingerprint};
+use crate::engine::identity::{AgentId, DocId, RuleFingerprint};
 
 /// First handshake message.
 #[derive(Clone, Copy, Debug)]

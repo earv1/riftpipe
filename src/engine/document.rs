@@ -3,7 +3,7 @@
 //! apply/materialize/diff. The v0 placeholder is `log::AppendLog`; the eg-walker
 //! text document (diamond-types) will implement this same trait.
 
-use crate::op::{Action, Op};
+use crate::engine::op::{Action, Op};
 
 pub trait Document: Default {
     /// Fold one (already-accepted) op into the document state.

@@ -3,7 +3,7 @@
 //! zero sockets — so they're fast and deterministic. Mock client 1, 2, ... N.
 
 use autoshare::net::{mock_pair, sync_full, MockNet};
-use autoshare::text::EgWalkerText;
+use autoshare::crdt::text::EgWalkerText;
 
 fn doc(name: &str, text: &str) -> EgWalkerText {
     let mut d = EgWalkerText::new(name);

@@ -9,7 +9,7 @@
 //! sequence merge — unlike the lockstep action-log game, this is the hero use.
 
 use crate::net::{Link, Result};
-use crate::text::EgWalkerText;
+use crate::crdt::text::EgWalkerText;
 
 pub struct TextPeer {
     doc: EgWalkerText,
