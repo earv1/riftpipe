@@ -9,9 +9,12 @@
 //!   {"op":"insert","pos":N,"text":"..."}
 //!   {"op":"delete","pos":N,"len":M}
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use similar::{capture_diff_slices, Algorithm, DiffOp};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::time::{interval, sleep_until, Instant, MissedTickBehavior};
 
 use crate::net::{anyerr, Result};
 use crate::text::EgWalkerText;
@@ -111,6 +114,33 @@ impl PipePeer {
         let after = self.doc.content();
         diff_to_ops(&before, &after)
     }
+
+    /// Our version vector as `(agent, seq)` pairs (for reconciliation/tests).
+    pub fn version_vector_pairs(&self) -> Vec<(String, usize)> {
+        self.doc.version_vector()
+    }
+
+    /// Our version vector (for reconciliation), JSON-encoded for the wire.
+    pub fn version_json(&self) -> Vec<u8> {
+        serde_json::to_vec(&self.doc.version_vector()).unwrap_or_default()
+    }
+
+    /// Ops the peer is missing, given their version vector (None if caught up).
+    pub fn ops_since(&self, theirs: &[(String, usize)]) -> Option<Vec<u8>> {
+        self.doc.ops_since(theirs)
+    }
+}
+
+// Wire message tags (prefix byte before the payload). The link otherwise carries
+// opaque bytes; this multiplexes ops vs. reconciliation.
+const TAG_DELTA: u8 = 0; // CRDT ops (push or sync response) -> merge
+const TAG_SYNC: u8 = 1; // sender's version vector -> reply with the missing ops
+
+fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(payload.len() + 1);
+    v.push(tag);
+    v.extend_from_slice(payload);
+    v
 }
 
 /// Event-driven stdio driver (`autoshare ... --pipe`). A single `select!` loop
@@ -122,6 +152,17 @@ pub async fn run_pipe(mut sink: IrohSink, mut source: IrohSource) -> Result<()> 
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let mut out = tokio::io::stdout();
 
+    // Reconciliation triggers (DESIGN.md §16): a periodic heartbeat, plus a
+    // debounced "after edits settle" timer. Both send our version vector; the
+    // peer replies with exactly the ops we're missing (empty if in sync).
+    let mut heartbeat = interval(Duration::from_secs(5));
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let idle = || Instant::now() + Duration::from_secs(3600); // "disabled" deadline
+    let mut settle_at = idle();
+
+    // Reconcile on connect (recovers state after a reconnect).
+    sink.send(frame(TAG_SYNC, &peer.version_json())).await?;
+
     loop {
         tokio::select! {
             line = stdin.next_line() => {
@@ -132,9 +173,9 @@ pub async fn run_pipe(mut sink: IrohSink, mut source: IrohSource) -> Result<()> 
                         if let Ok(op) = serde_json::from_str::<EditOp>(line) {
                             let before = peer.version();
                             peer.apply_local(&op);
-                            // Send only when the op actually changed the doc.
                             if peer.version() != before {
-                                sink.send(peer.encode_since_sent()).await?;
+                                sink.send(frame(TAG_DELTA, &peer.encode_since_sent())).await?;
+                                settle_at = Instant::now() + Duration::from_millis(500);
                             }
                         }
                     }
@@ -143,16 +184,40 @@ pub async fn run_pipe(mut sink: IrohSink, mut source: IrohSource) -> Result<()> 
             }
             msg = source.recv() => {
                 match msg? {
-                    Some(bytes) => {
-                        for op in peer.merge_remote(&bytes) {
-                            let mut line = serde_json::to_string(&op).map_err(anyerr)?;
-                            line.push('\n');
-                            out.write_all(line.as_bytes()).await.map_err(anyerr)?;
+                    Some(bytes) if !bytes.is_empty() => {
+                        let (tag, payload) = (bytes[0], &bytes[1..]);
+                        match tag {
+                            TAG_DELTA => {
+                                for op in peer.merge_remote(payload) {
+                                    let mut line = serde_json::to_string(&op).map_err(anyerr)?;
+                                    line.push('\n');
+                                    out.write_all(line.as_bytes()).await.map_err(anyerr)?;
+                                }
+                                out.flush().await.map_err(anyerr)?;
+                                settle_at = Instant::now() + Duration::from_millis(500);
+                            }
+                            TAG_SYNC => {
+                                if let Ok(theirs) =
+                                    serde_json::from_slice::<Vec<(String, usize)>>(payload)
+                                {
+                                    if let Some(missing) = peer.ops_since(&theirs) {
+                                        sink.send(frame(TAG_DELTA, &missing)).await?;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        out.flush().await.map_err(anyerr)?;
                     }
+                    Some(_) => {} // empty frame
                     None => break, // peer closed
                 }
+            }
+            _ = sleep_until(settle_at) => {
+                sink.send(frame(TAG_SYNC, &peer.version_json())).await?;
+                settle_at = idle();
+            }
+            _ = heartbeat.tick() => {
+                sink.send(frame(TAG_SYNC, &peer.version_json())).await?;
             }
         }
     }
@@ -213,6 +278,41 @@ mod tests {
         assert_eq!(buf_b, b.content(), "editor B out of sync with its CRDT");
         assert_eq!(buf_a, buf_b, "editors diverged: {buf_a:?} vs {buf_b:?}");
         assert!(buf_a.contains("hello") && buf_a.contains("world"));
+    }
+
+    #[test]
+    fn version_vector_resync_recovers_a_dropped_delta() {
+        let mut a = PipePeer::new("a");
+        let mut b = PipePeer::new("b");
+
+        // A makes two edits; B receives only the FIRST (the second delta is
+        // "lost", e.g. across a reconnect).
+        a.apply_local(&EditOp::Insert { pos: 0, text: "one ".into() });
+        let d1 = a.encode_since_sent();
+        a.apply_local(&EditOp::Insert { pos: 4, text: "two".into() });
+        let _dropped = a.encode_since_sent();
+        b.merge_remote(&d1);
+        assert_ne!(a.content(), b.content(), "B should be behind after the drop");
+
+        // Reconcile: B advertises its version, A sends exactly what B is missing.
+        let bv = b.version_vector_pairs();
+        let missing = a.ops_since(&bv).expect("A should have ops B lacks");
+        b.merge_remote(&missing);
+
+        assert_eq!(a.content(), b.content(), "resync must re-converge");
+        assert!(b.content().contains("one") && b.content().contains("two"));
+    }
+
+    #[test]
+    fn resync_sends_nothing_when_already_in_sync() {
+        let mut a = PipePeer::new("a");
+        let mut b = PipePeer::new("b");
+        a.apply_local(&EditOp::Insert { pos: 0, text: "hello".into() });
+        let d = a.encode_since_sent();
+        b.merge_remote(&d);
+        assert_eq!(a.content(), b.content());
+        // B is caught up -> A has nothing to send.
+        assert!(a.ops_since(&b.version_vector_pairs()).is_none());
     }
 
     #[test]

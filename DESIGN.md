@@ -504,3 +504,42 @@ may *write* each region (the guard), not who may *see* it.
 - **file-mirror mode** stays as-is (no overlays, scriptable, pipe-friendly).
 - **TUI mode** adds a compositor: shared doc + local overlays (stats HUD,
   messages) drawn together, overlays never synced.
+
+---
+
+## 16. Desync handling — reconciliation (IMPLEMENTED, partial)
+
+**Where desync comes from:**
+- *In-stream loss/reorder:* impossible — QUIC streams are reliable + ordered, so
+  while connected the CRDT always converges.
+- *Reconnection:* a dropped+re-established connection misses the deltas sent while
+  down.
+- *Bridge snapshot race:* the nvim bridge sends whole-buffer snapshots; if you
+  type in the window after autoshare merged a remote op but before the bridge
+  applied it, the snapshot diff can delete the remote edit → lasting divergence.
+
+**Mechanism (version-vector reconciliation):** peers exchange a compact **version
+vector** — the diamond-types frontier as portable `(agent, seq)` pairs
+(`version_vector()`), usually one or two entries. The receiver computes exactly
+the ops the sender is missing (`ops_since()` → map their frontier into our frame
+best-effort, `iter_range_since` to test for any ops, `encode_from(ENCODE_PATCH)`
+to encode them) — `None` when caught up (sends nothing), the full history for a
+fresh peer. `decode_and_add` is idempotent, so a resync is always safe.
+
+**Wire framing:** link messages are tagged — `DELTA` (ops → merge) vs `SYNC`
+(version vector → reply with the missing ops).
+
+**Triggers (the user chose both):**
+- **on connect** — recovers state after a reconnect / seeds a late joiner,
+- **after edits settle** — debounced ~500ms (activity-triggered),
+- **heartbeat** — every 5s (periodic). The vector is tiny, so idle traffic is a
+  few bytes every 5s (near-silent, not absolutely silent — the trade for
+  continuous detection).
+
+A `SYNC` exchange both *detects* and *heals* in one step: if the peer is missing
+ops they arrive; if not, nothing is sent.
+
+**Honest gap:** this is the reconciliation *protocol*, ready to recover on
+(re)connect. **Actual reconnection** — re-dialing a dropped iroh connection and
+re-entering the sync loop — is not yet implemented (a drop currently ends the
+session). That's the next piece; it will reuse this reconciliation unchanged.

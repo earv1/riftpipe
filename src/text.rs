@@ -13,6 +13,7 @@
 use std::ops::Range;
 
 use diamond_types::list::encoding::{ENCODE_FULL, ENCODE_PATCH};
+use diamond_types::list::remote_ids::RemoteId;
 use diamond_types::list::OpLog;
 use diamond_types::AgentId;
 use similar::{capture_diff_slices, Algorithm, DiffOp};
@@ -133,6 +134,42 @@ impl EgWalkerText {
     /// Encode the entire history — used to seed a brand-new peer.
     pub fn encode_full(&self) -> Vec<u8> {
         self.oplog.encode(ENCODE_FULL)
+    }
+
+    /// The version frontier as portable `(agent, seq)` pairs — the compact
+    /// "state vector" peers exchange to reconcile after a drop/reconnect
+    /// (DESIGN.md §16). Usually just one or two entries (the tips).
+    pub fn version_vector(&self) -> Vec<(String, usize)> {
+        self.oplog
+            .remote_version()
+            .iter()
+            .map(|r| (r.agent.to_string(), r.seq))
+            .collect()
+    }
+
+    /// Encode exactly the ops a peer is missing, given THEIR version vector. We
+    /// map their frontier into our frame best-effort (tips we don't have are ops
+    /// *they* have and we lack — irrelevant to what we send) and encode
+    /// everything after it. `None` when they're already caught up (so we send
+    /// nothing); the full history when their vector is empty (a fresh peer). This
+    /// is what makes reconciliation recover from any missed delta.
+    pub fn ops_since(&self, theirs: &[(String, usize)]) -> Option<Vec<u8>> {
+        let mut frontier: Vec<usize> = Vec::new();
+        for (agent, seq) in theirs {
+            let id = RemoteId {
+                agent: agent.as_str().into(),
+                seq: *seq,
+            };
+            if let Ok(t) = self.oplog.try_remote_to_local_time(&id) {
+                frontier.push(t);
+            }
+        }
+        // An encode always carries header bytes even with zero ops, so check for
+        // actual ops rather than byte-emptiness.
+        if self.oplog.iter_range_since(&frontier).next().is_none() {
+            return None;
+        }
+        Some(self.oplog.encode_from(ENCODE_PATCH, &frontier))
     }
 
     /// Merge encoded ops from a peer. diamond-types dedupes by global op id, so
