@@ -62,6 +62,34 @@ queue up and apply on reconnect.
 The `--pipe` protocol is just JSON lines — `{"op":"insert","pos":N,"text":"…"}`
 in, remote edits out. Any program (a test, a bot, a build tool) can be a peer.
 
+### 7. Run a P2P kanban — files *are* the database (no DB, no cloud)
+A serverless, end-to-end-encrypted kanban board. The board **is a directory tree**
+— `board.md` plus a folder per ticket (`card.md` prose, `meta.toml` structure,
+`comments/*.md`) — synced by folder mode: prose merges with the text CRDT,
+structure is last-writer-wins per file, so concurrent edits and card moves don't
+clobber. One Rust binary serves the bundled web UI *and* syncs the files:
+```sh
+riftpipe kanban serve ./board --port 7777
+```
+No database, no account — the board stays human-editable and git-friendly.
+
+### 8. …or run the whole app **in a browser**, no local server
+The same core compiles to WebAssembly (`riftpipe-core` + the `web/` crate): the
+eg-walker CRDT runs in the page, the board persists to the browser's private
+filesystem (**OPFS**), and the JSON API the UI calls is handled by wasm — so
+there's no localhost process, just a static bundle. Two browsers connect
+**peer-to-peer over WebRTC by sharing a link**: the connection id lives in the URL
+hash, a tiny content-blind signaling server (`riftpipe signal`) pairs the room,
+and data then flows direct. *Verified headlessly in real Chrome* — CRDT
+convergence, OPFS persistence, and link-based connection all pass; wiring the
+board's per-file sync over that link is the active next step.
+
+### 9. Embed the CRDT in your own web app
+`riftpipe-core` ships as a wasm package (`wasm-pack build`): `import { RiftDoc }`
+and you have an eg-walker document — `editTo` / `delta` / `merge` / `content`,
+plus `persist` / `load` to OPFS — the *same* CRDT the native CLI runs. Snapshot
+in, deltas out; converge with any peer over the link of your choice.
+
 ### Planned
 - **`wal-db`** — append-only write-ahead-log replication for databases (sync
   *state* separately from a *view*, e.g. a game's authoritative state vs. its
@@ -117,6 +145,23 @@ glob = "**/*.md"
 algo = "text-crdt"
 ```
 
+### Kanban + browser
+```sh
+# native: serve the kanban UI + JSON file-API over a board directory
+riftpipe kanban serve ./board --port 7777
+
+# the connection broker for browser peers (self-hosted, content-blind)
+riftpipe signal --port 9000
+
+# build the browser (wasm) package and verify it headlessly in real Chrome
+cd web && wasm-pack build --target web && ./test-headless.sh
+
+# mint a shareable connection link (the id is the room two peers join)
+./web/share-link.sh https://your-host    # -> https://your-host/#<id>
+```
+The shared layout lives in `riftpipe-core::kanban`, so a board is byte-for-byte
+portable between the native server and the browser build.
+
 ### Useful flags
 | flag | meaning |
 |------|---------|
@@ -130,9 +175,15 @@ algo = "text-crdt"
 
 ## How it works (short version)
 
-- **Transport** — iroh QUIC: dialable tickets, NAT hole-punching, prefers a
-  direct path and uses a relay only to bootstrap. Every link is authenticated
-  from a shared secret in the ticket and end-to-end encrypted.
+- **Transport** — every link is an abstraction (`Link`), so the wire underneath is
+  swappable and negotiated at connect time (a capability ladder: WebRTC-direct →
+  iroh-direct → iroh-relay):
+  - **native** — iroh QUIC: dialable tickets, NAT hole-punching, direct when it
+    can, relay only to bootstrap; authenticated from the ticket secret, e2e
+    encrypted.
+  - **browser** — WebRTC data channels, brokered by a tiny content-blind signaling
+    server (`riftpipe signal`) keyed on a connection id shared in a link; data
+    flows direct after the handshake.
 - **The seam** — each resource is synced by a pluggable `Syncer` (a *Strategy*):
   advertise what you have, answer "what are you missing", merge an opaque delta.
   Today's strategies are `text-crdt` (diamond-types eg-walker) and `rsync-file`
@@ -155,6 +206,10 @@ self-host a relay for production.
 ## Status
 
 Early/experimental (`v0.0.0`), developed against loopback and local networks.
-Text CRDT, rsync, folder sync, in-memory mode, reconnection, and the nvim bridge
-work; `wal-db`/`image` are stubs. Not yet hardened for hostile networks or large
-trees.
+Working: text CRDT, rsync, folder sync, in-memory mode, reconnection, the nvim
+bridge, the native kanban server, and the browser stack — the wasm CRDT, OPFS
+persistence, WebRTC + link-based signaling, and the in-browser kanban handler are
+all verified headlessly in real Chrome. In progress: wiring the browser board's
+per-file sync over the WebRTC link (so two browsers *collaborate*, not just run),
+and a browser↔native bridge. `wal-db`/`image` are stubs. Not yet proven on
+hostile/cross-NAT networks (needs the env-configurable STUN/TURN) or large trees.
