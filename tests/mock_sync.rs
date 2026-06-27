@@ -2,8 +2,8 @@
 //! exercise the exact `sync_full` driver the real iroh transport uses, but with
 //! zero sockets — so they're fast and deterministic. Mock client 1, 2, ... N.
 
-use autoshare::net::{mock_pair, sync_full, MockNet};
-use autoshare::crdt::text::EgWalkerText;
+use riftpipe::net::{mock_pair, sync_full, MockNet};
+use riftpipe::crdt::text::EgWalkerText;
 
 fn doc(name: &str, text: &str) -> EgWalkerText {
     let mut d = EgWalkerText::new(name);

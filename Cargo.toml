@@ -1,5 +1,5 @@
 [package]
-name = "autoshare"
+name = "riftpipe"
 version = "0.0.0"
 edition = "2021"
 description = "A Unix-like terminal construct for live, peer-to-peer collaborative text (see DESIGN.md)"
@@ -26,5 +26,5 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util"
 #   ratatui + crossterm — TTY repaint mode (DESIGN.md §4)
 
 [[bin]]
-name = "autoshare"
+name = "riftpipe"
 path = "src/main.rs"

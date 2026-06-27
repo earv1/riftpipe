@@ -1,20 +1,20 @@
-//! autoshare CLI. `simulate` and `text` run offline demos of the core. `share`
+//! riftpipe CLI. `simulate` and `text` run offline demos of the core. `share`
 //! and `join` do a real one-shot CRDT exchange over iroh (the live editing loop
 //! arrives with the demo app).
 
 use std::sync::Arc;
 
-use autoshare::crdt::text::EgWalkerText;
-use autoshare::engine::identity::AgentId;
-use autoshare::engine::log::AppendLog;
-use autoshare::engine::op::{Action, Op, OpId};
-use autoshare::engine::rules::TwoPlayerTurns;
-use autoshare::engine::simulation::{Suite, Vector};
-use autoshare::net::secure::{authenticate, Ticket};
-use autoshare::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr};
-use autoshare::net::{Counters, CountingLink};
-use autoshare::sync::mirror::TextPeer;
-use autoshare::sync::pipe::{run_pipe_reconnecting, Role};
+use riftpipe::crdt::text::EgWalkerText;
+use riftpipe::engine::identity::AgentId;
+use riftpipe::engine::log::AppendLog;
+use riftpipe::engine::op::{Action, Op, OpId};
+use riftpipe::engine::rules::TwoPlayerTurns;
+use riftpipe::engine::simulation::{Suite, Vector};
+use riftpipe::net::secure::{authenticate, Ticket};
+use riftpipe::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr};
+use riftpipe::net::{Counters, CountingLink};
+use riftpipe::sync::mirror::TextPeer;
+use riftpipe::sync::pipe::{run_pipe_reconnecting, Role};
 
 /// Parse `args[2..]` into positionals + flags. `--metrics <path>` takes a value.
 fn parse(args: &[String]) -> (Vec<String>, bool, Option<String>) {
@@ -47,10 +47,10 @@ async fn main() {
             match pos.first() {
                 Some(file) => {
                     if let Err(e) = share(file, pipe, metrics).await {
-                        eprintln!("[autoshare] share failed: {e}");
+                        eprintln!("[riftpipe] share failed: {e}");
                     }
                 }
-                None => eprintln!("usage: autoshare share <file> [--pipe] [--metrics <path>]"),
+                None => eprintln!("usage: riftpipe share <file> [--pipe] [--metrics <path>]"),
             }
         }
         "join" => {
@@ -58,20 +58,20 @@ async fn main() {
             match (pos.first(), pos.get(1)) {
                 (Some(ticket), Some(file)) => {
                     if let Err(e) = join(ticket, file, pipe, metrics).await {
-                        eprintln!("[autoshare] join failed: {e}");
+                        eprintln!("[riftpipe] join failed: {e}");
                     }
                 }
-                _ => eprintln!("usage: autoshare join <ticket> <file> [--pipe] [--metrics <path>]"),
+                _ => eprintln!("usage: riftpipe join <ticket> <file> [--pipe] [--metrics <path>]"),
             }
         }
         _ => {
-            eprintln!("autoshare — collaborative pipe");
+            eprintln!("riftpipe — collaborative pipe");
             eprintln!("usage:");
-            eprintln!("  autoshare simulate            # ruled replay engine demo (offline)");
-            eprintln!("  autoshare text                # eg-walker convergence demo (offline)");
-            eprintln!("  autoshare td                  # tower-defense core preview (offline)");
-            eprintln!("  autoshare share <file> [--pipe] [--metrics <path>]");
-            eprintln!("  autoshare join <ticket> <file> [--pipe] [--metrics <path>]");
+            eprintln!("  riftpipe simulate            # ruled replay engine demo (offline)");
+            eprintln!("  riftpipe text                # eg-walker convergence demo (offline)");
+            eprintln!("  riftpipe td                  # tower-defense core preview (offline)");
+            eprintln!("  riftpipe share <file> [--pipe] [--metrics <path>]");
+            eprintln!("  riftpipe join <ticket> <file> [--pipe] [--metrics <path>]");
             eprintln!("\nedit the file in your $EDITOR; changes converge across peers.");
             eprintln!("--pipe    speak the editor edit-stream protocol on stdin/stdout (for bridges)");
             eprintln!("--metrics write a one-line status to <path> for tmux to display");
@@ -83,7 +83,7 @@ async fn main() {
 /// Serve a file for live collaboration: go online (so the ticket is dialable from
 /// anywhere via relay), print a secret-bearing ticket (also written to
 /// `<file>.ticket` for scripts), accept + authenticate one peer, then run.
-async fn share(file: &str, pipe: bool, metrics: Option<String>) -> autoshare::net::Result<()> {
+async fn share(file: &str, pipe: bool, metrics: Option<String>) -> riftpipe::net::Result<()> {
     use std::time::Duration;
     let endpoint = bind_accept().await?;
     // Best-effort: get a relay home so peers on other networks can reach us.
@@ -110,14 +110,14 @@ async fn share(file: &str, pipe: bool, metrics: Option<String>) -> autoshare::ne
     let peer = link.remote_id();
     let (mut counting, counters) = CountingLink::new(link);
     if let Some(path) = metrics {
-        autoshare::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
+        riftpipe::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
     }
     eprintln!("authenticated — live syncing {file} (end-to-end encrypted). ^C to stop.");
     live_file_loop(file, &mut counting).await
 }
 
 /// Join a shared file via its ticket: dial, authenticate with the secret, run.
-async fn join(ticket: &str, file: &str, pipe: bool, metrics: Option<String>) -> autoshare::net::Result<()> {
+async fn join(ticket: &str, file: &str, pipe: bool, metrics: Option<String>) -> riftpipe::net::Result<()> {
     let ticket = Ticket::decode(ticket)?;
     let endpoint = bind_connect().await?;
 
@@ -131,7 +131,7 @@ async fn join(ticket: &str, file: &str, pipe: bool, metrics: Option<String>) -> 
     let peer = link.remote_id();
     let (mut counting, counters) = CountingLink::new(link);
     if let Some(path) = metrics {
-        autoshare::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
+        riftpipe::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
     }
     eprintln!("authenticated — live syncing {file} (end-to-end encrypted). ^C to stop.");
     live_file_loop(file, &mut counting).await
@@ -147,13 +147,13 @@ fn basename(p: &str) -> &str {
 
 /// The shared round loop (file-mirror mode): read the file, run a text-pipe
 /// round, write back the merged result. Works over any `Link`.
-async fn live_file_loop(file: &str, link: &mut dyn autoshare::net::Link) -> autoshare::net::Result<()> {
+async fn live_file_loop(file: &str, link: &mut dyn riftpipe::net::Link) -> riftpipe::net::Result<()> {
     use std::time::Duration;
     let mut peer = TextPeer::new(file);
     loop {
         let snapshot = std::fs::read_to_string(file).unwrap_or_default();
         if let Some(merged) = peer.round(link, &snapshot).await? {
-            std::fs::write(file, &merged).map_err(autoshare::net::anyerr)?;
+            std::fs::write(file, &merged).map_err(riftpipe::net::anyerr)?;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -166,7 +166,7 @@ async fn live_file_loop(file: &str, link: &mut dyn autoshare::net::Link) -> auto
 /// Solo scripted preview of the tower-defense sim (no networking) — just to see
 /// the board render and confirm the deterministic core feels alive.
 fn demo_td() {
-    use autoshare::engine::game::{Action, ActionKind, Player, World};
+    use riftpipe::engine::game::{Action, ActionKind, Player, World};
 
     let script = [
         Action { tick: 2, seq: 0, player: Player::P1, kind: ActionKind::PlaceTower { tile: 4 } },
@@ -181,7 +181,7 @@ fn demo_td() {
 
     let mut w = World::default();
     let mut idx = 0;
-    println!("autoshare :: tower-defense core preview (solo, scripted)\n");
+    println!("riftpipe :: tower-defense core preview (solo, scripted)\n");
     for frame in 0..=6 {
         let target = frame * 12;
         while w.tick < target {
@@ -191,7 +191,7 @@ fn demo_td() {
             }
             w.step();
         }
-        print!("{}", autoshare::engine::game::render(&w));
+        print!("{}", riftpipe::engine::game::render(&w));
         println!();
     }
 }
@@ -210,7 +210,7 @@ fn demo_text() {
     a.merge(&db);
     b.merge(&da);
 
-    println!("autoshare :: eg-walker text convergence (diamond-types)\n");
+    println!("riftpipe :: eg-walker text convergence (diamond-types)\n");
     println!("  alice: {:?}", a.content());
     println!("  bob:   {:?}", b.content());
     println!(
@@ -261,7 +261,7 @@ fn demo_simulation() {
         ],
     };
 
-    println!("autoshare :: deterministic replay + guard + simulation\n");
+    println!("riftpipe :: deterministic replay + guard + simulation\n");
     for r in suite.run::<AppendLog, _, _>(&make_rule) {
         println!("  [{}] {}", if r.passed { "PASS" } else { "FAIL" }, r.name);
     }

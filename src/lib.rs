@@ -1,4 +1,4 @@
-//! autoshare — a Unix-like terminal construct for live, peer-to-peer
+//! riftpipe — a Unix-like terminal construct for live, peer-to-peer
 //! collaborative text (see DESIGN.md).
 //!
 //! Module map:

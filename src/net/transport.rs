@@ -16,7 +16,7 @@ use tokio::io::AsyncWriteExt;
 use crate::net::{anyerr, Counters, Link, Result};
 
 /// Application-layer protocol id — peers must agree on this to connect.
-pub const ALPN: &[u8] = b"autoshare/0";
+pub const ALPN: &[u8] = b"riftpipe/0";
 
 /// QUIC liveness tuning: send keep-alives every 2s and time a connection out
 /// after 6s of silence, so a vanished peer is detected quickly (the default is
@@ -32,7 +32,7 @@ fn quic_config() -> QuicTransportConfig {
         .build()
 }
 
-/// Bind an endpoint that accepts incoming autoshare connections.
+/// Bind an endpoint that accepts incoming riftpipe connections.
 pub async fn bind_accept() -> Result<Endpoint> {
     Endpoint::builder(presets::N0)
         .alpns(vec![ALPN.to_vec()])

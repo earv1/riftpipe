@@ -1,4 +1,4 @@
-# autoshare — Design Doc
+# riftpipe — Design Doc
 
 **Status:** Core working — eg-walker text (diamond-types) + iroh transport, with
 mock + real integration tests passing
@@ -17,10 +17,10 @@ store, etc., are all just different *rule-sets* plugged into one engine.
 
 ```sh
 # machine A — mirror a shared doc into a local file, live
-autoshare join <ticket> > notes.txt
+riftpipe join <ticket> > notes.txt
 
 # machine B — edit the same doc; both sides converge
-autoshare share notes.txt        # watches + syncs on save
+riftpipe share notes.txt        # watches + syncs on save
 ```
 
 Two terminals on two machines hold the same document. Edits made anywhere merge
@@ -72,7 +72,7 @@ Detect destination via `isatty`:
 - **Regular file** → `seek(0)` + truncate + rewrite on each change. `join > file`
   gives a live-mirrored file. **Likely the killer demo.**
 - **True pipe** (`| grep`) → successive full snapshots; `--patch` emits a diff
-  stream consumable by `autoshare apply`.
+  stream consumable by `riftpipe apply`.
 
 ---
 
@@ -121,7 +121,7 @@ A rule-set is a **pure deterministic guard** `validate(op, state_before) ->
 Accept | Reject`, run **during deterministic total-order replay**. Because the
 order is deterministic and the predicate is pure, every honest peer reaches the
 identical accept/reject verdict → convergence holds even though some ops are now
-rejected. This turns autoshare into a programmable convergent state machine;
+rejected. This turns riftpipe into a programmable convergent state machine;
 text is just the rule-set "always accept."
 
 Examples: turn-based game (a single **turn token** in shared state; valid iff
@@ -219,7 +219,7 @@ no commit and no network. Three uses of one loop:
 1. **Live** — materialize the doc from the event graph (+ transport).
 2. **Conformance** — replay golden vectors, compare state hashes (the handshake
    gate, §8).
-3. **Dry-run** — `autoshare simulate <ruleset> <ops>` to debug rules locally.
+3. **Dry-run** — `riftpipe simulate <ruleset> <ops>` to debug rules locally.
 
 ---
 
@@ -384,7 +384,7 @@ write P2's health. Resolution:
 ## 15. Editor bridges & the sync protocol (Unix decomposition — IMPLEMENTED)
 
 **Status:** `--pipe` core is event-driven (no lockstep, idle = silent); the
-neovim bridge (`nvim/autoshare.lua`) is built and verified. Local→core uses
+neovim bridge (`nvim/riftpipe.lua`) is built and verified. Local→core uses
 snapshots (phase 1; core diffs them); core→local uses granular ops applied via
 `nvim_buf_set_text` (cursor-preserving). Phase 2 (granular local→core via
 `on_bytes`) is the remaining optimization.
@@ -396,7 +396,7 @@ This is §9b (programmatic peers) applied to editing — the editor integration 
 its own composable Unix tool, not baked into the core.
 
 ```
-nvim  <--msgpack-RPC-->  autoshare-nvim (bridge)  <--edit-stream-->  autoshare sync  <--iroh-->  peer
+nvim  <--msgpack-RPC-->  riftpipe-nvim (bridge)  <--edit-stream-->  riftpipe sync  <--iroh-->  peer
 ```
 
 ### Boundary protocol (the key artifact)
@@ -409,12 +409,12 @@ bridge converts editor line/col ↔ char offset):
 - *(later)* `{"op":"cursor","pos":N}` — peer cursors
 
 ### Core "pipe mode"
-`autoshare sync --pipe`: read local edits from stdin → apply to the eg-walker
+`riftpipe sync --pipe`: read local edits from stdin → apply to the eg-walker
 CRDT → sync to peer; write remote edits to stdout → bridge applies them. Makes the
 core a CRDT-sync daemon any frontend can drive (the file-mirror and TUI become
 just two built-in frontends; bridges are external ones).
 
-### The nvim bridge (`autoshare-nvim`)
+### The nvim bridge (`riftpipe-nvim`)
 Connect to a running nvim (`$NVIM` / `--listen` socket); `nvim_buf_attach` →
 local edits → core; core's remote edits → `nvim_buf_set_text`. Separate binary;
 other editors (vscode, emacs, helix) get their own bridge without touching core.
@@ -454,7 +454,7 @@ other editors (vscode, emacs, helix) get their own bridge without touching core.
 ### 14.2 Observability — metrics via tmux (REVISED: no in-app TUI)
 **Pivot:** an in-app crossterm TUI compositor (drawing the doc + an overlay) was
 built then **removed** — once the editor (nvim via `--pipe`, §15) is the document
-UI, autoshare drawing the document is cruft. Instead: **autoshare renders
+UI, riftpipe drawing the document is cruft. Instead: **riftpipe renders
 nothing; tmux is the compositor.** A decoupled side-car task (`src/metrics.rs`)
 writes a one-line status to a file every ~0.5s — connection `direct`/`⚠RELAY`
 (§14.1), bytes up/down, sync rate — and tmux shows it in a **thin pane per peer**
@@ -515,7 +515,7 @@ may *write* each region (the guard), not who may *see* it.
 - *Reconnection:* a dropped+re-established connection misses the deltas sent while
   down.
 - *Bridge snapshot race:* the nvim bridge sends whole-buffer snapshots; if you
-  type in the window after autoshare merged a remote op but before the bridge
+  type in the window after riftpipe merged a remote op but before the bridge
   applied it, the snapshot diff can delete the remote edit → lasting divergence.
 
 **Mechanism (version-vector reconciliation):** peers exchange a compact **version

@@ -1,4 +1,4 @@
-//! Metrics emission (DESIGN.md §14.2). autoshare renders nothing itself — it
+//! Metrics emission (DESIGN.md §14.2). riftpipe renders nothing itself — it
 //! writes a one-line status to a file every ~0.5s and lets **tmux** display it (a
 //! thin pane per peer). This is decoupled from the sync loop: a side-car task
 //! that reads the byte counters and polls the connection path. No TUI, no

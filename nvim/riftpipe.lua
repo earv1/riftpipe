@@ -1,22 +1,22 @@
--- autoshare neovim bridge (session-local; no install).
+-- riftpipe neovim bridge (session-local; no install).
 --
 -- Load per-invocation:
---   AUTOSHARE_BIN=/path/to/autoshare \
---   AUTOSHARE_ARGS="share /path/file --pipe" \
---   nvim -c 'luafile /path/to/nvim/autoshare.lua' /path/file
+--   RIFTPIPE_BIN=/path/to/riftpipe \
+--   RIFTPIPE_ARGS="share /path/file --pipe" \
+--   nvim -c 'luafile /path/to/nvim/riftpipe.lua' /path/file
 --
--- It spawns `autoshare ... --pipe` and bridges the CURRENT buffer to its stdio:
+-- It spawns `riftpipe ... --pipe` and bridges the CURRENT buffer to its stdio:
 --   * local buffer change  -> {"op":"snapshot","text":...} on the job's stdin
---     (autoshare diffs it; only the delta crosses the network)
+--     (riftpipe diffs it; only the delta crosses the network)
 --   * remote edit op on stdout -> applied surgically via nvim_buf_set_text
 --     (cursor/undo preserved), with echo-suppression so it doesn't loop back.
 --
 -- The file on disk is only read at startup; sync is buffer<->pipe (no file race).
 
 local function parse_args()
-  local bin = vim.env.AUTOSHARE_BIN or "autoshare"
+  local bin = vim.env.RIFTPIPE_BIN or "riftpipe"
   local args = {}
-  for a in string.gmatch(vim.env.AUTOSHARE_ARGS or "", "%S+") do
+  for a in string.gmatch(vim.env.RIFTPIPE_ARGS or "", "%S+") do
     table.insert(args, a)
   end
   return bin, args
@@ -59,7 +59,7 @@ local function start()
   end
 
   if vim.fn.executable(bin) == 0 then
-    vim.notify("autoshare: `" .. bin .. "` not found (set AUTOSHARE_BIN)", vim.log.levels.ERROR)
+    vim.notify("riftpipe: `" .. bin .. "` not found (set RIFTPIPE_BIN)", vim.log.levels.ERROR)
     return
   end
 
@@ -89,16 +89,16 @@ local function start()
         end
       end
     end,
-    on_stderr = function() end, -- swallow autoshare's human/ticket messages
+    on_stderr = function() end, -- swallow riftpipe's human/ticket messages
     on_exit = function()
       vim.schedule(function()
-        vim.notify("autoshare: sync process exited", vim.log.levels.WARN)
+        vim.notify("riftpipe: sync process exited", vim.log.levels.WARN)
       end)
     end,
   })
 
   if job <= 0 then
-    vim.notify("autoshare: failed to start `" .. bin .. "`", vim.log.levels.ERROR)
+    vim.notify("riftpipe: failed to start `" .. bin .. "`", vim.log.levels.ERROR)
     return
   end
 
@@ -124,7 +124,7 @@ local function start()
     end,
   })
 
-  vim.notify("autoshare: bridge attached", vim.log.levels.INFO)
+  vim.notify("riftpipe: bridge attached", vim.log.levels.INFO)
 end
 
 start()

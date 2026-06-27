@@ -5,9 +5,9 @@
 
 use std::time::Duration;
 
-use autoshare::net::sync_full;
-use autoshare::crdt::text::EgWalkerText;
-use autoshare::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr};
+use riftpipe::net::sync_full;
+use riftpipe::crdt::text::EgWalkerText;
+use riftpipe::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_real_iroh_clients_converge() {

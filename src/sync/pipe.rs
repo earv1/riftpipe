@@ -1,5 +1,5 @@
 //! Pipe mode — the editor-stream protocol (DESIGN.md §15). This is the Unix
-//! boundary: autoshare becomes a CRDT-sync daemon that reads local edits on
+//! boundary: riftpipe becomes a CRDT-sync daemon that reads local edits on
 //! stdin and writes remote edits on stdout, both as line-delimited JSON. Any
 //! frontend (a neovim Lua bridge, a script, a test) drives it the same way; the
 //! core never knows what an editor is.
@@ -339,7 +339,7 @@ pub async fn run_pipe_reconnecting(
                         metrics_started = true;
                     }
                 }
-                eprintln!("[autoshare] connected — syncing");
+                eprintln!("[riftpipe] connected — syncing");
                 let (mut sink, mut source) = link.into_halves(counters.clone());
                 match session(&mut peer, &mut rx, &mut out, &mut sink, &mut source).await? {
                     SessionOutcome::StdinClosed => {
@@ -347,7 +347,7 @@ pub async fn run_pipe_reconnecting(
                         return Ok(());
                     }
                     SessionOutcome::LinkClosed => {
-                        eprintln!("[autoshare] disconnected — reconnecting…");
+                        eprintln!("[riftpipe] disconnected — reconnecting…");
                     }
                 }
             }
