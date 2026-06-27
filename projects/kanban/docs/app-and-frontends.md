@@ -58,20 +58,39 @@ A single self-contained HTML/JS file (no framework — truly bundled and hackabl
 **Your "plugins" live here** — vanilla-JS modules you drop in (filters, swimlanes,
 a detail panel). The HTTP API is the stable contract; no host app to fight.
 
-## The vim plugin
+The detail panel's title/description box is a **plain `<textarea>` that writes the
+whole `card.md`** (with clobber-safety) — deliberately *not* a homegrown
+collaborative editor. See the principle below: better prose editing comes from
+bridging a *real* editor, never from growing a CRDT textarea in the browser.
 
-Same bridge pattern as `nvim/riftpipe.lua`, but board-aware. Because the board is
-just files, several levels are possible:
-- **Zero-effort:** open `<board-dir>/tickets/<id>/card.md` in vim — riftpipe's
-  existing folder sync already keeps it converged. Editing a description or
-  adding a comment file Just Works.
+## Editor integrations (not a homegrown editor)
+
+> **Principle: we will NEVER build our own text editor.** Description/comment
+> editing always ties into an *existing* editor — Neovim via riftpipe's `--pipe`
+> bridge, VS Code, or "open in `$EDITOR`". The file-backed data model is what
+> makes this work: any editor that opens the file is a frontend. "Better editing"
+> therefore always means *better editor integration* (bridges/plugins), never a
+> homegrown editor or an in-app CRDT textarea.
+> See [`planned.md`](planned.md) for the full statement and the OUT-OF-SCOPE note.
+
+Because the board is just files, integrations come in layers — all reuse, no new
+protocol:
+
+- **Zero-effort (any editor):** open `<board-dir>/tickets/<id>/card.md` in vim,
+  VS Code, or whatever `$EDITOR` is — riftpipe's existing folder sync already
+  keeps it converged. Editing a description or adding a comment file Just Works.
+- **Live Neovim bridge:** point `nvim/riftpipe.lua` at a card's `card.md` with
+  `--pipe` (`RIFTPIPE_ARGS="share .../card.md --pipe"`). The buffer syncs
+  char-by-char through the existing text-crdt session — the editor *is* the
+  collaborative surface, so the app never reimplements one. The web UI can offer
+  "open this card in Neovim" as a one-click handoff.
 - **Board view (plugin):** render `board.md` + folded ticket summaries; commands
   `:KanbanMove`, `:KanbanAdd`, `:KanbanComment` that write the right files
   (`meta.toml` / a new `comments/*.md`). A thin Lua layer over the file
   convention — no new protocol.
 
-Because every frontend reads/writes the *same* files, the web UI, vim, and a
-plain editor are interchangeable — open whichever; they converge.
+Because every frontend reads/writes the *same* files, the web UI, Neovim, VS Code,
+and a plain `$EDITOR` are interchangeable — open whichever; they converge.
 
 ## Notes
 

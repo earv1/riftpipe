@@ -10,20 +10,25 @@ moves into the top-level [`DESIGN.md`](../../DESIGN.md) and its status into
 
 ## Index
 
-### kanban/ — a P2P kanban (files as the database) — CHOSEN
+### kanban — a P2P kanban (files as the database) — planning lives with the project
 Flagship use case: a serverless, e2e-encrypted collaborative kanban. **Decision
-(June 2026): the board is a directory tree** synced by riftpipe's existing folder
-mode — each file type bound to a `Syncer` we already ship (text-crdt for prose,
-rsync for structural/binary). The "database" is a *convention*, not new code.
-Source of truth = files; the web UI, a vim plugin, and any markdown editor are
-**interchangeable views**.
+(June 2026): the board is a directory tree** synced by riftpipe's folder mode
+(text-crdt for prose, rsync for structural/binary) — the "database" is a
+*convention*, not new code. Source of truth = files; the web UI and any editor
+are **interchangeable views** (we never build our own editor — we integrate).
+The kanban's planning + design now live **with the project**:
 
-- [`kanban/README.md`](kanban/README.md) — overview & big picture
-- [`kanban/data-model.md`](kanban/data-model.md) — directory layout, per-file algorithm, ordering, conflicts
-- [`kanban/app-and-frontends.md`](kanban/app-and-frontends.md) — `kanban serve`/`connect` wrapper, web UI, vim plugin
-- [`kanban/roadmap.md`](kanban/roadmap.md) — phased plan (mostly wiring + UI)
+- [`projects/kanban/docs/planned.md`](../../projects/kanban/docs/planned.md) — status, roadmap, TODO + the "no homegrown editor" principle
+- [`projects/kanban/docs/data-model.md`](../../projects/kanban/docs/data-model.md) — directory layout, per-file algorithm, ordering, conflicts
+- [`projects/kanban/docs/app-and-frontends.md`](../../projects/kanban/docs/app-and-frontends.md) — the wrapper, web UI, editor integrations
+
+### [`db-integration.md`](db-integration.md) — using a real DB with riftpipe (brainstorm)
+Forward-looking options for backing riftpipe's sync pattern with an actual
+database: **Shape A** (the DB provides CRDT merge — Automerge/Yrs, or the now-
+frozen cr-sqlite) vs **Shape B** (DB as plain storage, our op-log stays the merge
+engine — redb/sled, GlueSQL for SQL). Recommendations + non-fits. Builds on
+`db-sync.md`.
 
 ### [`db-sync.md`](db-sync.md) — SQLite substrate — CONSIDERED, NOT CHOSEN
-The cr-sqlite / SQLite-session analysis we evaluated and set aside (native
-dependency / new engine vs. zero new sync code). Kept for rationale and in case a
-future feature genuinely needs a relational CRDT db over the wire.
+The earlier cr-sqlite / SQLite-session analysis we evaluated and set aside.
+Superseded by `db-integration.md`'s broader survey; kept for rationale.

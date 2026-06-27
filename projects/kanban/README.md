@@ -34,7 +34,7 @@ a purely additive trail to build history/undo on later.
 
 Why split prose (`card.md`) from structure (`meta.toml`): they sync differently
 under riftpipe — prose merges (text CRDT), scalars are last-writer-wins (rsync).
-See [`../../docs/planned/kanban/`](../../docs/planned/kanban/).
+See the planning & design docs in [`docs/`](docs/planned.md).
 
 ## Run it
 

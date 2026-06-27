@@ -3,7 +3,8 @@
 **Status:** planned (design only). The board is a **directory tree** — no SQLite,
 no new sync engine. Each file type is bound to a `Syncer` we already ship
 (text-crdt / rsync) via the manifest, so the "database" is a *convention*, not
-code. (For why not SQLite/cr-sqlite, see [`../db-sync.md`](../db-sync.md).)
+code. (For why not SQLite/cr-sqlite, see
+[`db-sync.md`](../../../docs/planned/db-sync.md).)
 
 ## Layout
 
