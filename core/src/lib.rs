@@ -4,6 +4,7 @@
 //! async, no OS deps — so it builds for native and `wasm32` alike, and both the
 //! CLI (`riftpipe`) and the browser crate (`riftpipe-web`) share one document model.
 
+pub mod kanban;
 pub mod text;
 
 pub use text::EgWalkerText;

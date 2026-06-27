@@ -10,6 +10,7 @@ description = "Wasm-compatible core of riftpipe: the eg-walker text CRDT + delta
 [dependencies]
 diamond-types = "1.0.0"
 similar = "3.1.1"
+serde = { version = "1", features = ["derive"] }
 
 # On wasm32, diamond-types' transitive `getrandom` (0.2) needs a browser entropy
 # source — enable its `js` backend. Native targets are unaffected.

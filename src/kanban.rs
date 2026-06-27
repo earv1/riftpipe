@@ -21,26 +21,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use riftpipe_core::kanban as kb;
+use riftpipe_core::kanban::{Card, Comment};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server};
-
-#[derive(Serialize)]
-struct Card {
-    id: String,
-    title: String,
-    column: String,
-    position: i64,
-    done: bool,
-}
-
-#[derive(Serialize)]
-struct Comment {
-    id: String,
-    author: String,
-    ts: String,
-    text: String,
-}
 
 /// Shared, cheaply-clonable server state handed to each request thread.
 #[derive(Clone)]
@@ -149,53 +134,20 @@ fn read_text(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-/// First markdown "# " heading, or None.
-fn first_heading(text: &str) -> Option<String> {
-    for line in text.lines() {
-        let t = line.trim_end();
-        if let Some(rest) = t.strip_prefix("# ") {
-            let h = rest.trim();
-            if !h.is_empty() {
-                return Some(h.to_string());
-            }
-        }
-    }
-    None
-}
-
 /// board.md → (title, ordered columns). Robust to a missing/blank file.
 fn read_board_meta(dir: &Path) -> (String, Vec<String>) {
-    let text = read_text(&dir.join("board.md"));
-    let title = first_heading(&text).unwrap_or_else(|| "Board".to_string());
-    let mut columns = Vec::new();
-    for line in text.lines() {
-        let t = line.trim_end();
-        if let Some(rest) = t.strip_prefix("- ") {
-            let c = rest.trim();
-            if !c.is_empty() {
-                columns.push(c.to_string());
-            }
-        }
-    }
-    (title, columns)
+    kb::parse_board_md(&read_text(&dir.join("board.md")))
 }
 
 /// Read one card, falling back to defaults for any missing/invalid piece.
 fn read_card(dir: &Path, id: &str, columns: &[String]) -> Card {
-    let default_column = columns.first().cloned().unwrap_or_else(|| "Todo".to_string());
-    let meta: toml::Value = toml::from_str(&read_text(&card_dir(dir, id).join("meta.toml")))
-        .unwrap_or_else(|_| toml::Value::Table(Default::default()));
-    let column = meta
-        .get("column")
-        .and_then(toml::Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or(default_column);
-    let position = meta.get("position").and_then(toml::Value::as_integer).unwrap_or(0);
-    let done = meta.get("done").and_then(toml::Value::as_bool).unwrap_or(false);
-    let title = first_heading(&read_text(&card_dir(dir, id).join("card.md")))
-        .unwrap_or_else(|| id.to_string());
-    Card { id: id.to_string(), title, column, position, done }
+    let default_column = columns.first().map(String::as_str).unwrap_or("Todo");
+    kb::card_from_files(
+        id,
+        &read_text(&card_dir(dir, id).join("card.md")),
+        &read_text(&card_dir(dir, id).join("meta.toml")),
+        default_column,
+    )
 }
 
 fn read_board(dir: &Path) -> Value {
@@ -217,36 +169,13 @@ fn read_board(dir: &Path) -> Value {
     json!({ "title": title, "columns": columns, "cards": cards })
 }
 
-/// Split card.md into (title, description).
-fn split_card_md(text: &str) -> (String, String) {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut title = String::new();
-    let mut i = 0;
-    while i < lines.len() {
-        if let Some(rest) = lines[i].trim_end().strip_prefix("# ") {
-            if !rest.trim().is_empty() {
-                title = rest.trim().to_string();
-                i += 1;
-                break;
-            }
-        }
-        i += 1;
-    }
-    let description = lines[i.min(lines.len())..]
-        .join("\n")
-        .trim_start_matches('\n')
-        .trim_end()
-        .to_string();
-    (title, description)
-}
-
 fn read_detail(dir: &Path, id: &str) -> Option<Value> {
     if !card_dir(dir, id).is_dir() {
         return None;
     }
     let cols = read_board_meta(dir).1;
     let card = read_card(dir, id, &cols);
-    let (_t, description) = split_card_md(&read_text(&card_dir(dir, id).join("card.md")));
+    let (_t, description) = kb::split_card_md(&read_text(&card_dir(dir, id).join("card.md")));
     let comments = read_comments(dir, id);
     Some(json!({
         "id": card.id, "title": card.title, "column": card.column,
@@ -263,37 +192,17 @@ fn comments_dir(dir: &Path, id: &str) -> PathBuf {
     card_dir(dir, id).join("comments")
 }
 
-fn sanitize_author(author: &str) -> String {
-    let mut out = String::new();
-    let mut prev_dash = false;
-    for ch in author.to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' {
-            out.push(ch);
-            prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    let slug = out.trim_matches('-').to_string();
-    if slug.is_empty() { "anon".to_string() } else { slug }
-}
-
 fn read_comments(dir: &Path, id: &str) -> Vec<Comment> {
     let mut comments = Vec::new();
     if let Ok(entries) = std::fs::read_dir(comments_dir(dir, id)) {
         for e in entries.flatten() {
             let fname = e.file_name();
-            let name = match fname.to_str().and_then(|n| n.strip_suffix(".md")) {
-                Some(n) => n,
-                None => continue,
+            let Some(name) = fname.to_str().and_then(|n| n.strip_suffix(".md")) else {
+                continue;
             };
-            let sep = match name.find("__") {
-                Some(s) => s,
-                None => continue,
+            let Some((ts, author)) = kb::parse_comment_name(name) else {
+                continue;
             };
-            let ts = name[..sep].to_string();
-            let author = name[sep + 2..].to_string();
             let text = read_text(&comments_dir(dir, id).join(format!("{name}.md"))).trim_end().to_string();
             comments.push(Comment { id: name.to_string(), author, ts, text });
         }
@@ -303,7 +212,7 @@ fn read_comments(dir: &Path, id: &str) -> Vec<Comment> {
 }
 
 fn add_comment(dir: &Path, id: &str, author: &str, text: &str) -> Comment {
-    let slug = sanitize_author(author);
+    let slug = kb::sanitize_author(author);
     let ts = iso_now().replace(':', "-");
     let name = format!("{ts}__{slug}");
     let _ = std::fs::create_dir_all(comments_dir(dir, id));
@@ -316,24 +225,11 @@ fn add_comment(dir: &Path, id: &str, author: &str, text: &str) -> Comment {
 // ---------------------------------------------------------------------------
 
 fn write_meta(dir: &Path, id: &str, column: &str, position: i64, done: bool) {
-    #[derive(Serialize)]
-    struct M<'a> {
-        column: &'a str,
-        position: i64,
-        done: bool,
-    }
-    if let Ok(s) = toml::to_string(&M { column, position, done }) {
-        let _ = std::fs::write(card_dir(dir, id).join("meta.toml"), s);
-    }
+    let _ = std::fs::write(card_dir(dir, id).join("meta.toml"), kb::meta_toml(column, position, done));
 }
 
 fn write_card_md(dir: &Path, id: &str, title: &str, description: &str) {
-    let body = if description.trim().is_empty() {
-        format!("# {title}\n")
-    } else {
-        format!("# {title}\n\n{}\n", description.trim_end())
-    };
-    let _ = std::fs::write(card_dir(dir, id).join("card.md"), body);
+    let _ = std::fs::write(card_dir(dir, id).join("card.md"), kb::card_md(title, description));
 }
 
 fn new_id() -> String {
@@ -389,7 +285,7 @@ fn patch_card(dir: &Path, id: &str, patch: &Value) -> Option<Card> {
     write_meta(dir, id, &current.column, current.position, current.done);
 
     if patch.get("title").is_some() || patch.get("description").is_some() {
-        let existing = split_card_md(&read_text(&card_dir(dir, id).join("card.md")));
+        let existing = kb::split_card_md(&read_text(&card_dir(dir, id).join("card.md")));
         let title = patch.get("title").and_then(Value::as_str).map(str::to_string).unwrap_or(existing.0);
         let description = patch.get("description").and_then(Value::as_str).map(str::to_string).unwrap_or(existing.1);
         let title = if title.is_empty() { id.to_string() } else { title };
@@ -599,20 +495,12 @@ fn iso_now() -> String {
 mod tests {
     use super::*;
 
+    // Board/card/comment parsing lives in (and is tested by) riftpipe_core::kanban.
+    // Here we only cover the native-only bits: id generation and the clock.
     #[test]
-    fn parses_board_and_splits_card() {
-        assert_eq!(first_heading("# Hello\nbody").as_deref(), Some("Hello"));
-        let (t, d) = split_card_md("# Title\n\nthe body\nmore");
-        assert_eq!(t, "Title");
-        assert_eq!(d, "the body\nmore");
-    }
-
-    #[test]
-    fn ids_and_authors_and_iso_are_well_formed() {
+    fn ids_and_iso_are_well_formed() {
         let id = new_id();
         assert!(id.starts_with("tk_") && id.len() == 11);
-        assert_eq!(sanitize_author("Alice Smith!"), "alice-smith");
-        assert_eq!(sanitize_author("  "), "anon");
         let ts = iso_now();
         assert_eq!(ts.len(), 20); // YYYY-MM-DDTHH:MM:SSZ
         assert!(ts.ends_with('Z') && ts.contains('T'));
