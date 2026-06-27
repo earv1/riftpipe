@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
+use iroh::endpoint::{presets, Connection, QuicTransportConfig, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use tokio::io::AsyncWriteExt;
 
@@ -18,10 +18,25 @@ use crate::net::{anyerr, Counters, Link, Result};
 /// Application-layer protocol id — peers must agree on this to connect.
 pub const ALPN: &[u8] = b"autoshare/0";
 
+/// QUIC liveness tuning: send keep-alives every 2s and time a connection out
+/// after 6s of silence, so a vanished peer is detected quickly (the default is
+/// ~30s) — which is what makes reconnection feel responsive.
+fn quic_config() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .keep_alive_interval(Duration::from_secs(2))
+        .max_idle_timeout(Some(
+            Duration::from_secs(6).try_into().expect("valid idle timeout"),
+        ))
+        .default_path_keep_alive_interval(Duration::from_secs(2))
+        .default_path_max_idle_timeout(Duration::from_secs(6))
+        .build()
+}
+
 /// Bind an endpoint that accepts incoming autoshare connections.
 pub async fn bind_accept() -> Result<Endpoint> {
     Endpoint::builder(presets::N0)
         .alpns(vec![ALPN.to_vec()])
+        .transport_config(quic_config())
         .bind()
         .await
         .map_err(anyerr)
@@ -29,7 +44,11 @@ pub async fn bind_accept() -> Result<Endpoint> {
 
 /// Bind an endpoint used to dial out.
 pub async fn bind_connect() -> Result<Endpoint> {
-    Endpoint::bind(presets::N0).await.map_err(anyerr)
+    Endpoint::builder(presets::N0)
+        .transport_config(quic_config())
+        .bind()
+        .await
+        .map_err(anyerr)
 }
 
 /// This endpoint's dialable address. Waits briefly for the socket's direct

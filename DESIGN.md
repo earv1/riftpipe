@@ -539,7 +539,14 @@ fresh peer. `decode_and_add` is idempotent, so a resync is always safe.
 A `SYNC` exchange both *detects* and *heals* in one step: if the peer is missing
 ops they arrive; if not, nothing is sent.
 
-**Honest gap:** this is the reconciliation *protocol*, ready to recover on
-(re)connect. **Actual reconnection** — re-dialing a dropped iroh connection and
-re-entering the sync loop — is not yet implemented (a drop currently ends the
-session). That's the next piece; it will reuse this reconciliation unchanged.
+**Reconnection (IMPLEMENTED):** `--pipe` now survives a dropped link. The
+document + stdin/stdout pipe persist for the process lifetime (`PipePeer` +
+`stdin_ops()` channel); a `session` runs over one link and returns `LinkClosed`
+on drop (never a hard error). `run_pipe_reconnecting` loops: (re)dial/accept →
+auth → run session → on drop, back-off and reconnect — and the **on-connect
+SYNC reconciles** whatever was missed. Edits typed during the gap queue in the
+stdin channel and apply on resume. Fast drop detection comes from a short QUIC
+liveness config (keep-alive 2s, idle timeout 6s — vs the ~30s default).
+
+Verified end-to-end: a peer is killed and restarted; the survivor stays alive,
+detects the drop, and re-syncs the returning peer.

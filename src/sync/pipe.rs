@@ -9,16 +9,21 @@
 //!   {"op":"insert","pos":N,"text":"..."}
 //!   {"op":"delete","pos":N,"len":M}
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use iroh::{Endpoint, EndpointAddr};
 use serde::{Deserialize, Serialize};
 use similar::{capture_diff_slices, Algorithm, DiffOp};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, sleep_until, Instant, MissedTickBehavior};
 
-use crate::net::{anyerr, Result};
 use crate::crdt::text::EgWalkerText;
-use crate::net::transport::{IrohSink, IrohSource};
+use crate::net::secure::authenticate;
+use crate::net::transport::{accept_link, connect_link, IrohSink, IrohSource};
+use crate::net::{anyerr, Counters, Result};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -143,57 +148,119 @@ fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Event-driven stdio driver (`autoshare ... --pipe`). A single `select!` loop
-/// reacts to whichever happens: a local edit op on stdin (→ push a delta) or a
-/// remote delta on the link (→ emit edit ops to stdout). When idle, both arms
-/// park and **no traffic flows** — no lockstep, no polling.
-pub async fn run_pipe(mut sink: IrohSink, mut source: IrohSource) -> Result<()> {
-    let mut peer = PipePeer::new("pipe");
-    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
-    let mut out = tokio::io::stdout();
+// The send/recv halves a session runs over. Abstracted so the session loop is
+// testable with mocks and reusable across reconnects.
+#[async_trait]
+pub trait PipeSink: Send {
+    async fn send(&mut self, msg: Vec<u8>) -> Result<()>;
+    async fn finish(&mut self);
+}
+#[async_trait]
+pub trait PipeSource: Send {
+    async fn recv(&mut self) -> Result<Option<Vec<u8>>>;
+}
 
-    // Reconciliation triggers (DESIGN.md §16): a periodic heartbeat, plus a
-    // debounced "after edits settle" timer. Both send our version vector; the
-    // peer replies with exactly the ops we're missing (empty if in sync).
+#[async_trait]
+impl PipeSink for IrohSink {
+    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
+        IrohSink::send(self, msg).await
+    }
+    async fn finish(&mut self) {
+        IrohSink::finish(self).await
+    }
+}
+#[async_trait]
+impl PipeSource for IrohSource {
+    async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+        IrohSource::recv(self).await
+    }
+}
+
+/// Why a session ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SessionOutcome {
+    /// The link dropped — reconnect and resume (the doc state persists).
+    LinkClosed,
+    /// stdin closed (the frontend is gone) — quit.
+    StdinClosed,
+}
+
+/// Spawn a task reading edit ops from stdin into a channel. Runs once for the
+/// process lifetime, independent of sessions — so edits typed *during* a
+/// reconnect gap queue up and are applied when the next session resumes.
+pub fn stdin_ops() -> UnboundedReceiver<EditOp> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(op) = serde_json::from_str::<EditOp>(line) {
+                if tx.send(op).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// One sync session over a single link. `peer`/`rx`/`out` are owned by the
+/// reconnect loop and **persist across sessions**, so a dropped+re-established
+/// link resumes from the same document. Returns when the link drops
+/// (`LinkClosed`) or stdin ends (`StdinClosed`). A link error is reported as
+/// `LinkClosed`, never a hard error — so the loop reconnects.
+pub async fn session(
+    peer: &mut PipePeer,
+    rx: &mut UnboundedReceiver<EditOp>,
+    out: &mut (impl AsyncWrite + Unpin),
+    sink: &mut dyn PipeSink,
+    source: &mut dyn PipeSource,
+) -> Result<SessionOutcome> {
     let mut heartbeat = interval(Duration::from_secs(5));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let idle = || Instant::now() + Duration::from_secs(3600); // "disabled" deadline
+    let idle = || Instant::now() + Duration::from_secs(3600);
     let mut settle_at = idle();
 
-    // Reconcile on connect (recovers state after a reconnect).
-    sink.send(frame(TAG_SYNC, &peer.version_json())).await?;
+    // Reconcile on connect — recovers anything missed since the last session.
+    if sink.send(frame(TAG_SYNC, &peer.version_json())).await.is_err() {
+        return Ok(SessionOutcome::LinkClosed);
+    }
 
     loop {
         tokio::select! {
-            line = stdin.next_line() => {
-                match line.map_err(anyerr)? {
-                    Some(line) => {
-                        let line = line.trim();
-                        if line.is_empty() { continue; }
-                        if let Ok(op) = serde_json::from_str::<EditOp>(line) {
-                            let before = peer.version();
-                            peer.apply_local(&op);
-                            if peer.version() != before {
-                                sink.send(frame(TAG_DELTA, &peer.encode_since_sent())).await?;
-                                settle_at = Instant::now() + Duration::from_millis(500);
+            op = rx.recv() => {
+                match op {
+                    None => return Ok(SessionOutcome::StdinClosed), // frontend gone
+                    Some(op) => {
+                        let before = peer.version();
+                        peer.apply_local(&op);
+                        if peer.version() != before {
+                            if sink.send(frame(TAG_DELTA, &peer.encode_since_sent())).await.is_err() {
+                                return Ok(SessionOutcome::LinkClosed);
                             }
+                            settle_at = Instant::now() + Duration::from_millis(500);
                         }
                     }
-                    None => break, // stdin closed → frontend gone
                 }
             }
             msg = source.recv() => {
-                match msg? {
-                    Some(bytes) if !bytes.is_empty() => {
+                match msg {
+                    Err(_) | Ok(None) => return Ok(SessionOutcome::LinkClosed),
+                    Ok(Some(bytes)) if !bytes.is_empty() => {
                         let (tag, payload) = (bytes[0], &bytes[1..]);
                         match tag {
                             TAG_DELTA => {
                                 for op in peer.merge_remote(payload) {
                                     let mut line = serde_json::to_string(&op).map_err(anyerr)?;
                                     line.push('\n');
-                                    out.write_all(line.as_bytes()).await.map_err(anyerr)?;
+                                    if out.write_all(line.as_bytes()).await.is_err() {
+                                        return Ok(SessionOutcome::StdinClosed);
+                                    }
                                 }
-                                out.flush().await.map_err(anyerr)?;
+                                let _ = out.flush().await;
                                 settle_at = Instant::now() + Duration::from_millis(500);
                             }
                             TAG_SYNC => {
@@ -201,28 +268,93 @@ pub async fn run_pipe(mut sink: IrohSink, mut source: IrohSource) -> Result<()> 
                                     serde_json::from_slice::<Vec<(String, usize)>>(payload)
                                 {
                                     if let Some(missing) = peer.ops_since(&theirs) {
-                                        sink.send(frame(TAG_DELTA, &missing)).await?;
+                                        if sink.send(frame(TAG_DELTA, &missing)).await.is_err() {
+                                            return Ok(SessionOutcome::LinkClosed);
+                                        }
                                     }
                                 }
                             }
                             _ => {}
                         }
                     }
-                    Some(_) => {} // empty frame
-                    None => break, // peer closed
+                    Ok(Some(_)) => {} // empty frame
                 }
             }
             _ = sleep_until(settle_at) => {
-                sink.send(frame(TAG_SYNC, &peer.version_json())).await?;
+                if sink.send(frame(TAG_SYNC, &peer.version_json())).await.is_err() {
+                    return Ok(SessionOutcome::LinkClosed);
+                }
                 settle_at = idle();
             }
             _ = heartbeat.tick() => {
-                sink.send(frame(TAG_SYNC, &peer.version_json())).await?;
+                if sink.send(frame(TAG_SYNC, &peer.version_json())).await.is_err() {
+                    return Ok(SessionOutcome::LinkClosed);
+                }
             }
         }
     }
-    sink.finish().await;
-    Ok(())
+}
+
+/// Whether this peer dials out or waits for connections.
+pub enum Role {
+    Accept,
+    Connect(EndpointAddr),
+}
+
+/// Run `--pipe` with **reconnection**: keep one document + stdin/stdout pipe for
+/// the process lifetime, and repeatedly (re)establish a link. On a drop, resume
+/// the same document — the on-connect SYNC reconciles whatever was missed.
+/// Returns only when stdin closes (the frontend quit).
+pub async fn run_pipe_reconnecting(
+    endpoint: Endpoint,
+    role: Role,
+    secret: [u8; 32],
+    counters: Arc<Counters>,
+    metrics: Option<(String, String)>, // (path, title)
+) -> Result<()> {
+    let mut peer = PipePeer::new("pipe");
+    let mut rx = stdin_ops();
+    let mut out = tokio::io::stdout();
+    let mut metrics_started = false;
+    let base = Duration::from_millis(200);
+    let mut backoff = base;
+
+    loop {
+        let link = match &role {
+            Role::Accept => accept_link(&endpoint).await,
+            Role::Connect(addr) => connect_link(&endpoint, addr.clone()).await,
+        };
+        if let Ok(mut link) = link {
+            if authenticate(&mut link, &secret).await.is_ok() {
+                backoff = base; // reset on a good connection
+                if !metrics_started {
+                    if let Some((path, title)) = &metrics {
+                        crate::monitor::metrics::spawn(
+                            endpoint.clone(),
+                            link.remote_id(),
+                            counters.clone(),
+                            path.clone(),
+                            title.clone(),
+                        );
+                        metrics_started = true;
+                    }
+                }
+                eprintln!("[autoshare] connected — syncing");
+                let (mut sink, mut source) = link.into_halves(counters.clone());
+                match session(&mut peer, &mut rx, &mut out, &mut sink, &mut source).await? {
+                    SessionOutcome::StdinClosed => {
+                        sink.finish().await;
+                        return Ok(());
+                    }
+                    SessionOutcome::LinkClosed => {
+                        eprintln!("[autoshare] disconnected — reconnecting…");
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
 }
 
 #[cfg(test)]
@@ -313,6 +445,91 @@ mod tests {
         assert_eq!(a.content(), b.content());
         // B is caught up -> A has nothing to send.
         assert!(a.ops_since(&b.version_vector_pairs()).is_none());
+    }
+
+    // --- reconnection (session) tests ---
+    use std::collections::VecDeque;
+
+    struct MockSink {
+        sent: Vec<Vec<u8>>,
+    }
+    #[async_trait]
+    impl PipeSink for MockSink {
+        async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
+            self.sent.push(msg);
+            Ok(())
+        }
+        async fn finish(&mut self) {}
+    }
+    /// Yields queued frames, then `None` forever — simulating a link that
+    /// delivers some data and then drops.
+    struct DroppingSource {
+        queue: VecDeque<Vec<u8>>,
+    }
+    #[async_trait]
+    impl PipeSource for DroppingSource {
+        async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+            Ok(self.queue.pop_front())
+        }
+    }
+    /// Never yields — a live but quiet link.
+    struct PendingSource;
+    #[async_trait]
+    impl PipeSource for PendingSource {
+        async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn session_resumes_same_doc_across_a_reconnect() {
+        // Peer A produces a delta to deliver to B.
+        let mut a = PipePeer::new("a");
+        a.apply_local(&EditOp::Insert { pos: 0, text: "hello".into() });
+        let delta = a.encode_since_sent();
+
+        let mut b = PipePeer::new("b");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EditOp>();
+        let mut out: Vec<u8> = Vec::new();
+
+        // Session 1: deliver the delta, then the link drops.
+        let mut sink = MockSink { sent: vec![] };
+        let mut src = DroppingSource {
+            queue: VecDeque::from(vec![frame(TAG_DELTA, &delta)]),
+        };
+        let outcome = session(&mut b, &mut rx, &mut out, &mut sink, &mut src)
+            .await
+            .unwrap();
+        assert_eq!(outcome, SessionOutcome::LinkClosed);
+        assert_eq!(b.content(), "hello", "delta applied");
+
+        // Session 2 (reconnect) with a fresh, quiet link: state persists, and on
+        // a real drop it would reconcile via the on-connect SYNC (recorded here).
+        let mut sink2 = MockSink { sent: vec![] };
+        let mut src2 = DroppingSource {
+            queue: VecDeque::new(),
+        };
+        let outcome2 = session(&mut b, &mut rx, &mut out, &mut sink2, &mut src2)
+            .await
+            .unwrap();
+        assert_eq!(outcome2, SessionOutcome::LinkClosed);
+        assert_eq!(b.content(), "hello", "doc state persists across reconnect");
+        assert!(!sink2.sent.is_empty(), "a reconnect sends an on-connect SYNC");
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn session_quits_when_stdin_closes() {
+        let mut b = PipePeer::new("b");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EditOp>();
+        drop(tx); // frontend gone
+        let mut out: Vec<u8> = Vec::new();
+        let mut sink = MockSink { sent: vec![] };
+        let mut src = PendingSource; // link stays up, so only stdin can end it
+        let outcome = session(&mut b, &mut rx, &mut out, &mut sink, &mut src)
+            .await
+            .unwrap();
+        assert_eq!(outcome, SessionOutcome::StdinClosed);
     }
 
     #[test]

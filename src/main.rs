@@ -2,18 +2,19 @@
 //! and `join` do a real one-shot CRDT exchange over iroh (the live editing loop
 //! arrives with the demo app).
 
+use std::sync::Arc;
+
+use autoshare::crdt::text::EgWalkerText;
 use autoshare::engine::identity::AgentId;
 use autoshare::engine::log::AppendLog;
-use autoshare::net::CountingLink;
 use autoshare::engine::op::{Action, Op, OpId};
-use autoshare::sync::pipe::run_pipe;
 use autoshare::engine::rules::TwoPlayerTurns;
-use autoshare::net::secure::{authenticate, Ticket};
 use autoshare::engine::simulation::{Suite, Vector};
-use autoshare::crdt::text::EgWalkerText;
+use autoshare::net::secure::{authenticate, Ticket};
+use autoshare::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr};
+use autoshare::net::{Counters, CountingLink};
 use autoshare::sync::mirror::TextPeer;
-use autoshare::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr, IrohLink};
-use iroh::{Endpoint, EndpointId};
+use autoshare::sync::pipe::{run_pipe_reconnecting, Role};
 
 /// Parse `args[2..]` into positionals + flags. `--metrics <path>` takes a value.
 fn parse(args: &[String]) -> (Vec<String>, bool, Option<String>) {
@@ -97,47 +98,43 @@ async fn share(file: &str, pipe: bool, metrics: Option<String>) -> autoshare::ne
     eprintln!("share this ticket with a peer:\n\n{encoded}\n");
     eprintln!("waiting for a peer to join...");
 
+    // --pipe gets reconnection (persistent doc, re-dials on drop); file-mirror is
+    // single-shot.
+    if pipe {
+        let counters = Arc::new(Counters::default());
+        let m = metrics.map(|p| (p, basename(file).to_string()));
+        return run_pipe_reconnecting(endpoint, Role::Accept, secret, counters, m).await;
+    }
     let mut link = accept_link(&endpoint).await?;
     authenticate(&mut link, &secret).await?;
     let peer = link.remote_id();
-    run_frontend(link, &endpoint, peer, file, pipe, metrics).await
+    let (mut counting, counters) = CountingLink::new(link);
+    if let Some(path) = metrics {
+        autoshare::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
+    }
+    eprintln!("authenticated — live syncing {file} (end-to-end encrypted). ^C to stop.");
+    live_file_loop(file, &mut counting).await
 }
 
 /// Join a shared file via its ticket: dial, authenticate with the secret, run.
 async fn join(ticket: &str, file: &str, pipe: bool, metrics: Option<String>) -> autoshare::net::Result<()> {
     let ticket = Ticket::decode(ticket)?;
     let endpoint = bind_connect().await?;
+
+    if pipe {
+        let counters = Arc::new(Counters::default());
+        let m = metrics.map(|p| (p, basename(file).to_string()));
+        return run_pipe_reconnecting(endpoint, Role::Connect(ticket.addr), ticket.secret, counters, m).await;
+    }
     let mut link = connect_link(&endpoint, ticket.addr).await?;
     authenticate(&mut link, &ticket.secret).await?;
     let peer = link.remote_id();
-    run_frontend(link, &endpoint, peer, file, pipe, metrics).await
-}
-
-/// Pick the frontend. `--pipe` is event-driven (split the link into send/recv
-/// halves, no lockstep); the default file-mirror loop polls the file.
-async fn run_frontend(
-    link: IrohLink,
-    endpoint: &Endpoint,
-    peer: EndpointId,
-    file: &str,
-    pipe: bool,
-    metrics: Option<String>,
-) -> autoshare::net::Result<()> {
-    if pipe {
-        let counters = std::sync::Arc::new(autoshare::net::Counters::default());
-        let (sink, source) = link.into_halves(counters.clone());
-        if let Some(path) = metrics {
-            autoshare::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
-        }
-        run_pipe(sink, source).await
-    } else {
-        let (mut counting, counters) = CountingLink::new(link);
-        if let Some(path) = metrics {
-            autoshare::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
-        }
-        eprintln!("authenticated — live syncing {file} (end-to-end encrypted). ^C to stop.");
-        live_file_loop(file, &mut counting).await
+    let (mut counting, counters) = CountingLink::new(link);
+    if let Some(path) = metrics {
+        autoshare::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
     }
+    eprintln!("authenticated — live syncing {file} (end-to-end encrypted). ^C to stop.");
+    live_file_loop(file, &mut counting).await
 }
 
 /// Short label for the HUD (file name, not the whole path).
