@@ -1,0 +1,25 @@
+# How riftpipe should sync this board (DESIGN §17). Prose merges (text-crdt);
+# structural scalars and binaries are last-writer-wins (rsync).
+default = "rsync-file"
+
+[[rule]]
+glob = "board.md"
+algo = "text-crdt"
+
+[[rule]]
+glob = "**/card.md"
+algo = "text-crdt"
+
+[[rule]]
+glob = "**/comments/*.md"
+algo = "text-crdt"
+
+[[rule]]
+glob = "**/meta.toml"
+algo = "rsync-file"
+
+# Per-peer append-only change log (events/<site>.jsonl). One writer per file, so
+# it's conflict-free; text-crdt merges appends cleanly across reconnects.
+[[rule]]
+glob = "events/*.jsonl"
+algo = "text-crdt"

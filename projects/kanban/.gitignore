@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.ticket
+process
+board/.site
+board/events/

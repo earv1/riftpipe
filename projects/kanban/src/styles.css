@@ -1,0 +1,352 @@
+:root {
+  --bg: #f4f5f7;
+  --panel: #ebecf0;
+  --card: #ffffff;
+  --border: #dfe1e6;
+  --text: #172b4d;
+  --muted: #6b778c;
+  --accent: #0052cc;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
+
+.loading {
+  padding: 2rem;
+  color: var(--muted);
+}
+
+.topbar {
+  padding: 0.75rem 1.25rem;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+.columns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  padding: 1.25rem;
+  align-items: flex-start;
+}
+
+.column {
+  background: var(--panel);
+  border-radius: 8px;
+  width: 260px;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.column-title {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.cards {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.card {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: var(--card);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  box-shadow: 0 1px 2px rgba(9, 30, 66, 0.15);
+}
+
+.card input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
+
+.card .title {
+  flex: 1;
+  line-height: 1.3;
+  word-break: break-word;
+}
+
+.done .title {
+  text-decoration: line-through;
+  color: var(--muted);
+}
+
+.add-card {
+  display: flex;
+  gap: 0.35rem;
+  margin-top: 0.25rem;
+}
+
+.add-card input {
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.4rem 0.5rem;
+  font: inherit;
+  background: var(--card);
+}
+
+.add-card input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.add-card button {
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 4px;
+  width: 30px;
+  cursor: pointer;
+  font-size: 1rem;
+}
+
+.add-card button:hover {
+  background: #0747a6;
+}
+
+/* Clickable card titles open the detail drawer. */
+.title-link {
+  cursor: pointer;
+}
+
+.title-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+/* ---- Card detail drawer ---- */
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(9, 30, 66, 0.5);
+  z-index: 50;
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 100vh;
+  width: 420px;
+  max-width: 100vw;
+  background: var(--card);
+  box-shadow: -4px 0 16px rgba(9, 30, 66, 0.25);
+  z-index: 51;
+  overflow-y: auto;
+  padding: 1.5rem 1.5rem 2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.drawer-close {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.85rem;
+  border: none;
+  background: transparent;
+  font-size: 1.6rem;
+  line-height: 1;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0;
+}
+
+.drawer-close:hover {
+  color: var(--text);
+}
+
+.drawer-loading,
+.drawer-notfound {
+  color: var(--muted);
+  padding: 1rem 0;
+}
+
+.detail-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0.35rem 0.5rem;
+  margin-right: 1.5rem;
+  font-family: inherit;
+  color: var(--text);
+  background: transparent;
+}
+
+.detail-title:hover {
+  background: var(--bg);
+}
+
+.detail-title:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--card);
+}
+
+.detail-meta {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  color: var(--muted);
+}
+
+.detail-done {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+}
+
+.detail-column {
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.detail-label {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin: 0.5rem 0 0;
+}
+
+.detail-description {
+  min-height: 160px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.6rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--card);
+}
+
+.detail-description:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.comments {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.comments-empty {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.comment {
+  background: var(--bg);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+}
+
+.comment-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.2rem;
+}
+
+.comment-author {
+  font-weight: 600;
+}
+
+.comment-ts {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.comment-text {
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.add-comment {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.add-comment textarea {
+  min-height: 64px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem;
+  font: inherit;
+  color: var(--text);
+  background: var(--card);
+}
+
+.add-comment textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.add-comment button {
+  align-self: flex-end;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 4px;
+  padding: 0.4rem 0.9rem;
+  cursor: pointer;
+  font: inherit;
+}
+
+.add-comment button:hover {
+  background: #0747a6;
+}
+
+/* ---- Drag and drop ---- */
+.card {
+  cursor: grab;
+}
+
+.card.dragging {
+  opacity: 0.4;
+}
+
+.column.drag-over {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+  background: #e4ebf9;
+}
