@@ -2,3 +2,4 @@
 //! a file for tmux to display, plus connection-path detection.
 
 pub mod metrics;
+pub mod process;

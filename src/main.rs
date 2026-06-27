@@ -12,27 +12,76 @@ use riftpipe::engine::rules::TwoPlayerTurns;
 use riftpipe::engine::simulation::{Suite, Vector};
 use riftpipe::net::secure::{authenticate, Ticket};
 use riftpipe::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr};
-use riftpipe::net::{Counters, CountingLink};
+use riftpipe::net::{anyerr, Counters, CountingLink};
+use riftpipe::sync::folder::run_folder_reconnecting;
+use riftpipe::sync::manifest::Manifest;
 use riftpipe::sync::mirror::TextPeer;
 use riftpipe::sync::pipe::{run_pipe_reconnecting, Role};
+use riftpipe::sync::workspace::Workspace;
 
-/// Parse `args[2..]` into positionals + flags. `--metrics <path>` takes a value.
-fn parse(args: &[String]) -> (Vec<String>, bool, Option<String>) {
-    let (mut pos, mut pipe, mut metrics) = (Vec::new(), false, None);
+/// Parsed CLI options for `share`/`join`.
+struct Opts {
+    pos: Vec<String>,
+    pipe: bool,
+    memory: bool,
+    metrics: Option<String>,
+    manifest: Option<String>,
+    process: Option<String>,
+}
+
+/// Parse `args[2..]` into positionals + flags. `--metrics`/`--manifest`/
+/// `--process` each take a value.
+fn parse(args: &[String]) -> Opts {
+    let mut o = Opts {
+        pos: Vec::new(),
+        pipe: false,
+        memory: false,
+        metrics: None,
+        manifest: None,
+        process: None,
+    };
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--pipe" => pipe = true,
+            "--pipe" => o.pipe = true,
+            "--memory" => o.memory = true,
             "--metrics" => {
-                metrics = args.get(i + 1).cloned();
+                o.metrics = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--manifest" => {
+                o.manifest = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--process" => {
+                o.process = args.get(i + 1).cloned();
                 i += 1;
             }
             s if s.starts_with("--") => {}
-            s => pos.push(s.to_string()),
+            s => o.pos.push(s.to_string()),
         }
         i += 1;
     }
-    (pos, pipe, metrics)
+    o
+}
+
+/// Load the manifest: `--manifest <path>` if given, else `<dir>/riftpipe.toml`,
+/// else the default (all-rsync).
+fn load_manifest(opts: &Opts, dir: &str) -> riftpipe::net::Result<Manifest> {
+    let path = opts
+        .manifest
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(dir).join("riftpipe.toml"));
+    Manifest::load_or_default(&path).map_err(anyerr)
+}
+
+/// Where the in-memory `process` file goes: `--process <path>`, else `process`
+/// in memory mode, else none (file mode doesn't need it).
+fn process_path(opts: &Opts) -> Option<String> {
+    opts.process
+        .clone()
+        .or_else(|| opts.memory.then(|| "process".to_string()))
 }
 
 #[tokio::main]
@@ -43,25 +92,25 @@ async fn main() {
         "text" => demo_text(),
         "td" => demo_td(),
         "share" => {
-            let (pos, pipe, metrics) = parse(&args);
-            match pos.first() {
+            let opts = parse(&args);
+            match opts.pos.first().cloned() {
                 Some(file) => {
-                    if let Err(e) = share(file, pipe, metrics).await {
+                    if let Err(e) = share(&file, &opts).await {
                         eprintln!("[riftpipe] share failed: {e}");
                     }
                 }
-                None => eprintln!("usage: riftpipe share <file> [--pipe] [--metrics <path>]"),
+                None => eprintln!("usage: riftpipe share <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]"),
             }
         }
         "join" => {
-            let (pos, pipe, metrics) = parse(&args);
-            match (pos.first(), pos.get(1)) {
+            let opts = parse(&args);
+            match (opts.pos.first().cloned(), opts.pos.get(1).cloned()) {
                 (Some(ticket), Some(file)) => {
-                    if let Err(e) = join(ticket, file, pipe, metrics).await {
+                    if let Err(e) = join(&ticket, &file, &opts).await {
                         eprintln!("[riftpipe] join failed: {e}");
                     }
                 }
-                _ => eprintln!("usage: riftpipe join <ticket> <file> [--pipe] [--metrics <path>]"),
+                _ => eprintln!("usage: riftpipe join <ticket> <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]"),
             }
         }
         _ => {
@@ -70,11 +119,16 @@ async fn main() {
             eprintln!("  riftpipe simulate            # ruled replay engine demo (offline)");
             eprintln!("  riftpipe text                # eg-walker convergence demo (offline)");
             eprintln!("  riftpipe td                  # tower-defense core preview (offline)");
-            eprintln!("  riftpipe share <file> [--pipe] [--metrics <path>]");
-            eprintln!("  riftpipe join <ticket> <file> [--pipe] [--metrics <path>]");
+            eprintln!("  riftpipe share <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
+            eprintln!("  riftpipe join <ticket> <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
             eprintln!("\nedit the file in your $EDITOR; changes converge across peers.");
-            eprintln!("--pipe    speak the editor edit-stream protocol on stdin/stdout (for bridges)");
-            eprintln!("--metrics write a one-line status to <path> for tmux to display");
+            eprintln!("a DIR syncs the whole folder: each file gets the algorithm riftpipe.toml assigns");
+            eprintln!("(text-crdt / rsync-file; wal-db & image planned). See DESIGN.md §17.");
+            eprintln!("--pipe     speak the editor edit-stream protocol on stdin/stdout (for bridges)");
+            eprintln!("--memory   hold resources in RAM (no disk mirror); see them in the --process file");
+            eprintln!("--manifest path to riftpipe.toml (default: <dir>/riftpipe.toml)");
+            eprintln!("--process  write size+hash of all in-memory resources to <path> (default: process)");
+            eprintln!("--metrics  write a one-line status to <path> for tmux to display");
             eprintln!("try ./run-local.sh for a two-peer tmux demo.");
         }
     }
@@ -83,7 +137,7 @@ async fn main() {
 /// Serve a file for live collaboration: go online (so the ticket is dialable from
 /// anywhere via relay), print a secret-bearing ticket (also written to
 /// `<file>.ticket` for scripts), accept + authenticate one peer, then run.
-async fn share(file: &str, pipe: bool, metrics: Option<String>) -> riftpipe::net::Result<()> {
+async fn share(file: &str, opts: &Opts) -> riftpipe::net::Result<()> {
     use std::time::Duration;
     let endpoint = bind_accept().await?;
     // Best-effort: get a relay home so peers on other networks can reach us.
@@ -98,39 +152,64 @@ async fn share(file: &str, pipe: bool, metrics: Option<String>) -> riftpipe::net
     eprintln!("share this ticket with a peer:\n\n{encoded}\n");
     eprintln!("waiting for a peer to join...");
 
+    // A directory -> folder mode: multiplex every resource over one link, each on
+    // the algorithm the manifest assigns (DESIGN.md §17). Reconnects on drop.
+    if std::path::Path::new(file).is_dir() {
+        let counters = Arc::new(Counters::default());
+        let ws = Workspace::new(file, load_manifest(opts, file)?, opts.memory).map_err(anyerr)?;
+        let m = opts.metrics.clone().map(|p| (p, basename(file).to_string()));
+        eprintln!("authenticated — live syncing folder {file} (end-to-end encrypted). ^C to stop.");
+        return run_folder_reconnecting(
+            endpoint, Role::Accept, secret, counters, ws, m, process_path(opts),
+        )
+        .await;
+    }
+
     // --pipe gets reconnection (persistent doc, re-dials on drop); file-mirror is
     // single-shot.
-    if pipe {
+    if opts.pipe {
         let counters = Arc::new(Counters::default());
-        let m = metrics.map(|p| (p, basename(file).to_string()));
+        let m = opts.metrics.clone().map(|p| (p, basename(file).to_string()));
         return run_pipe_reconnecting(endpoint, Role::Accept, secret, counters, m).await;
     }
     let mut link = accept_link(&endpoint).await?;
     authenticate(&mut link, &secret).await?;
     let peer = link.remote_id();
     let (mut counting, counters) = CountingLink::new(link);
-    if let Some(path) = metrics {
+    if let Some(path) = opts.metrics.clone() {
         riftpipe::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
     }
     eprintln!("authenticated — live syncing {file} (end-to-end encrypted). ^C to stop.");
     live_file_loop(file, &mut counting).await
 }
 
-/// Join a shared file via its ticket: dial, authenticate with the secret, run.
-async fn join(ticket: &str, file: &str, pipe: bool, metrics: Option<String>) -> riftpipe::net::Result<()> {
+/// Join a shared file/dir via its ticket: dial, authenticate with the secret, run.
+async fn join(ticket: &str, file: &str, opts: &Opts) -> riftpipe::net::Result<()> {
     let ticket = Ticket::decode(ticket)?;
     let endpoint = bind_connect().await?;
 
-    if pipe {
+    // A directory -> folder mode (see `share`). The joiner discovers the
+    // sharer's files as their frames arrive.
+    if std::path::Path::new(file).is_dir() {
         let counters = Arc::new(Counters::default());
-        let m = metrics.map(|p| (p, basename(file).to_string()));
+        let ws = Workspace::new(file, load_manifest(opts, file)?, opts.memory).map_err(anyerr)?;
+        let m = opts.metrics.clone().map(|p| (p, basename(file).to_string()));
+        return run_folder_reconnecting(
+            endpoint, Role::Connect(ticket.addr), ticket.secret, counters, ws, m, process_path(opts),
+        )
+        .await;
+    }
+
+    if opts.pipe {
+        let counters = Arc::new(Counters::default());
+        let m = opts.metrics.clone().map(|p| (p, basename(file).to_string()));
         return run_pipe_reconnecting(endpoint, Role::Connect(ticket.addr), ticket.secret, counters, m).await;
     }
     let mut link = connect_link(&endpoint, ticket.addr).await?;
     authenticate(&mut link, &ticket.secret).await?;
     let peer = link.remote_id();
     let (mut counting, counters) = CountingLink::new(link);
-    if let Some(path) = metrics {
+    if let Some(path) = opts.metrics.clone() {
         riftpipe::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
     }
     eprintln!("authenticated — live syncing {file} (end-to-end encrypted). ^C to stop.");

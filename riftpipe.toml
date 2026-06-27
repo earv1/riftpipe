@@ -1,0 +1,33 @@
+# riftpipe.toml — example workspace manifest (DESIGN.md §17).
+#
+# Maps resource paths (relative, `/`-separated) to a sync algorithm by glob.
+# First matching rule wins; anything unmatched falls to `default`.
+#
+# Globs: `*` matches within a path segment, `**` crosses segments, `?` is one
+# non-`/` char. So `*.md` matches `readme.md` but not `docs/readme.md`; use
+# `**/*.md` for any depth.
+#
+# Algorithms:
+#   text-crdt   eg-walker text CRDT — char-level concurrent merge (prose/code)
+#   rsync-file  rsync block diff — efficient replication for opaque/binary files
+#               (last-writer-wins; no concurrent merge)
+#   wal-db      append-only log replication for databases   (PLANNED — stub)
+#   image       codec-aware tile merge for images           (PLANNED — stub)
+#
+# Place this file at the root of the shared directory (or pass --manifest).
+
+default = "rsync-file"
+
+[[rule]]
+glob = "**/*.md"
+algo = "text-crdt"
+
+[[rule]]
+glob = "**/*.txt"
+algo = "text-crdt"
+
+# Example of keeping game/db state on a different algorithm than its view —
+# this is the "sync state separately from a view" case (still a stub):
+# [[rule]]
+# glob = "state/**"
+# algo = "wal-db"

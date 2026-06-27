@@ -550,3 +550,112 @@ liveness config (keep-alive 2s, idle timeout 6s — vs the ~30s default).
 
 Verified end-to-end: a peer is killed and restarted; the survivor stays alive,
 detects the drop, and re-syncs the returning peer.
+
+---
+
+## 17. Folders & pluggable sync algorithms (SCAFFOLDED — rsync implemented)
+
+riftpipe began as one document with one CRDT. The next step is a **folder**: a
+tree of heterogeneous resources where *different files want different sync
+algorithms* — prose merges char-by-char, a binary blob wants efficient
+replication, a database wants append-only log shipping, an image wants tiles.
+Syncing a folder also cleanly solves the game problem: keep **state** (a
+db/log resource) separate from a **view** (a text resource), each on the
+algorithm that fits.
+
+### 17.1 The seam — Strategy, not "the adapter pattern"
+
+The organizing pattern is **Strategy**: a family of interchangeable algorithms
+behind one interface, selected at runtime. *Adapter* is the inner role each
+strategy plays when it wraps an existing library (the text strategy adapts
+diamond-types). The `Kind` enum + factory is a small **Abstract Factory**.
+
+The trait (`sync::syncer::Syncer`) is kept to the **minimal, reconcile-centric**
+contract the network layer truly needs — *advertise what you have*
+(`state_vector`), *answer "what are you missing"* (`delta_since`), *merge an
+opaque delta* (`merge`), plus an eager push path (`observe`/`push_delta`) for
+algorithms that can. It deliberately avoids a snapshot-in/out shape, which would
+distort non-snapshot algorithms (a WAL tails records; rsync negotiates via block
+checksums). All payloads are opaque bytes, so a new algorithm is one `impl
+Syncer`, nothing else. It is object-safe so heterogeneous resources can share one
+link in a `HashMap<ResourceId, Box<dyn Syncer>>`.
+
+`Kind`: `text-crdt` (done) · `rsync-file` (done) · `wal-db` (stub) · `image`
+(stub). Stubs `todo!()` their sync methods so a misconfigured manifest fails
+loudly, never silently corrupts.
+
+### 17.2 rsync (IMPLEMENTED)
+
+Classic rsync over opaque byte buffers (`sync::algo::rsync`):
+- **signatures** — split content into fixed blocks (`BLOCK = 1024`); per full
+  block a rolling **weak** checksum (adler-style, advances one byte at a time)
+  + a strong **blake3** hash. Advertised as the `state_vector`.
+- **diff** — the other side rolls a window over *its* content; on a weak (then
+  strong) match it emits `Copy(block)`, gaps become `Literal(bytes)`. This is
+  `delta_since`.
+- **reconstruct** — rebuild from the advertiser's blocks + literals (`merge`).
+
+Wire format is **postcard**, not JSON — JSON balloons `Vec<u8>` literals into
+number-arrays (a one-block change serialized larger than the file). The
+block-reuse test asserts the delta stays a fraction of the file.
+
+**rsync is replication, not merge.** It makes one buffer equal another; run
+bidirectionally on divergent content it would swap forever. So each replica
+carries a `(version, content-hash)` stamp and we apply **last-writer-wins**: a
+local change bumps `version`; ties break on the larger hash → a deterministic LWW
+register that converges. **v1 caveat:** a `Copy` references the *advertiser's*
+blocks, so if its content changed between advertising and applying, the rebuilt
+hash won't match `patch.hash` — `merge` rejects it and the next heartbeat SYNC
+retries. (Correct, occasionally one round slower.)
+
+### 17.5 Backings — file vs. in-memory (coexist)
+
+A `Syncer` only sees `&[u8]`; *where those bytes live* is a separate seam
+(`sync::backing::Backing`): `FileBacking` (mirror a path, today's behavior) or
+`MemoryBacking` (hold bytes in RAM, never touch disk). The two coexist — chosen
+per run, and later per-resource in the manifest. In-memory resources register
+with a `MemoryRegistry` so they can be observed together.
+
+### 17.6 The `process` file
+
+A single sidecar reporting **all** in-memory resources at once — one line each:
+`name⇥size⇥blake3-16`. **Size + hash only** (no payload bytes), and **decoupled**
+from the sync loop (a ~1s side-car task, like the metrics file): `cat` it
+whenever. Modeled on §14.2's "tmux is the compositor" — riftpipe writes a file,
+something else reads it.
+
+### 17.3 / 17.4 wal-db & image (PLANNED)
+
+- **wal-db** — append-only log: `state_vector` = per-writer highest-seq offset
+  map; `delta_since` = missing frames; `merge` = append in writer order.
+  Convergence is "union of frames," no rewrite. Compaction layered on top.
+- **image** — codec-aware tile merge: decode to a tile grid, each tile an
+  independently-versioned cell; ship/composite changed tiles. Text CRDT ops are
+  the wrong granularity for pixels.
+
+### 17.7 Folder mode — wired (CLI)
+
+`share <dir>` / `join <ticket> <dir>` now sync a whole folder:
+- **Manifest** (`sync::manifest`) — `riftpipe.toml` at the dir root (or
+  `--manifest`), glob → `Kind`. First match wins, else `default` (rsync).
+- **Workspace** (`sync::workspace`) — scans the tree (skips dotfiles, the
+  manifest, `.ticket`s), binds each file to a `Syncer` + a backing; unimplemented
+  kinds are skipped (a stub never panics a live session).
+- **Multiplexed session** (`sync::folder`) — one link, many resources. Frame =
+  `[path_len u16][path][tag][payload]`; tags `DELTA` / `SYNCREQ` / `SYNCREP`.
+  Local changes are found by **polling** the backings (200ms); an unknown path in
+  an inbound frame **auto-creates** the resource (peer-driven discovery). Same
+  reconnect loop as `--pipe`.
+- **Request/reply advertising** — a local change sends `SYNCREQ`; the peer
+  answers `SYNCREP` with *its* signatures so a pull-only algorithm (rsync) can
+  then push its `DELTA`. `REP` is never replied to, so it can't ping-pong; the
+  heartbeat re-`REQ`s every 5s.
+- **`--memory`** holds resources in RAM (seeded once from disk) instead of
+  mirroring to disk; **`--process <path>`** writes the §17.6 size+hash file.
+
+Verified end-to-end over loopback: a text file (text-crdt) and a binary blob
+(rsync) sync into a nested subdir A→B with discovery; a live edit on one side
+converges to the other; memory mode surfaces resources in the `process` file.
+
+**Still to come:** implement `wal-db` and `image`; per-resource backing choice in
+the manifest (memory vs file per glob); Phase 2 granular nvim edits (§15/§16).
