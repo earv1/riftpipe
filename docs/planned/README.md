@@ -22,6 +22,16 @@ The kanban's planning + design now live **with the project**:
 - [`projects/kanban/docs/data-model.md`](../../projects/kanban/docs/data-model.md) — directory layout, per-file algorithm, ordering, conflicts
 - [`projects/kanban/docs/app-and-frontends.md`](../../projects/kanban/docs/app-and-frontends.md) — the wrapper, web UI, editor integrations
 
+### [`transport-negotiation.md`](transport-negotiation.md) — connection negotiation & multi-peer transport
+**iroh = control plane, data plane = negotiated.** Every peer always has the iroh
+`Link` (the floor + WebRTC signaling channel); on connect they negotiate the best
+mutually-supported transport (a ladder: webrtc-direct → iroh-direct → iroh-relay)
+and upgrade if it wins, never regressing below the floor. Extends the §8 handshake
+with a capability phase; folds in §14.1 (direct-first). Plus the **multi-peer**
+generalization — a session is a *peer set* with fan-out, made safe by §16's
+idempotent reconciliation (duplicate/multi-path delivery is a no-op). Thinking
+doc; not yet built.
+
 ### [`db-integration.md`](db-integration.md) — using a real DB with riftpipe (brainstorm)
 Forward-looking options for backing riftpipe's sync pattern with an actual
 database: **Shape A** (the DB provides CRDT merge — Automerge/Yrs, or the now-

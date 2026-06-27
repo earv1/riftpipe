@@ -1,3 +1,12 @@
+// API layer — backed by the in-browser **Rust kanban server** (wasm + OPFS), not
+// a localhost process. The shapes are unchanged; the only difference is the
+// transport: each request is handled by `kanbanHandle` from the `riftpipe-web`
+// wasm package instead of crossing the network. No local server.
+//
+// (The exported function signatures are identical to the old fetch-based API, so
+// the SolidJS components don't change.)
+import init, { kanbanHandle } from "../../../web/pkg/riftpipe_web.js";
+
 export interface Card {
   id: string;
   title: string;
@@ -24,20 +33,41 @@ export interface CardDetail extends Card {
   comments: Comment[];
 }
 
+// Initialize the wasm module once, lazily.
+let _ready: Promise<unknown> | null = null;
+function ready(): Promise<unknown> {
+  return (_ready ??= init());
+}
+
+interface ApiResponse {
+  status: number;
+  body: string;
+}
+
+/** Call the in-browser handler; returns a tiny Response-like object. */
+async function api(
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<{ status: number; json: () => any }> {
+  await ready();
+  const payload = body === undefined ? "" : JSON.stringify(body);
+  const res = (await kanbanHandle(method, path, payload)) as ApiResponse;
+  return { status: res.status, json: () => JSON.parse(res.body) };
+}
+
 export async function getBoard(): Promise<Board> {
-  return fetch("/api/board").then((r) => r.json());
+  return (await api("GET", "/api/board")).json();
 }
 
 export async function getCard(id: string): Promise<Card | null> {
-  const r = await fetch(`/api/cards/${id}`);
-  if (r.status === 404) return null;
-  return r.json();
+  const r = await api("GET", `/api/cards/${id}`);
+  return r.status === 404 ? null : r.json();
 }
 
 export async function getCardDetail(id: string): Promise<CardDetail | null> {
-  const r = await fetch(`/api/cards/${id}/detail`);
-  if (r.status === 404) return null;
-  return r.json();
+  const r = await api("GET", `/api/cards/${id}/detail`);
+  return r.status === 404 ? null : r.json();
 }
 
 export async function addComment(
@@ -45,28 +75,17 @@ export async function addComment(
   text: string,
   author?: string,
 ): Promise<Comment> {
-  return fetch(`/api/cards/${id}/comments`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(author === undefined ? { text } : { author, text }),
-  }).then((r) => r.json());
+  const body = author === undefined ? { text } : { author, text };
+  return (await api("POST", `/api/cards/${id}/comments`, body)).json();
 }
 
 export async function addCard(column: string, title: string): Promise<Card> {
-  return fetch("/api/cards", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ column, title }),
-  }).then((r) => r.json());
+  return (await api("POST", "/api/cards", { column, title })).json();
 }
 
 export async function patchCard(
   id: string,
   patch: Partial<Card> & { description?: string },
 ): Promise<Card> {
-  return fetch(`/api/cards/${id}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(patch),
-  }).then((r) => r.json());
+  return (await api("PATCH", `/api/cards/${id}`, patch)).json();
 }

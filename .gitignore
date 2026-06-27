@@ -1,3 +1,4 @@
 /target
 *.ticket
 .DS_Store
+.claude/settings.json

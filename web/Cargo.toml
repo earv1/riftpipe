@@ -1,0 +1,52 @@
+[package]
+name = "riftpipe-web"
+version = "0.0.0"
+edition = "2021"
+description = "Browser (wasm) side of riftpipe: the web-sys WebRTC data-plane Link"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+riftpipe-core = { path = "../core" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+futures-channel = "0.3"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "RtcPeerConnection",
+    "RtcConfiguration",
+    "RtcDataChannel",
+    "RtcDataChannelInit",
+    "RtcDataChannelEvent",
+    "RtcDataChannelState",
+    "RtcSdpType",
+    "RtcSessionDescription",
+    "RtcSessionDescriptionInit",
+    "RtcIceGatheringState",
+    "MessageEvent",
+    "Event",
+    # WebSocket signaling (connection id in the URL → a room on the signal server).
+    "WebSocket",
+    "Location",
+    # OPFS (Origin Private File System) — local, serverless persistence.
+    "Window",
+    "Navigator",
+    "StorageManager",
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemGetFileOptions",
+    "FileSystemWritableFileStream",
+    "WritableStream",
+    "File",
+    "Blob",
+]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

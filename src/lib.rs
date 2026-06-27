@@ -14,6 +14,8 @@
 
 pub mod crdt;
 pub mod engine;
+pub mod kanban;
 pub mod monitor;
 pub mod net;
+pub mod signal;
 pub mod sync;

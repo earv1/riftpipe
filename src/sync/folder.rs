@@ -30,6 +30,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::net::secure::authenticate;
+use crate::sync::pipe::negotiate_session_halves;
 use crate::net::transport::{accept_link, connect_link};
 use crate::net::{Counters, Result};
 use crate::sync::pipe::{PipeSink, PipeSource, Role, SessionOutcome};
@@ -265,9 +266,12 @@ pub async fn run_folder_reconnecting(
                         metrics_started = true;
                     }
                 }
-                eprintln!("[riftpipe] connected — syncing folder");
-                let (mut sink, mut source) = link.into_halves(counters.clone());
-                match session(&mut ws, &mut watch_rx, &mut sink, &mut source).await? {
+                // Negotiate the transport + maybe upgrade to WebRTC (shared with
+                // --pipe). `_keep` holds the iroh link alive for the session.
+                let (mut sink, mut source, _keep, transport) =
+                    negotiate_session_halves(link, counters.clone()).await;
+                eprintln!("[riftpipe] connected — syncing folder ({transport:?})");
+                match session(&mut ws, &mut watch_rx, &mut *sink, &mut *source).await? {
                     SessionOutcome::StdinClosed => {
                         sink.finish().await;
                         return Ok(());

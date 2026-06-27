@@ -10,9 +10,13 @@ use riftpipe::engine::log::AppendLog;
 use riftpipe::engine::op::{Action, Op, OpId};
 use riftpipe::engine::rules::TwoPlayerTurns;
 use riftpipe::engine::simulation::{Suite, Vector};
+use riftpipe::net::negotiate::{exchange_caps, Caps, Transport};
 use riftpipe::net::secure::{authenticate, Ticket};
-use riftpipe::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr};
-use riftpipe::net::{anyerr, Counters, CountingLink};
+use riftpipe::net::transport::{
+    accept_link, bind_accept, bind_connect, connect_link, local_addr, IrohLink,
+};
+use riftpipe::net::webrtc::upgrade_to_webrtc;
+use riftpipe::net::{anyerr, Counters, CountingLink, Link};
 use riftpipe::sync::folder::run_folder_reconnecting;
 use riftpipe::sync::manifest::Manifest;
 use riftpipe::sync::mirror::TextPeer;
@@ -76,6 +80,13 @@ fn load_manifest(opts: &Opts, dir: &str) -> riftpipe::net::Result<Manifest> {
     Manifest::load_or_default(&path).map_err(anyerr)
 }
 
+/// Find `--flag value` in args, returning the value that follows the flag.
+fn flag_value(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1).cloned())
+}
+
 /// Where the in-memory `process` file goes: `--process <path>`, else `process`
 /// in memory mode, else none (file mode doesn't need it).
 fn process_path(opts: &Opts) -> Option<String> {
@@ -113,6 +124,30 @@ async fn main() {
                 _ => eprintln!("usage: riftpipe join <ticket> <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]"),
             }
         }
+        "kanban" => match args.get(2).map(String::as_str) {
+            Some("serve") => {
+                let dir = args.get(3).cloned().unwrap_or_else(|| "board".to_string());
+                let port = flag_value(&args, "--port").and_then(|v| v.parse().ok()).unwrap_or(7777);
+                let dist = flag_value(&args, "--dist")
+                    .unwrap_or_else(|| "projects/kanban/dist".to_string());
+                // The HTTP server is synchronous (tiny_http); run it off the async
+                // runtime so a future folder-sync task can share the process.
+                let res = tokio::task::spawn_blocking(move || {
+                    riftpipe::kanban::serve(&dir, port, &dist).map_err(|e| e.to_string())
+                })
+                .await;
+                if let Ok(Err(e)) = res {
+                    eprintln!("[kanban] serve failed: {e}");
+                }
+            }
+            _ => eprintln!("usage: riftpipe kanban serve <board-dir> [--port 7777] [--dist <spa-dir>]"),
+        },
+        "signal" => {
+            let port = flag_value(&args, "--port").and_then(|v| v.parse().ok()).unwrap_or(9000);
+            if let Err(e) = riftpipe::signal::serve(port).await {
+                eprintln!("[signal] serve failed: {e}");
+            }
+        }
         _ => {
             eprintln!("riftpipe — collaborative pipe");
             eprintln!("usage:");
@@ -121,6 +156,7 @@ async fn main() {
             eprintln!("  riftpipe td                  # tower-defense core preview (offline)");
             eprintln!("  riftpipe share <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
             eprintln!("  riftpipe join <ticket> <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
+            eprintln!("  riftpipe kanban serve <board-dir> [--port 7777] [--dist <spa-dir>]  # serve the kanban UI + JSON file-API");
             eprintln!("\nedit the file in your $EDITOR; changes converge across peers.");
             eprintln!("a DIR syncs the whole folder: each file gets the algorithm riftpipe.toml assigns");
             eprintln!("(text-crdt / rsync-file; wal-db & image planned). See DESIGN.md §17.");
@@ -175,12 +211,32 @@ async fn share(file: &str, opts: &Opts) -> riftpipe::net::Result<()> {
     let mut link = accept_link(&endpoint).await?;
     authenticate(&mut link, &secret).await?;
     let peer = link.remote_id();
-    let (mut counting, counters) = CountingLink::new(link);
+    let (mut counting, counters, transport) = negotiated_file_link(link).await?;
     if let Some(path) = opts.metrics.clone() {
         riftpipe::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
     }
-    eprintln!("authenticated — live syncing {file} (end-to-end encrypted). ^C to stop.");
-    live_file_loop(file, &mut counting).await
+    eprintln!("authenticated — live syncing {file} ({transport:?}, end-to-end encrypted). ^C to stop.");
+    live_file_loop(file, &mut *counting).await
+}
+
+/// Caps exchange + optional WebRTC upgrade for the single-shot file-mirror path —
+/// the `live_file_loop` analogue of `negotiate_session_halves`. Returns a boxed
+/// `Link` (iroh or WebRTC), its byte counters, and the realized transport.
+async fn negotiated_file_link(
+    mut link: IrohLink,
+) -> riftpipe::net::Result<(Box<dyn Link>, Arc<Counters>, Transport)> {
+    let outcome = exchange_caps(&mut link, &Caps::native()).await?;
+    if outcome.transport == Transport::WebrtcDirect {
+        match upgrade_to_webrtc(&mut link, outcome.we_offer).await {
+            Ok(w) => {
+                let (counting, counters) = CountingLink::new(w);
+                return Ok((Box::new(counting), counters, Transport::WebrtcDirect));
+            }
+            Err(e) => eprintln!("[riftpipe] webrtc upgrade failed ({e}); staying on iroh"),
+        }
+    }
+    let (counting, counters) = CountingLink::new(link);
+    Ok((Box::new(counting), counters, Transport::IrohDirect))
 }
 
 /// Join a shared file/dir via its ticket: dial, authenticate with the secret, run.
@@ -208,12 +264,12 @@ async fn join(ticket: &str, file: &str, opts: &Opts) -> riftpipe::net::Result<()
     let mut link = connect_link(&endpoint, ticket.addr).await?;
     authenticate(&mut link, &ticket.secret).await?;
     let peer = link.remote_id();
-    let (mut counting, counters) = CountingLink::new(link);
+    let (mut counting, counters, transport) = negotiated_file_link(link).await?;
     if let Some(path) = opts.metrics.clone() {
         riftpipe::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
     }
-    eprintln!("authenticated — live syncing {file} (end-to-end encrypted). ^C to stop.");
-    live_file_loop(file, &mut counting).await
+    eprintln!("authenticated — live syncing {file} ({transport:?}, end-to-end encrypted). ^C to stop.");
+    live_file_loop(file, &mut *counting).await
 }
 
 /// Short label for the HUD (file name, not the whole path).

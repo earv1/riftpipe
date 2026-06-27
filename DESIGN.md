@@ -450,6 +450,36 @@ other editors (vscode, emacs, helix) get their own bridge without touching core.
   public peers, not the worst-case pair. The warning is exactly for that case.
 - *Open:* confirm the intended meaning of "warning" — warn on relay fallback, or
   warn whenever bypassing? (Leaning: warn on relay.)
+- **Generalization → transport negotiation & multi-peer.** §14.1's direct/relay
+  choice is the bottom of a transport *ladder* (`webrtc-direct → iroh-direct →
+  iroh-relay`). The connect handshake (§8) now carries a **capability exchange**
+  that picks the highest mutually-supported rung, with the iroh `Link` as the
+  always-reachable floor — the seam the browser (iroh-signals/WebRTC-data) build
+  and the N-peer fan-out plug into. Design + multi-peer thinking:
+  [`docs/planned/transport-negotiation.md`](docs/planned/transport-negotiation.md).
+  *Status:*
+  - Capability negotiation (`net::negotiate`, `CAPS` over the link) — **implemented
+    and wired into every handshake** (`--pipe`, folder, file-mirror).
+  - WebRTC data-plane `Link` + iroh-brokered non-trickle signaling
+    (`net::webrtc`, `webrtc-rs`) — **implemented**.
+  - **Session runs over the negotiated `Link`** (`PipeSink`/`PipeSource` halves for
+    both iroh and WebRTC; `sync::pipe::negotiate_session_halves`), and
+    `Caps::native` advertises `WebrtcDirect` — so **native↔native now upgrades to a
+    WebRTC data channel end-to-end**, with the iroh link kept alive as
+    control/fallback and a transparent fall-back to iroh on upgrade failure.
+  - STUN/TURN are **env-configurable** (`RIFTPIPE_STUN` / `RIFTPIPE_TURN[_USER|_PASS]`);
+    default is host candidates only (LAN/loopback/public-IP).
+  - **Native tests:** `net::negotiate` + `net::webrtc` unit tests, and an
+    end-to-end integration test (`tests/networking.rs`) over a real loopback iroh
+    connection: auth → caps → WebRTC upgrade → data over the negotiated transport.
+  - **Browser `web-sys` `Link`** (`web/` crate) — the wasm counterpart of
+    `net::webrtc`, **implemented and verified headlessly**: `web/test-headless.sh`
+    runs the establishment test in real (headless) Chrome via `wasm-bindgen-test`
+    (it auto-fetches a chromedriver matching the local Chrome build, since
+    `wasm-pack` otherwise force-uses a mismatched latest driver). The `web/` crate
+    is `[workspace] exclude`d from the native build.
+  - *Remaining:* wire the browser `Link` to an iroh-over-WebSocket signaling link
+    in the wasm app (the kanban integration); multi-peer fan-out stays design-only.
 
 ### 14.2 Observability — metrics via tmux (REVISED: no in-app TUI)
 **Pivot:** an in-app crossterm TUI compositor (drawing the doc + an overlay) was

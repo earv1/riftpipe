@@ -1,7 +1,14 @@
 # Planned: the kanban app & frontends
 
-**Status:** planned (design only). riftpipe as the wrapper: sync + serve + a
-bundled UI, with interchangeable frontends over one directory tree.
+**Status:** the **Serve** layer (HTTP file-API + static UI host) is **implemented
+in Rust** — `riftpipe kanban serve <board-dir> [--port 7777] [--dist <spa-dir>]`
+(`src/kanban.rs`, `tiny_http`). It ports the Deno reference server route-for-route
+(`/api/board`, `/api/cards/:id[/detail]`, POST `/api/cards`, PATCH
+`/api/cards/:id`, POST `/api/cards/:id/comments`, SSE `/api/events`), serves the
+built SolidJS SPA, and reads/writes the same on-disk model — verified end-to-end
+against the existing UI bundle. **Remaining:** fold the **Sync** step (folder mode
+over the same dir) into the command so one process serves *and* syncs, and
+**Bundle** the SPA via `include_str!` (today it's served from `--dist`).
 
 ## Commands
 

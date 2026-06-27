@@ -9,5 +9,6 @@
 
 pub mod image;
 pub mod rsync;
+pub mod sqlite;
 pub mod text_crdt;
 pub mod wal;

@@ -1,0 +1,17 @@
+[package]
+name = "riftpipe-core"
+version = "0.0.0"
+edition = "2021"
+description = "Wasm-compatible core of riftpipe: the eg-walker text CRDT + delta encoding (no transport)"
+
+# Pure-Rust, target-agnostic: this is the one piece of riftpipe that compiles for
+# BOTH native and wasm32. The native crate and the browser (wasm) crate both depend
+# on it, so the document model + wire encoding have a single source of truth.
+[dependencies]
+diamond-types = "1.0.0"
+similar = "3.1.1"
+
+# On wasm32, diamond-types' transitive `getrandom` (0.2) needs a browser entropy
+# source — enable its `js` backend. Native targets are unaffected.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

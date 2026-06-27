@@ -21,8 +21,10 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, sleep_until, Instant, MissedTickBehavior};
 
 use crate::crdt::text::EgWalkerText;
+use crate::net::negotiate::{exchange_caps, Caps, Transport};
 use crate::net::secure::authenticate;
-use crate::net::transport::{accept_link, connect_link, IrohSink, IrohSource};
+use crate::net::transport::{accept_link, connect_link, IrohLink, IrohSink, IrohSource};
+use crate::net::webrtc::{upgrade_to_webrtc, WebrtcSink, WebrtcSource};
 use crate::net::{anyerr, Counters, Result};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -174,6 +176,57 @@ impl PipeSource for IrohSource {
     async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
         IrohSource::recv(self).await
     }
+}
+
+#[async_trait]
+impl PipeSink for WebrtcSink {
+    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
+        WebrtcSink::send(self, msg).await
+    }
+    async fn finish(&mut self) {
+        WebrtcSink::finish(self).await
+    }
+}
+#[async_trait]
+impl PipeSource for WebrtcSource {
+    async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+        WebrtcSource::recv(self).await
+    }
+}
+
+/// Negotiate the data transport over the (authenticated) iroh `link`, optionally
+/// upgrade to WebRTC, and return the session's send/recv halves
+/// (`docs/planned/transport-negotiation.md`). Shared by `--pipe` and folder mode.
+///
+/// On a WebRTC upgrade the iroh link is returned as the `keepalive` (control /
+/// fallback — and it keeps the QUIC connection alive so metrics' `connection_kind`
+/// still resolves); on iroh transport it's consumed into the halves. An upgrade
+/// failure transparently falls back to iroh. The returned `Transport` is what the
+/// data plane actually ended up using.
+pub async fn negotiate_session_halves(
+    mut link: IrohLink,
+    counters: Arc<Counters>,
+) -> (Box<dyn PipeSink>, Box<dyn PipeSource>, Option<IrohLink>, Transport) {
+    let outcome = exchange_caps(&mut link, &Caps::native()).await;
+    if let Ok(o) = &outcome {
+        if o.transport == Transport::WebrtcDirect {
+            match upgrade_to_webrtc(&mut link, o.we_offer).await {
+                Ok(w) => {
+                    let (sink, source) = w.into_halves(counters);
+                    return (Box::new(sink), Box::new(source), Some(link), Transport::WebrtcDirect);
+                }
+                Err(e) => eprintln!("[riftpipe] webrtc upgrade failed ({e}); staying on iroh"),
+            }
+        }
+    }
+    // Either iroh was chosen, caps failed, or the WebRTC upgrade fell back. We're
+    // on the iroh link now; report iroh-direct rather than the unrealized webrtc.
+    let transport = match outcome {
+        Ok(o) if o.transport != Transport::WebrtcDirect => o.transport,
+        _ => Transport::IrohDirect,
+    };
+    let (sink, source) = link.into_halves(counters);
+    (Box::new(sink), Box::new(source), None, transport)
 }
 
 /// Why a session ended.
@@ -339,9 +392,12 @@ pub async fn run_pipe_reconnecting(
                         metrics_started = true;
                     }
                 }
-                eprintln!("[riftpipe] connected — syncing");
-                let (mut sink, mut source) = link.into_halves(counters.clone());
-                match session(&mut peer, &mut rx, &mut out, &mut sink, &mut source).await? {
+                // Negotiate the transport + maybe upgrade to WebRTC. `_keep` holds
+                // the iroh link alive (control/fallback) for the session's lifetime.
+                let (mut sink, mut source, _keep, transport) =
+                    negotiate_session_halves(link, counters.clone()).await;
+                eprintln!("[riftpipe] connected — syncing ({transport:?})");
+                match session(&mut peer, &mut rx, &mut out, &mut *sink, &mut *source).await? {
                     SessionOutcome::StdinClosed => {
                         sink.finish().await;
                         return Ok(());
