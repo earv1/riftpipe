@@ -36,15 +36,21 @@ link, connect P2P over WebRTC via the signaling server, and a card created throu
 browser A's UI appears in browser B, with no server in the data path. Run with
 `projects/kanban/e2e/run.sh`.
 
-## Transport fragmentation (#3) — narrower than it looked
+## Transport fragmentation (#3) — RESOLVED
 
-Native speaks iroh; the browser speaks WebRTC + the signaling server. They don't
-interoperate **today**, but the bridge is *achievable, not fundamental*: native
-already carries `webrtc-rs`, and the signaling server is a generic room relay. A
-native peer can join a signaling room over a WebSocket and establish WebRTC
-(`webrtc-rs`) with a browser peer — both sides speak the same WebRTC. So
-"browser↔native" is a wiring task (native WS-signaling client reusing the existing
-`webrtc-rs` establishment), not a research problem. Not yet built.
+> **Done & verified end-to-end.** A native peer now joins the same WebSocket
+> signaling server the browser uses (`net::webrtc::connect_via_signaling`),
+> speaking the browser's JSON protocol, and establishes WebRTC via `webrtc-rs`.
+> `projects/kanban/e2e/run-bridge.sh` proves it across the stack with Playwright:
+> a real browser (web-sys) and a native process (webrtc-rs) connect through the
+> signaling server and exchange messages **both ways** over WebRTC. Native↔native
+> via the signaling server is also a Rust integration test
+> (`tests/networking.rs`).
+
+Native still *prefers* iroh among native peers (the capability ladder), but the
+two stacks are no longer islands — anything that speaks the signaling+WebRTC path
+interoperates. (Full board-level sync between a native peer and a browser would
+additionally need a native `BoardSync`; the transport bridge it rides on is done.)
 
 ## Honestly deferred / can't verify here
 

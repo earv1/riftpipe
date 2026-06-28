@@ -213,6 +213,9 @@ per-file board sync over the link** (two browsers converge card prose as a CRDT
 and structural moves as LWW). All verified headlessly in real Chrome, and the full
 **two-real-browser loop is verified end-to-end with Playwright** (a card created
 in one browser's UI appears in the other, no server in the data path). The SolidJS
-app builds as a self-contained static bundle. In progress: a browser↔native bridge.
-`wal-db`/`image` are stubs. Not yet proven on hostile/cross-NAT networks (needs the
-env-configurable STUN/TURN) or large trees.
+app builds as a self-contained static bundle. The **browser↔native bridge** also
+works — a native `webrtc-rs` peer and a browser `web-sys` peer connect through the
+signaling server and exchange data over WebRTC (verified end-to-end with
+Playwright). Remaining: full board-level sync between a native peer and a browser
+(needs a native `BoardSync`). `wal-db`/`image` are stubs. Not yet proven on
+hostile/cross-NAT networks (needs the env-configurable STUN/TURN) or large trees.
