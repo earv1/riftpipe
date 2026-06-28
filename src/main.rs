@@ -148,6 +148,24 @@ async fn main() {
                 eprintln!("[signal] serve failed: {e}");
             }
         }
+        // Cross-stack bridge probe: connect to a browser peer via the signaling
+        // server, send a message, print the one received. Used by the e2e test.
+        "webrtc-echo" => {
+            use riftpipe::net::Link;
+            let room = args.get(2).cloned().unwrap_or_default();
+            let signal = flag_value(&args, "--signal").unwrap_or_else(|| "ws://127.0.0.1:9000".to_string());
+            let send = flag_value(&args, "--send").unwrap_or_else(|| "hello-from-native".to_string());
+            match riftpipe::net::webrtc::connect_via_signaling(&signal, &room).await {
+                Ok(mut link) => {
+                    let _ = link.send(send.into_bytes()).await;
+                    match link.recv().await {
+                        Ok(Some(b)) => println!("GOT:{}", String::from_utf8_lossy(&b)),
+                        _ => eprintln!("webrtc-echo: no message"),
+                    }
+                }
+                Err(e) => eprintln!("webrtc-echo: connect failed: {e}"),
+            }
+        }
         _ => {
             eprintln!("riftpipe — collaborative pipe");
             eprintln!("usage:");

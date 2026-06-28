@@ -409,7 +409,9 @@ async fn recv_sdp(sig: &mut Signaling) -> Result<String, JsValue> {
 /// return the established WebRTC link. The signaling server pairs the room and
 /// relays the offer/answer; data then flows **direct**, peer-to-peer.
 pub async fn connect_via_signaling(ws_url: &str, room: &str) -> Result<WebrtcLink, JsValue> {
-    let mut sig = Signaling::connect(&format!("{ws_url}?room={room}")).await?;
+    // `/` before the query (browsers normalize this, but be explicit/consistent).
+    let url = format!("{}/?room={room}", ws_url.trim_end_matches('/'));
+    let mut sig = Signaling::connect(&url).await?;
     let role = loop {
         match sig.recv().await {
             Some(m) => {
@@ -424,6 +426,16 @@ pub async fn connect_via_signaling(ws_url: &str, room: &str) -> Result<WebrtcLin
         }
     };
     establish_over_signaling(role == "offerer", &mut sig).await
+}
+
+/// Connect via signaling, send `payload`, await one message, return it as text.
+/// Used by the browser↔native cross-stack e2e test.
+#[wasm_bindgen(js_name = webrtcEcho)]
+pub async fn webrtc_echo(ws_url: String, room: String, payload: String) -> Result<String, JsValue> {
+    let mut link = connect_via_signaling(&ws_url, &room).await?;
+    link.send(payload.as_bytes())?;
+    let got = link.recv().await.ok_or_else(|| JsValue::from_str("no message received"))?;
+    Ok(String::from_utf8_lossy(&got).into_owned())
 }
 
 #[cfg(test)]

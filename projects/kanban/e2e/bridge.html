@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+  <head><meta charset="utf-8" /><title>riftpipe bridge probe</title></head>
+  <body>
+    <pre id="result">pending</pre>
+    <script type="module">
+      import init, { webrtcEcho } from "../../../web/pkg/riftpipe_web.js";
+      const result = document.getElementById("result");
+      try {
+        await init();
+        const room = location.hash.slice(1);
+        const signal =
+          new URLSearchParams(location.search).get("signal") ||
+          `ws://${location.hostname}:9000`;
+        // Connect to the native peer sharing this room; send, receive its reply.
+        const got = await webrtcEcho(signal, room, "hello-from-browser");
+        result.textContent = "GOT:" + got;
+      } catch (e) {
+        result.textContent = "ERR:" + (e && e.message ? e.message : e);
+      }
+    </script>
+  </body>
+</html>

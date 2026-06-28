@@ -312,7 +312,9 @@ fn json_field(text: &str, expect_type: &str, field: &str) -> Option<String> {
 /// `ws_url`, establishing a WebRTC `Link` (the native end of the browser↔native
 /// bridge). The server assigns the offerer role and relays the offer/answer.
 pub async fn connect_via_signaling(ws_url: &str, room: &str) -> Result<WebrtcLink> {
-    let url = format!("{ws_url}?room={room}");
+    // A `/` before the query is required — `ws://host:port?room=…` has an empty
+    // path and yields an invalid HTTP request line (tungstenite won't normalize it).
+    let url = format!("{}/?room={room}", ws_url.trim_end_matches('/'));
     let (ws, _) = tokio_tungstenite::connect_async(&url).await.map_err(anyerr)?;
     let (mut write, mut read) = ws.split();
 
