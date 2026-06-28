@@ -23,6 +23,8 @@ use web_sys::{
 
 /// The kanban "server" running in the browser (the JSON API over OPFS).
 pub mod kanban;
+/// Per-file sync of a board over an established WebRTC link.
+pub mod board_sync;
 
 /// One end of a WebRTC data channel, wrapped so the rest of riftpipe can treat it
 /// as a byte pipe. Mirrors the native `WebrtcLink`: `send` writes to the channel,
@@ -44,6 +46,23 @@ impl WebrtcLink {
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         use futures_util::StreamExt;
         self.inbound.next().await
+    }
+
+    /// A cheap clone of the send side, so a sync loop can keep sending while the
+    /// link's `recv` is owned by a spawned receive task.
+    pub fn sender(&self) -> WebrtcSender {
+        WebrtcSender { dc: self.dc.clone() }
+    }
+}
+
+/// The send half of a [`WebrtcLink`] (just the data channel).
+pub struct WebrtcSender {
+    dc: RtcDataChannel,
+}
+
+impl WebrtcSender {
+    pub fn send(&self, bytes: &[u8]) -> Result<(), JsValue> {
+        self.dc.send_with_u8_array(bytes)
     }
 }
 
@@ -630,5 +649,76 @@ mod tests {
     fn json_str(json: &str, key: &str) -> String {
         let v = js_sys::JSON::parse(json).unwrap();
         js_sys::Reflect::get(&v, &key.into()).unwrap().as_string().unwrap()
+    }
+
+    /// Yield to the event loop for `ms` so spawned recv tasks can run.
+    async fn sleep(ms: i32) {
+        let p = js_sys::Promise::new(&mut |resolve, _| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms)
+                .unwrap();
+        });
+        let _ = JsFuture::from(p).await;
+    }
+
+    /// **Collaboration in the browser:** two `BoardSync`s, connected through the
+    /// real signaling server + WebRTC, converge per-file board state — a text file
+    /// (CRDT, concurrent edits both survive) and a structural file (LWW). This is
+    /// the layer that makes the browser kanban actually *sync*, not just run.
+    #[wasm_bindgen_test]
+    async fn two_board_syncs_collaborate_over_the_link() {
+        use crate::board_sync::BoardSync;
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+
+        let url = "ws://127.0.0.1:9011/";
+        let room = "boardsync-it";
+        let (la, lb) = futures_util::future::join(
+            connect_via_signaling(url, room),
+            connect_via_signaling(url, room),
+        )
+        .await;
+        let (la, lb) = (la.expect("A connects"), lb.expect("B connects"));
+
+        let got_a = Rc::new(RefCell::new(HashMap::<String, Vec<u8>>::new()));
+        let got_b = Rc::new(RefCell::new(HashMap::<String, Vec<u8>>::new()));
+        let (ga, gb) = (got_a.clone(), got_b.clone());
+        let sync_a = BoardSync::new(la, Rc::new(move |p, b| { ga.borrow_mut().insert(p, b); }));
+        let sync_b = BoardSync::new(lb, Rc::new(move |p, b| { gb.borrow_mut().insert(p, b); }));
+
+        // A creates a card's prose; B receives it (CRDT) — and a structural move (LWW).
+        sync_a.push_text("tickets/x/card.md", "# Hello\n\nfrom A\n");
+        sync_a.push_lww("tickets/x/meta.toml", b"column = \"Doing\"\nposition = 0\ndone = false\n");
+
+        let key = "tickets/x/card.md".to_string();
+        for _ in 0..100 {
+            if got_b.borrow().contains_key(&key) { break; }
+            sleep(20).await;
+        }
+        assert_eq!(
+            got_b.borrow().get(&key).map(|b| String::from_utf8_lossy(b).into_owned()),
+            Some("# Hello\n\nfrom A\n".to_string()),
+            "B received A's card prose over the link",
+        );
+        assert!(
+            got_b.borrow().get("tickets/x/meta.toml").map(|b| String::from_utf8_lossy(b).contains("Doing")).unwrap_or(false),
+            "B received A's structural move (LWW)",
+        );
+
+        // Concurrent edits to the SAME file from both peers converge (CRDT).
+        sync_a.push_text("board.md", "# Board\n\n- Todo\n");
+        sync_b.push_text("board.md", "# Board\n\n- Done\n");
+        for _ in 0..100 {
+            let (a, b) = (got_a.borrow().contains_key("board.md"), got_b.borrow().contains_key("board.md"));
+            if a && b { break; }
+            sleep(20).await;
+        }
+        // Both peers end with the same merged board.md (deterministic CRDT result).
+        sleep(60).await;
+        let a_board = got_a.borrow().get("board.md").map(|b| String::from_utf8_lossy(b).into_owned());
+        let b_board = got_b.borrow().get("board.md").map(|b| String::from_utf8_lossy(b).into_owned());
+        assert_eq!(a_board, b_board, "concurrent board.md edits converge on both peers");
     }
 }
