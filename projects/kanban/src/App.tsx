@@ -1,6 +1,6 @@
 import { createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, connectPeer, type Card } from "./api.ts";
+import { getBoard, addCard, patchCard, connectPeer, onLocalChange, type Card } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 
 export function App() {
@@ -32,6 +32,8 @@ export function App() {
   };
 
   onMount(() => {
+    // A local mutation (our own add/move/edit) refreshes the board too — no SSE.
+    onLocalChange(() => void refresh());
     (async () => {
       await refresh();
       // If the URL carries a connection id, connect P2P (WebRTC) and refresh on

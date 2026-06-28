@@ -1,0 +1,7 @@
+{
+  "name": "kanban-e2e",
+  "private": true,
+  "devDependencies": {
+    "playwright": "^1.61.1"
+  }
+}

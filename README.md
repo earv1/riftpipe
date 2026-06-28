@@ -210,8 +210,9 @@ Working: text CRDT, rsync, folder sync, in-memory mode, reconnection, the nvim
 bridge, the native kanban server, and the browser stack — the wasm CRDT, OPFS
 persistence, WebRTC + link-based signaling, the in-browser kanban handler, **and
 per-file board sync over the link** (two browsers converge card prose as a CRDT
-and structural moves as LWW) — all verified headlessly in real Chrome; the
-SolidJS app builds as a self-contained static bundle. In progress: a browser↔native
-bridge, and the full two-real-browser UI loop (verified by composition today).
+and structural moves as LWW). All verified headlessly in real Chrome, and the full
+**two-real-browser loop is verified end-to-end with Playwright** (a card created
+in one browser's UI appears in the other, no server in the data path). The SolidJS
+app builds as a self-contained static bundle. In progress: a browser↔native bridge.
 `wal-db`/`image` are stubs. Not yet proven on hostile/cross-NAT networks (needs the
 env-configurable STUN/TURN) or large trees.

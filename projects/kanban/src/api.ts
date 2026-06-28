@@ -43,6 +43,13 @@ function ready(): Promise<unknown> {
   return (_ready ??= init());
 }
 
+// Without a server there's no SSE; a successful local mutation notifies the app
+// to refresh (remote peer merges notify via connectPeer's callback).
+let _onLocalChange: (() => void) | null = null;
+export function onLocalChange(cb: () => void): void {
+  _onLocalChange = cb;
+}
+
 interface ApiResponse {
   status: number;
   body: string;
@@ -57,6 +64,7 @@ async function api(
   await ready();
   const payload = body === undefined ? "" : JSON.stringify(body);
   const res = (await kanbanHandle(method, path, payload)) as ApiResponse;
+  if (method !== "GET" && res.status < 400) _onLocalChange?.();
   return { status: res.status, json: () => JSON.parse(res.body) };
 }
 

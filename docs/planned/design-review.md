@@ -30,9 +30,11 @@ Original gap (kept for context): the browser handler wrote OPFS but didn't sync;
 the building blocks (RiftDoc, the WebRTC link, the signaling server) existed but
 weren't wired. They are now.
 
-*Caveat:* the full two-real-browser UI loop is verified by composition (sync core
-+ handler + OPFS + bundle each tested), not a single end-to-end two-browser UI
-test — one page shares one OPFS, so that needs two browser contexts (Playwright).
+*Verified end-to-end:* `projects/kanban/e2e/` drives **two real isolated browser
+contexts** with Playwright — both load the static bundle at the same connection-id
+link, connect P2P over WebRTC via the signaling server, and a card created through
+browser A's UI appears in browser B, with no server in the data path. Run with
+`projects/kanban/e2e/run.sh`.
 
 ## Transport fragmentation (#3) — narrower than it looked
 
