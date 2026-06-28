@@ -1,91 +1,59 @@
 # Publish the kanban on GitHub Pages (and share with a friend)
 
-The board runs entirely in the browser — GitHub Pages serves the static bundle,
-and two browsers sync **peer-to-peer over WebRTC**. Pages is HTTPS, which satisfies
-WebRTC + OPFS's secure-context requirement. The data never touches a server.
+The board runs entirely in the browser and syncs **peer-to-peer over iroh** — and
+with iroh there's **nothing for you to host**. GitHub Pages serves the static
+bundle; the peer-to-peer bootstrap *and* transport ride **n0's public relays**
+(free, end-to-end encrypted — the relay can't read your board). No signaling
+server, no STUN/TURN, no backend. Just publish the page and share a link.
 
-But two browsers on **different networks** need two small public helpers to *find*
-each other (they never see your board data):
-
-1. **A signaling server over `wss://`** — pairs the two peers by connection id so
-   they can swap WebRTC SDP. Required. (An HTTPS page cannot talk to insecure
-   `ws://`, and `localhost` isn't reachable by your friend.)
-2. **STUN** — lets each browser learn its public address for hole-punching. A free
-   public STUN is the default; nothing to host.
-3. **TURN** — only for hostile/symmetric NATs (the relay fallback). Optional.
-
-## 1. Host the signaling server (the one thing you must run)
-
-`riftpipe signal` is a content-blind room relay. It speaks plain `ws://`; put TLS
-in front of it. The easy path is **fly.io** (free tier, gives you `wss://` for free):
-
-```sh
-# from the repo root
-cd deploy
-fly launch --copy-config --no-deploy   # choose a unique app name
-fly deploy
-# → your server is at wss://<app>.fly.dev
-```
-
-(`deploy/signal.Dockerfile` builds the binary and runs `riftpipe signal` bound to
-`0.0.0.0`; `deploy/fly.toml` wires fly's TLS edge to it.)
-
-Any host works — a VPS with **Caddy** as a TLS reverse proxy is two lines:
-
-```
-signal.example.com {
-    reverse_proxy 127.0.0.1:9000
-}
-```
-…with `RIFTPIPE_BIND=0.0.0.0 riftpipe signal --port 9000` running behind it.
-
-## 2. Turn on GitHub Pages
+## 1. Turn on GitHub Pages
 
 In the repo: **Settings → Pages → Build and deployment → Source: GitHub Actions**.
-The workflow `.github/workflows/pages.yml` builds the wasm core + the SolidJS
-bundle and deploys it on every push to `main`.
+The workflow `.github/workflows/pages.yml` builds the wasm core (iroh included) +
+the SolidJS bundle and deploys it on every push to `main`. Your board is then at
+`https://<user>.github.io/<repo>/`.
 
-## 3. Point the app at your signaling server
+(The build compiles iroh to WebAssembly, which needs a wasm-capable clang — the
+workflow installs it. Nothing for you to configure.)
 
-**Settings → Secrets and variables → Actions → Variables**, add:
+## 2. Share a board
 
-| name | value | required |
-|------|-------|----------|
-| `SIGNAL_URL` | `wss://<app>.fly.dev` | **yes** |
-| `STUN_URL` | `stun:stun.l.google.com:19302` | no (this is the default) |
-| `TURN_URL` | `turn:your-turn:3478` | no (hostile-NAT fallback) |
-| `TURN_USER` | turn username | with TURN |
-| `TURN_PASS` | *(add as a **Secret**, not a Variable)* | with TURN |
-
-Push to `main` (or run the workflow manually). Your board is now at
-`https://<user>.github.io/riftpipe/`.
-
-## 4. Share a board
-
-A board is a connection id in the URL hash — share the **same** link and you share
-the board:
+Open the published URL. The tab becomes the **host** and writes its connection
+**ticket** into the address bar:
 
 ```
-https://<user>.github.io/riftpipe/#standup-7f3a91
+https://<user>.github.io/riftpipe/#<ticket>
 ```
 
-Pick any unique id, or mint one:
+Send that link to a friend. They open it, join over the relay, and you're
+collaborating live — create cards and they sync both ways. Each browser keeps its
+own copy in OPFS, so the board survives reloads.
 
-```sh
-./web/share-link.sh https://<user>.github.io/riftpipe
-# → https://<user>.github.io/riftpipe/#<random-id>
-```
-
-Both of you open that link; create cards and they sync live, no server in the data
-path. (Each browser keeps its own copy in OPFS, so the board survives reloads.)
+That's the whole deployment. No server you run, anywhere.
 
 ## Reality check
 
-- **Same `#id` = same board.** Different ids are different boards.
-- **First connection needs both peers online together** to pair through signaling;
-  after that, edits flow directly browser-to-browser.
-- **A really locked-down NAT** (symmetric/CGNAT on both ends) needs the TURN relay
-  — set `TURN_URL`/`TURN_USER`/`TURN_PASS`. The relay path is verified
-  (`projects/kanban/e2e/run-bridge-relay.sh`); STUN-only hole-punching between two
-  arbitrary networks is the case we can't test without two machines.
-- The signaling server only brokers the handshake; it never sees card content.
+- **Same `#ticket` = same board.** The host must keep its tab open while others
+  join (it's the rendezvous point); after joining, edits flow peer-to-peer.
+- **Privacy:** n0's relay sees connection metadata (who talks to whom, and volume)
+  but **not** your board — traffic is end-to-end encrypted. To avoid n0 entirely,
+  self-host an [iroh relay](https://www.iroh.computer/docs) and point the build at
+  it; that's the only reason you'd run any server.
+- **Bundle size:** ~3 MB wasm (≈1 MB gzipped) — the cost of bundling a full P2P
+  stack. One-time, then browser-cached.
+- **A host that reloads** mints a new ephemeral identity, so the old `#ticket`
+  link goes stale (persisting the host key for stable links is a future tweak).
+
+## Appendix: the WebSocket transport (optional, for the native bridge)
+
+A second transport exists — `?transport=ws` (or `VITE_TRANSPORT=ws` at build) — that
+uses a tiny WebSocket signaling server + WebRTC instead of iroh. You only need this
+to bridge a **browser to a native `riftpipe` peer** (which speaks WebRTC). It *does*
+require hosting a signaling server over `wss://`:
+
+- `deploy/signal.Dockerfile` + `deploy/fly.toml` deploy `riftpipe signal` behind
+  TLS (e.g. fly.io gives `wss://<app>.fly.dev`).
+- Set repo variables `SIGNAL_URL` (and optional `STUN_URL`/`TURN_*`) and build with
+  `VITE_TRANSPORT=ws`.
+
+For browser-to-browser sharing you don't need any of this — iroh is the default.

@@ -45,6 +45,12 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
+      - name: Wasm-capable clang (iroh/ring compile C to wasm)
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang llvm
+          echo "CC_wasm32_unknown_unknown=clang" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=llvm-ar" >> "$GITHUB_ENV"
+
       - name: Build wasm package
         run: cd web && wasm-pack build --target web --out-dir pkg
 

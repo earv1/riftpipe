@@ -524,38 +524,6 @@ mod tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    /// Two iroh endpoints in the browser connect through n0's public relay and
-    /// round-trip a message — proves browser↔browser iroh works (no signaling
-    /// server, no host). Needs network to reach the relay.
-    #[wasm_bindgen_test]
-    async fn iroh_relay_roundtrip() {
-        use crate::iroh_link::{addr_of, bind_accept, bind_connect, ticket_of, wait_for_addr, IrohLink};
-
-        let host = bind_accept().await.expect("bind host");
-        let host_addr = wait_for_addr(&host).await;
-        assert!(!host_addr.addrs.is_empty(), "host acquired a relay address");
-        let ticket = ticket_of(&host_addr); // what would go in the share link
-
-        // Host: accept one connection, read the joiner's frame, echo it back.
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Ok(mut link) = IrohLink::accept(&host).await {
-                if let Some(msg) = link.recv().await {
-                    let _ = link.send(&msg).await;
-                    sleep_test(800).await; // stay open so the reply is delivered
-                }
-            }
-        });
-
-        // Joiner: dial the ticket and round-trip a message through the relay.
-        let joiner = bind_connect().await.expect("bind joiner");
-        let mut link = IrohLink::connect(&joiner, addr_of(&ticket).unwrap())
-            .await
-            .expect("connect via relay");
-        link.send(b"ping-over-iroh").await.expect("send");
-        let got = link.recv().await.expect("recv echo");
-        assert_eq!(got, b"ping-over-iroh", "round-tripped through n0 relay");
-    }
-
     async fn sleep_test(ms: u32) {
         gloo_timers::future::TimeoutFuture::new(ms).await;
     }
@@ -593,11 +561,11 @@ mod tests {
         let joiner = BoardSync::over_iroh(link, nop);
         joiner.push_text("tickets/x/card.md", "# hello over iroh\n");
 
-        for _ in 0..200 {
+        for _ in 0..300 {
             if !host_got.borrow().is_empty() {
                 break;
             }
-            sleep_test(50).await;
+            sleep_test(50).await; // up to 15s — a real relay round-trip varies
         }
         let got = host_got.borrow();
         assert!(

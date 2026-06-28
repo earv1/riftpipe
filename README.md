@@ -162,14 +162,16 @@ cd web && wasm-pack build --target web && ./test-headless.sh
 The shared layout lives in `riftpipe-core::kanban`, so a board is byte-for-byte
 portable between the native server and the browser build.
 
-#### Publish it & share with a friend
+#### Publish it & share with a friend — nothing to host
 The browser build deploys to **GitHub Pages** (`.github/workflows/pages.yml`): push
 to `main` and the wasm core + SolidJS bundle ship to `https://<user>.github.io/<repo>/`.
-Two people on different networks then collaborate P2P by opening the same
-`…/#<board-id>` link — you just need a public **signaling server over `wss://`**
-(`deploy/signal.Dockerfile` + `deploy/fly.toml` deploy `riftpipe signal` behind
-TLS) and STUN (a public one is the default). Full walkthrough:
-**[docs/deploy-pages.md](docs/deploy-pages.md)**.
+By default it syncs **peer-to-peer over iroh**, so there's **no signaling server,
+no STUN/TURN, no backend to run** — the bootstrap and transport ride n0's free,
+end-to-end-encrypted relays. Open the page (the tab becomes the host and writes its
+ticket into the URL), send the `…/#<ticket>` link to a friend, and you're
+collaborating live. A `?transport=ws` path (a hosted `wss://` signaling server +
+WebRTC) also exists, but only for bridging a browser to a **native** peer. Full
+walkthrough: **[docs/deploy-pages.md](docs/deploy-pages.md)**.
 
 ### Useful flags
 | flag | meaning |
