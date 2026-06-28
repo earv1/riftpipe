@@ -5,7 +5,11 @@
 //
 // (The exported function signatures are identical to the old fetch-based API, so
 // the SolidJS components don't change.)
-import init, { kanbanHandle } from "../../../web/pkg/riftpipe_web.js";
+import init, {
+  kanbanHandle,
+  connectAndSync,
+  connectionId,
+} from "../../../web/pkg/riftpipe_web.js";
 
 export interface Card {
   id: string;
@@ -54,6 +58,26 @@ async function api(
   const payload = body === undefined ? "" : JSON.stringify(body);
   const res = (await kanbanHandle(method, path, payload)) as ApiResponse;
   return { status: res.status, json: () => JSON.parse(res.body) };
+}
+
+/** Signaling server URL — `?signal=ws://…` overrides the default (port 9000). */
+function signalUrl(): string {
+  const override = new URL(location.href).searchParams.get("signal");
+  return override ?? `ws://${location.hostname || "localhost"}:9000`;
+}
+
+/**
+ * If the page URL carries a connection id (`#<id>`), connect peer-to-peer over
+ * WebRTC and sync the board. `onRemote` fires whenever a peer's edit is merged
+ * into local OPFS, so the caller can refetch. Returns false if there's no id
+ * (single-player). Sharing the link == sharing the board.
+ */
+export async function connectPeer(onRemote: () => void): Promise<boolean> {
+  await ready();
+  const id = connectionId();
+  if (!id) return false;
+  await connectAndSync(signalUrl(), id, onRemote);
+  return true;
 }
 
 export async function getBoard(): Promise<Board> {

@@ -15,8 +15,55 @@ use std::rc::Rc;
 
 use riftpipe_core::text::EgWalkerText;
 use serde::{Deserialize, Serialize};
+use wasm_bindgen::prelude::*;
 
 use crate::{WebrtcLink, WebrtcSender};
+
+thread_local! {
+    /// The active board connection, if any (single-threaded wasm).
+    static SYNC: RefCell<Option<BoardSync>> = RefCell::new(None);
+}
+
+/// Connect to the peer sharing `room` (the connection id) via the signaling server,
+/// then sync the board over the link: a peer's merged file lands in OPFS and
+/// `on_change` fires so the UI refetches. Call once; the kanban handler pushes
+/// local edits automatically thereafter.
+#[wasm_bindgen(js_name = connectAndSync)]
+pub async fn connect_and_sync(
+    ws_url: String,
+    room: String,
+    on_change: js_sys::Function,
+) -> Result<(), JsValue> {
+    let link = crate::connect_via_signaling(&ws_url, &room).await?;
+    let on_change = Rc::new(on_change);
+    let on_merged: Rc<dyn Fn(String, Vec<u8>)> = Rc::new(move |path: String, bytes: Vec<u8>| {
+        let cb = on_change.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = crate::kanban::write_path(&path, &bytes).await; // land the merge in OPFS
+            let _ = cb.call0(&JsValue::NULL); // nudge the UI to refetch
+        });
+    });
+    SYNC.with(|c| *c.borrow_mut() = Some(BoardSync::new(link, on_merged)));
+    Ok(())
+}
+
+/// Push a text file's new content to the connected peer (no-op if not connected).
+pub fn push_text(path: &str, content: &str) {
+    SYNC.with(|c| {
+        if let Some(s) = c.borrow().as_ref() {
+            s.push_text(path, content);
+        }
+    });
+}
+
+/// Push a structural file (LWW) to the connected peer (no-op if not connected).
+pub fn push_lww(path: &str, bytes: &[u8]) {
+    SYNC.with(|c| {
+        if let Some(s) = c.borrow().as_ref() {
+            s.push_lww(path, bytes);
+        }
+    });
+}
 
 #[derive(Serialize, Deserialize)]
 enum SyncMsg {

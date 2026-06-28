@@ -54,6 +54,18 @@ async fn write_text(dir: &FileSystemDirectoryHandle, name: &str, content: &str) 
     Ok(())
 }
 
+/// Write bytes to an OPFS path like `tickets/<id>/card.md`, creating dirs as
+/// needed. Used by the sync layer to land a peer's merged file.
+pub async fn write_path(path: &str, bytes: &[u8]) -> Result<(), JsValue> {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some((file, dirs)) = parts.split_last() else { return Ok(()) };
+    let mut dir = opfs_root().await?;
+    for d in dirs {
+        dir = subdir(&dir, d, true).await?;
+    }
+    write_text(&dir, file, &String::from_utf8_lossy(bytes)).await
+}
+
 /// Entry names in a directory (drives the OPFS `keys()` async iterator).
 async fn list(dir: &FileSystemDirectoryHandle) -> Vec<String> {
     let mut names = Vec::new();
@@ -214,6 +226,11 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
             let cdir = ensure_card_dir(&root, &id).await?;
             write_card(&cdir, &title, "").await?;
             write_meta(&cdir, &column, max_pos + 1, false).await?;
+            crate::board_sync::push_text(&format!("tickets/{id}/card.md"), &kb::card_md(&title, ""));
+            crate::board_sync::push_lww(
+                &format!("tickets/{id}/meta.toml"),
+                kb::meta_toml(&column, max_pos + 1, false).as_bytes(),
+            );
             Ok(json_resp(&summary(&Card { id, title, column, position: max_pos + 1, done: false })))
         }
 
@@ -239,8 +256,13 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
             // Always persist structural fields; only re-serialize card.md when the
             // title/description actually changed (mirrors native; avoids prose drift).
             write_meta(&cdir, &card.column, card.position, card.done).await?;
+            crate::board_sync::push_lww(
+                &format!("tickets/{id}/meta.toml"),
+                kb::meta_toml(&card.column, card.position, card.done).as_bytes(),
+            );
             if touched_text {
                 write_card(&cdir, &card.title, &description).await?;
+                crate::board_sync::push_text(&format!("tickets/{id}/card.md"), &kb::card_md(&card.title, &description));
             }
             Ok(json_resp(&summary(&card)))
         }
@@ -260,6 +282,7 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
             let cdir = subdir(&tickets, id, false).await?;
             let comments = subdir(&cdir, "comments", true).await?;
             write_text(&comments, &format!("{name}.md"), &text).await?;
+            crate::board_sync::push_text(&format!("tickets/{id}/comments/{name}.md"), &text);
             Ok(json_resp(&Comment { id: name, author, ts, text }))
         }
 

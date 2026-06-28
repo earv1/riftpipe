@@ -1,6 +1,6 @@
-import { createSignal, onMount, onCleanup, For, Show } from "solid-js";
+import { createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, getCard, addCard, patchCard, type Card } from "./api.ts";
+import { getBoard, addCard, patchCard, connectPeer, type Card } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 
 export function App() {
@@ -17,48 +17,31 @@ export function App() {
   const [draggedId, setDraggedId] = createSignal<string | null>(null);
   const [dragOverCol, setDragOverCol] = createSignal<string | null>(null);
 
+  // Reload the whole board (cheap — it's local OPFS) and nudge an open card.
+  const refresh = async () => {
+    try {
+      const b = await getBoard();
+      setBoard("title", b.title);
+      setBoard("columns", reconcile(b.columns));
+      setBoard("cards", reconcile(b.cards, { key: "id" }));
+      setBoard("loaded", true);
+      if (openId()) setDetailTick((n) => n + 1);
+    } catch (_e) {
+      // transient; next event will retry
+    }
+  };
+
   onMount(() => {
-    let es: EventSource | undefined;
-
     (async () => {
+      await refresh();
+      // If the URL carries a connection id, connect P2P (WebRTC) and refresh on
+      // each peer edit merged into local OPFS. No id => single-player, no server.
       try {
-        const data = await getBoard();
-        setBoard(reconcile({ ...data, loaded: true }));
+        await connectPeer(() => void refresh());
       } catch (_e) {
-        // initial load failed; SSE updates may still arrive
+        // no peer / signaling unavailable — runs fine solo
       }
-
-      es = new EventSource("/api/events");
-      es.onmessage = async (e) => {
-        let msg: { type: string; id?: string };
-        try {
-          msg = JSON.parse(e.data);
-        } catch {
-          return;
-        }
-
-        if (msg.type === "ticket" && msg.id) {
-          // If the open ticket changed, nudge the drawer to re-fetch.
-          if (msg.id === openId()) setDetailTick((n) => n + 1);
-          const card = await getCard(msg.id);
-          if (card) {
-            const i = board.cards.findIndex((c) => c.id === card.id);
-            if (i >= 0) setBoard("cards", i, reconcile(card));
-            else setBoard("cards", board.cards.length, card);
-          } else {
-            // Deleted ticket — drop it from the board.
-            setBoard("cards", (cs) => cs.filter((c) => c.id !== msg.id));
-          }
-        } else if (msg.type === "board") {
-          const b = await getBoard();
-          setBoard("title", b.title);
-          setBoard("columns", reconcile(b.columns));
-          setBoard("cards", reconcile(b.cards, { key: "id" }));
-        }
-      };
     })();
-
-    onCleanup(() => es?.close());
   });
 
   const cardsIn = (col: string): Card[] =>
