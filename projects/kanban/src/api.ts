@@ -10,6 +10,7 @@ import init, {
   connectAndSync,
   connectionId,
   configureIce,
+  irohConnect,
 } from "../../../web/pkg/riftpipe_web.js";
 
 // Build-time config (Vite env). Set these for a deployed/cross-network build:
@@ -90,17 +91,38 @@ function signalUrl(): string {
 }
 
 /**
- * If the page URL carries a connection id (`#<id>`), connect peer-to-peer over
- * WebRTC and sync the board. `onRemote` fires whenever a peer's edit is merged
- * into local OPFS, so the caller can refetch. Returns false if there's no id
- * (single-player). Sharing the link == sharing the board.
+ * Connect peer-to-peer and sync the board. `onRemote` fires whenever a peer's
+ * edit is merged into local OPFS, so the caller can refetch.
+ *
+ * Default transport is **iroh** — no signaling server, no host you run (traffic
+ * rides n0's free relays). The URL hash carries the host's ticket; an empty hash
+ * means *this* tab is the host, and we write its ticket into the URL so it's
+ * shareable. `?transport=ws` (or `VITE_TRANSPORT=ws`) selects the WebSocket-
+ * signaling + WebRTC path instead (used by the native bridge).
  */
 export async function connectPeer(onRemote: () => void): Promise<boolean> {
   await ready();
+  const transport =
+    env.VITE_TRANSPORT ??
+    new URLSearchParams(location.search).get("transport") ??
+    "iroh";
+
+  if (transport === "iroh") {
+    const ticket = location.hash.slice(1);
+    try {
+      const result = await irohConnect(ticket, onRemote);
+      // Host (empty ticket in): publish the returned ticket to the URL to share.
+      if (typeof result === "string" && result) location.hash = result;
+      return true;
+    } catch (e) {
+      console.warn("iroh connect failed; working solo:", e);
+      return false;
+    }
+  }
+
+  // WebSocket signaling + WebRTC (native bridge / legacy).
   const id = connectionId();
   if (!id) return false;
-  // STUN (default public) lets peers on different networks discover each other;
-  // TURN (optional) relays when a direct path can't be punched.
   configureIce(
     env.VITE_STUN ?? "stun:stun.l.google.com:19302",
     env.VITE_TURN ?? "",

@@ -33,16 +33,58 @@ pub async fn connect_and_sync(
     on_change: js_sys::Function,
 ) -> Result<(), JsValue> {
     let link = crate::connect_via_signaling(&ws_url, &room).await?;
+    SYNC.with(|c| *c.borrow_mut() = Some(BoardSync::new(link, opfs_on_merged(on_change))));
+    Ok(())
+}
+
+/// A merge handler that lands the file in OPFS and nudges the UI to refetch.
+fn opfs_on_merged(on_change: js_sys::Function) -> Rc<dyn Fn(String, Vec<u8>)> {
     let on_change = Rc::new(on_change);
-    let on_merged: Rc<dyn Fn(String, Vec<u8>)> = Rc::new(move |path: String, bytes: Vec<u8>| {
+    Rc::new(move |path: String, bytes: Vec<u8>| {
         let cb = on_change.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = crate::kanban::write_path(&path, &bytes).await; // land the merge in OPFS
-            let _ = cb.call0(&JsValue::NULL); // nudge the UI to refetch
+            let _ = crate::kanban::write_path(&path, &bytes).await;
+            let _ = cb.call0(&JsValue::NULL);
         });
-    });
-    SYNC.with(|c| *c.borrow_mut() = Some(BoardSync::new(link, on_merged)));
-    Ok(())
+    })
+}
+
+thread_local! {
+    /// Keeps the iroh endpoint alive for the page's lifetime.
+    static IROH_EP: RefCell<Option<iroh::Endpoint>> = const { RefCell::new(None) };
+}
+
+/// Connect + sync a board over **iroh** — no signaling server, no host you run
+/// (traffic rides n0's relays). With an empty `ticket`, this peer becomes the
+/// host: it binds, returns its ticket (put it in the share link), and accepts a
+/// peer. With a ticket, this peer joins that host. Returns the host ticket (host)
+/// or null (joiner). The kanban handler's pushes sync automatically thereafter.
+#[wasm_bindgen(js_name = irohConnect)]
+pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result<JsValue, JsValue> {
+    use crate::iroh_link::{addr_of, bind_accept, bind_connect, ticket_of, wait_for_addr, IrohLink};
+    let on_merged = opfs_on_merged(on_change);
+
+    if ticket.is_empty() {
+        // Host: bind, publish ticket, accept one peer in the background.
+        let ep = bind_accept().await.map_err(|e| JsValue::from_str(&e))?;
+        let my_ticket = ticket_of(&wait_for_addr(&ep).await);
+        let accept_ep = ep.clone();
+        IROH_EP.with(|c| *c.borrow_mut() = Some(ep));
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(link) = IrohLink::accept(&accept_ep).await {
+                SYNC.with(|c| *c.borrow_mut() = Some(BoardSync::over_iroh(link, on_merged)));
+            }
+        });
+        Ok(JsValue::from_str(&my_ticket))
+    } else {
+        // Joiner: dial the host's ticket through the relay.
+        let ep = bind_connect().await.map_err(|e| JsValue::from_str(&e))?;
+        let addr = addr_of(&ticket).map_err(|e| JsValue::from_str(&e))?;
+        let link = IrohLink::connect(&ep, addr).await.map_err(|e| JsValue::from_str(&e))?;
+        IROH_EP.with(|c| *c.borrow_mut() = Some(ep));
+        SYNC.with(|c| *c.borrow_mut() = Some(BoardSync::over_iroh(link, on_merged)));
+        Ok(JsValue::NULL)
+    }
 }
 
 /// Push a text file's new content to the connected peer (no-op if not connected).
@@ -117,6 +159,10 @@ impl BoardSync {
                 Self::apply_inbound(&sy, &bytes, &on_merged);
             }
         });
+        // Kick the bi-stream open: iroh's accept_bi only returns once the dialer
+        // sends data, so an empty frame establishes the link before any edit. The
+        // peer's recv loop ignores it (an empty frame fails to decode).
+        let _ = outbound.unbounded_send(Vec::new());
         BoardSync { outbound, syncer }
     }
 

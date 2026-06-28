@@ -10,7 +10,7 @@ PORT=8123
 echo "== building bundle (wasm + SolidJS) =="
 # VITE_STUN="" — loopback peers use host candidates; a public STUN would stall
 # non-trickle gathering on a host with no internet.
-( cd projects/kanban && VITE_STUN="" deno task build ) >/tmp/kanban-build.log 2>&1 || { echo "build failed"; tail -20 /tmp/kanban-build.log; exit 1; }
+( cd projects/kanban && VITE_STUN="" VITE_TRANSPORT=ws deno task build ) >/tmp/kanban-build.log 2>&1 || { echo "build failed"; tail -20 /tmp/kanban-build.log; exit 1; }
 
 echo "== building native binary (for the signal server) =="
 cargo build --quiet --bin riftpipe || exit 1
