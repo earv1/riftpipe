@@ -162,6 +162,15 @@ cd web && wasm-pack build --target web && ./test-headless.sh
 The shared layout lives in `riftpipe-core::kanban`, so a board is byte-for-byte
 portable between the native server and the browser build.
 
+#### Publish it & share with a friend
+The browser build deploys to **GitHub Pages** (`.github/workflows/pages.yml`): push
+to `main` and the wasm core + SolidJS bundle ship to `https://<user>.github.io/<repo>/`.
+Two people on different networks then collaborate P2P by opening the same
+`…/#<board-id>` link — you just need a public **signaling server over `wss://`**
+(`deploy/signal.Dockerfile` + `deploy/fly.toml` deploy `riftpipe signal` behind
+TLS) and STUN (a public one is the default). Full walkthrough:
+**[docs/deploy-pages.md](docs/deploy-pages.md)**.
+
 ### Useful flags
 | flag | meaning |
 |------|---------|
