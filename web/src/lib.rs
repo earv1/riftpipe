@@ -560,6 +560,53 @@ mod tests {
         gloo_timers::future::TimeoutFuture::new(ms).await;
     }
 
+    /// A full board edit syncs browser→browser over iroh's relay: a joiner pushes a
+    /// `card.md` through `BoardSync::over_iroh`, the host receives + merges it. No
+    /// signaling server, no host machine — proves the kanban can sync over iroh.
+    #[wasm_bindgen_test]
+    async fn board_sync_over_iroh_converges() {
+        use crate::board_sync::BoardSync;
+        use crate::iroh_link::{addr_of, bind_accept, bind_connect, ticket_of, wait_for_addr, IrohLink};
+
+        let host_ep = bind_accept().await.expect("host");
+        let ticket = ticket_of(&wait_for_addr(&host_ep).await);
+
+        // Host: accept the joiner's stream and stand up a BoardSync that records merges.
+        let host_got: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::new(RefCell::new(Vec::new()));
+        let hg = host_got.clone();
+        let host_keep: Rc<RefCell<Option<BoardSync>>> = Rc::new(RefCell::new(None));
+        let hk = host_keep.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(link) = IrohLink::accept(&host_ep).await {
+                let on_merged: Rc<dyn Fn(String, Vec<u8>)> =
+                    Rc::new(move |p, b| hg.borrow_mut().push((p, b)));
+                *hk.borrow_mut() = Some(BoardSync::over_iroh(link, on_merged));
+            }
+        });
+
+        // Joiner: connect via the relay ticket and push a card.
+        let joiner_ep = bind_connect().await.expect("joiner");
+        let link = IrohLink::connect(&joiner_ep, addr_of(&ticket).unwrap())
+            .await
+            .expect("connect");
+        let nop: Rc<dyn Fn(String, Vec<u8>)> = Rc::new(|_, _| {});
+        let joiner = BoardSync::over_iroh(link, nop);
+        joiner.push_text("tickets/x/card.md", "# hello over iroh\n");
+
+        for _ in 0..200 {
+            if !host_got.borrow().is_empty() {
+                break;
+            }
+            sleep_test(50).await;
+        }
+        let got = host_got.borrow();
+        assert!(
+            got.iter()
+                .any(|(p, b)| p == "tickets/x/card.md" && b == b"# hello over iroh\n"),
+            "host merged the joiner's card over iroh: {got:?}",
+        );
+    }
+
     /// Establish a connected pair of `WebrtcLink`s in the (headless) browser via a
     /// full non-trickle offer/answer between two `RtcPeerConnection`s. Signaling is
     /// wired directly here (in the real app it crosses the iroh link).

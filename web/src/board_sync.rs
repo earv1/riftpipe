@@ -10,10 +10,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use futures_channel::mpsc::{unbounded, UnboundedSender};
+use futures_util::StreamExt;
 use riftpipe_core::sync::{SyncMsg, Syncer};
 use wasm_bindgen::prelude::*;
 
-use crate::{WebrtcLink, WebrtcSender};
+use crate::WebrtcLink;
 
 thread_local! {
     /// The active board connection, if any (single-threaded wasm).
@@ -61,31 +63,73 @@ pub fn push_lww(path: &str, bytes: &[u8]) {
     });
 }
 
-/// Syncs a board's files over a WebRTC link. `on_merged(path, bytes)` fires for
-/// every remote update (the app writes OPFS + refreshes; a test captures bytes).
+/// A unique per-peer agent id (a shared id would corrupt the CRDT).
+fn make_agent() -> String {
+    format!("p{:08x}", (js_sys::Math::random() * 4_294_967_296.0) as u32)
+}
+
+/// Syncs a board's files over *either* transport. Local pushes are serialized to
+/// an outbound channel that a transport-specific send loop drains; a recv loop
+/// applies remote messages and fires `on_merged(path, bytes)` (the app writes OPFS
+/// + refreshes; a test captures bytes). Same protocol regardless of transport.
 pub struct BoardSync {
-    sender: WebrtcSender,
+    outbound: UnboundedSender<Vec<u8>>,
     syncer: Rc<RefCell<Syncer>>,
 }
 
 impl BoardSync {
+    /// Over a WebRTC link.
     pub fn new(link: WebrtcLink, on_merged: Rc<dyn Fn(String, Vec<u8>)>) -> BoardSync {
-        let agent = format!("p{:08x}", (js_sys::Math::random() * 4_294_967_296.0) as u32);
+        let syncer = Rc::new(RefCell::new(Syncer::new(make_agent())));
+        let (outbound, mut rx) = unbounded::<Vec<u8>>();
         let sender = link.sender();
-        let syncer = Rc::new(RefCell::new(Syncer::new(agent)));
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(bytes) = rx.next().await {
+                let _ = sender.send(&bytes);
+            }
+        });
         let sy = syncer.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut link = link;
             while let Some(bytes) = link.recv().await {
-                let Ok(msg) = postcard::from_bytes::<SyncMsg>(&bytes) else {
-                    continue;
-                };
-                if let Some((path, merged)) = sy.borrow_mut().apply(msg) {
-                    on_merged(path, merged);
-                }
+                Self::apply_inbound(&sy, &bytes, &on_merged);
             }
         });
-        BoardSync { sender, syncer }
+        BoardSync { outbound, syncer }
+    }
+
+    /// Over a relay-brokered iroh link (no signaling server, no host).
+    pub fn over_iroh(
+        link: crate::iroh_link::IrohLink,
+        on_merged: Rc<dyn Fn(String, Vec<u8>)>,
+    ) -> BoardSync {
+        let syncer = Rc::new(RefCell::new(Syncer::new(make_agent())));
+        let (outbound, mut rx) = unbounded::<Vec<u8>>();
+        let (mut sink, mut source) = link.into_halves();
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(bytes) = rx.next().await {
+                let _ = sink.send(&bytes).await;
+            }
+        });
+        let sy = syncer.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(bytes) = source.recv().await {
+                Self::apply_inbound(&sy, &bytes, &on_merged);
+            }
+        });
+        BoardSync { outbound, syncer }
+    }
+
+    fn apply_inbound(
+        syncer: &Rc<RefCell<Syncer>>,
+        bytes: &[u8],
+        on_merged: &Rc<dyn Fn(String, Vec<u8>)>,
+    ) {
+        if let Ok(msg) = postcard::from_bytes::<SyncMsg>(bytes) {
+            if let Some((path, merged)) = syncer.borrow_mut().apply(msg) {
+                on_merged(path, merged);
+            }
+        }
     }
 
     pub fn push_text(&self, path: &str, content: &str) {
@@ -101,7 +145,7 @@ impl BoardSync {
 
     fn send(&self, msg: &SyncMsg) {
         if let Ok(bytes) = postcard::to_allocvec(msg) {
-            let _ = self.sender.send(&bytes);
+            let _ = self.outbound.unbounded_send(bytes);
         }
     }
 }

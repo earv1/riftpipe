@@ -112,4 +112,36 @@ impl IrohLink {
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         read_framed(&mut self.recv).await
     }
+
+    /// Split into independent send/recv halves so a peer can push and pull
+    /// concurrently (what `BoardSync` needs).
+    pub fn into_halves(self) -> (IrohSink, IrohSource) {
+        (
+            IrohSink { _conn: self._conn, send: self.send },
+            IrohSource { recv: self.recv },
+        )
+    }
+}
+
+/// Send half of a split iroh link.
+pub struct IrohSink {
+    _conn: Connection, // keep the connection alive while either half lives
+    send: SendStream,
+}
+
+impl IrohSink {
+    pub async fn send(&mut self, msg: &[u8]) -> Result<(), String> {
+        write_framed(&mut self.send, msg).await
+    }
+}
+
+/// Receive half of a split iroh link.
+pub struct IrohSource {
+    recv: RecvStream,
+}
+
+impl IrohSource {
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        read_framed(&mut self.recv).await
+    }
 }
