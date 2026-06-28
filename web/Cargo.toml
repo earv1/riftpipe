@@ -23,6 +23,8 @@ version = "0.3"
 features = [
     "RtcPeerConnection",
     "RtcConfiguration",
+    "RtcIceServer",
+    "RtcIceTransportPolicy",
     "RtcDataChannel",
     "RtcDataChannelInit",
     "RtcDataChannelEvent",

@@ -172,6 +172,9 @@ async fn main() {
                         Ok(Some(b)) => println!("GOT:{}", String::from_utf8_lossy(&b)),
                         _ => eprintln!("webrtc-echo: no message"),
                     }
+                    // Stay open briefly so our sent message reaches the peer before
+                    // we close (otherwise the faster side races the slower's recv).
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
                 Err(e) => eprintln!("webrtc-echo: connect failed: {e}"),
             }

@@ -161,13 +161,22 @@ fn ice_servers() -> Vec<RTCIceServer> {
     servers
 }
 
-/// Build a peer connection with the configured ICE servers.
+/// Build a peer connection with the configured ICE servers. With
+/// `RIFTPIPE_FORCE_RELAY` set, ICE is restricted to **relay (TURN) candidates
+/// only** — host and srflx are banned, so the peers must traverse the TURN server.
+/// This exercises the worst-case (symmetric/CGNAT) path on a single machine.
 async fn new_peer_connection() -> Result<Arc<RTCPeerConnection>> {
+    use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
     let api = APIBuilder::new()
         .with_media_engine(MediaEngine::default())
         .build();
     let config = RTCConfiguration {
         ice_servers: ice_servers(),
+        ice_transport_policy: if std::env::var("RIFTPIPE_FORCE_RELAY").is_ok() {
+            RTCIceTransportPolicy::Relay
+        } else {
+            RTCIceTransportPolicy::default()
+        },
         ..Default::default()
     };
     let pc = api.new_peer_connection(config).await.map_err(anyerr)?;

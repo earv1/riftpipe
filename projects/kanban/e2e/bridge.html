@@ -4,14 +4,18 @@
   <body>
     <pre id="result">pending</pre>
     <script type="module">
-      import init, { webrtcEcho } from "../../../web/pkg/riftpipe_web.js";
+      import init, { webrtcEcho, configureIce } from "../../../web/pkg/riftpipe_web.js";
       const result = document.getElementById("result");
       try {
         await init();
+        const params = new URLSearchParams(location.search);
         const room = location.hash.slice(1);
-        const signal =
-          new URLSearchParams(location.search).get("signal") ||
-          `ws://${location.hostname}:9000`;
+        const signal = params.get("signal") || `ws://${location.hostname}:9000`;
+        // If a TURN server is given, force RELAY-ONLY ICE (the cross-NAT fallback).
+        const turn = params.get("turn");
+        if (turn) {
+          configureIce(turn, params.get("turnuser") || "", params.get("turnpass") || "", true);
+        }
         // Connect to the native peer sharing this room; send, receive its reply.
         const got = await webrtcEcho(signal, room, "hello-from-browser");
         result.textContent = "GOT:" + got;

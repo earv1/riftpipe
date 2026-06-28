@@ -341,8 +341,51 @@ async fn wait_open(dc: &RtcDataChannel) {
 
 /// Establish a [`WebrtcLink`] with the peer in our room, exchanging SDP over the
 /// signaling channel (non-trickle). `we_offer` comes from the server's role msg.
+struct IceCfg {
+    turn_url: String,
+    user: String,
+    pass: String,
+    relay: bool,
+}
+
+thread_local! {
+    static ICE_CFG: RefCell<Option<IceCfg>> = const { RefCell::new(None) };
+}
+
+/// Configure ICE for subsequent connections: a TURN server + optional relay-only
+/// policy (the cross-NAT fallback). Call before `connectAndSync`/`webrtcEcho`.
+#[wasm_bindgen(js_name = configureIce)]
+pub fn configure_ice(turn_url: String, username: String, credential: String, force_relay: bool) {
+    ICE_CFG.with(|c| {
+        *c.borrow_mut() = Some(IceCfg { turn_url, user: username, pass: credential, relay: force_relay });
+    });
+}
+
+/// Build a peer connection, applying any configured TURN + relay-only policy.
+fn new_pc() -> Result<RtcPeerConnection, JsValue> {
+    ICE_CFG.with(|c| match c.borrow().as_ref() {
+        Some(cfg) => {
+            let config = web_sys::RtcConfiguration::new();
+            if !cfg.turn_url.is_empty() {
+                let server = web_sys::RtcIceServer::new();
+                server.set_urls(&JsValue::from_str(&cfg.turn_url));
+                server.set_username(&cfg.user);
+                server.set_credential(&cfg.pass);
+                let arr = js_sys::Array::new();
+                arr.push(&server);
+                config.set_ice_servers(&arr);
+            }
+            if cfg.relay {
+                config.set_ice_transport_policy(web_sys::RtcIceTransportPolicy::Relay);
+            }
+            RtcPeerConnection::new_with_configuration(&config)
+        }
+        None => RtcPeerConnection::new(),
+    })
+}
+
 async fn establish_over_signaling(we_offer: bool, sig: &mut Signaling) -> Result<WebrtcLink, JsValue> {
-    let pc = RtcPeerConnection::new()?;
+    let pc = new_pc()?;
     if we_offer {
         let dc = pc.create_data_channel("riftpipe");
         let inbound = pipe_inbound(&dc);

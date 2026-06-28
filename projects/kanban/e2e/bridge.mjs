@@ -7,8 +7,16 @@ import { chromium } from "playwright";
 const PORT = process.env.PORT || "8124";
 const ROOM = process.env.ROOM;
 const SIGNAL_URL = process.env.SIGNAL_URL || "ws://127.0.0.1:9020";
+// Optional TURN config — when set, the page forces relay-only ICE.
+let turnQuery = "";
+if (process.env.TURN_URL) {
+  turnQuery =
+    `&turn=${encodeURIComponent(process.env.TURN_URL)}` +
+    `&turnuser=${encodeURIComponent(process.env.TURN_USER || "")}` +
+    `&turnpass=${encodeURIComponent(process.env.TURN_PASS || "")}`;
+}
 // 127.0.0.1 (not localhost) so the browser and the IPv4-bound signal server agree.
-const url = `http://127.0.0.1:${PORT}/projects/kanban/e2e/bridge.html?signal=${encodeURIComponent(SIGNAL_URL)}#${ROOM}`;
+const url = `http://127.0.0.1:${PORT}/projects/kanban/e2e/bridge.html?signal=${encodeURIComponent(SIGNAL_URL)}${turnQuery}#${ROOM}`;
 
 const browser = await chromium.launch();
 let code = 1;
