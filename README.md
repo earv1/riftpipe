@@ -208,8 +208,10 @@ self-host a relay for production.
 Early/experimental (`v0.0.0`), developed against loopback and local networks.
 Working: text CRDT, rsync, folder sync, in-memory mode, reconnection, the nvim
 bridge, the native kanban server, and the browser stack — the wasm CRDT, OPFS
-persistence, WebRTC + link-based signaling, and the in-browser kanban handler are
-all verified headlessly in real Chrome. In progress: wiring the browser board's
-per-file sync over the WebRTC link (so two browsers *collaborate*, not just run),
-and a browser↔native bridge. `wal-db`/`image` are stubs. Not yet proven on
-hostile/cross-NAT networks (needs the env-configurable STUN/TURN) or large trees.
+persistence, WebRTC + link-based signaling, the in-browser kanban handler, **and
+per-file board sync over the link** (two browsers converge card prose as a CRDT
+and structural moves as LWW) — all verified headlessly in real Chrome; the
+SolidJS app builds as a self-contained static bundle. In progress: a browser↔native
+bridge, and the full two-real-browser UI loop (verified by composition today).
+`wal-db`/`image` are stubs. Not yet proven on hostile/cross-NAT networks (needs the
+env-configurable STUN/TURN) or large trees.

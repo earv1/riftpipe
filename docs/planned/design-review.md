@@ -14,22 +14,25 @@ what's honestly deferred.
   doing whole-board LWW. (Fixes critique #4 *to the documented design*; see the
   open question on concurrent same-card moves below.)
 
-## The critical remaining gap: the browser kanban doesn't sync yet
+## The critical remaining gap — RESOLVED
 
-The browser handler writes the file tree to **OPFS**, and the building blocks for
-sync exist and are tested (RiftDoc convergence, the WebRTC link, the signaling
-server) — **but they are not wired together.** A card created in one browser lands
-in that browser's OPFS and goes nowhere. So the browser kanban is, today, still
-**single-browser**.
+> **Done.** `web/src/board_sync.rs` (`BoardSync`) now syncs the board over the
+> established WebRTC link: text files (`card.md`, `comments/*.md`, `board.md`) as
+> eg-walker CRDTs, structural files (`meta.toml`) as last-writer-wins. The kanban
+> handler pushes each mutation; `connectAndSync` lands remote merges in OPFS and
+> refreshes the UI; `api.ts`/`App.tsx` connect P2P when the URL carries a
+> connection id. Verified headlessly (two `BoardSync`s converge a text file with
+> concurrent edits + a structural move), and the SolidJS app builds as a
+> self-contained static bundle. The browser kanban now **collaborates**, not just
+> runs.
 
-To make it multi-peer (the whole point):
-1. Per text file (`card.md`, `comments/*.md`) → a `RiftDoc`; exchange deltas over
-   the established WebRTC link (connected via the signaling room / shared link).
-2. Structural files (`meta.toml`) → LWW over the link (the rsync analogue).
-3. On a remote delta, write the merged bytes back to OPFS so the UI re-renders.
+Original gap (kept for context): the browser handler wrote OPFS but didn't sync;
+the building blocks (RiftDoc, the WebRTC link, the signaling server) existed but
+weren't wired. They are now.
 
-This is the next real build, and it's the difference between "runs in a browser"
-and "*collaborates* in a browser."
+*Caveat:* the full two-real-browser UI loop is verified by composition (sync core
++ handler + OPFS + bundle each tested), not a single end-to-end two-browser UI
+test — one page shares one OPFS, so that needs two browser contexts (Playwright).
 
 ## Transport fragmentation (#3) — narrower than it looked
 
