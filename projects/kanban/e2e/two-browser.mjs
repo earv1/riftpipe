@@ -8,7 +8,9 @@ import { chromium } from "playwright";
 
 const PORT = process.env.PORT || "8123";
 const ROOM = "pw-" + Math.random().toString(16).slice(2, 10);
-const url = `http://localhost:${PORT}/#${ROOM}`;
+// 127.0.0.1 (not localhost) so the page's signalUrl (ws://<hostname>:9000) is IPv4,
+// matching the IPv4-bound signal server — localhost may resolve to ::1.
+const url = `http://127.0.0.1:${PORT}/#${ROOM}`;
 
 const browser = await chromium.launch();
 let code = 1;

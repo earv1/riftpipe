@@ -8,7 +8,9 @@ cd "$ROOT"
 PORT=8123
 
 echo "== building bundle (wasm + SolidJS) =="
-( cd projects/kanban && deno task build ) >/tmp/kanban-build.log 2>&1 || { echo "build failed"; tail -20 /tmp/kanban-build.log; exit 1; }
+# VITE_STUN="" — loopback peers use host candidates; a public STUN would stall
+# non-trickle gathering on a host with no internet.
+( cd projects/kanban && VITE_STUN="" deno task build ) >/tmp/kanban-build.log 2>&1 || { echo "build failed"; tail -20 /tmp/kanban-build.log; exit 1; }
 
 echo "== building native binary (for the signal server) =="
 cargo build --quiet --bin riftpipe || exit 1
@@ -20,8 +22,10 @@ PREVIEW=$!
 SIGNAL=$!
 trap 'kill $PREVIEW $SIGNAL 2>/dev/null' EXIT
 
-# Wait for the static server to answer.
-for _ in $(seq 1 50); do curl -fsS "http://localhost:$PORT/" >/dev/null 2>&1 && break; sleep 0.2; done
+# Wait for the static server AND the signal server (browsers connect once on load
+# and don't retry, so the signal port must be up first).
+for _ in $(seq 1 50); do curl -fsS "http://127.0.0.1:$PORT/" >/dev/null 2>&1 && break; sleep 0.2; done
+for _ in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/9000") 2>/dev/null && break; sleep 0.2; done
 
 echo "== running Playwright two-browser test =="
 ( cd projects/kanban/e2e && PORT=$PORT node two-browser.mjs )

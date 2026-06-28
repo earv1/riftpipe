@@ -1,0 +1,19 @@
+# fly.io config for the riftpipe signaling server. fly terminates TLS, so the
+# public endpoint is wss://<app>.fly.dev — exactly what the HTTPS Pages app needs.
+#
+#   fly launch --copy-config --no-deploy   # pick a unique app name when prompted
+#   fly deploy
+#
+# Then set the repo variable SIGNAL_URL = wss://<app>.fly.dev  (see docs/deploy-pages.md)
+app = "riftpipe-signal-CHANGEME"
+primary_region = "iad"
+
+[build]
+  dockerfile = "signal.Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 0

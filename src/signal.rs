@@ -34,10 +34,14 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_ROOMS: usize = 50_000;
 const MAX_ROOM_ID_LEN: usize = 128;
 
-/// Serve the signaling server on `127.0.0.1:port`. Blocks (runs forever).
+/// Serve the signaling server on `<host>:port` (blocks forever). The host is
+/// `127.0.0.1` by default; set `RIFTPIPE_BIND=0.0.0.0` to accept external
+/// connections (e.g. a deployed server behind a TLS proxy — see
+/// `deploy/signal.Dockerfile`).
 pub async fn serve(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-    eprintln!("[signal] signaling server on ws://127.0.0.1:{port}/?room=<id>");
+    let host = std::env::var("RIFTPIPE_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let listener = TcpListener::bind((host.as_str(), port)).await?;
+    eprintln!("[signal] signaling server on ws://{host}:{port}/?room=<id>");
     serve_on(listener).await;
     Ok(())
 }

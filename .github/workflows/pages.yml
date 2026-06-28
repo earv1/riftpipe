@@ -1,0 +1,82 @@
+name: Deploy kanban to GitHub Pages
+
+# Builds the in-browser kanban (wasm core + SolidJS bundle) and publishes it to
+# GitHub Pages. Configure the signaling server (and optional STUN/TURN) via repo
+# variables — see docs/deploy-pages.md.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "core/**"
+      - "projects/kanban/**"
+      - "src/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let a newer push supersede an in-flight run.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build wasm package
+        run: cd web && wasm-pack build --target web --out-dir pkg
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Build kanban bundle
+        env:
+          # Project site lives at https://<user>.github.io/<repo>/
+          PAGES_BASE: /${{ github.event.repository.name }}/
+          # Set these as repo variables/secrets (Settings → Secrets and variables → Actions):
+          VITE_SIGNAL_URL: ${{ vars.SIGNAL_URL }}
+          VITE_STUN: ${{ vars.STUN_URL }}
+          VITE_TURN: ${{ vars.TURN_URL }}
+          VITE_TURN_USER: ${{ vars.TURN_USER }}
+          VITE_TURN_PASS: ${{ secrets.TURN_PASS }}
+        run: cd projects/kanban && deno task build
+
+      - name: Add SPA fallback (deep links / #ids)
+        run: cp projects/kanban/dist/index.html projects/kanban/dist/404.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: projects/kanban/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

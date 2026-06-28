@@ -9,7 +9,14 @@ import init, {
   kanbanHandle,
   connectAndSync,
   connectionId,
+  configureIce,
 } from "../../../web/pkg/riftpipe_web.js";
+
+// Build-time config (Vite env). Set these for a deployed/cross-network build:
+//   VITE_SIGNAL_URL  — public signaling server, e.g. wss://signal.example.com
+//   VITE_STUN        — STUN url (defaults to a public one so hole-punch works)
+//   VITE_TURN/_USER/_PASS — optional relay for hostile NATs
+const env: Record<string, string | undefined> = (import.meta as any).env || {};
 
 export interface Card {
   id: string;
@@ -68,10 +75,18 @@ async function api(
   return { status: res.status, json: () => JSON.parse(res.body) };
 }
 
-/** Signaling server URL — `?signal=ws://…` overrides the default (port 9000). */
+/**
+ * Signaling server URL. Priority: `?signal=…` (per-link override) → build-time
+ * `VITE_SIGNAL_URL` (the deployed default) → localhost:9000 (dev). A page served
+ * over HTTPS (e.g. GitHub Pages) must use `wss://` here — browsers block `ws://`.
+ */
 function signalUrl(): string {
   const override = new URL(location.href).searchParams.get("signal");
-  return override ?? `ws://${location.hostname || "localhost"}:9000`;
+  return (
+    override ??
+    env.VITE_SIGNAL_URL ??
+    `ws://${location.hostname || "localhost"}:9000`
+  );
 }
 
 /**
@@ -84,6 +99,15 @@ export async function connectPeer(onRemote: () => void): Promise<boolean> {
   await ready();
   const id = connectionId();
   if (!id) return false;
+  // STUN (default public) lets peers on different networks discover each other;
+  // TURN (optional) relays when a direct path can't be punched.
+  configureIce(
+    env.VITE_STUN ?? "stun:stun.l.google.com:19302",
+    env.VITE_TURN ?? "",
+    env.VITE_TURN_USER ?? "",
+    env.VITE_TURN_PASS ?? "",
+    false,
+  );
   await connectAndSync(signalUrl(), id, onRemote);
   return true;
 }

@@ -342,6 +342,7 @@ async fn wait_open(dc: &RtcDataChannel) {
 /// Establish a [`WebrtcLink`] with the peer in our room, exchanging SDP over the
 /// signaling channel (non-trickle). `we_offer` comes from the server's role msg.
 struct IceCfg {
+    stun_url: String,
     turn_url: String,
     user: String,
     pass: String,
@@ -352,28 +353,48 @@ thread_local! {
     static ICE_CFG: RefCell<Option<IceCfg>> = const { RefCell::new(None) };
 }
 
-/// Configure ICE for subsequent connections: a TURN server + optional relay-only
-/// policy (the cross-NAT fallback). Call before `connectAndSync`/`webrtcEcho`.
+/// Configure ICE for subsequent connections: a STUN server (for cross-network
+/// hole-punching), an optional TURN server (relay fallback), and optional
+/// relay-only policy. Any field may be empty. Call before `connectAndSync`.
 #[wasm_bindgen(js_name = configureIce)]
-pub fn configure_ice(turn_url: String, username: String, credential: String, force_relay: bool) {
+pub fn configure_ice(
+    stun_url: String,
+    turn_url: String,
+    username: String,
+    credential: String,
+    force_relay: bool,
+) {
     ICE_CFG.with(|c| {
-        *c.borrow_mut() = Some(IceCfg { turn_url, user: username, pass: credential, relay: force_relay });
+        *c.borrow_mut() = Some(IceCfg {
+            stun_url,
+            turn_url,
+            user: username,
+            pass: credential,
+            relay: force_relay,
+        });
     });
 }
 
-/// Build a peer connection, applying any configured TURN + relay-only policy.
+/// Build a peer connection, applying any configured STUN/TURN + relay policy.
 fn new_pc() -> Result<RtcPeerConnection, JsValue> {
     ICE_CFG.with(|c| match c.borrow().as_ref() {
         Some(cfg) => {
             let config = web_sys::RtcConfiguration::new();
+            let servers = js_sys::Array::new();
+            if !cfg.stun_url.is_empty() {
+                let s = web_sys::RtcIceServer::new();
+                s.set_urls(&JsValue::from_str(&cfg.stun_url));
+                servers.push(&s);
+            }
             if !cfg.turn_url.is_empty() {
-                let server = web_sys::RtcIceServer::new();
-                server.set_urls(&JsValue::from_str(&cfg.turn_url));
-                server.set_username(&cfg.user);
-                server.set_credential(&cfg.pass);
-                let arr = js_sys::Array::new();
-                arr.push(&server);
-                config.set_ice_servers(&arr);
+                let s = web_sys::RtcIceServer::new();
+                s.set_urls(&JsValue::from_str(&cfg.turn_url));
+                s.set_username(&cfg.user);
+                s.set_credential(&cfg.pass);
+                servers.push(&s);
+            }
+            if servers.length() > 0 {
+                config.set_ice_servers(&servers);
             }
             if cfg.relay {
                 config.set_ice_transport_policy(web_sys::RtcIceTransportPolicy::Relay);

@@ -14,7 +14,7 @@
         // If a TURN server is given, force RELAY-ONLY ICE (the cross-NAT fallback).
         const turn = params.get("turn");
         if (turn) {
-          configureIce(turn, params.get("turnuser") || "", params.get("turnpass") || "", true);
+          configureIce("", turn, params.get("turnuser") || "", params.get("turnpass") || "", true);
         }
         // Connect to the native peer sharing this room; send, receive its reply.
         const got = await webrtcEcho(signal, room, "hello-from-browser");

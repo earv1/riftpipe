@@ -13,7 +13,9 @@ TITLE="from-browser-to-native"
 NDIR="$(mktemp -d)"
 
 echo "== building bundle + native =="
-( cd projects/kanban && deno task build ) >/tmp/bb-build.log 2>&1 || { echo "build failed"; tail -10 /tmp/bb-build.log; exit 1; }
+# VITE_STUN="" — loopback peers connect on host candidates; a public STUN would
+# just stall non-trickle gathering when the test host has no internet.
+( cd projects/kanban && VITE_STUN="" deno task build ) >/tmp/bb-build.log 2>&1 || { echo "build failed"; tail -10 /tmp/bb-build.log; exit 1; }
 cargo build --quiet --bin riftpipe || exit 1
 
 echo "== serving kanban dist + signaling on $SIGPORT =="
