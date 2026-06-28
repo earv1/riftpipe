@@ -12,6 +12,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# iroh/ring need a wasm-capable clang — Apple clang has no WebAssembly backend.
+export CC_wasm32_unknown_unknown="${CC_wasm32_unknown_unknown:-$(brew --prefix llvm)/bin/clang}"
+export AR_wasm32_unknown_unknown="${AR_wasm32_unknown_unknown:-$(brew --prefix llvm)/bin/llvm-ar}"
+
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 PLATFORM="mac-arm64"
 
