@@ -61,13 +61,22 @@ native peer (edit files in any editor) and a browser peer collaborate on one boa
 
 ## What's actually left
 
-**Only cross-NAT (#5).** Everything else — the unified file-tree model, browser
-collaboration, the browser↔native bridge, bidirectional board sync — is built and
-verified (loopback / single-machine / two browser contexts / a native process).
-The one genuinely unverified thing is **real two-machine, hostile-NAT
-connectivity**, which needs two boxes on different networks and a STUN/TURN relay
-(the env-config — `RIFTPIPE_STUN`/`RIFTPIPE_TURN` — exists, unexercised). That's a
-hardware/network requirement, not a code gap — the blocker.
+Everything — the unified file-tree model, browser collaboration, the
+browser↔native bridge, bidirectional board sync — is built and verified.
+
+**The cross-NAT *fallback* (#5) is now verified too.** A hostile-NAT pair's
+worst-case path is to relay through TURN; we prove that on one machine by forcing
+**relay-only ICE** (host + srflx candidates banned) with a local TURN server
+(coturn). `projects/kanban/e2e/run-relay.sh` (two native `webrtc-rs` peers) and
+`run-bridge-relay.sh` (a real browser + a native process, both relay-only) connect
+and exchange data through the relay. So the `RIFTPIPE_TURN` config path and the
+relay guarantee are exercised end-to-end across both stacks.
+
+The **only** thing still unproven is real NAT *traversal* between two **distinct
+public IPs** (the medium case — direct hole-punch via STUN, which on one machine
+can't be simulated because both peers share loopback). That needs two boxes on
+different networks; and even there, the fallback is the relay we've already
+proven. A genuine hardware requirement, not a code gap.
 
 ## Honestly deferred / can't verify here
 

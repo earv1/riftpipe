@@ -217,7 +217,10 @@ app builds as a self-contained static bundle. The **browser↔native bridge** wo
 too — and **board sync between a native peer and a browser is bidirectional**: a
 card made in the browser UI lands on the native peer's disk, and editing the
 native `card.md` in any editor updates the browser (`riftpipe kanban connect`,
-shared `riftpipe_core::sync`; verified end-to-end with Playwright). `wal-db`/`image`
-are stubs. The one thing **not** yet proven is real two-machine, **cross-NAT**
-connectivity — it needs two boxes on different networks and the env-configurable
-STUN/TURN relay (a hardware/network requirement, not a code gap).
+shared `riftpipe_core::sync`; verified end-to-end with Playwright). The **cross-NAT
+relay fallback** is verified too — forcing relay-only ICE through a local TURN
+server, two native peers *and* a browser↔native pair connect entirely through the
+relay (the worst-case hostile-NAT path). `wal-db`/`image` are stubs. The one thing
+**not** yet proven is direct NAT *traversal* between two distinct public IPs, which
+needs two machines on different networks (the relay fallback there is already
+proven) — a hardware requirement, not a code gap.
