@@ -49,8 +49,25 @@ browser A's UI appears in browser B, with no server in the data path. Run with
 
 Native still *prefers* iroh among native peers (the capability ladder), but the
 two stacks are no longer islands — anything that speaks the signaling+WebRTC path
-interoperates. (Full board-level sync between a native peer and a browser would
-additionally need a native `BoardSync`; the transport bridge it rides on is done.)
+interoperates.
+
+**Full board sync between a native peer and a browser is done, bidirectionally.**
+The sync protocol lives in `riftpipe_core::sync` (shared native+wasm); `riftpipe
+kanban connect <id> <dir>` joins a browser's room, receives edits to disk, and a
+notify watcher pushes the native peer's own edits back. Verified end-to-end
+(`projects/kanban/e2e/run-board-bridge.sh`): a card created in the browser UI lands
+on the native disk, and editing the native `card.md` updates the browser UI. So a
+native peer (edit files in any editor) and a browser peer collaborate on one board.
+
+## What's actually left
+
+**Only cross-NAT (#5).** Everything else — the unified file-tree model, browser
+collaboration, the browser↔native bridge, bidirectional board sync — is built and
+verified (loopback / single-machine / two browser contexts / a native process).
+The one genuinely unverified thing is **real two-machine, hostile-NAT
+connectivity**, which needs two boxes on different networks and a STUN/TURN relay
+(the env-config — `RIFTPIPE_STUN`/`RIFTPIPE_TURN` — exists, unexercised). That's a
+hardware/network requirement, not a code gap — the blocker.
 
 ## Honestly deferred / can't verify here
 
