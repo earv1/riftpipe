@@ -140,7 +140,17 @@ async fn main() {
                     eprintln!("[kanban] serve failed: {e}");
                 }
             }
-            _ => eprintln!("usage: riftpipe kanban serve <board-dir> [--port 7777] [--dist <spa-dir>]"),
+            Some("connect") => {
+                let connid = args.get(3).cloned().unwrap_or_default();
+                let dir = args.get(4).cloned().unwrap_or_else(|| "board".to_string());
+                let signal = flag_value(&args, "--signal").unwrap_or_else(|| "ws://127.0.0.1:9000".to_string());
+                if connid.is_empty() {
+                    eprintln!("usage: riftpipe kanban connect <connection-id> <board-dir> [--signal ws://…]");
+                } else if let Err(e) = riftpipe::kanban::connect_board(&signal, &connid, &dir).await {
+                    eprintln!("[kanban] connect failed: {e}");
+                }
+            }
+            _ => eprintln!("usage: riftpipe kanban serve <board-dir> [--port 7777] [--dist <spa-dir>]\n       riftpipe kanban connect <connection-id> <board-dir> [--signal ws://…]"),
         },
         "signal" => {
             let port = flag_value(&args, "--port").and_then(|v| v.parse().ok()).unwrap_or(9000);

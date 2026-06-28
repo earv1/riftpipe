@@ -5,6 +5,7 @@
 //! CLI (`riftpipe`) and the browser crate (`riftpipe-web`) share one document model.
 
 pub mod kanban;
+pub mod sync;
 pub mod text;
 
 pub use text::EgWalkerText;

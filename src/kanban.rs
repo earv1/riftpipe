@@ -65,6 +65,39 @@ pub fn serve(dir: &str, port: u16, dist: &str) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// Join a browser peer's board over WebRTC (the same signaling room / shared link)
+/// and receive its edits into `dir` — the native end of browser↔native board
+/// collaboration. Text files merge as CRDTs, structural files as LWW (via the
+/// shared `riftpipe_core::sync`). Receive-only for now; blocks until the link drops.
+pub async fn connect_board(signal: &str, room: &str, dir: &str) -> crate::net::Result<()> {
+    use riftpipe_core::sync::{SyncMsg, Syncer};
+    use std::path::Component;
+
+    let link = crate::net::webrtc::connect_via_signaling(signal, room).await?;
+    let (_sink, mut source) = link.into_halves(std::sync::Arc::new(crate::net::Counters::default()));
+    let mut syncer = Syncer::new(format!("n{:08x}", rand::random::<u32>()));
+    let dir = PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).map_err(crate::net::anyerr)?;
+    eprintln!("[kanban] connected to room '{room}'; receiving board into {}", dir.display());
+
+    while let Ok(Some(bytes)) = source.recv().await {
+        let Ok(msg) = postcard::from_bytes::<SyncMsg>(&bytes) else { continue };
+        if let Some((path, merged)) = syncer.apply(msg) {
+            // Reject path escapes from a peer-supplied path.
+            if Path::new(&path).components().any(|c| matches!(c, Component::ParentDir | Component::RootDir)) {
+                continue;
+            }
+            let full = dir.join(&path);
+            if let Some(parent) = full.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&full, &merged);
+            println!("SYNCED:{path}");
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Routing
 // ---------------------------------------------------------------------------
