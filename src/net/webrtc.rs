@@ -17,8 +17,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
@@ -285,6 +287,110 @@ async fn recv_signal(link: &mut dyn Link) -> Result<Signal> {
         .await?
         .ok_or_else(|| anyerr("webrtc: signaling link closed"))?;
     postcard::from_bytes(&bytes).map_err(anyerr)
+}
+
+// ---------------------------------------------------------------------------
+// Browser↔native bridge: connect over the SAME WebSocket signaling server the
+// browser uses (rooms by connection id), speaking the *browser's JSON protocol*
+// (`{"type":"role"|"sdp",...}`) — so a native webrtc-rs peer and a browser
+// web-sys peer establish WebRTC with each other. (`docs/planned/transport-negotiation.md`)
+// ---------------------------------------------------------------------------
+
+fn sdp_json(sdp: &str) -> String {
+    serde_json::json!({ "type": "sdp", "sdp": sdp }).to_string()
+}
+
+fn json_field(text: &str, expect_type: &str, field: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v.get("type")?.as_str()? != expect_type {
+        return None;
+    }
+    v.get(field)?.as_str().map(str::to_string)
+}
+
+/// Connect to the peer sharing `room` via the WebSocket signaling server at
+/// `ws_url`, establishing a WebRTC `Link` (the native end of the browser↔native
+/// bridge). The server assigns the offerer role and relays the offer/answer.
+pub async fn connect_via_signaling(ws_url: &str, room: &str) -> Result<WebrtcLink> {
+    let url = format!("{ws_url}?room={room}");
+    let (ws, _) = tokio_tungstenite::connect_async(&url).await.map_err(anyerr)?;
+    let (mut write, mut read) = ws.split();
+
+    // Wait for the server's role assignment.
+    let we_offer = loop {
+        match read.next().await {
+            Some(Ok(WsMessage::Text(t))) => {
+                if let Some(role) = json_field(&t, "role", "role") {
+                    break role == "offerer";
+                }
+                if t.contains("room full") || t.contains("capacity") {
+                    return Err(anyerr("signaling: room unavailable"));
+                }
+            }
+            Some(Ok(_)) => continue,
+            _ => return Err(anyerr("signaling: closed before role")),
+        }
+    };
+
+    let pc = new_peer_connection().await?;
+    let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (ready_tx, mut ready_rx) = mpsc::channel::<Arc<RTCDataChannel>>(1);
+
+    if we_offer {
+        let dc = pc.create_data_channel(CHANNEL_LABEL, None).await.map_err(anyerr)?;
+        wire_channel(&dc, in_tx, ready_tx);
+        let offer = pc.create_offer(None).await.map_err(anyerr)?;
+        pc.set_local_description(offer).await.map_err(anyerr)?;
+        wait_for_ice(&pc).await;
+        let local = pc.local_description().await.ok_or_else(|| anyerr("no local sdp"))?;
+        write.send(WsMessage::text(sdp_json(&local.sdp))).await.map_err(anyerr)?;
+        let answer = recv_sdp_ws(&mut read).await?;
+        pc.set_remote_description(RTCSessionDescription::answer(answer).map_err(anyerr)?)
+            .await
+            .map_err(anyerr)?;
+    } else {
+        let in_tx2 = in_tx.clone();
+        let ready_tx2 = ready_tx.clone();
+        pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+            let inbound = in_tx2.clone();
+            let ready = ready_tx2.clone();
+            Box::pin(async move {
+                wire_channel(&dc, inbound, ready);
+            })
+        }));
+        let offer = recv_sdp_ws(&mut read).await?;
+        pc.set_remote_description(RTCSessionDescription::offer(offer).map_err(anyerr)?)
+            .await
+            .map_err(anyerr)?;
+        let answer = pc.create_answer(None).await.map_err(anyerr)?;
+        pc.set_local_description(answer).await.map_err(anyerr)?;
+        wait_for_ice(&pc).await;
+        let local = pc.local_description().await.ok_or_else(|| anyerr("no local sdp"))?;
+        write.send(WsMessage::text(sdp_json(&local.sdp))).await.map_err(anyerr)?;
+    }
+
+    let dc = ready_rx.recv().await.ok_or_else(|| anyerr("webrtc: data channel never opened"))?;
+    Ok(WebrtcLink { _pc: pc, dc, inbound: in_rx })
+}
+
+async fn recv_sdp_ws<S>(read: &mut S) -> Result<String>
+where
+    S: StreamExt<Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    loop {
+        match read.next().await {
+            Some(Ok(WsMessage::Text(t))) => {
+                if let Some(sdp) = json_field(&t, "sdp", "sdp") {
+                    return Ok(sdp);
+                }
+                if t.contains("peer-left") {
+                    return Err(anyerr("signaling: peer left"));
+                }
+            }
+            Some(Ok(_)) => continue,
+            _ => return Err(anyerr("signaling: closed during sdp exchange")),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -123,3 +123,33 @@ async fn full_stack_upgrades_to_webrtc_and_carries_data() {
     .await
     .expect("full stack completes within budget");
 }
+
+/// The native end of the **browser↔native bridge**: two native `webrtc-rs` peers
+/// connect through the WebSocket signaling server — the *same* server and JSON
+/// protocol the browser uses — and exchange data over WebRTC. Since the wire is
+/// identical to the browser's `connect_via_signaling`, a browser peer can connect
+/// to a native peer the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_peers_bridge_via_signaling_server() {
+    use riftpipe::net::webrtc::connect_via_signaling;
+    use riftpipe::net::Link;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(riftpipe::signal::serve_on(listener));
+    let url = format!("ws://{addr}/");
+    let room = "native-bridge-it";
+
+    let (ra, rb) = tokio::time::timeout(BUDGET, async {
+        tokio::join!(connect_via_signaling(&url, room), connect_via_signaling(&url, room))
+    })
+    .await
+    .expect("connect via signaling within budget");
+    let (mut la, mut lb) = (ra.expect("peer A"), rb.expect("peer B"));
+
+    la.send(b"native over signaling".to_vec()).await.unwrap();
+    assert_eq!(lb.recv().await.unwrap().expect("B receives"), b"native over signaling");
+    lb.send(b"reply".to_vec()).await.unwrap();
+    assert_eq!(la.recv().await.unwrap().expect("A receives"), b"reply");
+}
