@@ -341,6 +341,17 @@ async fn wait_open(dc: &RtcDataChannel) {
 
 /// Establish a [`WebrtcLink`] with the peer in our room, exchanging SDP over the
 /// signaling channel (non-trickle). `we_offer` comes from the server's role msg.
+/// SPIKE: bind an iroh endpoint in the browser (relay-only via n0) and return its
+/// node id. Proves iroh compiles + runs in wasm before wiring it as a `Link`.
+#[wasm_bindgen(js_name = irohNodeId)]
+pub async fn iroh_node_id() -> Result<String, JsValue> {
+    let ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await
+        .map_err(|e| JsValue::from_str(&format!("iroh bind: {e}")))?;
+    Ok(ep.id().to_string())
+}
+
 struct IceCfg {
     stun_url: String,
     turn_url: String,

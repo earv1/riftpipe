@@ -9,6 +9,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 riftpipe-core = { path = "../core" }
+# iroh in the browser (relay-only — browsers can't UDP-hole-punch). default-features
+# off drops `metrics` so the wasm build succeeds (n0's WASM/browser guidance).
+iroh = { version = "1", default-features = false, features = ["tls-ring"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
