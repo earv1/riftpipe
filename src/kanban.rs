@@ -66,35 +66,100 @@ pub fn serve(dir: &str, port: u16, dist: &str) -> Result<(), Box<dyn std::error:
 }
 
 /// Join a browser peer's board over WebRTC (the same signaling room / shared link)
-/// and receive its edits into `dir` — the native end of browser↔native board
-/// collaboration. Text files merge as CRDTs, structural files as LWW (via the
-/// shared `riftpipe_core::sync`). Receive-only for now; blocks until the link drops.
+/// and sync `dir` both ways — the native end of browser↔native board
+/// collaboration. Remote edits land on disk; local edits (any editor touching the
+/// files) are watched and pushed. Text files merge as CRDTs, structural files as
+/// LWW (the shared `riftpipe_core::sync`). Blocks until the link drops.
 pub async fn connect_board(signal: &str, room: &str, dir: &str) -> crate::net::Result<()> {
+    use notify::{RecursiveMode, Watcher};
     use riftpipe_core::sync::{SyncMsg, Syncer};
+    use std::collections::HashMap;
     use std::path::Component;
+    use std::sync::Mutex;
+
+    fn escapes(path: &str) -> bool {
+        Path::new(path).components().any(|c| matches!(c, Component::ParentDir | Component::RootDir))
+    }
+    fn rel_of(full: &Path, dir: &Path) -> Option<String> {
+        let rel = full.strip_prefix(dir).ok()?.to_string_lossy().replace('\\', "/");
+        if rel.is_empty() || rel.contains("/.") { None } else { Some(rel) }
+    }
 
     let link = crate::net::webrtc::connect_via_signaling(signal, room).await?;
-    let (_sink, mut source) = link.into_halves(std::sync::Arc::new(crate::net::Counters::default()));
-    let mut syncer = Syncer::new(format!("n{:08x}", rand::random::<u32>()));
+    let (sink, mut source) = link.into_halves(std::sync::Arc::new(crate::net::Counters::default()));
     let dir = PathBuf::from(dir);
     std::fs::create_dir_all(&dir).map_err(crate::net::anyerr)?;
-    eprintln!("[kanban] connected to room '{room}'; receiving board into {}", dir.display());
+    // Canonicalize so it matches the watcher's event paths (on macOS /var is a
+    // symlink to /private/var, which would otherwise break strip_prefix).
+    let dir = std::fs::canonicalize(&dir).map_err(crate::net::anyerr)?;
+    eprintln!("[kanban] connected to room '{room}'; syncing board at {}", dir.display());
 
-    while let Ok(Some(bytes)) = source.recv().await {
-        let Ok(msg) = postcard::from_bytes::<SyncMsg>(&bytes) else { continue };
-        if let Some((path, merged)) = syncer.apply(msg) {
-            // Reject path escapes from a peer-supplied path.
-            if Path::new(&path).components().any(|c| matches!(c, Component::ParentDir | Component::RootDir)) {
+    let sink = Arc::new(tokio::sync::Mutex::new(sink));
+    let syncer = Arc::new(Mutex::new(Syncer::new(format!("n{:08x}", rand::random::<u32>()))));
+    // Last bytes written from a remote merge per path — the watcher skips a file
+    // whose content equals what we just wrote (the echo of a remote update), so a
+    // remote edit isn't pushed straight back (which would ping-pong LWW versions).
+    // Content-based, not time-based, so a *genuine* local edit right after a remote
+    // write is still pushed.
+    let echo: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Native local edits → push. A notify callback (sync) feeds paths to a task.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(ev) = res {
+            for p in ev.paths {
+                let _ = tx.send(p);
+            }
+        }
+    })
+    .map_err(crate::net::anyerr)?;
+    watcher.watch(&dir, RecursiveMode::Recursive).map_err(crate::net::anyerr)?;
+
+    let (w_sink, w_syncer, w_echo, w_dir) = (sink.clone(), syncer.clone(), echo.clone(), dir.clone());
+    tokio::spawn(async move {
+        while let Some(path) = rx.recv().await {
+            let Some(rel) = rel_of(&path, &w_dir) else { continue };
+            if !path.is_file() {
                 continue;
             }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            // Skip the echo of a file we just wrote from a remote merge (same bytes).
+            if w_echo.lock().unwrap().get(&rel).is_some_and(|b| b == &bytes) {
+                continue;
+            }
+            let msg = if rel.ends_with(".md") {
+                w_syncer.lock().unwrap().local_text(&rel, &String::from_utf8_lossy(&bytes))
+            } else {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                w_syncer.lock().unwrap().local_lww(&rel, bytes, now)
+            };
+            if let Ok(b) = postcard::to_allocvec(&msg) {
+                let _ = w_sink.lock().await.send(b).await;
+            }
+        }
+    });
+
+    // Remote edits → disk.
+    while let Ok(Some(bytes)) = source.recv().await {
+        let Ok(msg) = postcard::from_bytes::<SyncMsg>(&bytes) else { continue };
+        let merged = syncer.lock().unwrap().apply(msg);
+        if let Some((path, bytes)) = merged {
+            if escapes(&path) {
+                continue;
+            }
+            echo.lock().unwrap().insert(path.clone(), bytes.clone());
             let full = dir.join(&path);
             if let Some(parent) = full.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&full, &merged);
+            let _ = std::fs::write(&full, &bytes);
             println!("SYNCED:{path}");
         }
     }
+    drop(watcher);
     Ok(())
 }
 

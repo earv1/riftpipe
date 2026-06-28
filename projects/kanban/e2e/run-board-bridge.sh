@@ -31,18 +31,12 @@ echo "== starting native peer: kanban connect $ROOM -> $NDIR =="
 NATIVE=$!
 sleep 0.8
 
-echo "== running browser (Playwright) =="
-( cd projects/kanban/e2e && PORT=$PORT ROOM="$ROOM" SIGNAL_URL="$SIGNAL_URL" CARD_TITLE="$TITLE" node board-bridge.mjs )
+echo "== running browser (Playwright) — bidirectional check =="
+( cd projects/kanban/e2e && PORT=$PORT ROOM="$ROOM" SIGNAL_URL="$SIGNAL_URL" NDIR="$NDIR" node board-bridge.mjs )
 RESULT=$?
 sleep 1
 
 echo "== native log: =="; cat /tmp/bb-native.log
 echo "== files on native disk: =="; ( cd "$NDIR" && find . -type f | sed 's|^\./||' )
-if grep -rqs "$TITLE" "$NDIR"/tickets/*/card.md 2>/dev/null; then
-  echo "PASS: card created in the browser landed on the native peer's disk"
-else
-  echo "FAIL: card not found on native disk"
-  RESULT=1
-fi
 echo "== exit: $RESULT =="
 exit $RESULT
