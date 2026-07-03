@@ -83,6 +83,36 @@ async fn list(dir: &FileSystemDirectoryHandle) -> Vec<String> {
     names
 }
 
+/// Push every existing OPFS board file into the active `BoardSync`, so a peer we
+/// connect to **merges with** our pre-existing board — not just live edits.
+/// Distinct cards union (distinct paths); a same-path file (`board.md`) resolves
+/// by origin in `core::sync`. Safe on a fresh board (nothing to push).
+pub async fn prime_board() {
+    let Ok(root) = opfs_root().await else { return };
+    if let Some(board) = read_text(&root, "board.md").await {
+        crate::board_sync::push_text("board.md", &board);
+    }
+    let Ok(tickets) = subdir(&root, "tickets", false).await else {
+        return;
+    };
+    for id in list(&tickets).await {
+        let Ok(cdir) = subdir(&tickets, &id, false).await else { continue };
+        if let Some(card) = read_text(&cdir, "card.md").await {
+            crate::board_sync::push_text(&format!("tickets/{id}/card.md"), &card);
+        }
+        if let Some(meta) = read_text(&cdir, "meta.toml").await {
+            crate::board_sync::push_lww(&format!("tickets/{id}/meta.toml"), meta.as_bytes());
+        }
+        if let Ok(comments) = subdir(&cdir, "comments", false).await {
+            for c in list(&comments).await {
+                if let Some(text) = read_text(&comments, &c).await {
+                    crate::board_sync::push_text(&format!("tickets/{id}/comments/{c}"), &text);
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Board reading / mutations (over the file tree, via core logic)
 // ---------------------------------------------------------------------------

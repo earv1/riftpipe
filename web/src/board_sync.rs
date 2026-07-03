@@ -34,6 +34,7 @@ pub async fn connect_and_sync(
 ) -> Result<(), JsValue> {
     let link = crate::connect_via_signaling(&ws_url, &room).await?;
     SYNC.with(|c| *c.borrow_mut() = Some(BoardSync::new(link, opfs_on_merged(on_change))));
+    wasm_bindgen_futures::spawn_local(crate::kanban::prime_board());
     Ok(())
 }
 
@@ -68,6 +69,7 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
 
     // Host when there's no ticket, OR the ticket is our own — a reloaded host keeps
     // its persisted identity, so its share link stays valid instead of going stale.
+    // Host when there's no ticket, OR the ticket is our own.
     let host = ticket.is_empty() || addr_of(&ticket).map(|a| a.id == my_id).unwrap_or(false);
 
     if host {
@@ -78,6 +80,7 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
         wasm_bindgen_futures::spawn_local(async move {
             if let Ok(link) = IrohLink::accept(&accept_ep).await {
                 SYNC.with(|c| *c.borrow_mut() = Some(BoardSync::over_iroh(link, on_merged)));
+                wasm_bindgen_futures::spawn_local(crate::kanban::prime_board());
             }
         });
         Ok(JsValue::from_str(&my_ticket))
@@ -88,6 +91,7 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
         let link = IrohLink::connect(&ep, addr).await.map_err(|e| JsValue::from_str(&e))?;
         IROH_EP.with(|c| *c.borrow_mut() = Some(ep));
         SYNC.with(|c| *c.borrow_mut() = Some(BoardSync::over_iroh(link, on_merged)));
+        wasm_bindgen_futures::spawn_local(crate::kanban::prime_board());
         Ok(JsValue::NULL)
     }
 }

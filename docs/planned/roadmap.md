@@ -58,6 +58,17 @@ sense to do it, not strict priority.
    resolution; one local writer so locking is moot (the kanban pattern
    generalized). See `db-integration.md`.
 
+### Done
+
+- **Merge two independent boards** — peers prime their stored board on connect
+  (`kanban::prime_board`) and the sync layer unions distinct cards + resolves a
+  same-path file by origin (`core::sync`). Verified `run-iroh-merge.sh`: two
+  browsers each with their own card connect over iroh and both see both. Converges
+  for N peers (`three_independent_boards_converge`). *Remaining nits:* primed
+  `meta.toml` (LWW) uses wall-clock now() so a same-card meta conflict is racy
+  (cards rarely collide); and pasting a share link into a **solo tab** doesn't
+  reconnect (hash-only change ≠ reload — the app should react to `hashchange`).
+
 ## Smaller
 
 8. **"New board" UX** — a button that mints a fresh ticket instead of relying on
