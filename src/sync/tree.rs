@@ -1,15 +1,17 @@
-//! Board sync — the native driver for the shared `riftpipe_core::sync` protocol
+//! Tree sync — the native driver for the shared `riftpipe_core::sync` protocol
 //! (the same one the browser speaks over its gossip mesh / WebRTC links). It
-//! binds that pure protocol to a directory + a split link: remote edits land on
-//! disk, local edits (any editor touching the files) are watched and pushed.
-//! Text files (`*.md`) merge as CRDTs, structural files as LWW — all conflict
-//! resolution lives in `riftpipe_core::sync::Syncer`; this module is only I/O.
+//! binds that pure protocol to ANY file tree + a split link: remote edits land
+//! on disk, local edits (any editor touching the files) are watched and pushed.
+//! Text files (`*.md`) merge as CRDTs, everything else as LWW, and dot-paths
+//! never sync — all conflict resolution lives in `riftpipe_core::sync::Syncer`;
+//! this module is only I/O. The kanban app is the showcase consumer (its board
+//! directory is just such a tree), not the owner.
 //!
 //! Transport-blind: takes the `net::{Sink, Source}` halves, so it runs over
 //! whatever dialed the link (WebRTC via signaling today; iroh works the same).
 //!
 //! Shape matches the sibling sessions (`folder::session`, `pipe::session`): the
-//! caller owns the state ([`BoardPeer`]) and the watcher channel; [`run`] is a
+//! caller owns the state ([`TreePeer`]) and the watcher channel; [`run`] is a
 //! single `tokio::select!` loop — no spawned tasks, no shared-state locks.
 
 use std::collections::{HashMap, HashSet};
@@ -44,7 +46,7 @@ fn rel_of(full: &Path, dir: &Path) -> Option<String> {
     }
 }
 
-/// Create the board dir if needed and canonicalize it so it matches the
+/// Create the dir if needed and canonicalize it so it matches the
 /// watcher's event paths (on macOS /var is a symlink to /private/var, which
 /// would otherwise break `strip_prefix`).
 pub fn prepare_dir(dir: &Path) -> Result<PathBuf> {
@@ -52,9 +54,9 @@ pub fn prepare_dir(dir: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(dir).map_err(anyerr)
 }
 
-/// One peer's board-sync state, owned by the caller (like `Workspace` for
+/// One peer's tree-sync state, owned by the caller (like `Workspace` for
 /// folder mode): the protocol `Syncer` plus a content-hash memo.
-pub struct BoardPeer {
+pub struct TreePeer {
     syncer: Syncer,
     /// blake3 of the last-known content per rel path — updated on every push
     /// and every remote persist. A push is skipped when the on-disk hash equals
@@ -64,16 +66,16 @@ pub struct BoardPeer {
     seen: HashMap<String, [u8; 32]>,
 }
 
-impl BoardPeer {
+impl TreePeer {
     pub fn new() -> Self {
-        BoardPeer {
+        TreePeer {
             syncer: Syncer::new(format!("n{:08x}", rand::random::<u32>())),
             seen: HashMap::new(),
         }
     }
 }
 
-impl Default for BoardPeer {
+impl Default for TreePeer {
     fn default() -> Self {
         Self::new()
     }
@@ -94,12 +96,12 @@ pub fn watch(dir: &Path) -> (Option<RecommendedWatcher>, UnboundedReceiver<PathB
     }) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("[board] watcher unavailable ({e}); falling back to poll");
+            eprintln!("[tree] watcher unavailable ({e}); falling back to poll");
             return (None, rx);
         }
     };
     if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
-        eprintln!("[board] watch failed ({e}); falling back to poll");
+        eprintln!("[tree] watch failed ({e}); falling back to poll");
         return (None, rx);
     }
     (Some(watcher), rx)
@@ -108,7 +110,7 @@ pub fn watch(dir: &Path) -> (Option<RecommendedWatcher>, UnboundedReceiver<PathB
 /// Push one local file if its content changed since we last saw it. No-ops on
 /// dot-paths, non-files, and unchanged content; records the hash on push.
 async fn push_local(
-    peer: &mut BoardPeer,
+    peer: &mut TreePeer,
     path: &Path,
     dir: &Path,
     sink: &mut dyn Sink,
@@ -158,12 +160,12 @@ fn scan_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Sync the board `dir` both ways over an established link: one `select!` loop
-/// over watcher events (`rx`), incoming messages, and — when `poll` is set
+/// Sync the tree at `dir` both ways over an established link: one `select!`
+/// loop over watcher events (`rx`), incoming messages, and — when `poll` is set
 /// because the watcher failed — a slow rescan. Returns when the link closes
 /// (`source.recv()` yields `Ok(None)` or an error is unrecoverable).
 pub async fn run(
-    peer: &mut BoardPeer,
+    peer: &mut TreePeer,
     rx: &mut UnboundedReceiver<PathBuf>,
     poll: bool,
     sink: &mut dyn Sink,
@@ -238,6 +240,21 @@ pub async fn run(
     }
 }
 
+/// Dial a peer's room over WebRTC (via the signaling server) and sync `dir`
+/// both ways — the native end of browser↔native collaboration. Blocks until
+/// the link drops. If the watcher can't start, degrades to the poll fallback —
+/// never aborts.
+pub async fn connect(signal: &str, room: &str, dir: &str) -> Result<()> {
+    let link = crate::net::webrtc::connect_via_signaling(signal, room).await?;
+    let (mut sink, mut source) =
+        link.into_halves(std::sync::Arc::new(crate::net::Counters::default()));
+    let dir = prepare_dir(Path::new(dir))?;
+    eprintln!("[riftpipe] connected to room '{room}'; syncing {}", dir.display());
+    let (watcher, mut rx) = watch(&dir);
+    let mut peer = TreePeer::new();
+    run(&mut peer, &mut rx, watcher.is_none(), &mut sink, &mut source, &dir).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,13 +262,13 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     fn dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("riftpipe-board-{}-{tag}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("riftpipe-tree-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::canonicalize(&d).unwrap()
     }
 
-    /// Drive two crossed BoardPeers over a mock link: feed `feed` (paths
+    /// Drive two crossed TreePeers over a mock link: feed `feed` (paths
     /// relative to `da`) to A as watcher events, run both sessions until
     /// `settled()` holds, keep pumping briefly so in-flight messages land, then
     /// tear down by dropping A's send half — B's `source.recv()` sees the
@@ -269,14 +286,14 @@ mod tests {
 
         let db_owned = db.to_path_buf();
         let b_task = tokio::spawn(async move {
-            let mut pb = BoardPeer::new();
+            let mut pb = TreePeer::new();
             run(&mut pb, &mut rx_b, false, &mut sink_b, &mut source_b, &db_owned)
                 .await
                 .expect("B's session ends cleanly when A hangs up");
         });
 
         {
-            let mut pa = BoardPeer::new();
+            let mut pa = TreePeer::new();
             let run_a = run(&mut pa, &mut rx_a, false, &mut sink_a, &mut source_a, da);
             tokio::pin!(run_a);
             loop {
@@ -320,7 +337,7 @@ mod tests {
             ),
         )
         .await
-        .expect("board sync timed out");
+        .expect("tree sync timed out");
 
         assert_eq!(
             std::fs::read(db.join("tickets/tk_1/card.md")).unwrap(),
@@ -358,7 +375,7 @@ mod tests {
             ),
         )
         .await
-        .expect("board sync timed out");
+        .expect("tree sync timed out");
 
         assert!(!db.join(".site").exists(), "top-level .site must never sync");
         assert!(!db.join("tickets/.hidden").exists(), "nested dotfile must never sync");

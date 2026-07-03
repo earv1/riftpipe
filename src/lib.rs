@@ -7,12 +7,13 @@
 //!   crdt/     the meat: the eg-walker text document (re-export of
 //!             riftpipe_core::text, diamond-types)
 //!   sync/     reconciliation: the editor --pipe protocol (+ version-vector
-//!             reconciliation) and the file-mirror loop, plus the pluggable
-//!             multi-algorithm seam (strategy/algo/backing — DESIGN.md §17:
-//!             text CRDT + rsync, with file/memory backings)
+//!             reconciliation), the file-mirror loop, the tree-sync driver
+//!             (any file tree over the shared core protocol), plus the
+//!             pluggable multi-algorithm seam (strategy/algo/backing —
+//!             DESIGN.md §17: text CRDT + rsync, with file/memory backings)
 //!   monitor/  observability helpers: metrics + the in-memory `process` file
-//!   app/      runnable servers on top of the plumbing: the kanban board
-//!             server (serve/connect) and the WebRTC signaling relay
+//!   app/      runnable servers on top of the plumbing: generic HTTP hosting
+//!             (static + SSE change events) and the WebRTC signaling relay
 
 pub mod app;
 pub mod crdt;

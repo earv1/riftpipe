@@ -1,6 +1,7 @@
 //! riftpipe CLI. `text` runs an offline demo of the CRDT core. `share` and `join`
-//! do a real one-shot CRDT exchange over iroh; `kanban`, `signal`, and
-//! `webrtc-echo` back the browser stack.
+//! do a real one-shot CRDT exchange over iroh; `connect` syncs a folder with a
+//! browser peer over WebRTC; `serve` static-hosts a folder with live change
+//! events; `signal` and `webrtc-echo` back the browser stack.
 
 use std::sync::Arc;
 
@@ -114,34 +115,30 @@ async fn main() {
                 _ => eprintln!("usage: riftpipe join <ticket> <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]"),
             }
         }
-        "kanban" => match args.get(2).map(String::as_str) {
-            Some("serve") => {
-                let dir = args.get(3).cloned().unwrap_or_else(|| "board".to_string());
-                let port = flag_value(&args, "--port").and_then(|v| v.parse().ok()).unwrap_or(7777);
-                let dist = flag_value(&args, "--dist")
-                    .unwrap_or_else(|| "projects/kanban/dist".to_string());
+        "connect" => {
+            let connid = args.get(2).cloned().unwrap_or_default();
+            let dir = args.get(3).cloned().unwrap_or_default();
+            let signal = flag_value(&args, "--signal").unwrap_or_else(|| "ws://127.0.0.1:9000".to_string());
+            if connid.is_empty() || dir.is_empty() {
+                eprintln!("usage: riftpipe connect <connection-id> <dir> [--signal ws://127.0.0.1:9000]");
+            } else if let Err(e) = riftpipe::sync::tree::connect(&signal, &connid, &dir).await {
+                eprintln!("[riftpipe] connect failed: {e}");
+            }
+        }
+        "serve" => {
+            let dir = args.get(2).cloned().unwrap_or_default();
+            let port = flag_value(&args, "--port").and_then(|v| v.parse().ok()).unwrap_or(8080);
+            if dir.is_empty() {
+                eprintln!("usage: riftpipe serve <dir> [--port 8080]");
+            } else {
                 // The HTTP server is synchronous (tiny_http); run it off the async
-                // runtime so a future folder-sync task can share the process.
-                let res = tokio::task::spawn_blocking(move || {
-                    riftpipe::app::kanban::serve(&dir, port, &dist).map_err(|e| e.to_string())
-                })
-                .await;
+                // runtime so a future sync task can share the process.
+                let res = tokio::task::spawn_blocking(move || serve_dir(&dir, port)).await;
                 if let Ok(Err(e)) = res {
-                    eprintln!("[kanban] serve failed: {e}");
+                    eprintln!("[serve] failed: {e}");
                 }
             }
-            Some("connect") => {
-                let connid = args.get(3).cloned().unwrap_or_default();
-                let dir = args.get(4).cloned().unwrap_or_else(|| "board".to_string());
-                let signal = flag_value(&args, "--signal").unwrap_or_else(|| "ws://127.0.0.1:9000".to_string());
-                if connid.is_empty() {
-                    eprintln!("usage: riftpipe kanban connect <connection-id> <board-dir> [--signal ws://…]");
-                } else if let Err(e) = riftpipe::app::kanban::connect_board(&signal, &connid, &dir).await {
-                    eprintln!("[kanban] connect failed: {e}");
-                }
-            }
-            _ => eprintln!("usage: riftpipe kanban serve <board-dir> [--port 7777] [--dist <spa-dir>]\n       riftpipe kanban connect <connection-id> <board-dir> [--signal ws://…]"),
-        },
+        }
         "signal" => {
             let port = flag_value(&args, "--port").and_then(|v| v.parse().ok()).unwrap_or(9000);
             if let Err(e) = riftpipe::app::signal::serve(port).await {
@@ -175,7 +172,11 @@ async fn main() {
             eprintln!("  riftpipe text                # eg-walker convergence demo (offline)");
             eprintln!("  riftpipe share <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
             eprintln!("  riftpipe join <ticket> <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
-            eprintln!("  riftpipe kanban serve <board-dir> [--port 7777] [--dist <spa-dir>]  # serve the kanban UI + JSON file-API");
+            eprintln!("  riftpipe connect <connection-id> <dir> [--signal ws://127.0.0.1:9000]  # sync a folder with a browser peer over WebRTC");
+            eprintln!("  riftpipe serve <dir> [--port 8080]  # static-host a folder + SSE change events at /events");
+            eprintln!("                                      # (share/join a folder + serve = live-updating static site)");
+            eprintln!("  riftpipe signal [--port 9000]       # WebRTC signaling relay for browser peers");
+            eprintln!("  riftpipe webrtc-echo <connection-id> [--signal ws://…] [--send <msg>]  # cross-stack bridge probe");
             eprintln!("\nedit the file in your $EDITOR; changes converge across peers.");
             eprintln!("a DIR syncs the whole folder: each file gets the algorithm riftpipe.toml assigns");
             eprintln!("(text-crdt / rsync-file; wal-db & image planned). See DESIGN.md §17.");
@@ -271,6 +272,44 @@ async fn join(ticket: &str, file: &str, opts: &Opts) -> riftpipe::net::Result<()
     }
     eprintln!("authenticated — live syncing {file} ({:?}, end-to-end encrypted). ^C to stop.", nl.transport);
     live_file_loop(file, &mut *nl.link).await
+}
+
+/// `riftpipe serve`: static-host `dir` (with SPA index.html fallback) plus SSE
+/// change events at `/events` — share/join a folder in another process and
+/// `serve` it here for a live-updating static site. Blocks.
+fn serve_dir(dir: &str, port: u16) -> Result<(), String> {
+    use riftpipe::app::host::Host;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let host = Host::new(dir);
+    // Canonicalize so watcher event paths (which come back canonical, e.g.
+    // /private/var on macOS) strip cleanly to relative paths.
+    let root = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+    host.watch(root.clone(), move |p| {
+        let rel = p.strip_prefix(&root).ok()?.to_string_lossy().replace('\\', "/");
+        // Dot-paths are machine-local (same rule as sync) — don't announce them.
+        if rel.is_empty() || rel.split('/').any(|c| c.starts_with('.')) {
+            return None;
+        }
+        Some(serde_json::json!({ "type": "change", "path": rel }))
+    });
+    let server = tiny_http::Server::http(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    eprintln!("[serve] hosting {dir} on http://localhost:{port}  (change events at /events)");
+    for request in server.incoming_requests() {
+        let host = host.clone();
+        // One thread per request: SSE connections block their thread for life.
+        std::thread::spawn(move || {
+            let path = request.url().split('?').next().unwrap_or("").to_string();
+            let r = if path == "/events" {
+                host.sse(request)
+            } else {
+                host.serve_static(request, &path)
+            };
+            if let Err(e) = r {
+                eprintln!("[serve] request error: {e}");
+            }
+        });
+    }
+    Ok(())
 }
 
 /// Short label for the HUD (file name, not the whole path).

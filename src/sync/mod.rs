@@ -6,24 +6,24 @@
 //!   manifest  riftpipe.toml: glob -> algorithm (§17)
 //!   workspace a folder of resources, each bound to a SyncStrategy + backing (§17)
 //!   folder    multiplexed reconnecting session: many resources over one link
-//!   board     the board-sync driver: riftpipe_core::sync (the browser protocol)
-//!             bound to a directory + a split link — native↔browser kanban
+//!   tree      the tree-sync driver: riftpipe_core::sync (the browser protocol)
+//!             bound to any file tree + a split link — native↔browser sync
 //!   pipe      the editor edit-stream protocol over --pipe (text, live)
 //!   mirror    the file-mirror loop (text, single-shot)
 //!
 //! (* planned stubs.) `pipe`/`mirror` are the original text-only paths;
 //! `strategy`/`algo`/`backing`/`manifest`/`workspace`/`folder` are folder-wide,
-//! per-resource, multi-algorithm sync (DESIGN.md §17). `board` rides the shared
+//! per-resource, multi-algorithm sync (DESIGN.md §17). `tree` rides the shared
 //! core protocol instead, for wire-compatibility with browser peers.
 
 pub mod algo;
 pub mod backing;
-pub mod board;
 pub mod folder;
 pub mod manifest;
 pub mod mirror;
 pub mod pipe;
 pub mod strategy;
+pub mod tree;
 pub mod workspace;
 
 use crate::crdt::text::EgWalkerText;

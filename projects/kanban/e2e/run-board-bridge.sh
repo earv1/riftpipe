@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Full browser↔native board collaboration: a browser runs the kanban app at a
-# connection-id link; a native peer (`riftpipe kanban connect`) joins the same
+# connection-id link; a native peer (`riftpipe connect`) joins the same
 # room. A card created through the browser UI must land on the native peer's disk.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -28,8 +28,8 @@ trap 'kill $PREVIEW $SIGNAL $NATIVE 2>/dev/null; rm -rf "$NDIR"' EXIT
 for _ in $(seq 1 50); do curl -fsS "http://127.0.0.1:$PORT/" >/dev/null 2>&1 && break; sleep 0.2; done
 for _ in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/$SIGPORT") 2>/dev/null && break; sleep 0.2; done
 
-echo "== starting native peer: kanban connect $ROOM -> $NDIR =="
-( ./target/debug/riftpipe kanban connect "$ROOM" "$NDIR" --signal "$SIGNAL_URL" ) >/tmp/bb-native.log 2>&1 &
+echo "== starting native peer: connect $ROOM -> $NDIR =="
+( ./target/debug/riftpipe connect "$ROOM" "$NDIR" --signal "$SIGNAL_URL" ) >/tmp/bb-native.log 2>&1 &
 NATIVE=$!
 sleep 0.8
 

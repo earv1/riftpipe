@@ -1,5 +1,5 @@
 // Bidirectional browser↔native board collaboration. A browser runs the kanban app
-// at a connection-id link; a native peer (`riftpipe kanban connect`) joins the same
+// at a connection-id link; a native peer (`riftpipe connect`) joins the same
 // room, syncing into NDIR.
 //   browser→native: a card created in the UI must land on the native disk.
 //   native→browser: editing the native card.md must update the browser UI.

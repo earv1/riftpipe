@@ -1,7 +1,10 @@
-//! The kanban serve layer — a small JSON file-API + static host over a board
-//! directory, ported from the Deno reference server (`projects/kanban/server`).
-//! It does **not** re-implement sync: it just reads/writes plain files, and
-//! riftpipe's folder mode carries them to peers (DESIGN §17, app-and-frontends.md).
+//! kanban-server — the kanban board server: a small JSON file-API + static SPA
+//! host over a board directory, ported from the Deno reference server
+//! (`projects/kanban/server`). It does **not** re-implement sync: it just
+//! reads/writes plain files, and riftpipe's folder/tree sync carries them to
+//! peers (DESIGN §17, app-and-frontends.md). Static serving + SSE change
+//! events come from riftpipe's generic hosting layer (`riftpipe::app::host`);
+//! only the kanban routes and file model live here.
 //!
 //! On-disk model (human-editable, git-friendly):
 //!   <dir>/board.md              "# Title", then "- Column" per column (in order)
@@ -14,43 +17,89 @@
 //! GET /api/cards/:id/detail, POST /api/cards, PATCH /api/cards/:id,
 //! POST /api/cards/:id/comments, GET /api/events (SSE), and the static SPA.
 
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use riftpipe::app::host::{read_json, respond, respond_json, Host};
 use riftpipe_core::kanban as kb;
 use riftpipe_core::kanban::{Card, Comment};
-use serde::Serialize;
 use serde_json::{json, Value};
-use tiny_http::{Header, Method, Request, Response, Server};
+use tiny_http::{Method, Request, Server};
 
 /// Shared, cheaply-clonable server state handed to each request thread.
 #[derive(Clone)]
 struct State {
     dir: PathBuf,
-    dist: PathBuf,
-    /// SSE subscribers — each gets change frames; dead ones are pruned on send.
-    clients: Arc<Mutex<Vec<Sender<Vec<u8>>>>>,
+    /// Static SPA + SSE change events — the generic hosting layer.
+    host: Host,
     /// Serializes mutating requests so concurrent create/patch can't interleave
     /// reads+writes of the same files (e.g. duplicate `position`).
     writes: Arc<Mutex<()>>,
 }
 
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return;
+    }
+    let dir = args
+        .get(1)
+        .filter(|a| !a.starts_with("--"))
+        .cloned()
+        .or_else(|| std::env::var("KANBAN_DIR").ok())
+        .unwrap_or_else(|| "board".to_string());
+    let port = flag_value(&args, "--port")
+        .or_else(|| std::env::var("KANBAN_PORT").ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7777);
+    let dist = flag_value(&args, "--dist").unwrap_or_else(default_dist);
+    if let Err(e) = serve(&dir, port, &dist) {
+        eprintln!("[kanban] serve failed: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn print_help() {
+    eprintln!("kanban-server — kanban board server: JSON file-API + static SPA host + SSE");
+    eprintln!("usage: kanban-server [<board-dir>] [--port 7777] [--dist <spa-dir>]");
+    eprintln!("  <board-dir>  board directory (env KANBAN_DIR; default \"board\")");
+    eprintln!("  --port       listen port (env KANBAN_PORT; default 7777)");
+    eprintln!("  --dist       built SPA directory. Default probes \"projects/kanban/dist\"");
+    eprintln!("               (run from the repo root) then \"dist\" (run from projects/kanban).");
+    eprintln!("API: GET /api/board, GET /api/cards/:id[/detail], POST /api/cards,");
+    eprintln!("     PATCH /api/cards/:id, POST /api/cards/:id/comments, GET /api/events (SSE)");
+}
+
+/// Find `--flag value` in args, returning the value that follows the flag.
+fn flag_value(args: &[String], name: &str) -> Option<String> {
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+}
+
+/// Default SPA dir: whichever of `projects/kanban/dist` (running from the repo
+/// root) or `dist` (running from projects/kanban) exists — repo root wins.
+fn default_dist() -> String {
+    for cand in ["projects/kanban/dist", "dist"] {
+        if Path::new(cand).is_dir() {
+            return cand.to_string();
+        }
+    }
+    "dist".to_string()
+}
+
 /// Serve the board `dir` on `127.0.0.1:port`, hosting the SPA from `dist`. Blocks.
-pub fn serve(dir: &str, port: u16, dist: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn serve(dir: &str, port: u16, dist: &str) -> Result<(), Box<dyn std::error::Error>> {
     let state = State {
         dir: PathBuf::from(dir),
-        dist: PathBuf::from(dist),
-        clients: Arc::new(Mutex::new(Vec::new())),
+        host: Host::new(dist),
         writes: Arc::new(Mutex::new(())),
     };
     std::fs::create_dir_all(&state.dir)?;
-
-    spawn_watcher(state.clone());
-    spawn_keepalive(state.clients.clone());
+    // The change frames the kanban UI consumes: {"type":"ticket","id"} / {"type":"board"}.
+    state.host.watch(state.dir.clone(), message_for_path);
 
     let server = Server::http(("127.0.0.1", port)).map_err(|e| e.to_string())?;
     eprintln!("[kanban] serving {dir} on http://localhost:{port}  (UI from {dist})");
@@ -63,23 +112,6 @@ pub fn serve(dir: &str, port: u16, dist: &str) -> Result<(), Box<dyn std::error:
         });
     }
     Ok(())
-}
-
-/// Join a browser peer's board over WebRTC (the same signaling room / shared link)
-/// and sync `dir` both ways — the native end of browser↔native board
-/// collaboration. Dials the link, then hands the halves to the shared board-sync
-/// driver ([`crate::sync::board`]). Blocks until the link drops.
-pub async fn connect_board(signal: &str, room: &str, dir: &str) -> crate::net::Result<()> {
-    use crate::sync::board;
-
-    let link = crate::net::webrtc::connect_via_signaling(signal, room).await?;
-    let (mut sink, mut source) = link.into_halves(Arc::new(crate::net::Counters::default()));
-    let dir = board::prepare_dir(Path::new(dir))?;
-    eprintln!("[kanban] connected to room '{room}'; syncing board at {}", dir.display());
-    // If the watcher can't start, degrade to the poll fallback — never abort.
-    let (watcher, mut rx) = board::watch(&dir);
-    let mut peer = board::BoardPeer::new();
-    board::run(&mut peer, &mut rx, watcher.is_none(), &mut sink, &mut source, &dir).await
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +131,7 @@ fn route(mut request: Request, state: &State) -> io::Result<()> {
         (Method::Get, ["api", "board"]) => {
             respond_json(request, &read_board(&state.dir))
         }
-        (Method::Get, ["api", "events"]) => sse(request, state),
+        (Method::Get, ["api", "events"]) => state.host.sse(request),
         (Method::Get, ["api", "cards", id, "detail"]) => match read_detail(&state.dir, id) {
             Some(d) => respond_json(request, &d),
             None => respond(request, 404, "Not Found"),
@@ -138,7 +170,7 @@ fn route(mut request: Request, state: &State) -> io::Result<()> {
             let comment = add_comment(&state.dir, id, author, &text);
             respond_json(request, &comment)
         }
-        (Method::Get, _) if !path.starts_with("/api/") => serve_static(request, state, &path),
+        (Method::Get, _) if !path.starts_with("/api/") => state.host.serve_static(request, &path),
         _ => respond(request, 404, "Not Found"),
     }
 }
@@ -320,7 +352,7 @@ fn patch_card(dir: &Path, id: &str, patch: &Value) -> Option<Card> {
 }
 
 // ---------------------------------------------------------------------------
-// Change notifications (SSE) — a notify watcher broadcasts to subscribers
+// Change notifications — path → SSE frame mapping (the UI's contract)
 // ---------------------------------------------------------------------------
 
 /// Map a changed path to an SSE message, or None to ignore (events log, .site).
@@ -340,167 +372,6 @@ fn message_for_path(p: &Path) -> Option<Value> {
         return Some(json!({ "type": "board" }));
     }
     None
-}
-
-fn broadcast(clients: &Arc<Mutex<Vec<Sender<Vec<u8>>>>>, frame: Vec<u8>) {
-    let mut guard = clients.lock().unwrap();
-    guard.retain(|tx| tx.send(frame.clone()).is_ok());
-}
-
-fn spawn_watcher(state: State) {
-    use notify::{RecursiveMode, Watcher};
-    thread::spawn(move || {
-        let clients = state.clients.clone();
-        let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(ev) = res {
-                let mut seen = std::collections::HashSet::new();
-                for p in ev.paths {
-                    if let Some(msg) = message_for_path(&p) {
-                        let key = msg.to_string();
-                        if seen.insert(key) {
-                            let frame = format!("data: {msg}\n\n").into_bytes();
-                            broadcast(&clients, frame);
-                        }
-                    }
-                }
-            }
-        }) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("[kanban] watcher init failed: {e}");
-                return;
-            }
-        };
-        if let Err(e) = watcher.watch(&state.dir, RecursiveMode::Recursive) {
-            eprintln!("[kanban] watch failed: {e}");
-            return;
-        }
-        // Keep the watcher alive for the process lifetime.
-        loop {
-            thread::sleep(Duration::from_secs(3600));
-        }
-    });
-}
-
-/// Periodic SSE comment so dead connections are detected/pruned and proxies
-/// don't time the stream out.
-fn spawn_keepalive(clients: Arc<Mutex<Vec<Sender<Vec<u8>>>>>) {
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(15));
-        broadcast(&clients, b":\n\n".to_vec());
-    });
-}
-
-/// A `Read` that yields SSE frames from a channel, blocking until the next one.
-struct SseReader {
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    buf: Vec<u8>,
-    pos: usize,
-}
-
-impl Read for SseReader {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.buf.len() {
-            match self.rx.recv() {
-                Ok(frame) => {
-                    self.buf = frame;
-                    self.pos = 0;
-                }
-                Err(_) => return Ok(0), // server gone → EOF
-            }
-        }
-        let n = (self.buf.len() - self.pos).min(out.len());
-        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(n)
-    }
-}
-
-fn sse(request: Request, state: &State) -> io::Result<()> {
-    let (tx, rx) = channel::<Vec<u8>>();
-    // Send an initial comment so the stream opens immediately.
-    let _ = tx.send(b":ok\n\n".to_vec());
-    state.clients.lock().unwrap().push(tx);
-    let reader = SseReader { rx, buf: Vec::new(), pos: 0 };
-    let response = Response::new(
-        tiny_http::StatusCode(200),
-        vec![
-            header("Content-Type", "text/event-stream"),
-            header("Cache-Control", "no-cache"),
-            header("Connection", "keep-alive"),
-        ],
-        reader,
-        None, // chunked — the stream never ends
-        None,
-    );
-    request.respond(response)
-}
-
-// ---------------------------------------------------------------------------
-// Static files (the built SPA), with index.html fallback for client routing
-// ---------------------------------------------------------------------------
-
-fn serve_static(request: Request, state: &State, path: &str) -> io::Result<()> {
-    let rel = path.trim_start_matches('/');
-    let candidate = if rel.is_empty() { state.dist.join("index.html") } else { state.dist.join(rel) };
-    // Resolve `..`/symlinks and confirm the result is STILL inside dist — a lexical
-    // `starts_with` is fooled by `..` (`dist/../../etc/passwd` lexically starts with
-    // `dist`), so canonicalize both and compare. A miss falls back to the SPA shell.
-    let safe = std::fs::canonicalize(&candidate).ok().filter(|c| {
-        c.is_file() && std::fs::canonicalize(&state.dist).map(|d| c.starts_with(d)).unwrap_or(false)
-    });
-    let target = match safe {
-        Some(c) => c,
-        None => state.dist.join("index.html"), // SPA fallback
-    };
-    match std::fs::read(&target) {
-        Ok(bytes) => {
-            let ct = content_type(&target);
-            let response = Response::from_data(bytes).with_header(header("Content-Type", ct));
-            request.respond(response)
-        }
-        Err(_) => respond(request, 404, "Not Found"),
-    }
-}
-
-fn content_type(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("json") => "application/json",
-        Some("svg") => "image/svg+xml",
-        Some("ico") => "image/x-icon",
-        Some("png") => "image/png",
-        Some("woff2") => "font/woff2",
-        _ => "application/octet-stream",
-    }
-}
-
-// ---------------------------------------------------------------------------
-// HTTP helpers
-// ---------------------------------------------------------------------------
-
-fn header(name: &str, value: &str) -> Header {
-    Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("valid header")
-}
-
-/// Cap a request body at 1 MiB so a client can't stream unbounded data into RAM.
-const MAX_BODY: u64 = 1 << 20;
-
-fn read_json(request: &mut Request) -> Value {
-    let mut body = String::new();
-    let _ = request.as_reader().take(MAX_BODY).read_to_string(&mut body);
-    serde_json::from_str(&body).unwrap_or(Value::Null)
-}
-
-fn respond_json<T: Serialize>(request: Request, value: &T) -> io::Result<()> {
-    let body = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
-    request.respond(Response::from_string(body).with_header(header("Content-Type", "application/json")))
-}
-
-fn respond(request: Request, status: u16, msg: &str) -> io::Result<()> {
-    request.respond(Response::from_string(msg).with_status_code(status))
 }
 
 /// UTC ISO-8601 timestamp with millis, e.g. `2026-06-27T18:37:19.123Z`. Millis

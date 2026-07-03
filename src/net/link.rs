@@ -38,7 +38,7 @@ pub trait Link: Send {
 /// The send half of a split link. Splitting lets a session push (on a local
 /// change) and pull (on arrival) concurrently instead of in lockstep rounds.
 /// Every transport's halves implement these two traits, so everything above
-/// (`sync::pipe`, `sync::folder`, `sync::board`) is transport-blind.
+/// (`sync::pipe`, `sync::folder`, `sync::tree`) is transport-blind.
 #[async_trait]
 pub trait Sink: Send {
     async fn send(&mut self, msg: Vec<u8>) -> Result<()>;
@@ -132,7 +132,7 @@ impl Link for MockLink {
 impl MockLink {
     /// Split into independent send/recv halves — the in-memory analogue of
     /// `IrohLink::into_halves` / `WebrtcLink::into_halves`, so the split-link
-    /// sessions (`sync::board`, …) are testable without sockets. Dropping a
+    /// sessions (`sync::tree`, …) are testable without sockets. Dropping a
     /// `MockSink` closes its channel, so the peer's `Source::recv` returns
     /// `Ok(None)` and that peer's session ends — mirroring a real hangup.
     pub fn into_halves(self) -> (MockSink, MockSource) {
