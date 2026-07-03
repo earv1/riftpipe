@@ -83,6 +83,18 @@ impl Mesh {
         self.endpoint.addr()
     }
 
+    /// Wait until this peer has a dialable (relay) address to share.
+    pub async fn wait_for_addr(&self) -> EndpointAddr {
+        for _ in 0..400 {
+            let a = self.endpoint.addr();
+            if !a.addrs.is_empty() {
+                return a;
+            }
+            gloo_timers::future::TimeoutFuture::new(50).await;
+        }
+        self.endpoint.addr()
+    }
+
     /// Broadcast `bytes` to every peer in the mesh.
     pub async fn broadcast(&self, bytes: Vec<u8>) -> Result<(), String> {
         self.sender
@@ -243,6 +255,61 @@ impl GossipBoardSync {
 
 fn hex32(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+thread_local! {
+    /// The active gossip board sync, if the app is on the mesh transport.
+    static GOSSIP: std::cell::RefCell<Option<GossipBoardSync>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Install the active gossip sync (replacing any prior one).
+pub(crate) fn set_active(bs: GossipBoardSync) {
+    GOSSIP.with(|c| *c.borrow_mut() = Some(bs));
+}
+
+/// Tear down any active gossip sync (drops the mesh → closes the endpoint).
+pub(crate) fn clear_active() {
+    GOSSIP.with(|c| *c.borrow_mut() = None);
+}
+
+/// Route a text push to the mesh if active; `true` if it was handled.
+pub(crate) fn try_push_text(path: &str, content: &str) -> bool {
+    GOSSIP.with(|c| match c.borrow().as_ref() {
+        Some(bs) => {
+            bs.push_text(path, content);
+            true
+        }
+        None => false,
+    })
+}
+
+/// Route a structural push to the mesh if active; `true` if it was handled.
+pub(crate) fn try_push_lww(path: &str, bytes: &[u8]) -> bool {
+    GOSSIP.with(|c| match c.borrow().as_ref() {
+        Some(bs) => {
+            bs.push_lww(path, bytes);
+            true
+        }
+        None => false,
+    })
+}
+
+/// Debug: this peer's direct neighbors in the mesh (hex ids), as a JSON array.
+#[wasm_bindgen::prelude::wasm_bindgen(js_name = connectedPeers)]
+pub fn connected_peers() -> String {
+    GOSSIP.with(|c| {
+        let peers = c.borrow().as_ref().map(|bs| bs.peers()).unwrap_or_default();
+        serde_json::to_string(&peers).unwrap_or_else(|_| "[]".into())
+    })
+}
+
+/// Debug: the gossiped routing map `id -> [neighbors]` across the mesh, as JSON.
+#[wasm_bindgen::prelude::wasm_bindgen(js_name = routingMap)]
+pub fn routing_map() -> String {
+    GOSSIP.with(|c| {
+        let map = c.borrow().as_ref().map(|bs| bs.routing_map()).unwrap_or_default();
+        serde_json::to_string(&map).unwrap_or_else(|_| "{}".into())
+    })
 }
 
 #[cfg(test)]

@@ -62,45 +62,35 @@ thread_local! {
 /// or null (joiner). The kanban handler's pushes sync automatically thereafter.
 #[wasm_bindgen(js_name = irohConnect)]
 pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result<JsValue, JsValue> {
-    use crate::iroh_link::{addr_of, bind_accept, bind_connect, ticket_of, wait_for_addr, IrohLink};
+    use crate::gossip::{GossipBoardSync, Mesh};
+    use crate::iroh_link::{addr_of, ticket_of};
     let on_merged = opfs_on_merged(on_change);
     let sk = load_or_create_secret_key();
     let my_id = sk.public();
 
-    // Tear down any prior iroh session (e.g. reconnecting to a pasted link) so the
-    // same persisted identity rebinds cleanly — closing the endpoint also ends a
-    // still-pending accept loop that holds a clone of it.
-    if let Some(old) = IROH_EP.with(|c| c.borrow_mut().take()) {
-        old.close().await;
-    }
-    SYNC.with(|c| *c.borrow_mut() = None);
+    // Tear down any prior mesh session (dropping it closes the old endpoint) before
+    // rebinding under the same persisted identity.
+    crate::gossip::clear_active();
 
-    // Host when there's no ticket, OR the ticket is our own — a reloaded/pasted
-    // host keeps its persisted identity, so its share link stays valid.
+    // Host when there's no ticket, OR the ticket is our own — the host defines the
+    // topic; everyone else joins the same swarm and it's no longer special.
     let host = ticket.is_empty() || addr_of(&ticket).map(|a| a.id == my_id).unwrap_or(false);
 
-    if host {
-        let ep = bind_accept(sk).await.map_err(|e| JsValue::from_str(&e))?;
-        let my_ticket = ticket_of(&wait_for_addr(&ep).await);
-        let accept_ep = ep.clone();
-        IROH_EP.with(|c| *c.borrow_mut() = Some(ep));
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Ok(link) = IrohLink::accept(&accept_ep).await {
-                SYNC.with(|c| *c.borrow_mut() = Some(BoardSync::over_iroh(link, on_merged)));
-                wasm_bindgen_futures::spawn_local(crate::kanban::prime_board());
-            }
-        });
-        Ok(JsValue::from_str(&my_ticket))
+    let (mesh, my_ticket) = if host {
+        let mesh = Mesh::join(sk, my_id, None).await.map_err(|e| JsValue::from_str(&e))?;
+        let addr = mesh.wait_for_addr().await;
+        (mesh, Some(ticket_of(&addr)))
     } else {
-        // Joiner: dial the host's ticket through the relay.
-        let ep = bind_connect(sk).await.map_err(|e| JsValue::from_str(&e))?;
         let addr = addr_of(&ticket).map_err(|e| JsValue::from_str(&e))?;
-        let link = IrohLink::connect(&ep, addr).await.map_err(|e| JsValue::from_str(&e))?;
-        IROH_EP.with(|c| *c.borrow_mut() = Some(ep));
-        SYNC.with(|c| *c.borrow_mut() = Some(BoardSync::over_iroh(link, on_merged)));
-        wasm_bindgen_futures::spawn_local(crate::kanban::prime_board());
-        Ok(JsValue::NULL)
-    }
+        let host_id = addr.id;
+        let mesh = Mesh::join(sk, host_id, Some(addr)).await.map_err(|e| JsValue::from_str(&e))?;
+        (mesh, None)
+    };
+
+    crate::gossip::set_active(GossipBoardSync::new(mesh, on_merged));
+    wasm_bindgen_futures::spawn_local(crate::kanban::prime_board());
+
+    Ok(my_ticket.map(|t| JsValue::from_str(&t)).unwrap_or(JsValue::NULL))
 }
 
 /// Load the browser's persisted iroh identity from localStorage, or generate +
@@ -137,8 +127,12 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Push a text file's new content to the connected peer (no-op if not connected).
+/// Push a text file's new content to peers — to the gossip mesh if active, else the
+/// point-to-point link (no-op if neither is connected).
 pub fn push_text(path: &str, content: &str) {
+    if crate::gossip::try_push_text(path, content) {
+        return;
+    }
     SYNC.with(|c| {
         if let Some(s) = c.borrow().as_ref() {
             s.push_text(path, content);
@@ -146,8 +140,11 @@ pub fn push_text(path: &str, content: &str) {
     });
 }
 
-/// Push a structural file (LWW) to the connected peer (no-op if not connected).
+/// Push a structural file (LWW) to peers (mesh if active, else the link).
 pub fn push_lww(path: &str, bytes: &[u8]) {
+    if crate::gossip::try_push_lww(path, bytes) {
+        return;
+    }
     SYNC.with(|c| {
         if let Some(s) = c.borrow().as_ref() {
             s.push_lww(path, bytes);

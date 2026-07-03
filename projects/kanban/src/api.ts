@@ -11,7 +11,17 @@ import init, {
   connectionId,
   configureIce,
   irohConnect,
+  connectedPeers,
+  routingMap,
 } from "../../../web/pkg/riftpipe_web.js";
+
+// Debugging hooks for the gossip mesh — inspect from the console:
+//   riftpipe.connectedPeers()  → this peer's direct neighbors (hex ids)
+//   riftpipe.routingMap()      → the whole mesh topology { id: [neighbors] }
+(globalThis as any).riftpipe = {
+  connectedPeers: () => JSON.parse(connectedPeers()),
+  routingMap: () => JSON.parse(routingMap()),
+};
 
 // Build-time config (Vite env). Set these for a deployed/cross-network build:
 //   VITE_SIGNAL_URL  — public signaling server, e.g. wss://signal.example.com
