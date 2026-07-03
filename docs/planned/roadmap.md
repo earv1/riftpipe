@@ -36,10 +36,13 @@ sense to do it, not strict priority.
    Holepunch HyperDHT lesson, applied within iroh). Closes the last "someone sees
    metadata" gap.
 
-4. **Persisted host identity** — the host's iroh key is ephemeral, so a reload
-   mints a new ticket and the shared `#ticket` link goes stale. Persist the secret
-   key (localStorage); decide host-vs-join by comparing the URL ticket's id to our
-   own. Makes share links durable across reloads.
+4. **Persisted host identity** — *done.* The iroh secret key is persisted in
+   localStorage, so a host keeps the same EndpointId — and the same shareable
+   ticket — across reloads. `irohConnect` hosts when the URL ticket is empty *or*
+   its id equals ours (a reloaded host recognizes its own link), and joins
+   otherwise. Proven deterministically headless (`persisted_iroh_identity_is_stable`)
+   + the two-browser `run-iroh` flow still passes. (Reconnecting an *already-joined*
+   peer after the host reloads is separate — that's live reconnection, below.)
 
 5. **Multi-peer (N-writer)** — today it's 2-peer host/join. Accept multiple peers
    (host fans out, or a small mesh) so a board can have >2 collaborators.

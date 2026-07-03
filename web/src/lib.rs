@@ -531,6 +531,17 @@ mod tests {
     // harness, not this fast loopback unit suite. The protocol/merge logic is
     // covered by `riftpipe_core::sync` unit tests.
 
+    /// A persisted iroh identity is stable across "reloads" (a second call reads the
+    /// stored key), so a host's shareable ticket survives a page reload. No network.
+    #[wasm_bindgen_test]
+    fn persisted_iroh_identity_is_stable() {
+        let store = web_sys::window().unwrap().local_storage().unwrap().unwrap();
+        store.remove_item("riftpipe:iroh_sk").ok();
+        let id1 = crate::board_sync::load_or_create_secret_key().public();
+        let id2 = crate::board_sync::load_or_create_secret_key().public();
+        assert_eq!(id1, id2, "second call returns the persisted identity");
+    }
+
     /// Establish a connected pair of `WebrtcLink`s in the (headless) browser via a
     /// full non-trickle offer/answer between two `RtcPeerConnection`s. Signaling is
     /// wired directly here (in the real app it crosses the iroh link).

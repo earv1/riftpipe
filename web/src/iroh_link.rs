@@ -5,7 +5,7 @@
 //! the connection id in the URL is an iroh ticket (the host's relay address).
 
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, EndpointAddr, SecretKey};
 
 /// ALPN for the kanban sync protocol.
 pub const ALPN: &[u8] = b"riftpipe/kanban/0";
@@ -14,9 +14,12 @@ async fn sleep_ms(ms: u32) {
     gloo_timers::future::TimeoutFuture::new(ms).await;
 }
 
-/// Bind an endpoint that accepts incoming connections (the board "host").
-pub async fn bind_accept() -> Result<Endpoint, String> {
+/// Bind an endpoint that accepts incoming connections (the board "host"). Binding
+/// under a *persisted* `sk` keeps the same EndpointId — and so the same shareable
+/// ticket — across page reloads.
+pub async fn bind_accept(sk: SecretKey) -> Result<Endpoint, String> {
     Endpoint::builder(presets::N0)
+        .secret_key(sk)
         .alpns(vec![ALPN.to_vec()])
         .bind()
         .await
@@ -24,8 +27,9 @@ pub async fn bind_accept() -> Result<Endpoint, String> {
 }
 
 /// Bind an endpoint used only to dial out (the "joiner").
-pub async fn bind_connect() -> Result<Endpoint, String> {
+pub async fn bind_connect(sk: SecretKey) -> Result<Endpoint, String> {
     Endpoint::builder(presets::N0)
+        .secret_key(sk)
         .bind()
         .await
         .map_err(|e| e.to_string())

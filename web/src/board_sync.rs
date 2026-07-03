@@ -63,10 +63,15 @@ thread_local! {
 pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result<JsValue, JsValue> {
     use crate::iroh_link::{addr_of, bind_accept, bind_connect, ticket_of, wait_for_addr, IrohLink};
     let on_merged = opfs_on_merged(on_change);
+    let sk = load_or_create_secret_key();
+    let my_id = sk.public();
 
-    if ticket.is_empty() {
-        // Host: bind, publish ticket, accept one peer in the background.
-        let ep = bind_accept().await.map_err(|e| JsValue::from_str(&e))?;
+    // Host when there's no ticket, OR the ticket is our own — a reloaded host keeps
+    // its persisted identity, so its share link stays valid instead of going stale.
+    let host = ticket.is_empty() || addr_of(&ticket).map(|a| a.id == my_id).unwrap_or(false);
+
+    if host {
+        let ep = bind_accept(sk).await.map_err(|e| JsValue::from_str(&e))?;
         let my_ticket = ticket_of(&wait_for_addr(&ep).await);
         let accept_ep = ep.clone();
         IROH_EP.with(|c| *c.borrow_mut() = Some(ep));
@@ -78,13 +83,47 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
         Ok(JsValue::from_str(&my_ticket))
     } else {
         // Joiner: dial the host's ticket through the relay.
-        let ep = bind_connect().await.map_err(|e| JsValue::from_str(&e))?;
+        let ep = bind_connect(sk).await.map_err(|e| JsValue::from_str(&e))?;
         let addr = addr_of(&ticket).map_err(|e| JsValue::from_str(&e))?;
         let link = IrohLink::connect(&ep, addr).await.map_err(|e| JsValue::from_str(&e))?;
         IROH_EP.with(|c| *c.borrow_mut() = Some(ep));
         SYNC.with(|c| *c.borrow_mut() = Some(BoardSync::over_iroh(link, on_merged)));
         Ok(JsValue::NULL)
     }
+}
+
+/// Load the browser's persisted iroh identity from localStorage, or generate +
+/// store one. A stable identity means a host's shareable ticket survives reloads.
+pub(crate) fn load_or_create_secret_key() -> iroh::SecretKey {
+    const STORE_KEY: &str = "riftpipe:iroh_sk";
+    let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
+    if let Some(store) = &storage {
+        if let Ok(Some(hex)) = store.get_item(STORE_KEY) {
+            if let Some(bytes) = hex32(&hex) {
+                return iroh::SecretKey::from_bytes(&bytes);
+            }
+        }
+    }
+    let sk = iroh::SecretKey::generate();
+    if let Some(store) = &storage {
+        let _ = store.set_item(STORE_KEY, &to_hex(&sk.to_bytes()));
+    }
+    sk
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Push a text file's new content to the connected peer (no-op if not connected).
