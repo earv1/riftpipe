@@ -107,6 +107,22 @@ impl Syncer {
         Some(SyncMsg::TextDelta { path: path.to_string(), ops, vv, origin })
     }
 
+    /// Full self-contained state of every text doc — broadcast to a newly-joined
+    /// neighbor (gossip has no per-peer delta) so it catches up + merges.
+    pub fn full_state(&self) -> Vec<SyncMsg> {
+        self.docs
+            .iter()
+            .filter_map(|(path, doc)| {
+                doc.ops_since(&[]).map(|ops| SyncMsg::TextDelta {
+                    path: path.clone(),
+                    ops,
+                    vv: doc.version_vector(),
+                    origin: doc.origin(),
+                })
+            })
+            .collect()
+    }
+
     /// Record a local structural write; `now` is a millisecond clock.
     pub fn local_lww(&mut self, path: &str, bytes: Vec<u8>, now: u64) -> SyncMsg {
         let v = self.lww.entry(path.to_string()).or_insert(0);

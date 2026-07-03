@@ -98,6 +98,151 @@ impl Mesh {
             _ => None,
         }
     }
+
+    /// Split into a broadcast sender, an event receiver, and a keep-alive handle
+    /// (the endpoint/router/gossip must outlive both).
+    fn into_parts(self) -> (GossipSender, GossipReceiver, MeshKeepAlive) {
+        (
+            self.sender,
+            self.receiver,
+            MeshKeepAlive { _endpoint: self.endpoint, _router: self._router, _gossip: self._gossip },
+        )
+    }
+}
+
+/// Keeps the mesh's endpoint/router/gossip alive for the sync's lifetime.
+pub struct MeshKeepAlive {
+    _endpoint: Endpoint,
+    _router: Router,
+    _gossip: Gossip,
+}
+
+/// What travels over the gossip topic: board sync messages, plus periodic presence
+/// so peers can build a routing map for debugging.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum GossipMsg {
+    Sync(riftpipe_core::sync::SyncMsg),
+    /// "I am `id`, directly connected to `neighbors`." Aggregated into the map.
+    Presence { id: [u8; 32], neighbors: Vec<[u8; 32]> },
+}
+
+/// Board sync over the gossip mesh. Local pushes broadcast to everyone; received
+/// messages merge via the N-peer-safe `Syncer`. A new neighbor is caught up by
+/// re-broadcasting our full board. Tracks direct neighbors + a gossiped routing map.
+pub struct GossipBoardSync {
+    syncer: std::rc::Rc<std::cell::RefCell<riftpipe_core::sync::Syncer>>,
+    sender: GossipSender,
+    neighbors: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<[u8; 32]>>>,
+    routing: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<[u8; 32], Vec<[u8; 32]>>>>,
+    _keep: MeshKeepAlive,
+}
+
+impl GossipBoardSync {
+    pub fn new(mesh: Mesh, on_merged: std::rc::Rc<dyn Fn(String, Vec<u8>)>) -> GossipBoardSync {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let my_id = *mesh.my_id().as_bytes();
+        let (sender, mut receiver, keep) = mesh.into_parts();
+        let agent = format!("g{:08x}", (js_sys::Math::random() * 4_294_967_296.0) as u32);
+        let syncer = Rc::new(RefCell::new(riftpipe_core::sync::Syncer::new(agent)));
+        let neighbors = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
+        let routing = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+
+        let (sy, nb, rt, snd) = (syncer.clone(), neighbors.clone(), routing.clone(), sender.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let broadcast = |gm: &GossipMsg| {
+                postcard::to_allocvec(gm).ok().map(|b| b.into())
+            };
+            while let Some(Ok(ev)) = receiver.next().await {
+                match ev {
+                    Event::Received(m) => {
+                        let Ok(gm) = postcard::from_bytes::<GossipMsg>(&m.content) else { continue };
+                        match gm {
+                            GossipMsg::Sync(msg) => {
+                                let (persist, replies) = sy.borrow_mut().apply(msg);
+                                if let Some((path, bytes)) = persist {
+                                    on_merged(path, bytes);
+                                }
+                                for r in replies {
+                                    if let Some(b) = broadcast(&GossipMsg::Sync(r)) {
+                                        let _ = snd.broadcast(b).await;
+                                    }
+                                }
+                            }
+                            GossipMsg::Presence { id, neighbors } => {
+                                rt.borrow_mut().insert(id, neighbors);
+                            }
+                        }
+                    }
+                    Event::NeighborUp(id) => {
+                        nb.borrow_mut().insert(*id.as_bytes());
+                        // Catch the new neighbor up with our whole board.
+                        let full = sy.borrow().full_state();
+                        for msg in full {
+                            if let Some(b) = broadcast(&GossipMsg::Sync(msg)) {
+                                let _ = snd.broadcast(b).await;
+                            }
+                        }
+                        let list: Vec<[u8; 32]> = nb.borrow().iter().copied().collect();
+                        rt.borrow_mut().insert(my_id, list.clone());
+                        if let Some(b) = broadcast(&GossipMsg::Presence { id: my_id, neighbors: list }) {
+                            let _ = snd.broadcast(b).await;
+                        }
+                    }
+                    Event::NeighborDown(id) => {
+                        nb.borrow_mut().remove(id.as_bytes());
+                        let list: Vec<[u8; 32]> = nb.borrow().iter().copied().collect();
+                        rt.borrow_mut().insert(my_id, list.clone());
+                        if let Some(b) = broadcast(&GossipMsg::Presence { id: my_id, neighbors: list }) {
+                            let _ = snd.broadcast(b).await;
+                        }
+                    }
+                    Event::Lagged => {}
+                }
+            }
+        });
+
+        GossipBoardSync { syncer, sender, neighbors, routing, _keep: keep }
+    }
+
+    pub fn push_text(&self, path: &str, content: &str) {
+        if let Some(msg) = self.syncer.borrow_mut().local_text(path, content) {
+            self.broadcast(GossipMsg::Sync(msg));
+        }
+    }
+
+    pub fn push_lww(&self, path: &str, bytes: &[u8]) {
+        let now = js_sys::Date::now() as u64;
+        let msg = self.syncer.borrow_mut().local_lww(path, bytes.to_vec(), now);
+        self.broadcast(GossipMsg::Sync(msg));
+    }
+
+    fn broadcast(&self, gm: GossipMsg) {
+        if let Ok(bytes) = postcard::to_allocvec(&gm) {
+            let sender = self.sender.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = sender.broadcast(bytes.into()).await;
+            });
+        }
+    }
+
+    /// Direct neighbors in the swarm (this peer's connected peers), as hex ids.
+    pub fn peers(&self) -> Vec<String> {
+        self.neighbors.borrow().iter().map(hex32).collect()
+    }
+
+    /// The gossiped routing map: `id -> [neighbor ids]` across the whole mesh.
+    pub fn routing_map(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        self.routing
+            .borrow()
+            .iter()
+            .map(|(k, v)| (hex32(k), v.iter().map(hex32).collect()))
+            .collect()
+    }
+}
+
+fn hex32(b: &[u8; 32]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -149,6 +294,51 @@ mod tests {
             got.as_deref(),
             Some(&b"ping-over-gossip"[..]),
             "host received the gossip broadcast",
+        );
+    }
+
+    /// A card pushed on one peer syncs to another over the gossip mesh — proves
+    /// board sync (not just raw bytes) works over gossip.
+    #[wasm_bindgen_test]
+    async fn board_syncs_over_gossip_mesh() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let host_sk = SecretKey::generate();
+        let host_id = host_sk.public();
+        let host_mesh = Mesh::join(host_sk, host_id, None).await.expect("host");
+        for _ in 0..200 {
+            if !host_mesh.addr().addrs.is_empty() {
+                break;
+            }
+            sleep_ms(50).await;
+        }
+        let host_addr = host_mesh.addr();
+        let host_bs = GossipBoardSync::new(host_mesh, Rc::new(|_, _| {}));
+
+        let join_sk = SecretKey::generate();
+        let joiner_mesh = Mesh::join(join_sk, host_id, Some(host_addr)).await.expect("joiner");
+        let got: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::new(RefCell::new(Vec::new()));
+        let g = got.clone();
+        let _joiner_bs =
+            GossipBoardSync::new(joiner_mesh, Rc::new(move |p, b| g.borrow_mut().push((p, b))));
+
+        // Let the swarm form, then the host pushes a card.
+        sleep_ms(2500).await;
+        host_bs.push_text("tickets/x/card.md", "# gossip card\n");
+
+        for _ in 0..300 {
+            if got.borrow().iter().any(|(p, _)| p == "tickets/x/card.md") {
+                break;
+            }
+            sleep_ms(50).await;
+        }
+        assert!(
+            got.borrow()
+                .iter()
+                .any(|(p, b)| p == "tickets/x/card.md" && b == b"# gossip card\n"),
+            "joiner received the card over the gossip mesh: {:?}",
+            got.borrow(),
         );
     }
 }
