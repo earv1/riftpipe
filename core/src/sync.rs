@@ -49,7 +49,9 @@ pub struct Syncer {
     /// Paths we've asked the peer to resync (full) and are still waiting on — so a
     /// stream of un-appliable deltas can't trigger a storm of resync requests.
     awaiting_resync: HashSet<String>,
-    lww: HashMap<String, u64>,
+    /// Per structural path: the LWW `(version, bytes)` — bytes cached so a new mesh
+    /// neighbor can be caught up with them (`full_state`).
+    lww: HashMap<String, (u64, Vec<u8>)>,
 }
 
 impl Syncer {
@@ -110,7 +112,8 @@ impl Syncer {
     /// Full self-contained state of every text doc — broadcast to a newly-joined
     /// neighbor (gossip has no per-peer delta) so it catches up + merges.
     pub fn full_state(&self) -> Vec<SyncMsg> {
-        self.docs
+        let mut msgs: Vec<SyncMsg> = self
+            .docs
             .iter()
             .filter_map(|(path, doc)| {
                 doc.ops_since(&[]).map(|ops| SyncMsg::TextDelta {
@@ -120,14 +123,23 @@ impl Syncer {
                     origin: doc.origin(),
                 })
             })
-            .collect()
+            .collect();
+        for (path, (version, bytes)) in &self.lww {
+            msgs.push(SyncMsg::Lww {
+                path: path.clone(),
+                version: *version,
+                bytes: bytes.clone(),
+            });
+        }
+        msgs
     }
 
     /// Record a local structural write; `now` is a millisecond clock.
     pub fn local_lww(&mut self, path: &str, bytes: Vec<u8>, now: u64) -> SyncMsg {
-        let v = self.lww.entry(path.to_string()).or_insert(0);
-        *v = now.max(*v + 1);
-        SyncMsg::Lww { path: path.to_string(), version: *v, bytes }
+        let entry = self.lww.entry(path.to_string()).or_insert((0, Vec::new()));
+        entry.0 = now.max(entry.0 + 1);
+        entry.1 = bytes.clone();
+        SyncMsg::Lww { path: path.to_string(), version: entry.0, bytes }
     }
 
     /// Apply a received message: returns `(bytes to persist, messages to send
@@ -209,9 +221,10 @@ impl Syncer {
                 None => (None, Vec::new()),
             },
             SyncMsg::Lww { path, version, bytes } => {
-                let v = self.lww.entry(path.clone()).or_insert(0);
-                if version > *v {
-                    *v = version;
+                let entry = self.lww.entry(path.clone()).or_insert((0, Vec::new()));
+                if version > entry.0 {
+                    entry.0 = version;
+                    entry.1 = bytes.clone();
                     (Some((path, bytes)), Vec::new())
                 } else {
                     (None, Vec::new())
@@ -336,6 +349,26 @@ mod tests {
         assert_eq!(b.apply(newer).0.unwrap().1, b"new");
         let stale = SyncMsg::Lww { path: "meta.toml".into(), version: 1, bytes: b"old".to_vec() };
         assert!(b.apply(stale).0.is_none(), "stale LWW ignored");
+    }
+
+    #[test]
+    fn full_state_catches_up_text_and_lww() {
+        // A fresh mesh neighbor is caught up with both the text docs AND the LWW
+        // structural files (meta.toml) via full_state.
+        let mut a = Syncer::new("a");
+        a.local_text("tickets/x/card.md", "# hi\n");
+        a.local_lww("tickets/x/meta.toml", b"column=Doing\n".to_vec(), 1000);
+
+        let mut b = Syncer::new("b");
+        for m in a.full_state() {
+            b.apply(m);
+        }
+        assert_eq!(b.docs["tickets/x/card.md"].content(), "# hi\n");
+        assert_eq!(
+            b.lww.get("tickets/x/meta.toml").map(|(_, by)| by.as_slice()),
+            Some(&b"column=Doing\n"[..]),
+            "neighbor caught up the LWW meta too",
+        );
     }
 
     #[test]
