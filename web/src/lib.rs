@@ -197,13 +197,7 @@ impl RiftDoc {
 // OPFS — local, serverless persistence (Origin Private File System)
 // ---------------------------------------------------------------------------
 
-async fn opfs_root() -> Result<web_sys::FileSystemDirectoryHandle, JsValue> {
-    let nav = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?.navigator();
-    let dir = wasm_bindgen_futures::JsFuture::from(nav.storage().get_directory())
-        .await?
-        .unchecked_into::<web_sys::FileSystemDirectoryHandle>();
-    Ok(dir)
-}
+use crate::kanban::opfs_root;
 
 /// Write `bytes` to OPFS file `name` (created if absent).
 pub async fn opfs_write(name: &str, bytes: &[u8]) -> Result<(), JsValue> {

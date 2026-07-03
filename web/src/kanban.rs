@@ -23,7 +23,7 @@ use web_sys::{
 // OPFS file-tree helpers
 // ---------------------------------------------------------------------------
 
-async fn opfs_root() -> Result<FileSystemDirectoryHandle, JsValue> {
+pub(crate) async fn opfs_root() -> Result<FileSystemDirectoryHandle, JsValue> {
     let nav = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?.navigator();
     Ok(JsFuture::from(nav.storage().get_directory()).await?.unchecked_into())
 }
