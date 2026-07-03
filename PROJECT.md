@@ -26,9 +26,7 @@ riftpipe.io/.sh available. "Open a rift, pipe through it.")
 ## How to build / run
 ```sh
 cargo test                  # full suite (currently 21 passing, 0 warnings)
-cargo run -- simulate       # offline: ruled replay engine demo
 cargo run -- text           # offline: eg-walker convergence demo
-cargo run -- td             # offline: tower-defense core preview (emoji board)
 ./run-local.sh              # two-peer tmux demo: nvim + bridge, live char sync, metrics panes
 ```
 CLI: `riftpipe share <file> [--pipe] [--metrics <path>]` /
@@ -48,7 +46,6 @@ RIFTPIPE_BIN=./target/debug/riftpipe RIFTPIPE_ARGS="share /path/file --pipe" \
   - `algo/`  — concrete algorithms: text_crdt (real), rsync (real), wal/image (stubs)
   - `backing` — where bytes live: FileBacking vs MemoryBacking + MemoryRegistry (§17.5)
 - `monitor/` — metrics (one-line status to a file for tmux; connection-kind detection), process (the in-memory `process` sidecar: size+hash for all RAM resources, §17.6)
-- `engine/` — programmable-rules state machine + tower-defense demo (replay, rules, op, log, document, simulation, identity, handshake, game, play)
 
 ## What's done
 - **Folder sync — CLI-wired (DESIGN §17, local on `main`):** `share <dir>` /
@@ -87,8 +84,8 @@ RIFTPIPE_BIN=./target/debug/riftpipe RIFTPIPE_ARGS="share /path/file --pipe" \
 
 ## TODO / next steps (rough priority)
 Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
-1. **Implement `wal-db`** (append-only frames) — unblocks the game state/view
-   split (state → wal-db, view → text-crdt).
+1. **Implement `wal-db`** (append-only frames) — sync *state* (the WAL) separately
+   from a *view* (e.g. a DB's authoritative log vs. a rendered projection).
 2. **Implement `image`** (tile merge) — eg-walker is the wrong granularity for
    pixels.
 3. **Per-resource backing in the manifest** — choose memory vs file per glob
@@ -97,7 +94,7 @@ Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
 5. Robustness: rsync v1 caveat (Copy references advertiser's blocks — stale-basis
    reconstruction is rejected by hash + retried; consider basis-pinning); folder
    deletes aren't synced yet (only creates/edits).
-Older/parallel: file-mirror reconnection; CRDT-native tower defense (§13);
+Older/parallel: file-mirror reconnection;
 verify connect-anywhere on real networks (§14.1); domain + landing.
 
 ## Key gotchas / decisions to remember
@@ -107,6 +104,6 @@ verify connect-anywhere on real networks (§14.1); domain + landing.
   reconnect loop can re-dial; `StdinClosed` means the frontend quit → exit.
 - **Bridge snapshot race** (DESIGN.md §16): typing in the window between merging a
   remote op and the bridge applying it can clobber — Phase 2 granular ops fixes it.
-- **Lockstep is gone from text sync** (kept only in the game sim, where it's correct).
+- **Lockstep is gone from text sync.**
 - iroh `presets::N0` relays are dev-only / metadata-exposing — fine for bootstrap,
   go-direct removes them from the data path; self-host a relay for production.

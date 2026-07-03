@@ -219,7 +219,6 @@ no commit and no network. Three uses of one loop:
 1. **Live** — materialize the doc from the event graph (+ transport).
 2. **Conformance** — replay golden vectors, compare state hashes (the handshake
    gate, §8).
-3. **Dry-run** — `riftpipe simulate <ruleset> <ops>` to debug rules locally.
 
 ---
 
@@ -305,79 +304,6 @@ action-in/state-out seam (§5).
   invariant confluence (parked, §6)
 - Fraser, *Differential Synchronization* (2009) — considered, set aside
 - iroh — https://iroh.computer
-
----
-
-## 13. Concept: CRDT-native tower defense (the eg-walker demo)
-
-**Motivation.** The lockstep TD prototype (`game.rs`/`play.rs`) converges via a
-grow-only *action log* and a deterministic sim — it never uses eg-walker, because
-an append-only log has no mid-sequence edits. This concept instead makes the
-**shared game board a text/sequence document**, so the game IS collaborative text
-editing — and eg-walker becomes the hero of the demo, not infrastructure for a
-different feature.
-
-### Core idea
-The board is a single shared **text document** (a grid of emoji cells, rows
-separated by newlines) replicated by eg-walker. The rendered screen *is* the
-merged document — both players see the same converged board. Two CRDT roles
-(player's framing):
-
-1. **Viewing the screen** — the board grid is one shared sequence; everyone
-   materializes the same text.
-2. **Sharing separate information** — each player *owns a region* of the document
-   and edits only it: their units (specific emoji), their health/gold readout,
-   etc. Concurrent edits land in disjoint regions, so they merge with no
-   interleaving and no conflict.
-
-### Authority model (uses the guard, §6, and ties to per-region permissions)
-- Each cell / HUD field has an **owner**. The guard rejects edits by a non-owner
-  — P1 cannot move P2's units or touch P2's health. This is the "columnar /
-  per-region edit permission" from §6, made concrete and visual.
-- A move = an in-place edit of owned cells (clear old cell, write new cell),
-  recovered by the §3 diff-to-ops and merged by eg-walker.
-- No global deterministic sim and **no lockstep**: the document is the truth.
-  Each client animates its own entities by editing its region in real time; the
-  CRDT converges the views. (This is "local-first multiplayer / per-entity
-  authority.")
-
-### Cross-player interaction (the genuinely hard part — write it down honestly)
-Combat crosses ownership boundaries: P1's unit hits P2's unit, but only P2 may
-write P2's health. Resolution:
-- P1 **cannot** edit P2's region. Instead P1 appends an **effect event**
-  (`{attack, target, dmg}`) to a shared append-only channel; **P2 reads it and
-  applies it to its own region.** Owner-applies-effects keeps authority clean and
-  reuses the event-log engine alongside the text doc. (So the final design uses
-  BOTH engines: eg-walker for the board view, an event log for cross-region
-  effects.)
-
-### Open problems to resolve before building
-1. **Grid ↔ sequence mapping. DECIDED: raw text grid** (not a structured map — a
-   structured cell map is replace-at-fixed-key = LWW, which sidesteps eg-walker's
-   concurrent-insert machinery entirely; the raw grid is what actually exercises
-   it). Constraints that come with the choice: edits must be *same-length in-place
-   replacements* (inserts would shift the grid), and the glyph set must be
-   curated to **single-codepoint, single-width** emoji so `offset = y*(W+1)+x`
-   stays valid (❤️ = heart + variation selector and other multi-codepoint/
-   double-width emoji are banned from cells).
-2. **Combat authority & timing.** The effect-event channel introduces latency
-   (P2 applies damage one round-trip later) and ordering questions. Acceptable on
-   loopback; note it.
-3. **Neutral / shared entities.** Auto-spawned creeps and the path need an owner
-   (assign to the lane's defender? a "system" peer per §9b?).
-4. **Real-time edit cadence & tearing.** Both players rewriting cells every frame
-   = lots of small ops; need to debounce and ensure a half-applied remote frame
-   never renders as garbage.
-5. **Whose render?** Each peer renders the merged doc locally; confirm both
-   converge to the same frame under steady editing (state-hash check).
-
-### Relationship to what's built
-- Keep `game.rs` (deterministic sim + guard + render) as a reusable model and a
-  fallback; the lockstep path stays valid and tested.
-- The CRDT-native path replaces *transport of state* (lockstep) with *the board
-  document itself* (eg-walker) + an effect-event channel. Build **collaborative
-  text pipe first** (proves eg-walker live), then layer the board/ownership/
-  effects on top of it.
 
 ---
 

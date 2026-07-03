@@ -10,10 +10,8 @@
 //!             multi-algorithm seam (syncer/algo/backing — DESIGN.md §17:
 //!             text CRDT + rsync, with file/memory backings)
 //!   monitor/  observability helpers: metrics + the in-memory `process` file
-//!   engine/   the programmable-rules state machine + tower-defense demo
 
 pub mod crdt;
-pub mod engine;
 pub mod kanban;
 pub mod monitor;
 pub mod net;

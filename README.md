@@ -107,10 +107,8 @@ Requires a recent Rust toolchain.
 cargo build --release          # binary at target/release/riftpipe
 cargo test                     # full suite
 
-# offline demos (no networking)
+# offline demo (no networking)
 cargo run -- text              # eg-walker text convergence
-cargo run -- simulate          # deterministic ruled-replay engine
-cargo run -- td                # tower-defense core preview
 
 # two-peer tmux demo: nvim + bridge, live char sync, metrics panes
 ./run-local.sh

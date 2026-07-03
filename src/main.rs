@@ -1,15 +1,10 @@
-//! riftpipe CLI. `simulate` and `text` run offline demos of the core. `share`
-//! and `join` do a real one-shot CRDT exchange over iroh (the live editing loop
-//! arrives with the demo app).
+//! riftpipe CLI. `text` runs an offline demo of the CRDT core. `share` and `join`
+//! do a real one-shot CRDT exchange over iroh; `kanban`, `signal`, and
+//! `webrtc-echo` back the browser stack.
 
 use std::sync::Arc;
 
 use riftpipe::crdt::text::EgWalkerText;
-use riftpipe::engine::identity::AgentId;
-use riftpipe::engine::log::AppendLog;
-use riftpipe::engine::op::{Action, Op, OpId};
-use riftpipe::engine::rules::TwoPlayerTurns;
-use riftpipe::engine::simulation::{Suite, Vector};
 use riftpipe::net::negotiate::{exchange_caps, Caps, Transport};
 use riftpipe::net::secure::{authenticate, Ticket};
 use riftpipe::net::transport::{
@@ -99,9 +94,7 @@ fn process_path(opts: &Opts) -> Option<String> {
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str).unwrap_or("help") {
-        "simulate" => demo_simulation(),
         "text" => demo_text(),
-        "td" => demo_td(),
         "share" => {
             let opts = parse(&args);
             match opts.pos.first().cloned() {
@@ -182,9 +175,7 @@ async fn main() {
         _ => {
             eprintln!("riftpipe — collaborative pipe");
             eprintln!("usage:");
-            eprintln!("  riftpipe simulate            # ruled replay engine demo (offline)");
             eprintln!("  riftpipe text                # eg-walker convergence demo (offline)");
-            eprintln!("  riftpipe td                  # tower-defense core preview (offline)");
             eprintln!("  riftpipe share <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
             eprintln!("  riftpipe join <ticket> <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
             eprintln!("  riftpipe kanban serve <board-dir> [--port 7777] [--dist <spa-dir>]  # serve the kanban UI + JSON file-API");
@@ -329,39 +320,6 @@ async fn live_file_loop(file: &str, link: &mut dyn riftpipe::net::Link) -> riftp
 // Offline demos
 // --------------------------------------------------------------------------
 
-/// Solo scripted preview of the tower-defense sim (no networking) — just to see
-/// the board render and confirm the deterministic core feels alive.
-fn demo_td() {
-    use riftpipe::engine::game::{Action, ActionKind, Player, World};
-
-    let script = [
-        Action { tick: 2, seq: 0, player: Player::P1, kind: ActionKind::PlaceTower { tile: 4 } },
-        Action { tick: 2, seq: 1, player: Player::P2, kind: ActionKind::PlaceTower { tile: 6 } },
-        Action { tick: 6, seq: 2, player: Player::P1, kind: ActionKind::PlaceTower { tile: 8 } },
-        Action { tick: 12, seq: 3, player: Player::P2, kind: ActionKind::SendCreep },
-        Action { tick: 24, seq: 4, player: Player::P1, kind: ActionKind::SendCreep },
-        Action { tick: 24, seq: 5, player: Player::P1, kind: ActionKind::SendCreep },
-    ];
-    let mut sorted = script.to_vec();
-    sorted.sort_by_key(|a| (a.tick, a.seq, a.player as usize));
-
-    let mut w = World::default();
-    let mut idx = 0;
-    println!("riftpipe :: tower-defense core preview (solo, scripted)\n");
-    for frame in 0..=6 {
-        let target = frame * 12;
-        while w.tick < target {
-            while idx < sorted.len() && sorted[idx].tick == w.tick {
-                w.apply(&sorted[idx]);
-                idx += 1;
-            }
-            w.step();
-        }
-        print!("{}", riftpipe::engine::game::render(&w));
-        println!();
-    }
-}
-
 fn demo_text() {
     let mut a = EgWalkerText::new("alice");
     a.edit_to("hello world");
@@ -385,52 +343,3 @@ fn demo_text() {
     );
 }
 
-fn mv(agent: AgentId, seq: u64, lamport: u64, text: &str) -> Op {
-    Op {
-        id: OpId { agent, seq },
-        lamport,
-        parents: vec![],
-        action: Action::Append(format!("{text}\n")),
-    }
-}
-
-fn demo_simulation() {
-    let alice = AgentId::from_name("alice");
-    let bob = AgentId::from_name("bob");
-    let make_rule = || TwoPlayerTurns {
-        first: alice,
-        second: bob,
-    };
-
-    let suite = Suite {
-        vectors: vec![
-            Vector {
-                name: "alternating-turns".into(),
-                events: vec![
-                    mv(alice, 0, 0, "a-move-1"),
-                    mv(bob, 0, 1, "b-move-1"),
-                    mv(alice, 1, 2, "a-move-2"),
-                ],
-                expect_state: "a-move-1\nb-move-1\na-move-2\n".into(),
-                expect_rejected: vec![],
-            },
-            Vector {
-                name: "out-of-turn-rejected".into(),
-                events: vec![
-                    mv(alice, 0, 0, "a"),
-                    mv(bob, 0, 1, "b1"),
-                    mv(bob, 1, 2, "b2"),
-                ],
-                expect_state: "a\nb1\n".into(),
-                expect_rejected: vec![OpId { agent: bob, seq: 1 }],
-            },
-        ],
-    };
-
-    println!("riftpipe :: deterministic replay + guard + simulation\n");
-    for r in suite.run::<AppendLog, _, _>(&make_rule) {
-        println!("  [{}] {}", if r.passed { "PASS" } else { "FAIL" }, r.name);
-    }
-    let h = suite.transcript_hash::<AppendLog, _, _>(&make_rule);
-    println!("\n  handshake transcript hash = {h:#018x}");
-}
