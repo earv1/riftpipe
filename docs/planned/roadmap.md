@@ -44,8 +44,17 @@ sense to do it, not strict priority.
    + the two-browser `run-iroh` flow still passes. (Reconnecting an *already-joined*
    peer after the host reloads is separate — that's live reconnection, below.)
 
-5. **Multi-peer (N-writer)** — today it's 2-peer host/join. Accept multiple peers
-   (host fans out, or a small mesh) so a board can have >2 collaborators.
+5. **Multi-peer (N-writer)** — *done, as a gossip mesh.* A board is an **iroh-gossip
+   topic** (= the host's EndpointId); peers broadcast `SyncMsg`s epidemically and the
+   swarm routes them — no fixed hub, it self-organizes and survives peers leaving.
+   The N-peer-safe origin merge (already built) converges everyone. `web/src/gossip.rs`
+   (`Mesh` + `GossipBoardSync`); the app's `irohConnect` joins the mesh. A `NeighborUp`
+   catches a newcomer up with our full board. **Debug:** `riftpipe.connectedPeers()`
+   (direct neighbors) and `riftpipe.routingMap()` (the gossiped `{id:[neighbors]}`
+   topology). Verified `run-iroh-mesh.sh`: three browsers, all see all cards.
+   *Remaining:* the topology is currently a star when everyone bootstraps off the host;
+   hyparview will add cross-links over time, and gossiping more bootstrap peers would
+   speed mesh healing. LWW (`meta.toml`) still isn't in `full_state` catch-up.
 
 ## Data model / DB
 
