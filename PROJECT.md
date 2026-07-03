@@ -25,7 +25,7 @@ riftpipe.io/.sh available. "Open a rift, pipe through it.")
 
 ## How to build / run
 ```sh
-cargo test                  # full workspace suite (riftpipe + core + kanban-server), 0 warnings
+cargo test                  # full workspace suite (riftpipe + core), 0 warnings
 cargo run -- text           # offline: eg-walker convergence demo
 ./run-local.sh              # two-peer tmux demo: nvim + bridge, live char sync, metrics panes
 ```
@@ -35,8 +35,8 @@ CLI (all generic — no app verbs, see `agent.md`):
 `riftpipe connect <connection-id> <dir> [--signal ws://…]` (tree sync with a
 core-protocol peer, e.g. a browser board) ·
 `riftpipe serve <dir> [--port]` (generic static host + SSE change events) ·
-`riftpipe signal [--port]`. The kanban app server is its own crate:
-`cargo run -p kanban-server -- <board-dir> [--port 7777] [--dist <spa>]`.
+`riftpipe signal [--port]`. The kanban app has **no server** — its API runs
+in-page as wasm; `riftpipe serve` hosts the static bundle.
 
 nvim bridge (session-local, no install):
 ```sh
@@ -67,9 +67,9 @@ src/:
   - `manifest`/`workspace` — riftpipe.toml glob→Kind rules; a folder of resources
 - `monitor/` — metrics (one-line status to a file for tmux; connection-kind detection), process (the in-memory `process` sidecar: size+hash for all RAM resources, §17.6)
 - `app/`   — generic runnables: host (static dir hosting + SSE change events —
-  `riftpipe serve`, also consumed as a library by app servers) and signal
-  (WebSocket signaling relay). App servers live outside the binary: the kanban
-  server is `projects/kanban/server-rs` (crate `kanban-server`, workspace member).
+  `riftpipe serve`, also consumable as a library) and signal (WebSocket
+  signaling relay). No app servers anywhere: the kanban app's API is the wasm
+  payload in the page.
 
 ## What's done
 - **Folder sync — CLI-wired (DESIGN §17, local on `main`):** `share <dir>` /
@@ -99,9 +99,11 @@ src/:
   + lock-across-await fixed, blake3 `seen` map, degrade-to-poll, first tests
   over mock halves); negotiation consolidated (`NegotiatedSession` /
   `negotiate_link`, one policy, the binary's divergent copy deleted); **kanban
-  fully extracted from the binary** (server → `projects/kanban/server-rs`,
-  generic `connect`/`serve` verbs, `app::host`); `docs/architecture.md` with
-  validated mermaid diagrams; `agent.md` with the durable working rules.
+  fully extracted from the binary** (generic `connect`/`serve` verbs,
+  `app::host`) and then **all kanban servers removed** (Deno + the brief
+  `kanban-server` crate) — the wasm payload is the backend;
+  `docs/architecture.md` with validated mermaid diagrams; `agent.md` with the
+  durable working rules.
 
 ## Planned (design docs)
 - **P2P kanban — files as the database** — see [`docs/planned/`](docs/planned/).
@@ -111,9 +113,9 @@ src/:
   comments → text-crdt; `meta.toml`/attachments → rsync). Ticket folders are
   **stable**; column (incl. `archived`) is a **field** in `meta.toml` (path = sync
   identity, so cards don't move between folders). The app composes with generic
-  riftpipe verbs (`riftpipe connect`, `riftpipe serve`) — its server is the
-  separate `kanban-server` crate; vim plugin + any markdown editor are
-  interchangeable views. **No new sync engine, no native deps** — mostly wiring
+  riftpipe verbs (`riftpipe connect`, `riftpipe serve`) — there is no server,
+  the wasm payload handles the API in-page; vim plugin + any markdown editor
+  are interchangeable views. **No new sync engine, no native deps** — mostly wiring
   + UI. SQLite/cr-sqlite was considered and set aside (see
   `docs/planned/db-sync.md`).
 

@@ -41,5 +41,5 @@ path = "src/main.rs"
 # verified separately via `wasm-pack test --headless`. Excluded so it never enters
 # the native build/test.
 [workspace]
-members = ["core", "projects/kanban/server-rs"]
+members = ["core"]
 exclude = ["web"]

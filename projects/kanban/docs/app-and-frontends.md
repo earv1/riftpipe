@@ -1,24 +1,23 @@
 # Planned: the kanban app & frontends
 
-**Status:** the **Serve** layer (HTTP file-API + static UI host) is **implemented
-in Rust** as its **own crate** — `kanban-server <board-dir> [--port 7777]
-[--dist <spa-dir>]` ([`../server-rs/`](../server-rs/), `tiny_http`, built on
-riftpipe's generic `app::host` for static+SSE). It ports the Deno reference
-server route-for-route (`/api/board`, `/api/cards/:id[/detail]`, POST
-`/api/cards`, PATCH `/api/cards/:id`, POST `/api/cards/:id/comments`, SSE
-`/api/events`), serves the built SolidJS SPA, and reads/writes the same on-disk
-model. Per the generic-core principle (`agent.md`), the riftpipe **binary has no
-kanban verbs** — the app composes with generic ones. **Remaining:** run sync +
-serve as one supervised pair (today: two processes), and **Bundle** the SPA via
-`include_str!` (today it's served from `--dist`).
+**Status:** the serve layer is **gone — superseded by the wasm payload.** The
+JSON API (`/api/board`, `/api/cards/:id[/detail]`, POST `/api/cards`, PATCH
+`/api/cards/:id`, POST `/api/cards/:id/comments`) is handled **in-page** by
+`kanbanHandle` (the Rust handler compiled to wasm, over OPFS); the UI ships as
+a static bundle. Two server implementations existed along the way (the Deno
+reference `server/main.ts`, then a Rust `kanban-server` crate) — both removed
+once the browser path made them redundant. Per the generic-core principle
+(`agent.md`), the riftpipe **binary has no kanban verbs**; the app composes
+with generic ones.
 
 ## Commands
 
 ```
-kanban-server <board-dir> [--port 7777] [--dist <spa>]   # the app server (this project)
-riftpipe share <board-dir>            # sync side, prints a ticket   (folder mode)
-riftpipe join <ticket> <board-dir>    # …or join a shared board      (folder mode)
-riftpipe connect <conn-id> <board-dir> [--signal ws://…] # sync with a browser peer
+deno task build                          # static bundle (incl. wasm) -> dist/
+riftpipe serve ./dist [--port 8080]      # host the bundle (or Pages / any static host)
+riftpipe connect <conn-id> <board-dir>   # sync a browser board to real files
+riftpipe share <board-dir>               # …or folder-mode between machines
+riftpipe join <ticket> <board-dir>
 ```
 
 One process does three things:

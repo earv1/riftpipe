@@ -85,9 +85,9 @@ sense to do it, not strict priority.
 ## Architecture / hygiene (from the July 2026 review + restructure)
 
 The restructure made the native binary fully generic (verbs: `share · join ·
-connect · serve · signal`; kanban's server lives in
-`projects/kanban/server-rs`, the tree-sync driver is `sync::tree`, generic
-static+SSE hosting is `app::host`). What remains:
+connect · serve · signal`; the tree-sync driver is `sync::tree`, generic
+static+SSE hosting is `app::host`), and the kanban servers were then removed
+entirely — the wasm payload is the app's backend. What remains:
 
 8. **Get kanban out of the riftpipe crates entirely** — `riftpipe_core::kanban`
    (the board file format) and the kanban handler inside `web/` still violate

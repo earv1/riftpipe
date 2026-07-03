@@ -4,9 +4,11 @@ The authoritative planning doc for the **riftpipe kanban** project (this is a
 *separate* project from the riftpipe core — SolidJS UI over a file-backed
 board, deployed as an **in-browser wasm app**; made collaborative by riftpipe).
 It composes with riftpipe purely through the filesystem (OPFS in the browser).
-The riftpipe binary has **no kanban code** (see `agent.md`): the app's native
-server is the co-located [`server-rs/`](../server-rs/) crate (`kanban-server`),
-and sync uses the generic verbs (`riftpipe connect` / `share` / `join`).
+There is **no server** — the wasm payload handles the API in-page — and the
+riftpipe binary has **no kanban code** (see `agent.md`): native machines use
+the generic verbs (`riftpipe connect` / `share` / `join` / `serve`). The
+earlier Deno reference server and the short-lived Rust `kanban-server` have
+both been removed.
 
 Companion design docs (co-located here):
 
@@ -30,12 +32,14 @@ A working vertical slice over a board *directory* (no SQLite, no new sync engine
 - **Board** with columns, add-card, drag-to-column, toggle done.
 - **Ticket detail drawer:** live (debounce-free) title + description editing with
   clobber-safety; comments (one file each under `comments/`, conflict-free).
-- **Per-peer append-only change-event log** (`events/<site>.jsonl`) + `GET
-  /api/history` (one file per peer → merges with zero conflicts).
-- **Realtime:** `Deno.watchFs` → SSE → Solid store + reconcile (only the changed
-  card re-renders).
-- **Two-peer demo:** `./run-demo.sh` (two kanban servers over two boards kept in
-  sync by riftpipe).
+- **Per-peer append-only change-event log** design (`events/<site>.jsonl`, one
+  file per peer → merges with zero conflicts). *Currently writer-less — it
+  lived in the removed servers; moving into the wasm handler is TODO below.*
+- **Realtime:** in-page — mutations go straight to the Solid store; remote
+  merges arrive via the sync layer's `on_merged` and reconcile (only the
+  changed card re-renders).
+- **Demos:** two/three-browser e2e flows over iroh + the gossip mesh
+  (`e2e/run-iroh*.sh`).
 
 The board is just files: `board.md` + `tickets/<id>/{card.md, meta.toml,
 comments/*.md, attachments/*}` + `events/<site>.jsonl`. Prose (`card.md`,
@@ -95,12 +99,12 @@ Roughly priority order. Most of this is *wiring and UI*, not new sync code.
   edits to *different* fields of the *same* card both survive. Whole-file rsync
   today loses one (rare). Lives in the riftpipe core, not the app. See
   [`data-model.md`](data-model.md#future-nicety-an-lww-record-syncer).
-- **Retire Deno** — everything runs in the browser now, so the Deno server is a
-  legacy reference: port `run-demo.sh` (and any e2e that still hits it) onto
-  `kanban-server`, then delete `server/main.ts`; bundle the built SPA + wasm as
-  the one deployable artifact (and `include_bytes!` it into `kanban-server` so
-  the native path is a single binary too). Vite-via-Deno can stay as build
-  tooling until the bundle step replaces it.
+- **Servers removed — finish the follow-through.** `server/main.ts` (Deno),
+  `server-rs/` (Rust), and `run-demo.sh` are gone; the wasm payload is the
+  backend. Remaining: (a) the **change-event log** (`events/<site>.jsonl`) was
+  written by the servers — move it into the wasm handler so history survives
+  serverless; (b) Vite-via-Deno remains as *build tooling only* — swap to
+  plain npm/vite (or keep, it's contained) when convenient.
 - **Own the kanban code riftpipe still carries** — `riftpipe_core::kanban` (the
   format parser) and the kanban handler in `web/` belong to this project, not
   the riftpipe crates. Blocked on the wasm-crate split (roadmap §"Architecture

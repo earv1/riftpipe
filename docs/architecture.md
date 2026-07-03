@@ -8,7 +8,7 @@
 
 ```
 riftpipe/
-  Cargo.toml            root package + workspace [core, kanban-server], exclude [web]
+  Cargo.toml            root package (native binary) + workspace [core], exclude [web]
   core/                 riftpipe-core — pure, wasm-safe, the single source of truth
   src/                  the native `riftpipe` binary (lib + main) — generic verbs only:
                         share · join · connect · serve · signal
@@ -21,8 +21,8 @@ riftpipe/
     monitor/            metrics + in-memory `process` sidecar
     app/                generic runnables: host (static + SSE), signal relay
   web/                  riftpipe-web — wasm crate (workspace-excluded, own lockfile)
-  projects/kanban/      the showcase app: SolidJS UI + kanban-server (server-rs/,
-                        Rust) + Deno reference server + e2e harness + seed board
+  projects/kanban/      the showcase app: SolidJS UI over the in-page wasm API
+                        (no server) + e2e harness + seed board
   nvim/                 Neovim bridge (session-local lua)
   tests/                native integration tests (mock, real iroh, full stack)
   deploy/               fly.io signaling server (legacy/fallback transport)
@@ -38,14 +38,12 @@ The two platform crates only add transport + storage; the UIs only render.
 ```mermaid
 flowchart LR
     ED["editors & scripts<br/>(stdio JSON)"] --> CLI
-    UI["SolidJS board UI"] --> WEB
-    KS["kanban-server (app crate)<br/>projects/kanban/server-rs"] --> CLI
+    UI["SolidJS board UI<br/>(static bundle — no server)"] --> WEB
     CLI["riftpipe (native)<br/>src/ — generic verbs, iroh/WebRTC,<br/>folder & tree sync, host/signal"]
-    WEB["riftpipe-web (wasm)<br/>web/ — OPFS, iroh relay,<br/>gossip mesh, board API"]
+    WEB["riftpipe-web (wasm)<br/>web/ — OPFS, iroh relay,<br/>gossip mesh, board API in-page"]
     CLI <-. "iroh QUIC · WebRTC" .-> WEB
     CLI --> CORE
     WEB --> CORE
-    KS --> CORE
     CORE["riftpipe-core (pure)<br/>eg-walker CRDT · sync protocol ·<br/>kanban file format* · WAL frames"]
 ```
 
@@ -82,9 +80,9 @@ Why the seams hold:
   still exist (folder framing vs `SyncMsg`) — that's the remaining
   consolidation candidate, now side-by-side in one module.
 - **`app` is generic.** `host` serves a static dir + SSE change events (the
-  `serve` verb; app servers like kanban-server consume it as a library);
-  `signal` relays SDP blobs. `connect` dials a link and hands the halves to
-  `sync::tree::run`. No app nouns anywhere in the binary.
+  `serve` verb, also consumable as a library); `signal` relays SDP blobs.
+  `connect` dials a link and hands the halves to `sync::tree::run`. No app
+  nouns anywhere in the binary.
 
 ## The two flagship data paths
 
@@ -242,9 +240,11 @@ Fixed in the July 2026 restructure + review series:
   binary's duplicate negotiation orchestration is gone (`NegotiatedSession` /
   `negotiate_link`, one policy).
 - ~~`net` depended on the CRDT~~ — `sync_full` moved from `net/link.rs` to `sync/`.
-- ~~Kanban code in the binary~~ — the serve layer is the `kanban-server` crate
-  (`projects/kanban/server-rs`, on generic `app::host`); the sync driver is the
-  app-neutral `sync::tree` behind `riftpipe connect`; verbs are all generic.
+- ~~Kanban code in the binary~~ — the sync driver is the app-neutral
+  `sync::tree` behind `riftpipe connect`; static hosting is generic
+  `app::host`; verbs are all generic. The kanban servers themselves (Deno
+  reference, then a brief `kanban-server` crate) were subsequently **removed
+  entirely** — the wasm payload is the backend.
 - ~~Board-sync correctness debt~~ — dotfile leak (`.site`) fixed both
   directions; guard-across-await + triple Arc/Mutex replaced by one select!
   loop with caller-owned `TreePeer`; unbounded echo map → blake3 `seen`;
@@ -262,5 +262,5 @@ Still open (tracked in `docs/planned/roadmap.md` §Architecture / hygiene):
 - **`web/` is workspace-excluded** with a git-ignored `Cargo.lock` — dependency
   graphs can silently skew on wire-critical deps.
 - **Two deploy stories** — Pages ships the iroh app; `deploy/` + workflow vars
-  still treat the signaling server as first-class. The Deno reference server is
-  also slated for retirement (browser wasm bundle is the runtime).
+  still treat the signaling server as first-class. (The kanban servers
+  themselves are gone — the wasm payload is the backend.)

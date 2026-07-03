@@ -1,24 +1,22 @@
 # riftpipe kanban
 
 A super-simple, file-backed kanban board. **SolidJS + Vite** frontend over a
-tiny JSON file-API. The API has **three interchangeable backends**, all speaking
-the same endpoints over the same board *directory* format:
+tiny JSON file-API — and **there is no server**: `src/api.ts` calls
+`kanbanHandle` from [`web/pkg`](../../web/), the Rust kanban handler compiled
+to WebAssembly, running in the page. The board lives in the browser's private
+filesystem (OPFS); peers sync directly over iroh / the gossip mesh. The app is
+a static bundle plus a wasm payload.
 
-1. **In-browser wasm (the deployed default)** — `src/api.ts` calls
-   `kanbanHandle` from [`web/pkg`](../../web/), the Rust kanban handler compiled
-   to WebAssembly. The board lives in the browser's private filesystem (OPFS);
-   peers sync directly over iroh / the gossip mesh. No server at all.
-2. **Native Rust** — `kanban-server ./board` ([`server-rs/`](server-rs/), its own
-   crate), tiny_http + SSE over a real directory, built on riftpipe's generic
-   `app::host` (static + SSE) — the riftpipe binary itself has no kanban code.
-3. **Deno reference server** — [`server/main.ts`](server/main.ts), the original
-   implementation the other two were ported from. Kept as the readable spec,
-   slated for retirement (see [`docs/planned.md`](docs/planned.md)) — the
-   browser wasm bundle is the deployed runtime.
+Native machines participate through riftpipe's **generic verbs** (the binary
+has no kanban code):
 
-The file-backed backends have no idea riftpipe exists: point
-[riftpipe](../../) at the board directory and the board becomes live,
-peer-to-peer, end-to-end-encrypted, with zero changes here.
+- `riftpipe connect <connection-id> ./board` — sync a browser peer's board
+  into a real on-disk directory (edit `card.md` in vim, it converges);
+- `riftpipe serve ./dist` — statically host the built app (or any dir) with
+  live SSE change events.
+
+(Earlier server implementations — a Deno reference server and a Rust
+`kanban-server` — have been removed: the wasm payload *is* the backend.)
 
 > This is a **separate project** from the riftpipe core (different stack, own
 > tooling). They compose through the filesystem (or OPFS in the browser).
@@ -43,9 +41,10 @@ board/
 Every mutation appends a line to `events/<site>.jsonl`. The trick: each replica
 writes its **own** file (named by a per-machine site id in `.site`, a dotfile
 riftpipe skips), so two peers never touch the same file — the log merges across
-machines with **zero conflicts**. `GET /api/history` merges every
-`events/*.jsonl` and sorts by time. Board files stay the source of truth; this is
-a purely additive trail to build history/undo on later.
+machines with **zero conflicts**. Board files stay the source of truth; this is
+a purely additive trail to build history/undo on later. *(The retired servers
+wrote this log; moving it into the wasm handler is tracked in
+[`docs/planned.md`](docs/planned.md).)*
 
 Why split prose (`card.md`) from structure (`meta.toml`): they sync differently
 under riftpipe — prose merges (text CRDT), scalars are last-writer-wins (rsync).
@@ -54,52 +53,36 @@ See the planning & design docs in [`docs/`](docs/planned.md).
 ## Run it
 
 ```sh
-# terminal 1 — the file API server (watches the board dir)
-deno task api
-
-# terminal 2 — the Vite dev server (HMR), proxies /api -> :8000
+# build the wasm payload once (from web/), then the UI dev server
+(cd ../../web && wasm-pack build --target web)
 deno task dev
-# open the URL Vite prints (http://localhost:5173)
+# open the URL Vite prints (http://localhost:5173) — the API runs in-page
 ```
 
-Production-style (single process serving the built UI + API):
+Production-style (a static bundle — host it anywhere):
 ```sh
-deno task build      # vite build -> dist/
-deno task serve      # Deno serves dist/ + /api on :8000
+deno task build                    # vite build -> dist/ (bundles the wasm)
+riftpipe serve ./dist              # …or any static host / GitHub Pages
 ```
 
-Point at a different board dir with `KANBAN_DIR=/path/to/board`, and pick the
-port with `KANBAN_PORT=8001`.
+## Two-browser demo
 
-## Two-peer demo (one command)
+Open the app, share the link in the header (it carries the iroh ticket), and
+open it in a second browser/machine — both converge over the gossip mesh, no
+server anywhere. Scripted versions live in [`e2e/`](e2e/)
+(`run-iroh.sh`, `run-iroh-mesh.sh` for three browsers).
 
-```sh
-./run-demo.sh
-```
-Builds the UI, spins up **two** kanban servers over two boards kept in sync by
-riftpipe, and opens a browser window each:
-
-- peer A → http://localhost:8000
-- peer B → http://localhost:8001
-
-Edit a card in one window and watch it appear in the other. Peer B starts empty
-and fills in once the peers connect (a few seconds). Ctrl-C stops everything.
-
-- `KANBAN_BROWSER=none ./run-demo.sh` — skip auto-opening; instead use VS Code's
-  **Command Palette → "Simple Browser: Show"** with each URL (or the Ports panel
-  preview) to keep both boards inside the editor.
-
-## Make it collaborative (manually)
+## Bring it to disk (vim, scripts, native tools)
 
 ```sh
-# machine A
-riftpipe share ./board && KANBAN_DIR=./board deno task serve
-# machine B
-riftpipe join <ticket> ./board && KANBAN_DIR=./board KANBAN_PORT=8001 deno task serve
+riftpipe connect <connection-id> ./board   # the board materializes as files
+$EDITOR board/tickets/<id>/card.md         # edit; it converges back to the browser
 ```
-Both run the kanban over their local `board/`; riftpipe keeps the files converged.
+`riftpipe share ./board` / `join <ticket> ./board` similarly keep two on-disk
+copies converged (folder mode) — the board is just files either way.
 
 ## Status
-Vertical slice: columns, add card, move (←/→), toggle done, live refresh, and a
-per-peer change-event log (`/api/history`). Drag-and-drop, a card detail panel,
-comments, attachments, and a history view are next.
+Vertical slice: columns, add card, move (←/→), toggle done, live refresh —
+running fully in-browser (wasm + OPFS + gossip mesh), deployed on GitHub Pages.
+Drag-and-drop, comments UI, attachments, and a history view are next
+([`docs/planned.md`](docs/planned.md)).
