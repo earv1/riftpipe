@@ -66,8 +66,12 @@ sense to do it, not strict priority.
   browsers each with their own card connect over iroh and both see both. Converges
   for N peers (`three_independent_boards_converge`). *Remaining nits:* primed
   `meta.toml` (LWW) uses wall-clock now() so a same-card meta conflict is racy
-  (cards rarely collide); and pasting a share link into a **solo tab** doesn't
-  reconnect (hash-only change ≠ reload — the app should react to `hashchange`).
+  (cards rarely collide); and pasting a share link into a **solo tab** reconnects
+  best-effort via a `hashchange` listener, but if that tab was a *solo host* the
+  old accept loop still holds a clone of the endpoint, so the same-key rebind
+  doesn't cleanly succeed — opening the link fresh (new tab / reload) works. A
+  clean in-tab reconnect needs proper session teardown (abortable accept loop +
+  drop the old endpoint), which ties into **live reconnection**.
 
 ## Smaller
 

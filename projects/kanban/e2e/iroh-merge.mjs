@@ -38,9 +38,9 @@ try {
   await b.waitForSelector(`text=${titleB}`, { timeout: 10000 });
   console.log(`B made ${titleB} while solo`);
 
-  // B opens A's link fresh (a hash-only goto is same-document — no reload — so
-  // force a full load, as a user pasting the link into a new tab would get). Same
-  // context keeps card-B in OPFS + B's identity in localStorage.
+  // B opens A's link fresh (a new tab / reload — the common case, and a clean
+  // teardown of B's solo session). Same context keeps card-B in OPFS + B's
+  // identity in localStorage.
   await b.goto(base + "#" + ticket, { waitUntil: "load" });
   await b.reload({ waitUntil: "load" });
   await b.waitForSelector(".add-card input", { timeout: 20000 });

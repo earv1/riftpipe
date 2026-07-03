@@ -34,16 +34,28 @@ export function App() {
   onMount(() => {
     // A local mutation (our own add/move/edit) refreshes the board too — no SSE.
     onLocalChange(() => void refresh());
-    (async () => {
-      await refresh();
-      // If the URL carries a connection id, connect P2P (WebRTC) and refresh on
-      // each peer edit merged into local OPFS. No id => single-player, no server.
+
+    // Connect P2P when the URL carries a connection id / ticket; refresh on each
+    // peer edit merged into local OPFS. No id => single-player, no server.
+    let lastHash: string | null = null; // null => never connected (empty hash is valid)
+    const connect = async () => {
+      if (location.hash === lastHash) return; // e.g. the host writing its own ticket
+      lastHash = location.hash;
       try {
         await connectPeer(() => void refresh());
       } catch (_e) {
         // no peer / signaling unavailable — runs fine solo
       }
+      lastHash = location.hash; // a host may have just set the hash; don't re-trigger
+    };
+
+    (async () => {
+      await refresh();
+      await connect();
     })();
+
+    // Pasting a share link into this tab changes the hash — reconnect to it.
+    window.addEventListener("hashchange", () => void connect());
   });
 
   const cardsIn = (col: string): Card[] =>
