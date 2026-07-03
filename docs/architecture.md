@@ -176,6 +176,60 @@ the same board with the generic `riftpipe connect <id> <dir>`, whose
 `sync::tree` driver speaks the identical protocol against a real directory —
 the binary never knows it's a kanban board.
 
+## One bridge pattern, two dialects (vim vs wasm)
+
+The native editor path and the browser path are the **same four layers**: a
+dumb frontend, a thin glue file, the riftpipe engine owning everything hard,
+and files as truth. The only real difference is the wire dialect the glue
+speaks — JSON lines on stdio for the terminal world, a fetch-shaped JSON API
+for the web — because each is what that world's developers already know. The
+frontend never sees a CRDT, a version vector, or a socket in either column.
+
+```mermaid
+flowchart TB
+    subgraph NATIVE["native — the vim path"]
+        direction TB
+        NV["nvim — dumb frontend<br/>(edits a buffer, nothing else)"]
+        NB["riftpipe.lua — thin glue, ~130 lines<br/>(dump buffer · apply small ops · don't echo)"]
+        NP["riftpipe --pipe — the engine<br/>diff · CRDT · versions · encrypt · reconnect"]
+        NF[("files on disk")]
+        NV --- NB
+        NB -->|"JSON lines on stdio<br/>(document ops)"| NP
+        NP --- NF
+    end
+    subgraph BROWSER["browser — the wasm path"]
+        direction TB
+        WU["SolidJS UI — dumb frontend<br/>(renders state, nothing else)"]
+        WA["api.ts — thin glue<br/>(a fetch shim over the wasm handler)"]
+        WW["riftpipe-web wasm — the engine, in-page<br/>same Syncer · CRDT · gossip · persistence"]
+        WF[("OPFS files")]
+        WU --- WA
+        WA -->|"JSON API<br/>(GET/POST /api/… — resource-shaped)"| WW
+        WW --- WF
+    end
+    NP <-->|"one wire protocol — iroh QUIC · WebRTC · gossip"| WW
+    CORE["riftpipe-core — literally the same crate on both sides<br/>eg-walker CRDT · sync protocol · file format"]
+    NP --> CORE
+    WW --> CORE
+```
+
+Layer-by-layer, the correspondence is exact:
+
+| concept              | vim path                          | wasm path                          |
+|----------------------|-----------------------------------|------------------------------------|
+| dumb frontend        | nvim buffer                       | SolidJS store/UI                   |
+| thin glue            | `nvim/riftpipe.lua`               | `projects/kanban/src/api.ts`       |
+| glue's dialect       | JSON lines on stdio (document ops)| fetch-style JSON API (resources)   |
+| the engine           | `riftpipe --pipe` process         | `riftpipe-web` wasm in the page    |
+| where files live     | the real filesystem               | OPFS (the browser's private fs)    |
+| merge/versions/wire  | `riftpipe-core`                   | `riftpipe-core` (same crate)       |
+
+The dialects sit at different altitudes on purpose: an editor's natural unit
+is *document edits*, so the pipe carries ops against one text; a web UI's
+natural unit is *resources*, so the API carries cards and comments and the
+engine decomposes them into per-file CRDT/LWW sync underneath. Same
+architecture, each world addressed in its own idiom.
+
 ## Known seams & wrinkles
 
 Fixed in the July 2026 restructure + review series:
