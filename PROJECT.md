@@ -16,8 +16,8 @@ riftpipe.io/.sh available. "Open a rift, pipe through it.")
 
 ## Repo / branch state
 - GitHub: **https://github.com/earv1/riftpipe** (public).
-- **PR #1 (`event-driven-pipe`) merged into `main`** (fast-forward). Now working
-  **locally on `main`** — uncommitted folder-sync scaffolding lives in the tree.
+- Current work: branch **`serverless-browser-kanban`** — browser kanban over the
+  gossip mesh, plus the July 2026 restructure/review series (see `What's done`).
 - **Guardrail:** a hook blocks committing/pushing to `main` (and any command
   containing the word "main") — the user pushes branches and merges PRs. Claude
   does not commit on `main`; current work is left in the working tree.
@@ -25,12 +25,18 @@ riftpipe.io/.sh available. "Open a rift, pipe through it.")
 
 ## How to build / run
 ```sh
-cargo test                  # full suite (currently 21 passing, 0 warnings)
+cargo test                  # full workspace suite (riftpipe + core + kanban-server), 0 warnings
 cargo run -- text           # offline: eg-walker convergence demo
 ./run-local.sh              # two-peer tmux demo: nvim + bridge, live char sync, metrics panes
 ```
-CLI: `riftpipe share <file> [--pipe] [--metrics <path>]` /
-`riftpipe join <ticket> <file> [--pipe] [--metrics <path>]`.
+CLI (all generic — no app verbs, see `agent.md`):
+`riftpipe share <file|dir> [--pipe] [--metrics <path>]` ·
+`riftpipe join <ticket> <file|dir> [--pipe]` ·
+`riftpipe connect <connection-id> <dir> [--signal ws://…]` (tree sync with a
+core-protocol peer, e.g. a browser board) ·
+`riftpipe serve <dir> [--port]` (generic static host + SSE change events) ·
+`riftpipe signal [--port]`. The kanban app server is its own crate:
+`cargo run -p kanban-server -- <board-dir> [--port 7777] [--dist <spa>]`.
 
 nvim bridge (session-local, no install):
 ```sh
@@ -51,8 +57,8 @@ src/:
   diamond-types): diff-to-ops, delta encode/merge, version vectors
 - `sync/`  — sync_full (the shared full-state driver), pipe (the `--pipe`
   protocol: event-driven session, reconciliation, reconnection), mirror
-  (file-mirror loop), folder (multiplexed reconnecting folder session), board
-  (the riftpipe_core::sync board driver — wire-compatible with browser peers)
+  (file-mirror loop), folder (multiplexed reconnecting folder session), tree
+  (the riftpipe_core::sync file-tree driver — wire-compatible with browser peers)
   - `strategy` — the `SyncStrategy` adapter trait + `Kind` (the Strategy seam, DESIGN §17)
   - `algo/`  — concrete algorithms: text_crdt (real), rsync (real), wal/image
     (adapter stubs; wal's core primitive is `riftpipe_core::wal`), sqlite
@@ -60,9 +66,10 @@ src/:
   - `backing` — where bytes live: FileBacking vs MemoryBacking + MemoryRegistry (§17.5)
   - `manifest`/`workspace` — riftpipe.toml glob→Kind rules; a folder of resources
 - `monitor/` — metrics (one-line status to a file for tmux; connection-kind detection), process (the in-memory `process` sidecar: size+hash for all RAM resources, §17.6)
-- `app/`   — runnable servers on top of the plumbing: kanban (serve = HTTP/SSE
-  board server; connect = dial WebRTC + hand off to sync/board) and signal
-  (WebSocket signaling relay)
+- `app/`   — generic runnables: host (static dir hosting + SSE change events —
+  `riftpipe serve`, also consumed as a library by app servers) and signal
+  (WebSocket signaling relay). App servers live outside the binary: the kanban
+  server is `projects/kanban/server-rs` (crate `kanban-server`, workspace member).
 
 ## What's done
 - **Folder sync — CLI-wired (DESIGN §17, local on `main`):** `share <dir>` /
@@ -85,6 +92,16 @@ src/:
   stdin/stdout, re-dial with backoff, on-connect SYNC reconciles. QUIC liveness
   tuned (keep-alive 2s, idle 6s) for fast drop detection. (DESIGN.md §16)
 - Module reorg, `.luarc.json` (silences nvim `vim` global errors), rename.
+- **July 2026 restructure + review series** (this branch): `app/` split from
+  plumbing; transport-blind drivers via `net::{Sink, Source}`; `SyncStrategy`
+  rename (no more `Syncer` collision with `riftpipe_core::sync::Syncer`); board
+  sync rewritten as the generic `sync::tree` select!-loop driver (dotfile leak
+  + lock-across-await fixed, blake3 `seen` map, degrade-to-poll, first tests
+  over mock halves); negotiation consolidated (`NegotiatedSession` /
+  `negotiate_link`, one policy, the binary's divergent copy deleted); **kanban
+  fully extracted from the binary** (server → `projects/kanban/server-rs`,
+  generic `connect`/`serve` verbs, `app::host`); `docs/architecture.md` with
+  validated mermaid diagrams; `agent.md` with the durable working rules.
 
 ## Planned (design docs)
 - **P2P kanban — files as the database** — see [`docs/planned/`](docs/planned/).
@@ -93,10 +110,11 @@ src/:
   attachments/*}`. Each file gets the right `SyncStrategy` via the manifest (card/
   comments → text-crdt; `meta.toml`/attachments → rsync). Ticket folders are
   **stable**; column (incl. `archived`) is a **field** in `meta.toml` (path = sync
-  identity, so cards don't move between folders). riftpipe is the wrapper
-  (`kanban serve`/`connect`) serving a bundled web UI; vim plugin + any markdown
-  editor are interchangeable views. **No new sync engine, no native deps** —
-  mostly wiring + UI. SQLite/cr-sqlite was considered and set aside (see
+  identity, so cards don't move between folders). The app composes with generic
+  riftpipe verbs (`riftpipe connect`, `riftpipe serve`) — its server is the
+  separate `kanban-server` crate; vim plugin + any markdown editor are
+  interchangeable views. **No new sync engine, no native deps** — mostly wiring
+  + UI. SQLite/cr-sqlite was considered and set aside (see
   `docs/planned/db-sync.md`).
 
 ## TODO / next steps (rough priority)
@@ -113,6 +131,11 @@ Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
 5. Robustness: rsync v1 caveat (Copy references advertiser's blocks — stale-basis
    reconstruction is rejected by hash + retried; consider basis-pinning); folder
    deletes aren't synced yet (only creates/edits).
+6. **Architecture/hygiene backlog** — see `docs/planned/roadmap.md` §"Architecture
+   / hygiene": get kanban out of `riftpipe-core`/`web/` (wasm crate split), one
+   wire protocol (folder vs tree), `connect` over iroh + negotiation, track
+   `web/Cargo.lock`, retire the signaling deploy path, de-flake the real-relay
+   test.
 Older/parallel: file-mirror reconnection;
 verify connect-anywhere on real networks (§14.1); domain + landing.
 

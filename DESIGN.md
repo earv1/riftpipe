@@ -264,9 +264,9 @@ action-in/state-out seam (§5).
 
 - **`src/text.rs`** — real eg-walker text doc (diamond-types): snapshot
   diff-to-ops input (§3), encode/merge sync, proven concurrent convergence.
-- **`src/net.rs`** — transport-agnostic `Link` seam + `sync_full` driver +
-  in-memory mock transports (`mock_pair`, `MockNet` broadcast bus). The same
-  driver runs over mock and real links — this is what makes integration tests
+- **`src/net/`** — transport-agnostic `Link` seam + in-memory mock transports
+  (`mock_pair`, `MockNet` broadcast bus). The shared `sync::sync_full` driver
+  runs over mock and real links alike — this is what makes integration tests
   cheap.
 - **`src/transport.rs`** — real **iroh 1.0** `Link` (QUIC bi-stream, length
   framing, graceful `done()` teardown — note: must `finish()` the stream or the
@@ -392,8 +392,8 @@ other editors (vscode, emacs, helix) get their own bridge without touching core.
     and wired into every handshake** (`--pipe`, folder, file-mirror).
   - WebRTC data-plane `Link` + iroh-brokered non-trickle signaling
     (`net::webrtc`, `webrtc-rs`) — **implemented**.
-  - **Session runs over the negotiated `Link`** (`PipeSink`/`PipeSource` halves for
-    both iroh and WebRTC; `sync::pipe::negotiate_session_halves`), and
+  - **Session runs over the negotiated `Link`** (`net::{Sink, Source}` halves for
+    both iroh and WebRTC; `net::negotiate::negotiate_session_halves`), and
     `Caps::native` advertises `WebrtcDirect` — so **native↔native now upgrades to a
     WebRTC data channel end-to-end**, with the iroh link kept alive as
     control/fallback and a transparent fall-back to iroh on upgrade failure.
@@ -537,8 +537,8 @@ opaque delta* (`merge`), plus an eager push path (`observe`/`push_delta`) for
 algorithms that can. It deliberately avoids a snapshot-in/out shape, which would
 distort non-snapshot algorithms (a WAL tails records; rsync negotiates via block
 checksums). All payloads are opaque bytes, so a new algorithm is one `impl
-Syncer`, nothing else. It is object-safe so heterogeneous resources can share one
-link in a `HashMap<ResourceId, Box<dyn Syncer>>`.
+SyncStrategy`, nothing else. It is object-safe so heterogeneous resources can
+share one link in a `HashMap<ResourceId, Box<dyn SyncStrategy>>`.
 
 `Kind`: `text-crdt` (done) · `rsync-file` (done) · `wal-db` (stub) · `image`
 (stub). Stubs `todo!()` their sync methods so a misconfigured manifest fails
@@ -570,7 +570,7 @@ retries. (Correct, occasionally one round slower.)
 
 ### 17.5 Backings — file vs. in-memory (coexist)
 
-A `Syncer` only sees `&[u8]`; *where those bytes live* is a separate seam
+A `SyncStrategy` only sees `&[u8]`; *where those bytes live* is a separate seam
 (`sync::backing::Backing`): `FileBacking` (mirror a path, today's behavior) or
 `MemoryBacking` (hold bytes in RAM, never touch disk). The two coexist — chosen
 per run, and later per-resource in the manifest. In-memory resources register
@@ -599,7 +599,7 @@ something else reads it.
 - **Manifest** (`sync::manifest`) — `riftpipe.toml` at the dir root (or
   `--manifest`), glob → `Kind`. First match wins, else `default` (rsync).
 - **Workspace** (`sync::workspace`) — scans the tree (skips dotfiles, the
-  manifest, `.ticket`s), binds each file to a `Syncer` + a backing; unimplemented
+  manifest, `.ticket`s), binds each file to a `SyncStrategy` + a backing; unimplemented
   kinds are skipped (a stub never panics a live session).
 - **Multiplexed session** (`sync::folder`) — one link, many resources. Frame =
   `[path_len u16][path][tag][payload]`; tags `DELTA` / `SYNCREQ` / `SYNCREP`.

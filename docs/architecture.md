@@ -8,19 +8,21 @@
 
 ```
 riftpipe/
-  Cargo.toml            root package (native binary) + workspace [core], exclude [web]
+  Cargo.toml            root package + workspace [core, kanban-server], exclude [web]
   core/                 riftpipe-core — pure, wasm-safe, the single source of truth
-  src/                  the native `riftpipe` binary (lib + main)
+  src/                  the native `riftpipe` binary (lib + main) — generic verbs only:
+                        share · join · connect · serve · signal
     net/                transport: Link + Sink/Source seams, iroh QUIC, WebRTC,
-                        negotiate (caps ladder + session halves), secure (ticket/auth)
+                        negotiate (caps ladder + NegotiatedSession/Link), secure
     crdt/               re-export shim over riftpipe_core::text
-    sync/               every sync driver: --pipe, mirror, folder, board
+    sync/               every sync driver: --pipe, mirror, folder, tree
       strategy.rs       the SyncStrategy trait + Kind (folder mode's Strategy seam)
       algo/             text_crdt, rsync (real); wal, image (stubs); sqlite (unwired)
     monitor/            metrics + in-memory `process` sidecar
-    app/                runnables: kanban serve/connect, signal relay
+    app/                generic runnables: host (static + SSE), signal relay
   web/                  riftpipe-web — wasm crate (workspace-excluded, own lockfile)
-  projects/kanban/      SolidJS UI + Deno reference server + e2e harness + seed board
+  projects/kanban/      the showcase app: SolidJS UI + kanban-server (server-rs/,
+                        Rust) + Deno reference server + e2e harness + seed board
   nvim/                 Neovim bridge (session-local lua)
   tests/                native integration tests (mock, real iroh, full stack)
   deploy/               fly.io signaling server (legacy/fallback transport)
@@ -37,13 +39,18 @@ The two platform crates only add transport + storage; the UIs only render.
 flowchart LR
     ED["editors & scripts<br/>(stdio JSON)"] --> CLI
     UI["SolidJS board UI"] --> WEB
-    CLI["riftpipe (native)<br/>src/ — CLI, iroh/WebRTC,<br/>folder & board sync, servers"]
+    KS["kanban-server (app crate)<br/>projects/kanban/server-rs"] --> CLI
+    CLI["riftpipe (native)<br/>src/ — generic verbs, iroh/WebRTC,<br/>folder & tree sync, host/signal"]
     WEB["riftpipe-web (wasm)<br/>web/ — OPFS, iroh relay,<br/>gossip mesh, board API"]
     CLI <-. "iroh QUIC · WebRTC" .-> WEB
     CLI --> CORE
     WEB --> CORE
-    CORE["riftpipe-core (pure)<br/>eg-walker CRDT · board sync protocol ·<br/>kanban file format · WAL frames"]
+    KS --> CORE
+    CORE["riftpipe-core (pure)<br/>eg-walker CRDT · sync protocol ·<br/>kanban file format* · WAL frames"]
 ```
+
+\* the kanban format's presence in core is tracked debt — it belongs to the app
+(roadmap §Architecture / hygiene #8).
 
 ## Native layers (src/)
 
@@ -53,8 +60,8 @@ omitted — they hang off these layers without affecting the shape.
 
 ```mermaid
 flowchart TB
-    APP["app/ — things you run<br/>kanban serve (HTTP/SSE) · kanban connect · signal relay"]
-    SYNC["sync/ — every sync driver<br/>pipe (--pipe) · folder (multi-algo) · board (browser protocol) · mirror<br/>strategy: SyncStrategy + Kind → algo/ (text_crdt, rsync, …)"]
+    APP["app/ — generic runnables<br/>host (static dir + SSE change events, `serve`) · signal relay"]
+    SYNC["sync/ — every sync driver<br/>pipe (--pipe) · folder (multi-algo) · tree (core protocol, `connect`) · mirror<br/>strategy: SyncStrategy + Kind → algo/ (text_crdt, rsync, …)"]
     NET["net/ — transport only<br/>Link + Sink/Source traits · iroh QUIC · WebRTC · negotiate · secure"]
     CORE["riftpipe-core"]
     APP --> SYNC
@@ -70,12 +77,14 @@ Why the seams hold:
   optional WebRTC upgrade and hands back boxed halves, so `sync` never sees a
   concrete transport type.
 - **`sync` is the single home for drivers.** `pipe`/`folder` speak the native
-  wire formats; `board` speaks `riftpipe_core::sync` (the browser protocol) so
-  native and browser kanban peers interoperate. Two wire protocols still exist
-  (folder framing vs board `SyncMsg`) — that's the remaining consolidation
-  candidate, now side-by-side in one module instead of split across layers.
-- **`app` is thin.** `kanban serve` is HTTP + files; `kanban connect` dials a
-  link and hands the halves to `sync::board::run`; `signal` relays SDP blobs.
+  wire formats; `tree` speaks `riftpipe_core::sync` (the browser protocol) so
+  native and browser peers interoperate on any file tree. Two wire protocols
+  still exist (folder framing vs `SyncMsg`) — that's the remaining
+  consolidation candidate, now side-by-side in one module.
+- **`app` is generic.** `host` serves a static dir + SSE change events (the
+  `serve` verb; app servers like kanban-server consume it as a library);
+  `signal` relays SDP blobs. `connect` dials a link and hands the halves to
+  `sync::tree::run`. No app nouns anywhere in the binary.
 
 ## The two flagship data paths
 
@@ -163,35 +172,41 @@ the UI calls `kanbanHandle` (wasm) which reads/writes OPFS via
 (`card.md` → text-CRDT event, `meta.toml` → LWW) and broadcast on the
 iroh-gossip topic; receiving peers merge and land files back into OPFS. New
 neighbors are caught up with `full_state()` on `NeighborUp`. A native peer joins
-the same board with `riftpipe kanban connect`, whose `sync::board` driver speaks
-the identical protocol against a real directory.
+the same board with the generic `riftpipe connect <id> <dir>`, whose
+`sync::tree` driver speaks the identical protocol against a real directory —
+the binary never knows it's a kanban board.
 
 ## Known seams & wrinkles
 
-Fixed in the July 2026 restructure:
+Fixed in the July 2026 restructure + review series:
 
 - ~~Two unrelated types named `Syncer`~~ — folder mode's trait is now
   `SyncStrategy` (`sync/strategy.rs`); `Syncer` unambiguously means the
-  `riftpipe_core::sync` board protocol.
+  `riftpipe_core::sync` protocol.
 - ~~`sync` knew concrete transports~~ — the `Sink`/`Source` halves traits and
-  `negotiate_session_halves` moved into `net`; drivers are transport-blind.
-- ~~A hand-rolled sync engine inside `app/kanban.rs`~~ — extracted to
-  `sync::board`, beside the other drivers.
+  `negotiate_session_halves` moved into `net`; drivers are transport-blind. The
+  binary's duplicate negotiation orchestration is gone (`NegotiatedSession` /
+  `negotiate_link`, one policy).
 - ~~`net` depended on the CRDT~~ — `sync_full` moved from `net/link.rs` to `sync/`.
+- ~~Kanban code in the binary~~ — the serve layer is the `kanban-server` crate
+  (`projects/kanban/server-rs`, on generic `app::host`); the sync driver is the
+  app-neutral `sync::tree` behind `riftpipe connect`; verbs are all generic.
+- ~~Board-sync correctness debt~~ — dotfile leak (`.site`) fixed both
+  directions; guard-across-await + triple Arc/Mutex replaced by one select!
+  loop with caller-owned `TreePeer`; unbounded echo map → blake3 `seen`;
+  watcher failure degrades to poll; first mock-halves tests.
 
-Still open:
+Still open (tracked in `docs/planned/roadmap.md` §Architecture / hygiene):
 
-- **Two wire protocols** (folder framing vs board `SyncMsg`). Real
-  consolidation means folder mode adopting the core protocol (or vice versa)
-  without breaking browser peers — a design decision, tracked in PROJECT.md.
+- **Kanban still inside the crates** — `riftpipe_core::kanban` (format parser)
+  and the kanban handler in `web/`; needs the wasm-crate split.
+- **Two wire protocols** (folder framing vs `core::sync` `SyncMsg`).
+- **`connect` is signaling-only** — no iroh dial/negotiation yet, counters
+  unwired.
 - **`algo/sqlite.rs` is orphaned** — complete per-cell-LWW engine, tested, but
   not a `Kind` variant and unreachable from the binary.
-- **`web/` is workspace-excluded** with a git-ignored `Cargo.lock`; native and
-  browser dependency graphs (iroh, postcard, serde — wire-critical) can drift
-  silently. Versions match today.
-- **Two deploy stories.** GitHub Pages ships the iroh-relay app ("nothing to
-  host"); `deploy/` + the workflow's `VITE_SIGNAL_URL` vars still carry the
-  legacy WebSocket-signaling path as if first-class.
-- **Three kanban backends** (wasm, native, Deno) intentionally share the file
-  format and endpoints via `riftpipe-core`; the ~120-line route/handler shell
-  is the only parallel code.
+- **`web/` is workspace-excluded** with a git-ignored `Cargo.lock` — dependency
+  graphs can silently skew on wire-critical deps.
+- **Two deploy stories** — Pages ships the iroh app; `deploy/` + workflow vars
+  still treat the signaling server as first-class. The Deno reference server is
+  also slated for retirement (browser wasm bundle is the runtime).

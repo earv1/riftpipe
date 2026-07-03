@@ -1,5 +1,5 @@
 //! Pure kanban board logic — parsing + serialization for the on-disk file format,
-//! with **no I/O and no clock**. Shared by the native server (`src/kanban.rs`,
+//! with **no I/O and no clock**. Shared by the native server (`src/app/kanban.rs`,
 //! over `std::fs`) and the browser store (`riftpipe-web`, over OPFS), so the board
 //! format has ONE definition and a board is portable between a native peer and a
 //! browser peer.

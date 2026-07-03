@@ -1,20 +1,24 @@
 # Planned: the kanban app & frontends
 
 **Status:** the **Serve** layer (HTTP file-API + static UI host) is **implemented
-in Rust** — `riftpipe kanban serve <board-dir> [--port 7777] [--dist <spa-dir>]`
-(`src/app/kanban.rs`, `tiny_http`). It ports the Deno reference server route-for-route
-(`/api/board`, `/api/cards/:id[/detail]`, POST `/api/cards`, PATCH
-`/api/cards/:id`, POST `/api/cards/:id/comments`, SSE `/api/events`), serves the
-built SolidJS SPA, and reads/writes the same on-disk model — verified end-to-end
-against the existing UI bundle. **Remaining:** fold the **Sync** step (folder mode
-over the same dir) into the command so one process serves *and* syncs, and
-**Bundle** the SPA via `include_str!` (today it's served from `--dist`).
+in Rust** as its **own crate** — `kanban-server <board-dir> [--port 7777]
+[--dist <spa-dir>]` ([`../server-rs/`](../server-rs/), `tiny_http`, built on
+riftpipe's generic `app::host` for static+SSE). It ports the Deno reference
+server route-for-route (`/api/board`, `/api/cards/:id[/detail]`, POST
+`/api/cards`, PATCH `/api/cards/:id`, POST `/api/cards/:id/comments`, SSE
+`/api/events`), serves the built SolidJS SPA, and reads/writes the same on-disk
+model. Per the generic-core principle (`agent.md`), the riftpipe **binary has no
+kanban verbs** — the app composes with generic ones. **Remaining:** run sync +
+serve as one supervised pair (today: two processes), and **Bundle** the SPA via
+`include_str!` (today it's served from `--dist`).
 
 ## Commands
 
 ```
-riftpipe kanban serve   <board-dir> [--port 7777]        # share + serve; prints a ticket
-riftpipe kanban connect <ticket> <board-dir> [--port 7777]  # join + serve
+kanban-server <board-dir> [--port 7777] [--dist <spa>]   # the app server (this project)
+riftpipe share <board-dir>            # sync side, prints a ticket   (folder mode)
+riftpipe join <ticket> <board-dir>    # …or join a shared board      (folder mode)
+riftpipe connect <conn-id> <board-dir> [--signal ws://…] # sync with a browser peer
 ```
 
 One process does three things:

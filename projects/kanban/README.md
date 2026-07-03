@@ -8,10 +8,13 @@ the same endpoints over the same board *directory* format:
    `kanbanHandle` from [`web/pkg`](../../web/), the Rust kanban handler compiled
    to WebAssembly. The board lives in the browser's private filesystem (OPFS);
    peers sync directly over iroh / the gossip mesh. No server at all.
-2. **Native Rust** — `riftpipe kanban serve ./board` ([`src/app/kanban.rs`](../../src/app/kanban.rs)),
-   tiny_http + SSE over a real directory.
+2. **Native Rust** — `kanban-server ./board` ([`server-rs/`](server-rs/), its own
+   crate), tiny_http + SSE over a real directory, built on riftpipe's generic
+   `app::host` (static + SSE) — the riftpipe binary itself has no kanban code.
 3. **Deno reference server** — [`server/main.ts`](server/main.ts), the original
-   implementation the other two were ported from. Kept as the readable spec.
+   implementation the other two were ported from. Kept as the readable spec,
+   slated for retirement (see [`docs/planned.md`](docs/planned.md)) — the
+   browser wasm bundle is the deployed runtime.
 
 The file-backed backends have no idea riftpipe exists: point
 [riftpipe](../../) at the board directory and the board becomes live,

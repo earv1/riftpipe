@@ -1,9 +1,12 @@
 # Kanban — planning, roadmap & TODO
 
 The authoritative planning doc for the **riftpipe kanban** project (this is a
-*separate* project from the riftpipe core — Deno + SolidJS, file-backed, made
-collaborative by pointing [riftpipe](../../../) at the board directory). It
-composes with riftpipe purely through the filesystem.
+*separate* project from the riftpipe core — SolidJS UI over a file-backed
+board, deployed as an **in-browser wasm app**; made collaborative by riftpipe).
+It composes with riftpipe purely through the filesystem (OPFS in the browser).
+The riftpipe binary has **no kanban code** (see `agent.md`): the app's native
+server is the co-located [`server-rs/`](../server-rs/) crate (`kanban-server`),
+and sync uses the generic verbs (`riftpipe connect` / `share` / `join`).
 
 Companion design docs (co-located here):
 
@@ -92,6 +95,16 @@ Roughly priority order. Most of this is *wiring and UI*, not new sync code.
   edits to *different* fields of the *same* card both survive. Whole-file rsync
   today loses one (rare). Lives in the riftpipe core, not the app. See
   [`data-model.md`](data-model.md#future-nicety-an-lww-record-syncer).
+- **Retire Deno** — everything runs in the browser now, so the Deno server is a
+  legacy reference: port `run-demo.sh` (and any e2e that still hits it) onto
+  `kanban-server`, then delete `server/main.ts`; bundle the built SPA + wasm as
+  the one deployable artifact (and `include_bytes!` it into `kanban-server` so
+  the native path is a single binary too). Vite-via-Deno can stay as build
+  tooling until the bundle step replaces it.
+- **Own the kanban code riftpipe still carries** — `riftpipe_core::kanban` (the
+  format parser) and the kanban handler in `web/` belong to this project, not
+  the riftpipe crates. Blocked on the wasm-crate split (roadmap §"Architecture
+  / hygiene" #8): a generic riftpipe wasm crate + a kanban wasm crate here.
 
 ### Out of scope (per the principle)
 
