@@ -48,7 +48,9 @@ pub async fn sync_full(
     link.send(doc.encode_full()).await?;
     for _ in 0..peer_msgs {
         match link.recv().await? {
-            Some(bytes) => doc.merge(&bytes),
+            Some(bytes) => {
+                let _ = doc.merge(&bytes);
+            }
             None => break,
         }
     }

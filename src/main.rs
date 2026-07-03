@@ -367,14 +367,14 @@ fn demo_text() {
     a.edit_to("hello world");
     let seed = a.encode_full();
     let mut b = EgWalkerText::new("bob");
-    b.merge(&seed);
+    let _ = b.merge(&seed);
 
     let (ba, bb) = (a.version(), b.version());
     a.edit_to("hello brave world");
     b.edit_to("hello world!!!");
     let (da, db) = (a.encode_delta(&ba), b.encode_delta(&bb));
-    a.merge(&db);
-    b.merge(&da);
+    let _ = a.merge(&db);
+    let _ = b.merge(&da);
 
     println!("riftpipe :: eg-walker text convergence (diamond-types)\n");
     println!("  alice: {:?}", a.content());

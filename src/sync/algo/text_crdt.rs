@@ -67,7 +67,7 @@ impl Syncer for TextCrdtSyncer {
 
     fn merge(&mut self, delta: &[u8]) -> Option<Vec<u8>> {
         let before = self.doc.content();
-        self.doc.merge(delta);
+        let _ = self.doc.merge(delta);
         // Advancing the watermark past merged ops keeps us from echoing them back.
         self.last_sent = self.doc.version();
         let after = self.doc.content();

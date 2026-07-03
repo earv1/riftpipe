@@ -169,8 +169,10 @@ impl RiftDoc {
     }
 
     /// Merge a peer's `delta()`/`snapshot()` bytes. Idempotent + order-independent.
-    pub fn merge(&mut self, bytes: &[u8]) {
-        self.inner.merge(bytes);
+    /// Returns `false` if the bytes were a delta whose ancestors we don't hold
+    /// (ask the peer for a full snapshot to recover).
+    pub fn merge(&mut self, bytes: &[u8]) -> bool {
+        self.inner.merge(bytes)
     }
 
     /// Persist the whole document to OPFS under `name` — the browser's private,
@@ -184,7 +186,7 @@ impl RiftDoc {
     pub async fn load(agent: String, name: String) -> Result<RiftDoc, JsValue> {
         let mut doc = RiftDoc::new(&agent);
         if let Some(bytes) = opfs_read(&name).await? {
-            doc.inner.merge(&bytes);
+            let _ = doc.inner.merge(&bytes);
             doc.last_sent = doc.inner.version();
         }
         Ok(doc)

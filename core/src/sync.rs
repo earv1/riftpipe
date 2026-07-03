@@ -10,7 +10,7 @@
 //! last-writer-wins. No I/O, no clock — callers persist the result and pass a
 //! millisecond `now` for LWW versions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,9 @@ pub enum SyncMsg {
     /// A text delta: the ops the recipient lacks for `path`, plus the sender's
     /// version vector so the recipient learns what the sender now has.
     TextDelta { path: String, ops: Vec<u8>, vv: Vv },
+    /// "I couldn't apply your delta for `path` (missing an ancestor) — send me the
+    /// full self-contained state." The recovery path when a delta can't bridge.
+    Resync { path: String },
     /// A whole-file last-writer-wins update; newest version wins.
     Lww { path: String, version: u64, bytes: Vec<u8> },
 }
@@ -40,6 +43,9 @@ pub struct Syncer {
     /// Our best knowledge of what the peer already has, per text path — so we send
     /// only deltas. Advanced optimistically on send and from the peer's reported vv.
     peer_vv: HashMap<String, Vv>,
+    /// Paths we've asked the peer to resync (full) and are still waiting on — so a
+    /// stream of un-appliable deltas can't trigger a storm of resync requests.
+    awaiting_resync: HashSet<String>,
     lww: HashMap<String, u64>,
 }
 
@@ -49,6 +55,7 @@ impl Syncer {
             agent: agent.into(),
             docs: HashMap::new(),
             peer_vv: HashMap::new(),
+            awaiting_resync: HashSet::new(),
             lww: HashMap::new(),
         }
     }
@@ -126,14 +133,31 @@ impl Syncer {
                 (None, replies)
             }
             SyncMsg::TextDelta { path, ops, vv } => {
-                let content = {
-                    let doc = self.doc(&path);
-                    doc.merge(&ops);
-                    doc.content().into_bytes()
-                };
+                if !self.doc(&path).merge(&ops) {
+                    // Missing a causal ancestor. Ask once for a full self-contained
+                    // resync; suppress repeats until it arrives so a run of
+                    // un-appliable deltas can't cause a resync storm.
+                    if self.awaiting_resync.insert(path.clone()) {
+                        return (None, vec![SyncMsg::Resync { path }]);
+                    }
+                    return (None, Vec::new());
+                }
+                self.awaiting_resync.remove(&path);
+                let content = self.doc(&path).content().into_bytes();
                 self.advance_peer_vv(&path, &vv);
                 (Some((path, content)), Vec::new())
             }
+            SyncMsg::Resync { path } => match self.docs.get(&path) {
+                // Answer with our full state; the peer merges it to recover no
+                // matter what it was missing.
+                Some(doc) => {
+                    let ops = doc.encode_full();
+                    let vv = doc.version_vector();
+                    self.advance_peer_vv(&path, &vv);
+                    (None, vec![SyncMsg::TextDelta { path, ops, vv }])
+                }
+                None => (None, Vec::new()),
+            },
             SyncMsg::Lww { path, version, bytes } => {
                 let v = self.lww.entry(path.clone()).or_insert(0);
                 if version > *v {
@@ -262,5 +286,48 @@ mod tests {
         assert_eq!(b.apply(newer).0.unwrap().1, b"new");
         let stale = SyncMsg::Lww { path: "meta.toml".into(), version: 1, bytes: b"old".to_vec() };
         assert!(b.apply(stale).0.is_none(), "stale LWW ignored");
+    }
+
+    #[test]
+    fn gapped_delta_triggers_resync_and_recovers() {
+        use crate::text::EgWalkerText;
+
+        // Craft a delta that skips an ancestor (as a lost message would): edit 2's
+        // ops without edit 1. `src` (a full syncer) will answer the resync.
+        let mut probe = EgWalkerText::new("s");
+        probe.edit_to("one\n");
+        let v1 = probe.version();
+        probe.edit_to("one\ntwo\n");
+        let gapped = SyncMsg::TextDelta {
+            path: "card.md".into(),
+            ops: probe.encode_delta(&v1), // parent (edit 1) is missing
+            vv: probe.version_vector(),
+        };
+
+        let mut src = Syncer::new("s");
+        src.local_text("card.md", "one\n");
+        src.local_text("card.md", "one\ntwo\n");
+
+        // A fresh peer can't apply the gapped delta → asks for a resync.
+        let mut dst = Syncer::new("d");
+        let (persist, replies) = dst.apply(gapped);
+        assert!(persist.is_none());
+        assert!(
+            matches!(replies.as_slice(), [SyncMsg::Resync { .. }]),
+            "a gapped delta must trigger a resync request",
+        );
+
+        // A second un-appliable delta while awaiting the resync must NOT ask again.
+        let (_, again) = dst.apply(SyncMsg::TextDelta {
+            path: "card.md".into(),
+            ops: probe.encode_delta(&v1),
+            vv: probe.version_vector(),
+        });
+        assert!(again.is_empty(), "repeated gapped deltas are suppressed");
+
+        // The source answers with full state → the peer recovers.
+        let (_, full) = src.apply(replies.into_iter().next().unwrap());
+        let (persist, _) = dst.apply(full.into_iter().next().unwrap());
+        assert_eq!(persist.unwrap().1, b"one\ntwo\n", "peer recovered via full resync");
     }
 }

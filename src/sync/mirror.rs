@@ -67,7 +67,7 @@ impl TextPeer {
         let delta = self.doc.encode_delta(&self.last_sent);
         link.send(delta).await?;
         if let Some(bytes) = link.recv().await? {
-            self.doc.merge(&bytes);
+            let _ = self.doc.merge(&bytes);
         }
         // Everything we now hold has been exchanged.
         self.last_sent = self.doc.version();

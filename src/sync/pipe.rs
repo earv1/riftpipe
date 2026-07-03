@@ -116,7 +116,7 @@ impl PipePeer {
     /// (diffed BEFORE/AFTER, so they reflect only the remote change).
     pub fn merge_remote(&mut self, bytes: &[u8]) -> Vec<EditOp> {
         let before = self.doc.content();
-        self.doc.merge(bytes);
+        let _ = self.doc.merge(bytes);
         self.last_sent = self.doc.version();
         let after = self.doc.content();
         diff_to_ops(&before, &after)

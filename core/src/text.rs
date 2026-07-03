@@ -182,11 +182,13 @@ impl EgWalkerText {
     }
 
     /// Merge encoded ops from a peer. diamond-types dedupes by global op id, so
-    /// this is idempotent and order-independent — the CRDT guarantee.
-    pub fn merge(&mut self, bytes: &[u8]) {
-        self.oplog
-            .decode_and_add(bytes)
-            .expect("decode peer ops");
+    /// this is idempotent and order-independent — the CRDT guarantee. Returns
+    /// `false` if the bytes couldn't be applied — most importantly when a delta
+    /// (`ENCODE_PATCH`) references ancestors we don't hold — so the caller can ask
+    /// for a full self-contained resync instead of panicking.
+    #[must_use]
+    pub fn merge(&mut self, bytes: &[u8]) -> bool {
+        self.oplog.decode_and_add(bytes).is_ok()
     }
 }
 
@@ -202,7 +204,7 @@ mod tests {
         let seed = a.encode_full();
 
         let mut b = EgWalkerText::new("bob");
-        b.merge(&seed);
+        assert!(b.merge(&seed));
         assert_eq!(b.content(), "hello world");
 
         // Concurrent edits from the same base, in each replica's local frame.
@@ -214,8 +216,8 @@ mod tests {
         // Exchange deltas both ways.
         let da = a.encode_delta(&base_a);
         let db = b.encode_delta(&base_b);
-        a.merge(&db);
-        b.merge(&da);
+        assert!(a.merge(&db));
+        assert!(b.merge(&da));
 
         // Strong eventual consistency: identical content, both edits survive.
         assert_eq!(a.content(), b.content());
@@ -266,5 +268,23 @@ mod tests {
         assert_eq!(d.content(), "the quick brown fox");
         d.edit_to("the brown fox"); // mid-document delete
         assert_eq!(d.content(), "the brown fox");
+    }
+
+    #[test]
+    fn delta_missing_ancestors_is_rejected_then_full_recovers() {
+        // A delta whose parent (edit 1) the receiver doesn't hold must be refused,
+        // not panic — so the sync layer can fall back to a full resync.
+        let mut src = EgWalkerText::new("s");
+        src.edit_to("one\n");
+        let v1 = src.version();
+        src.edit_to("one\ntwo\n");
+        let orphan = src.encode_delta(&v1); // ops whose ancestor a fresh peer lacks
+
+        let mut dst = EgWalkerText::new("d");
+        assert!(!dst.merge(&orphan), "delta with missing ancestors must be rejected");
+
+        // A full, self-contained encode recovers.
+        assert!(dst.merge(&src.encode_full()));
+        assert_eq!(dst.content(), "one\ntwo\n");
     }
 }

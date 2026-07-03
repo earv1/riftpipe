@@ -14,13 +14,19 @@ sense to do it, not strict priority.
    protocol change. Matters most for long-lived documents (use case #1), where
    full-history-per-edit is O(history).
 
-2. **Make delta sync bulletproof** — the event approach trades simplicity for a
-   real invariant: never send a delta whose causal parents the peer lacks. Harden:
-   - detect an un-appliable delta (missing dependency) and fall back to a
-     full-state resync for that doc;
-   - correct version-vector merge on both send (optimistic advance) and receive;
-   - survive dropped / out-of-order frames (today we lean on the reliable ordered
-     channel — QUIC / DataChannel — which is fine but undocumented as a dependency).
+2. **Make delta sync bulletproof** — *mostly done.*
+   - ✅ Un-appliable delta (missing ancestor) → `merge` returns `false` instead of
+     panicking; the receiver sends `Resync`, the sender answers with full
+     self-contained state. Loop-capped (`awaiting_resync`) so a run of gapped
+     deltas can't cause a resync storm. Tested in `core::sync` + `core::text`.
+   - ✅ Version-vector merge is per-agent-max on both send and receive
+     (`advance_peer_vv`), so a stale report can't regress what we know they hold.
+   - *Remaining:* a `Resync` is only wired for **text**, not LWW files — a fresh
+     joiner still doesn't get existing `meta.toml` state until it's re-touched
+     (needs the transport to supply file bytes; see initial-state sync). And if a
+     *full* resync itself keeps failing (transport corruption), the doc parks
+     rather than looping — acceptable, but a bounded retry/telemetry hook is the
+     next refinement.
 
 ## Networking
 
