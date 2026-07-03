@@ -7,10 +7,18 @@
 //!
 //! Transport-blind: takes the `net::{Sink, Source}` halves, so it runs over
 //! whatever dialed the link (WebRTC via signaling today; iroh works the same).
+//!
+//! Shape matches the sibling sessions (`folder::session`, `pipe::session`): the
+//! caller owns the state ([`BoardPeer`]) and the watcher channel; [`run`] is a
+//! single `tokio::select!` loop — no spawned tasks, no shared-state locks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::time::{interval, MissedTickBehavior};
 
 use riftpipe_core::sync::{SyncMsg, Syncer};
 
@@ -20,101 +28,341 @@ fn escapes(path: &str) -> bool {
     Path::new(path).components().any(|c| matches!(c, Component::ParentDir | Component::RootDir))
 }
 
-fn rel_of(full: &Path, dir: &Path) -> Option<String> {
-    let rel = full.strip_prefix(dir).ok()?.to_string_lossy().replace('\\', "/");
-    if rel.is_empty() || rel.contains("/.") { None } else { Some(rel) }
+/// Any path with a `.`-prefixed component is machine-local (top-level `.site`
+/// — the per-machine site id — nested `tickets/.hidden`, editor droppings) and
+/// must never cross the wire, in EITHER direction.
+fn hidden(rel: &str) -> bool {
+    rel.split('/').any(|c| c.starts_with('.'))
 }
 
-/// Sync the board `dir` both ways over an established link. Blocks until the
-/// link drops.
-pub async fn run(
-    sink: Box<dyn Sink>,
-    mut source: Box<dyn Source>,
-    dir: &Path,
-) -> Result<()> {
-    use notify::{RecursiveMode, Watcher};
+fn rel_of(full: &Path, dir: &Path) -> Option<String> {
+    let rel = full.strip_prefix(dir).ok()?.to_string_lossy().replace('\\', "/");
+    if rel.is_empty() || hidden(&rel) {
+        None
+    } else {
+        Some(rel)
+    }
+}
 
+/// Create the board dir if needed and canonicalize it so it matches the
+/// watcher's event paths (on macOS /var is a symlink to /private/var, which
+/// would otherwise break `strip_prefix`).
+pub fn prepare_dir(dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(dir).map_err(anyerr)?;
-    // Canonicalize so it matches the watcher's event paths (on macOS /var is a
-    // symlink to /private/var, which would otherwise break strip_prefix).
-    let dir = std::fs::canonicalize(dir).map_err(anyerr)?;
+    std::fs::canonicalize(dir).map_err(anyerr)
+}
 
-    let sink = Arc::new(tokio::sync::Mutex::new(sink));
-    let syncer = Arc::new(Mutex::new(Syncer::new(format!("n{:08x}", rand::random::<u32>()))));
-    // Last bytes written from a remote merge per path — the watcher skips a file
-    // whose content equals what we just wrote (the echo of a remote update), so a
-    // remote edit isn't pushed straight back (which would ping-pong LWW versions).
-    // Content-based, not time-based, so a *genuine* local edit right after a remote
-    // write is still pushed.
-    let echo: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+/// One peer's board-sync state, owned by the caller (like `Workspace` for
+/// folder mode): the protocol `Syncer` plus a content-hash memo.
+pub struct BoardPeer {
+    syncer: Syncer,
+    /// blake3 of the last-known content per rel path — updated on every push
+    /// and every remote persist. A push is skipped when the on-disk hash equals
+    /// this (covers both the echo of a remote write and a no-op event), and it
+    /// is what the fallback poll diffs against. Hashes, not bytes, so it never
+    /// holds file copies.
+    seen: HashMap<String, [u8; 32]>,
+}
 
-    // Native local edits → push. A notify callback (sync) feeds paths to a task.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+impl BoardPeer {
+    pub fn new() -> Self {
+        BoardPeer {
+            syncer: Syncer::new(format!("n{:08x}", rand::random::<u32>())),
+            seen: HashMap::new(),
+        }
+    }
+}
+
+impl Default for BoardPeer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Start a recursive watcher on `dir`, feeding event paths into the returned
+/// channel. If the watcher can't start, warn and return `(None, rx)` — the
+/// caller passes `poll = watcher.is_none()` to [`run`] so the session degrades
+/// to the fallback poll instead of aborting (folder mode does the same).
+pub fn watch(dir: &Path) -> (Option<RecommendedWatcher>, UnboundedReceiver<PathBuf>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res {
             for p in ev.paths {
                 let _ = tx.send(p);
             }
         }
-    })
-    .map_err(anyerr)?;
-    watcher.watch(&dir, RecursiveMode::Recursive).map_err(anyerr)?;
-
-    let (w_sink, w_syncer, w_echo, w_dir) = (sink.clone(), syncer.clone(), echo.clone(), dir.clone());
-    tokio::spawn(async move {
-        while let Some(path) = rx.recv().await {
-            let Some(rel) = rel_of(&path, &w_dir) else { continue };
-            if !path.is_file() {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(&path) else { continue };
-            // Skip the echo of a file we just wrote from a remote merge (same bytes).
-            if w_echo.lock().unwrap().get(&rel).is_some_and(|b| b == &bytes) {
-                continue;
-            }
-            let msg = if rel.ends_with(".md") {
-                w_syncer.lock().unwrap().local_text(&rel, &String::from_utf8_lossy(&bytes))
-            } else {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                Some(w_syncer.lock().unwrap().local_lww(&rel, bytes, now))
-            };
-            if let Some(msg) = msg {
-                if let Ok(b) = postcard::to_allocvec(&msg) {
-                    let _ = w_sink.lock().await.send(b).await;
-                }
-            }
+    }) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("[board] watcher unavailable ({e}); falling back to poll");
+            return (None, rx);
         }
-    });
+    };
+    if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
+        eprintln!("[board] watch failed ({e}); falling back to poll");
+        return (None, rx);
+    }
+    (Some(watcher), rx)
+}
+
+/// Push one local file if its content changed since we last saw it. No-ops on
+/// dot-paths, non-files, and unchanged content; records the hash on push.
+async fn push_local(
+    peer: &mut BoardPeer,
+    path: &Path,
+    dir: &Path,
+    sink: &mut dyn Sink,
+) -> Result<()> {
+    let Some(rel) = rel_of(path, dir) else { return Ok(()) };
+    if !path.is_file() {
+        return Ok(());
+    }
+    let Ok(bytes) = std::fs::read(path) else { return Ok(()) };
+    let hash = *blake3::hash(&bytes).as_bytes();
+    // Same content we last pushed or persisted (remote-write echo / no-op event).
+    if peer.seen.get(&rel) == Some(&hash) {
+        return Ok(());
+    }
+    let msg = if rel.ends_with(".md") {
+        peer.syncer.local_text(&rel, &String::from_utf8_lossy(&bytes))
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Some(peer.syncer.local_lww(&rel, bytes, now))
+    };
+    peer.seen.insert(rel, hash);
+    if let Some(msg) = msg {
+        if let Ok(b) = postcard::to_allocvec(&msg) {
+            sink.send(b).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Collect every regular file under `dir`, skipping any dot-component (manual
+/// recursion — the tree is small and this avoids a walkdir dependency).
+fn scan_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        if e.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let p = e.path();
+        if p.is_dir() {
+            scan_files(&p, out);
+        } else if p.is_file() {
+            out.push(p);
+        }
+    }
+}
+
+/// Sync the board `dir` both ways over an established link: one `select!` loop
+/// over watcher events (`rx`), incoming messages, and — when `poll` is set
+/// because the watcher failed — a slow rescan. Returns when the link closes
+/// (`source.recv()` yields `Ok(None)` or an error is unrecoverable).
+pub async fn run(
+    peer: &mut BoardPeer,
+    rx: &mut UnboundedReceiver<PathBuf>,
+    poll: bool,
+    sink: &mut dyn Sink,
+    source: &mut dyn Source,
+    dir: &Path,
+) -> Result<()> {
+    let mut rescan = interval(Duration::from_secs(2));
+    rescan.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut rx_open = true;
 
     // Handshake: advertise our version vectors so the peer sends what we lack.
-    if let Ok(b) = postcard::to_allocvec(&syncer.lock().unwrap().hello()) {
-        let _ = sink.lock().await.send(b).await;
+    if let Ok(b) = postcard::to_allocvec(&peer.syncer.hello()) {
+        sink.send(b).await?;
     }
 
-    // Remote edits → disk (+ any handshake replies go back out over the sink).
-    while let Ok(Some(bytes)) = source.recv().await {
-        let Ok(msg) = postcard::from_bytes::<SyncMsg>(&bytes) else { continue };
-        let (persist, replies) = syncer.lock().unwrap().apply(msg);
-        if let Some((path, bytes)) = persist {
-            if !escapes(&path) {
-                echo.lock().unwrap().insert(path.clone(), bytes.clone());
-                let full = dir.join(&path);
-                if let Some(parent) = full.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+    loop {
+        tokio::select! {
+            // Native local edits → push (the watcher feeds paths into `rx`).
+            ev = rx.recv(), if rx_open => {
+                let Some(first) = ev else {
+                    // Watcher gone (e.g. it failed after creation); the poll arm
+                    // is the safety net — never abort the session over it.
+                    rx_open = false;
+                    continue;
+                };
+                // Coalesce a burst of events into a de-duplicated batch.
+                let mut batch = HashSet::new();
+                batch.insert(first);
+                while let Ok(p) = rx.try_recv() {
+                    batch.insert(p);
                 }
-                let _ = std::fs::write(&full, &bytes);
-                println!("SYNCED:{path}");
+                for p in batch {
+                    push_local(peer, &p, dir, sink).await?;
+                }
             }
-        }
-        for reply in replies {
-            if let Ok(b) = postcard::to_allocvec(&reply) {
-                let _ = sink.lock().await.send(b).await;
+            // Fallback poll: rescan for files whose content drifted from `seen`.
+            _ = rescan.tick(), if poll => {
+                let mut files = Vec::new();
+                scan_files(dir, &mut files);
+                for p in files {
+                    push_local(peer, &p, dir, sink).await?;
+                }
+            }
+            // Remote edits → disk (+ any handshake replies go back out).
+            msg = source.recv() => {
+                let bytes = match msg {
+                    Err(_) | Ok(None) => return Ok(()),
+                    Ok(Some(b)) => b,
+                };
+                let Ok(msg) = postcard::from_bytes::<SyncMsg>(&bytes) else { continue };
+                let (persist, replies) = peer.syncer.apply(msg);
+                if let Some((path, bytes)) = persist {
+                    // Refuse escaping paths AND dot-paths from the wire — `.site`
+                    // and friends are machine-local and must not be overwritten.
+                    if !escapes(&path) && !hidden(&path) {
+                        peer.seen.insert(path.clone(), *blake3::hash(&bytes).as_bytes());
+                        let full = dir.join(&path);
+                        if let Some(parent) = full.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(&full, &bytes);
+                        println!("SYNCED:{path}");
+                    }
+                }
+                for reply in replies {
+                    if let Ok(b) = postcard::to_allocvec(&reply) {
+                        sink.send(b).await?;
+                    }
+                }
             }
         }
     }
-    drop(watcher);
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::mock_pair;
+    use tokio::time::{sleep, timeout};
+
+    fn dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("riftpipe-board-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::canonicalize(&d).unwrap()
+    }
+
+    /// Drive two crossed BoardPeers over a mock link: feed `feed` (paths
+    /// relative to `da`) to A as watcher events, run both sessions until
+    /// `settled()` holds, keep pumping briefly so in-flight messages land, then
+    /// tear down by dropping A's send half — B's `source.recv()` sees the
+    /// close and its `run()` returns (the session-end path under test).
+    async fn converge(da: &Path, db: &Path, feed: &[&str], settled: impl Fn() -> bool) {
+        let (la, lb) = mock_pair();
+        let (mut sink_a, mut source_a) = la.into_halves();
+        let (mut sink_b, mut source_b) = lb.into_halves();
+
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+        let (_tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+        for f in feed {
+            tx_a.send(da.join(f)).unwrap();
+        }
+
+        let db_owned = db.to_path_buf();
+        let b_task = tokio::spawn(async move {
+            let mut pb = BoardPeer::new();
+            run(&mut pb, &mut rx_b, false, &mut sink_b, &mut source_b, &db_owned)
+                .await
+                .expect("B's session ends cleanly when A hangs up");
+        });
+
+        {
+            let mut pa = BoardPeer::new();
+            let run_a = run(&mut pa, &mut rx_a, false, &mut sink_a, &mut source_a, da);
+            tokio::pin!(run_a);
+            loop {
+                tokio::select! {
+                    r = &mut run_a => panic!("A's session ended early: {r:?}"),
+                    _ = sleep(Duration::from_millis(20)) => {
+                        if settled() {
+                            break;
+                        }
+                    }
+                }
+            }
+            // Settled — keep both sides pumping a little longer so anything
+            // still in flight (e.g. a wrongly-pushed dotfile) would land and
+            // be caught by the assertions.
+            tokio::select! {
+                r = &mut run_a => panic!("A's session ended early: {r:?}"),
+                _ = sleep(Duration::from_millis(300)) => {}
+            }
+        } // run_a dropped here, releasing the borrow on sink_a
+        drop(sink_a); // close B's source → B's run() returns
+        b_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_peers_converge_text_and_lww() {
+        let da = dir("conv-a");
+        let db = dir("conv-b");
+        std::fs::create_dir_all(da.join("tickets/tk_1")).unwrap();
+        std::fs::write(da.join("tickets/tk_1/card.md"), "# card one\n\nbody\n").unwrap();
+        std::fs::write(da.join("tickets/tk_1/meta.toml"), "column = \"Todo\"\nposition = 0\n").unwrap();
+
+        let (cb, mb) = (db.join("tickets/tk_1/card.md"), db.join("tickets/tk_1/meta.toml"));
+        timeout(
+            Duration::from_secs(15),
+            converge(
+                &da,
+                &db,
+                &["tickets/tk_1/card.md", "tickets/tk_1/meta.toml"],
+                || cb.is_file() && mb.is_file(),
+            ),
+        )
+        .await
+        .expect("board sync timed out");
+
+        assert_eq!(
+            std::fs::read(db.join("tickets/tk_1/card.md")).unwrap(),
+            b"# card one\n\nbody\n",
+            "text file arrives byte-identical via the CRDT path",
+        );
+        assert_eq!(
+            std::fs::read(db.join("tickets/tk_1/meta.toml")).unwrap(),
+            b"column = \"Todo\"\nposition = 0\n",
+            "structural file arrives via LWW",
+        );
+        std::fs::remove_dir_all(&da).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn dot_paths_never_sync() {
+        let da = dir("dot-a");
+        let db = dir("dot-b");
+        std::fs::create_dir_all(da.join("tickets")).unwrap();
+        std::fs::write(da.join(".site"), "site-a\n").unwrap();
+        std::fs::write(da.join("tickets/.hidden"), "shh\n").unwrap();
+        // A normal sentinel file: once it lands on B, A's whole batch (which
+        // included the dot-paths) has been processed.
+        std::fs::write(da.join("board.md"), "# Board\n\n- Todo\n").unwrap();
+
+        let sentinel = db.join("board.md");
+        timeout(
+            Duration::from_secs(15),
+            converge(
+                &da,
+                &db,
+                &[".site", "tickets/.hidden", "board.md"],
+                || sentinel.is_file(),
+            ),
+        )
+        .await
+        .expect("board sync timed out");
+
+        assert!(!db.join(".site").exists(), "top-level .site must never sync");
+        assert!(!db.join("tickets/.hidden").exists(), "nested dotfile must never sync");
+        std::fs::remove_dir_all(&da).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
 }

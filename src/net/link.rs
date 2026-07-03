@@ -129,6 +129,44 @@ impl Link for MockLink {
     }
 }
 
+impl MockLink {
+    /// Split into independent send/recv halves — the in-memory analogue of
+    /// `IrohLink::into_halves` / `WebrtcLink::into_halves`, so the split-link
+    /// sessions (`sync::board`, …) are testable without sockets. Dropping a
+    /// `MockSink` closes its channel, so the peer's `Source::recv` returns
+    /// `Ok(None)` and that peer's session ends — mirroring a real hangup.
+    pub fn into_halves(self) -> (MockSink, MockSource) {
+        (MockSink { tx: self.tx }, MockSource { rx: self.rx })
+    }
+}
+
+/// Send half of a split [`MockLink`].
+pub struct MockSink {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+/// Receive half of a split [`MockLink`].
+pub struct MockSource {
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+#[async_trait]
+impl Sink for MockSink {
+    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
+        self.tx.send(msg).map_err(anyerr)
+    }
+    /// No-op: an unbounded channel delivers everything already sent; closure
+    /// (which ends the peer's session) happens when the `MockSink` is dropped.
+    async fn finish(&mut self) {}
+}
+
+#[async_trait]
+impl Source for MockSource {
+    async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+        Ok(self.rx.recv().await)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mock broadcast bus — N clients, each sees everyone else's messages.
 // ---------------------------------------------------------------------------

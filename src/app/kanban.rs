@@ -70,10 +70,16 @@ pub fn serve(dir: &str, port: u16, dist: &str) -> Result<(), Box<dyn std::error:
 /// collaboration. Dials the link, then hands the halves to the shared board-sync
 /// driver ([`crate::sync::board`]). Blocks until the link drops.
 pub async fn connect_board(signal: &str, room: &str, dir: &str) -> crate::net::Result<()> {
+    use crate::sync::board;
+
     let link = crate::net::webrtc::connect_via_signaling(signal, room).await?;
-    let (sink, source) = link.into_halves(Arc::new(crate::net::Counters::default()));
-    eprintln!("[kanban] connected to room '{room}'; syncing board at {dir}");
-    crate::sync::board::run(Box::new(sink), Box::new(source), Path::new(dir)).await
+    let (mut sink, mut source) = link.into_halves(Arc::new(crate::net::Counters::default()));
+    let dir = board::prepare_dir(Path::new(dir))?;
+    eprintln!("[kanban] connected to room '{room}'; syncing board at {}", dir.display());
+    // If the watcher can't start, degrade to the poll fallback — never abort.
+    let (watcher, mut rx) = board::watch(&dir);
+    let mut peer = board::BoardPeer::new();
+    board::run(&mut peer, &mut rx, watcher.is_none(), &mut sink, &mut source, &dir).await
 }
 
 // ---------------------------------------------------------------------------
