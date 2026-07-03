@@ -12,12 +12,12 @@ use std::path::{Path, PathBuf};
 
 use crate::sync::backing::{Backing, FileBacking, MemoryRegistry};
 use crate::sync::manifest::Manifest;
-use crate::sync::syncer::{Kind, Syncer};
+use crate::sync::strategy::{Kind, SyncStrategy};
 
 /// One synced thing: its algorithm + where its bytes live.
 pub struct Resource {
     pub kind: Kind,
-    pub syncer: Box<dyn Syncer>,
+    pub strategy: Box<dyn SyncStrategy>,
     pub backing: Box<dyn Backing>,
 }
 
@@ -107,7 +107,7 @@ impl Workspace {
             eprintln!("[riftpipe] skipping {rel}: {kind:?} not implemented yet");
             return;
         }
-        let syncer = kind.build(rel);
+        let strategy = kind.build(rel);
         let backing: Box<dyn Backing> = if self.memory {
             let mut mb = self.registry.backing(rel);
             // Seed from disk once, if the file exists (sharing a dir into RAM).
@@ -122,7 +122,7 @@ impl Workspace {
             rel.to_string(),
             Resource {
                 kind,
-                syncer,
+                strategy,
                 backing,
             },
         );

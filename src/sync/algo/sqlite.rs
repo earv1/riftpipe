@@ -16,7 +16,7 @@
 //! is an LWW field. SQLite is just the local store (Shape B) — riftpipe owns the
 //! merge. Synced tables must have a TEXT primary key column named `id`.
 //!
-//! Status: standalone engine + tests. Wiring into the `Syncer`/folder seam (DB
+//! Status: standalone engine + tests. Wiring into the `SyncStrategy`/folder seam (DB
 //! resources are driven by `set()`, not file snapshots) is the next step.
 
 use std::collections::HashMap;

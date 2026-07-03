@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use riftpipe::net::sync_full;
+use riftpipe::sync::sync_full;
 use riftpipe::crdt::text::EgWalkerText;
 use riftpipe::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr};
 

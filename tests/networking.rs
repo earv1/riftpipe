@@ -6,7 +6,7 @@
 //!                    →  data over the negotiated transport
 //!
 //! Exercises `net::{transport, secure, negotiate, webrtc}` and the shared
-//! `sync::pipe::negotiate_session_halves` glue together, rather than any single
+//! `net::negotiate::negotiate_session_halves` glue together, rather than any single
 //! layer in isolation (those have unit tests).
 //!
 //! Structure notes:
@@ -28,7 +28,7 @@ use riftpipe::net::negotiate::{exchange_caps, Caps, Transport};
 use riftpipe::net::secure::authenticate;
 use riftpipe::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr};
 use riftpipe::net::Counters;
-use riftpipe::sync::pipe::negotiate_session_halves;
+use riftpipe::net::negotiate::negotiate_session_halves;
 
 const SECRET: [u8; 32] = [7u8; 32];
 const BUDGET: Duration = Duration::from_secs(60);
@@ -137,7 +137,7 @@ async fn native_peers_bridge_via_signaling_server() {
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(riftpipe::signal::serve_on(listener));
+    tokio::spawn(riftpipe::app::signal::serve_on(listener));
     let url = format!("ws://{addr}/");
     let room = "native-bridge-it";
 

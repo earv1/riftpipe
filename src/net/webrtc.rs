@@ -132,6 +132,23 @@ impl WebrtcSource {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::net::Sink for WebrtcSink {
+    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
+        WebrtcSink::send(self, msg).await
+    }
+    async fn finish(&mut self) {
+        WebrtcSink::finish(self).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::net::Source for WebrtcSource {
+    async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+        WebrtcSource::recv(self).await
+    }
+}
+
 /// ICE servers from the environment (self-host-friendly, never n0):
 /// - `RIFTPIPE_STUN` — comma-separated STUN URLs (e.g. `stun:stun.l.google.com:19302`).
 /// - `RIFTPIPE_TURN` (+ `RIFTPIPE_TURN_USER` / `RIFTPIPE_TURN_PASS`) — a TURN relay

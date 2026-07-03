@@ -1,12 +1,24 @@
 # riftpipe kanban
 
-A super-simple, file-backed kanban board. **SolidJS + Vite** frontend, a small
-**Deno** server that reads/writes a board *directory* — and that's it. It has no
-idea riftpipe exists: point [riftpipe](../../) at the board directory and the
-board becomes live, peer-to-peer, end-to-end-encrypted, with zero changes here.
+A super-simple, file-backed kanban board. **SolidJS + Vite** frontend over a
+tiny JSON file-API. The API has **three interchangeable backends**, all speaking
+the same endpoints over the same board *directory* format:
+
+1. **In-browser wasm (the deployed default)** — `src/api.ts` calls
+   `kanbanHandle` from [`web/pkg`](../../web/), the Rust kanban handler compiled
+   to WebAssembly. The board lives in the browser's private filesystem (OPFS);
+   peers sync directly over iroh / the gossip mesh. No server at all.
+2. **Native Rust** — `riftpipe kanban serve ./board` ([`src/app/kanban.rs`](../../src/app/kanban.rs)),
+   tiny_http + SSE over a real directory.
+3. **Deno reference server** — [`server/main.ts`](server/main.ts), the original
+   implementation the other two were ported from. Kept as the readable spec.
+
+The file-backed backends have no idea riftpipe exists: point
+[riftpipe](../../) at the board directory and the board becomes live,
+peer-to-peer, end-to-end-encrypted, with zero changes here.
 
 > This is a **separate project** from the riftpipe core (different stack, own
-> tooling). They compose through the filesystem.
+> tooling). They compose through the filesystem (or OPFS in the browser).
 
 ## The board is just files
 

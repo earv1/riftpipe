@@ -13,7 +13,7 @@ way."* The honest finding below is that **almost nothing implements our exact
 pattern** (leaderless, P2P-over-iroh, no central server). Most "sync databases"
 are hub-and-spoke. So the realistic question is narrower: which DB gives us a
 *merge engine* or a *storage substrate* we can bolt onto the existing
-[`Syncer`](../../src/sync/syncer.rs) seam, and which are just hype for our case.
+[`SyncStrategy`](../../src/sync/strategy.rs) seam, and which are just hype for our case.
 
 **The headline, though, isn't "which database" — see §2.** Because riftpipe apps
 only ever have *one local writer* per replica, DB concurrency/locking is a
@@ -390,7 +390,7 @@ SpacetimeDB (model + license). These stay on the watch-list, not the build-list.
   (now-confirmed) staleness.
 - DESIGN.md §17 — the `Syncer` seam, backings, and the planned `wal-db`/`image`
   kinds these directions would extend.
-- [`../../src/sync/syncer.rs`](../../src/sync/syncer.rs) — the trait every
+- [`../../src/sync/strategy.rs`](../../src/sync/strategy.rs) — the trait every
   candidate must map onto.
 
 ## Sources (verified June 2026)

@@ -1,9 +1,10 @@
-//! Transport-agnostic sync (DESIGN.md §5). A `Link` is a message-oriented
-//! bidirectional byte channel to one peer; everything above it (the CRDT sync
-//! driver) is identical whether the link is in-memory (tests) or real iroh QUIC.
+//! Transport-agnostic messaging (DESIGN.md §5). A `Link` is a message-oriented
+//! bidirectional byte channel to one peer; everything above it (the sync
+//! drivers in `sync/`) is identical whether the link is in-memory (tests) or
+//! real iroh QUIC.
 //!
 //! This is the seam that makes integration tests cheap: spin up N mock clients
-//! over `MockNet`/`mock_pair`, run the SAME `sync_full` driver the real
+//! over `MockNet`/`mock_pair`, run the SAME `sync::sync_full` driver the real
 //! transport uses, and assert convergence — no sockets required.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,8 +12,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc};
-
-use crate::crdt::text::EgWalkerText;
 
 pub type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, BoxErr>;
@@ -36,26 +35,22 @@ pub trait Link: Send {
     }
 }
 
-/// The shared sync driver used by BOTH mock and real transports: broadcast our
-/// full CRDT state, then merge `peer_msgs` incoming states. For a pair use
-/// `peer_msgs = 1`; for an N-client bus use `peer_msgs = N - 1`. Convergence is
-/// order-independent (the CRDT guarantee), so the driver needs no coordination.
-pub async fn sync_full(
-    doc: &mut EgWalkerText,
-    link: &mut dyn Link,
-    peer_msgs: usize,
-) -> Result<()> {
-    link.send(doc.encode_full()).await?;
-    for _ in 0..peer_msgs {
-        match link.recv().await? {
-            Some(bytes) => {
-                let _ = doc.merge(&bytes);
-            }
-            None => break,
-        }
-    }
-    link.done().await?;
-    Ok(())
+/// The send half of a split link. Splitting lets a session push (on a local
+/// change) and pull (on arrival) concurrently instead of in lockstep rounds.
+/// Every transport's halves implement these two traits, so everything above
+/// (`sync::pipe`, `sync::folder`, `sync::board`) is transport-blind.
+#[async_trait]
+pub trait Sink: Send {
+    async fn send(&mut self, msg: Vec<u8>) -> Result<()>;
+    /// Signal end-of-data so the last message is delivered before drop.
+    async fn finish(&mut self);
+}
+
+/// The receive half of a split link.
+#[async_trait]
+pub trait Source: Send {
+    /// Next message, or `None` when the peer/link is closed.
+    async fn recv(&mut self) -> Result<Option<Vec<u8>>>;
 }
 
 // ---------------------------------------------------------------------------

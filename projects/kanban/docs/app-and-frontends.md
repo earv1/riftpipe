@@ -2,7 +2,7 @@
 
 **Status:** the **Serve** layer (HTTP file-API + static UI host) is **implemented
 in Rust** — `riftpipe kanban serve <board-dir> [--port 7777] [--dist <spa-dir>]`
-(`src/kanban.rs`, `tiny_http`). It ports the Deno reference server route-for-route
+(`src/app/kanban.rs`, `tiny_http`). It ports the Deno reference server route-for-route
 (`/api/board`, `/api/cards/:id[/detail]`, POST `/api/cards`, PATCH
 `/api/cards/:id`, POST `/api/cards/:id/comments`, SSE `/api/events`), serves the
 built SolidJS SPA, and reads/writes the same on-disk model — verified end-to-end

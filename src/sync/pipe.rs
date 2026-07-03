@@ -12,7 +12,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use iroh::{Endpoint, EndpointAddr};
 use serde::{Deserialize, Serialize};
 use similar::{capture_diff_slices, Algorithm, DiffOp};
@@ -21,11 +20,10 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, sleep_until, Instant, MissedTickBehavior};
 
 use crate::crdt::text::EgWalkerText;
-use crate::net::negotiate::{exchange_caps, Caps, Transport};
+use crate::net::negotiate::negotiate_session_halves;
 use crate::net::secure::authenticate;
-use crate::net::transport::{accept_link, connect_link, IrohLink, IrohSink, IrohSource};
-use crate::net::webrtc::{upgrade_to_webrtc, WebrtcSink, WebrtcSource};
-use crate::net::{anyerr, Counters, Result};
+use crate::net::transport::{accept_link, connect_link};
+use crate::net::{anyerr, Counters, Result, Sink, Source};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -150,85 +148,6 @@ fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
     v
 }
 
-// The send/recv halves a session runs over. Abstracted so the session loop is
-// testable with mocks and reusable across reconnects.
-#[async_trait]
-pub trait PipeSink: Send {
-    async fn send(&mut self, msg: Vec<u8>) -> Result<()>;
-    async fn finish(&mut self);
-}
-#[async_trait]
-pub trait PipeSource: Send {
-    async fn recv(&mut self) -> Result<Option<Vec<u8>>>;
-}
-
-#[async_trait]
-impl PipeSink for IrohSink {
-    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
-        IrohSink::send(self, msg).await
-    }
-    async fn finish(&mut self) {
-        IrohSink::finish(self).await
-    }
-}
-#[async_trait]
-impl PipeSource for IrohSource {
-    async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
-        IrohSource::recv(self).await
-    }
-}
-
-#[async_trait]
-impl PipeSink for WebrtcSink {
-    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
-        WebrtcSink::send(self, msg).await
-    }
-    async fn finish(&mut self) {
-        WebrtcSink::finish(self).await
-    }
-}
-#[async_trait]
-impl PipeSource for WebrtcSource {
-    async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
-        WebrtcSource::recv(self).await
-    }
-}
-
-/// Negotiate the data transport over the (authenticated) iroh `link`, optionally
-/// upgrade to WebRTC, and return the session's send/recv halves
-/// (`docs/planned/transport-negotiation.md`). Shared by `--pipe` and folder mode.
-///
-/// On a WebRTC upgrade the iroh link is returned as the `keepalive` (control /
-/// fallback — and it keeps the QUIC connection alive so metrics' `connection_kind`
-/// still resolves); on iroh transport it's consumed into the halves. An upgrade
-/// failure transparently falls back to iroh. The returned `Transport` is what the
-/// data plane actually ended up using.
-pub async fn negotiate_session_halves(
-    mut link: IrohLink,
-    counters: Arc<Counters>,
-) -> (Box<dyn PipeSink>, Box<dyn PipeSource>, Option<IrohLink>, Transport) {
-    let outcome = exchange_caps(&mut link, &Caps::native()).await;
-    if let Ok(o) = &outcome {
-        if o.transport == Transport::WebrtcDirect {
-            match upgrade_to_webrtc(&mut link, o.we_offer).await {
-                Ok(w) => {
-                    let (sink, source) = w.into_halves(counters);
-                    return (Box::new(sink), Box::new(source), Some(link), Transport::WebrtcDirect);
-                }
-                Err(e) => eprintln!("[riftpipe] webrtc upgrade failed ({e}); staying on iroh"),
-            }
-        }
-    }
-    // Either iroh was chosen, caps failed, or the WebRTC upgrade fell back. We're
-    // on the iroh link now; report iroh-direct rather than the unrealized webrtc.
-    let transport = match outcome {
-        Ok(o) if o.transport != Transport::WebrtcDirect => o.transport,
-        _ => Transport::IrohDirect,
-    };
-    let (sink, source) = link.into_halves(counters);
-    (Box::new(sink), Box::new(source), None, transport)
-}
-
 /// Why a session ended.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SessionOutcome {
@@ -269,8 +188,8 @@ pub async fn session(
     peer: &mut PipePeer,
     rx: &mut UnboundedReceiver<EditOp>,
     out: &mut (impl AsyncWrite + Unpin),
-    sink: &mut dyn PipeSink,
-    source: &mut dyn PipeSource,
+    sink: &mut dyn Sink,
+    source: &mut dyn Source,
 ) -> Result<SessionOutcome> {
     let mut heartbeat = interval(Duration::from_secs(5));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -504,13 +423,14 @@ mod tests {
     }
 
     // --- reconnection (session) tests ---
+    use async_trait::async_trait;
     use std::collections::VecDeque;
 
     struct MockSink {
         sent: Vec<Vec<u8>>,
     }
     #[async_trait]
-    impl PipeSink for MockSink {
+    impl Sink for MockSink {
         async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
             self.sent.push(msg);
             Ok(())
@@ -523,7 +443,7 @@ mod tests {
         queue: VecDeque<Vec<u8>>,
     }
     #[async_trait]
-    impl PipeSource for DroppingSource {
+    impl Source for DroppingSource {
         async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
             Ok(self.queue.pop_front())
         }
@@ -531,7 +451,7 @@ mod tests {
     /// Never yields — a live but quiet link.
     struct PendingSource;
     #[async_trait]
-    impl PipeSource for PendingSource {
+    impl Source for PendingSource {
         async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
             std::future::pending().await
         }

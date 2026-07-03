@@ -1,5 +1,5 @@
 //! Where a resource's bytes live (DESIGN.md §17.5). The sync algorithm
-//! ([`Syncer`](crate::sync::syncer::Syncer)) only ever sees `&[u8]` — it doesn't
+//! ([`SyncStrategy`](crate::sync::strategy::SyncStrategy)) only ever sees `&[u8]` — it doesn't
 //! care whether those bytes are mirrored to a file on disk or held purely in
 //! RAM. That choice is this seam:
 //!
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// A resource's byte store. `load` reads the current local bytes (to feed
-/// `Syncer::observe`); `store` materializes merged bytes back.
+/// `SyncStrategy::observe`); `store` materializes merged bytes back.
 pub trait Backing: Send {
     fn name(&self) -> &str;
     fn load(&self) -> Vec<u8>;

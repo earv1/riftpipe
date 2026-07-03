@@ -2,7 +2,8 @@
 //! exercise the exact `sync_full` driver the real iroh transport uses, but with
 //! zero sockets — so they're fast and deterministic. Mock client 1, 2, ... N.
 
-use riftpipe::net::{mock_pair, sync_full, MockNet};
+use riftpipe::net::{mock_pair, MockNet};
+use riftpipe::sync::sync_full;
 use riftpipe::crdt::text::EgWalkerText;
 
 fn doc(name: &str, text: &str) -> EgWalkerText {

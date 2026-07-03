@@ -1,6 +1,6 @@
 //! Text CRDT strategy — the **adapter** onto diamond-types' [`EgWalkerText`]
 //! (DESIGN.md §17). This keeps the existing eg-walker text path exactly as it
-//! is and just dresses it in the [`Syncer`] trait so a folder can mix text
+//! is and just dresses it in the [`SyncStrategy`] trait so a folder can mix text
 //! resources with rsync/wal/image ones.
 //!
 //! The mapping is 1:1 with what `sync::pipe`/`sync::mirror` already do:
@@ -11,7 +11,7 @@
 //!   merge        -> fold remote ops, hand back the new materialized text
 
 use crate::crdt::text::EgWalkerText;
-use crate::sync::syncer::{Kind, Syncer};
+use crate::sync::strategy::{Kind, SyncStrategy};
 
 pub struct TextCrdtSyncer {
     doc: EgWalkerText,
@@ -34,7 +34,7 @@ impl TextCrdtSyncer {
     }
 }
 
-impl Syncer for TextCrdtSyncer {
+impl SyncStrategy for TextCrdtSyncer {
     fn kind(&self) -> Kind {
         Kind::TextCrdt
     }

@@ -38,14 +38,31 @@ RIFTPIPE_BIN=./target/debug/riftpipe RIFTPIPE_ARGS="share /path/file --pipe" \
   nvim -c 'luafile nvim/riftpipe.lua' /path/file
 ```
 
-## Module map (src/)
-- `net/`   — link (Link trait + mock + counters), transport (iroh), secure (ticket + auth)
-- `crdt/`  — text (eg-walker document, diamond-types): diff-to-ops, delta encode/merge, version vectors
-- `sync/`  — pipe (the `--pipe` protocol: event-driven session, reconciliation, reconnection), mirror (file-mirror loop)
-  - `syncer` — the `Syncer` adapter trait + `Kind` (the Strategy seam, DESIGN §17)
-  - `algo/`  — concrete algorithms: text_crdt (real), rsync (real), wal/image (stubs)
+## Module map
+Crates: `core/` (riftpipe-core: pure, wasm-safe — text CRDT, board sync
+protocol, kanban file format, wal frames), `src/` (native binary), `web/`
+(wasm/browser, workspace-excluded). See `docs/architecture.md` for the diagram.
+
+src/:
+- `net/`   — link (Link trait + mock + counters), transport (iroh), webrtc
+  (data-plane + upgrade + browser signaling client), negotiate (capability
+  ladder), secure (ticket + auth)
+- `crdt/`  — re-export shim over `riftpipe_core::text` (eg-walker document,
+  diamond-types): diff-to-ops, delta encode/merge, version vectors
+- `sync/`  — sync_full (the shared full-state driver), pipe (the `--pipe`
+  protocol: event-driven session, reconciliation, reconnection), mirror
+  (file-mirror loop), folder (multiplexed reconnecting folder session), board
+  (the riftpipe_core::sync board driver — wire-compatible with browser peers)
+  - `strategy` — the `SyncStrategy` adapter trait + `Kind` (the Strategy seam, DESIGN §17)
+  - `algo/`  — concrete algorithms: text_crdt (real), rsync (real), wal/image
+    (adapter stubs; wal's core primitive is `riftpipe_core::wal`), sqlite
+    (real + tested, not yet wired into `Kind`)
   - `backing` — where bytes live: FileBacking vs MemoryBacking + MemoryRegistry (§17.5)
+  - `manifest`/`workspace` — riftpipe.toml glob→Kind rules; a folder of resources
 - `monitor/` — metrics (one-line status to a file for tmux; connection-kind detection), process (the in-memory `process` sidecar: size+hash for all RAM resources, §17.6)
+- `app/`   — runnable servers on top of the plumbing: kanban (serve = HTTP/SSE
+  board server; connect = dial WebRTC + hand off to sync/board) and signal
+  (WebSocket signaling relay)
 
 ## What's done
 - **Folder sync — CLI-wired (DESIGN §17, local on `main`):** `share <dir>` /
@@ -56,7 +73,7 @@ RIFTPIPE_BIN=./target/debug/riftpipe RIFTPIPE_ARGS="share /path/file --pipe" \
   <path>` (size+hash of all in-memory resources). **Verified end-to-end over
   loopback**: text-crdt + rsync files sync into nested subdirs, live edits
   converge, memory/process file works. 46 tests green, 0 warnings.
-- **The adapter seam:** `Syncer` trait (Strategy) + `Kind` factory; **rsync**
+- **The adapter seam:** `SyncStrategy` trait + `Kind` factory; **rsync**
   (rolling weak + blake3 strong checksums, postcard wire, LWW `(version,hash)`
   convergence); text-crdt adapter; file/memory backings + `MemoryRegistry`.
   Example `riftpipe.toml` at repo root.
@@ -73,7 +90,7 @@ RIFTPIPE_BIN=./target/debug/riftpipe RIFTPIPE_ARGS="share /path/file --pipe" \
 - **P2P kanban — files as the database** — see [`docs/planned/`](docs/planned/).
   Decision (June 2026): the board is a **directory tree** synced by the existing
   folder mode — `board.md` + `tickets/<id>/{card.md, meta.toml, comments/*.md,
-  attachments/*}`. Each file gets the right `Syncer` via the manifest (card/
+  attachments/*}`. Each file gets the right `SyncStrategy` via the manifest (card/
   comments → text-crdt; `meta.toml`/attachments → rsync). Ticket folders are
   **stable**; column (incl. `archived`) is a **field** in `meta.toml` (path = sync
   identity, so cards don't move between folders). riftpipe is the wrapper
@@ -84,8 +101,10 @@ RIFTPIPE_BIN=./target/debug/riftpipe RIFTPIPE_ARGS="share /path/file --pipe" \
 
 ## TODO / next steps (rough priority)
 Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
-1. **Implement `wal-db`** (append-only frames) — sync *state* (the WAL) separately
-   from a *view* (e.g. a DB's authoritative log vs. a rendered projection).
+1. **Finish `wal-db`** — the core primitive landed (`core/src/wal.rs`: append-only
+   frames + deterministic linearizer, commit `630081f`); still to do: wire the
+   `Kind::WalDb` adapter (`src/sync/algo/wal.rs` is a `todo!()` stub) so a
+   manifest glob can use it.
 2. **Implement `image`** (tile merge) — eg-walker is the wrong granularity for
    pixels.
 3. **Per-resource backing in the manifest** — choose memory vs file per glob

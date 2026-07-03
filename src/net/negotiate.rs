@@ -8,9 +8,13 @@
 //! pair — never leave them unable to talk. This is the seam the WebRTC data plane
 //! and the browser build plug into later; today only the iroh rungs are realized.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-use crate::net::{anyerr, Link, Result};
+use crate::net::transport::IrohLink;
+use crate::net::webrtc::upgrade_to_webrtc;
+use crate::net::{anyerr, Counters, Link, Result, Sink, Source};
 
 /// Wire-format version of the capability exchange. Bumped on any breaking change
 /// to [`Caps`]; both peers are the same binary in our demos, so a mismatch is a
@@ -128,6 +132,41 @@ pub async fn exchange_caps(link: &mut dyn Link, local: &Caps) -> Result<Outcome>
         .ok_or_else(|| anyerr("caps: peer sent no capabilities"))?;
     let remote: Caps = postcard::from_bytes(&peer).map_err(anyerr)?;
     Ok(negotiate(local, &remote))
+}
+
+/// Negotiate the data transport over the (authenticated) iroh `link`, optionally
+/// upgrade to WebRTC, and return the session's send/recv halves
+/// (`docs/planned/transport-negotiation.md`). Shared by `--pipe` and folder mode.
+///
+/// On a WebRTC upgrade the iroh link is returned as the `keepalive` (control /
+/// fallback — and it keeps the QUIC connection alive so metrics' `connection_kind`
+/// still resolves); on iroh transport it's consumed into the halves. An upgrade
+/// failure transparently falls back to iroh. The returned `Transport` is what the
+/// data plane actually ended up using.
+pub async fn negotiate_session_halves(
+    mut link: IrohLink,
+    counters: Arc<Counters>,
+) -> (Box<dyn Sink>, Box<dyn Source>, Option<IrohLink>, Transport) {
+    let outcome = exchange_caps(&mut link, &Caps::native()).await;
+    if let Ok(o) = &outcome {
+        if o.transport == Transport::WebrtcDirect {
+            match upgrade_to_webrtc(&mut link, o.we_offer).await {
+                Ok(w) => {
+                    let (sink, source) = w.into_halves(counters);
+                    return (Box::new(sink), Box::new(source), Some(link), Transport::WebrtcDirect);
+                }
+                Err(e) => eprintln!("[riftpipe] webrtc upgrade failed ({e}); staying on iroh"),
+            }
+        }
+    }
+    // Either iroh was chosen, caps failed, or the WebRTC upgrade fell back. We're
+    // on the iroh link now; report iroh-direct rather than the unrealized webrtc.
+    let transport = match outcome {
+        Ok(o) if o.transport != Transport::WebrtcDirect => o.transport,
+        _ => Transport::IrohDirect,
+    };
+    let (sink, source) = link.into_halves(counters);
+    (Box::new(sink), Box::new(source), None, transport)
 }
 
 #[cfg(test)]

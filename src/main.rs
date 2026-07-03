@@ -126,7 +126,7 @@ async fn main() {
                 // The HTTP server is synchronous (tiny_http); run it off the async
                 // runtime so a future folder-sync task can share the process.
                 let res = tokio::task::spawn_blocking(move || {
-                    riftpipe::kanban::serve(&dir, port, &dist).map_err(|e| e.to_string())
+                    riftpipe::app::kanban::serve(&dir, port, &dist).map_err(|e| e.to_string())
                 })
                 .await;
                 if let Ok(Err(e)) = res {
@@ -139,7 +139,7 @@ async fn main() {
                 let signal = flag_value(&args, "--signal").unwrap_or_else(|| "ws://127.0.0.1:9000".to_string());
                 if connid.is_empty() {
                     eprintln!("usage: riftpipe kanban connect <connection-id> <board-dir> [--signal ws://…]");
-                } else if let Err(e) = riftpipe::kanban::connect_board(&signal, &connid, &dir).await {
+                } else if let Err(e) = riftpipe::app::kanban::connect_board(&signal, &connid, &dir).await {
                     eprintln!("[kanban] connect failed: {e}");
                 }
             }
@@ -147,7 +147,7 @@ async fn main() {
         },
         "signal" => {
             let port = flag_value(&args, "--port").and_then(|v| v.parse().ok()).unwrap_or(9000);
-            if let Err(e) = riftpipe::signal::serve(port).await {
+            if let Err(e) = riftpipe::app::signal::serve(port).await {
                 eprintln!("[signal] serve failed: {e}");
             }
         }

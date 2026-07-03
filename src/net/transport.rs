@@ -1,7 +1,7 @@
 //! Real iroh 1.0 transport (DESIGN.md §5/§11). Implements `net::Link` over a QUIC
 //! bidirectional stream with length-prefixed framing, plus helpers to bind
 //! endpoints and obtain accept/connect links. The sync logic on top is the same
-//! `net::sync_full` the mock transport uses.
+//! `sync::sync_full` the mock transport uses.
 
 use std::time::Duration;
 
@@ -158,6 +158,23 @@ impl IrohSource {
         self.recv.read_exact(&mut buf).await.map_err(anyerr)?;
         self.counters.recv.fetch_add(n as u64, Ordering::Relaxed);
         Ok(Some(buf))
+    }
+}
+
+#[async_trait]
+impl crate::net::Sink for IrohSink {
+    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
+        IrohSink::send(self, msg).await
+    }
+    async fn finish(&mut self) {
+        IrohSink::finish(self).await
+    }
+}
+
+#[async_trait]
+impl crate::net::Source for IrohSource {
+    async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+        IrohSource::recv(self).await
     }
 }
 

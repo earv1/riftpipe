@@ -20,7 +20,7 @@
 
 use serde::Deserialize;
 
-use crate::sync::syncer::Kind;
+use crate::sync::strategy::Kind;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {

@@ -27,7 +27,7 @@ peer-to-peer*; the answer is two strategies, picked per file:
 | `*.crdt.sqlite` | **cr-sqlite** (CRDT) | writers can edit the **same rows** | conflict-free (LWW columns + causal log) |
 | `*.wal.sqlite` | **SQLite session changesets** | writers own **disjoint rows** / append-only | union (no resolution needed) |
 
-Both sit behind the same [`Syncer`](../../src/sync/syncer.rs) trait — only the
+Both sit behind the same [`SyncStrategy`](../../src/sync/strategy.rs) trait — only the
 encode/merge internals differ. The manifest maps the globs to `Kind`s:
 
 ```toml

@@ -4,13 +4,13 @@
 //! in-memory backing):
 //!   1. The side that may be out of date advertises **block signatures** of its
 //!      content: a cheap rolling **weak** checksum + a strong **blake3** hash per
-//!      fixed-size block ([`signatures`], carried by [`Syncer::state_vector`]).
+//!      fixed-size block ([`signatures`], carried by [`SyncStrategy::state_vector`]).
 //!   2. The other side rolls a window byte-by-byte over *its* content, and where
 //!      the weak (then strong) checksum matches a known block, emits a `Copy`
 //!      referencing that block; the gaps become `Literal` bytes ([`diff`], via
-//!      [`Syncer::delta_since`]).
+//!      [`SyncStrategy::delta_since`]).
 //!   3. The first side reconstructs from its own blocks + the literals
-//!      ([`reconstruct`], via [`Syncer::merge`]).
+//!      ([`reconstruct`], via [`SyncStrategy::merge`]).
 //!
 //! ## rsync is replication, not merge — so we add an order
 //! Unlike the text CRDT, rsync has no notion of merging concurrent edits: it
@@ -27,7 +27,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::sync::syncer::{Kind, Syncer};
+use crate::sync::strategy::{Kind, SyncStrategy};
 
 /// Fixed block size. Small enough to dedup fine-grained edits, large enough to
 /// keep signature overhead sane.
@@ -223,7 +223,7 @@ struct Patch {
     delta: Delta,
 }
 
-// --- the Syncer adapter ---------------------------------------------------
+// --- the SyncStrategy adapter ---------------------------------------------------
 
 pub struct RsyncSyncer {
     current: Vec<u8>,
@@ -240,7 +240,7 @@ impl RsyncSyncer {
     }
 }
 
-impl Syncer for RsyncSyncer {
+impl SyncStrategy for RsyncSyncer {
     fn kind(&self) -> Kind {
         Kind::RsyncFile
     }

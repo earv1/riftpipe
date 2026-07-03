@@ -211,7 +211,11 @@ conformance suite regardless — it's the spec/regression harness.
 
 ---
 
-## 9. Simulation engine (one engine, three modes)
+## 9. Simulation engine (one engine, three modes) — REMOVED
+
+> **Removed from this repo** (commit `10c385e`, July 2026): the game/simulation
+> engine belonged in a separate project. Kept here as the decision record; no
+> `simulation` module exists in `src/` anymore.
 
 Simulation is not new machinery — it's the deterministic replay engine run with
 no commit and no network. Three uses of one loop:
@@ -526,7 +530,7 @@ behind one interface, selected at runtime. *Adapter* is the inner role each
 strategy plays when it wraps an existing library (the text strategy adapts
 diamond-types). The `Kind` enum + factory is a small **Abstract Factory**.
 
-The trait (`sync::syncer::Syncer`) is kept to the **minimal, reconcile-centric**
+The trait (`sync::strategy::SyncStrategy`) is kept to the **minimal, reconcile-centric**
 contract the network layer truly needs — *advertise what you have*
 (`state_vector`), *answer "what are you missing"* (`delta_since`), *merge an
 opaque delta* (`merge`), plus an eager push path (`observe`/`push_delta`) for

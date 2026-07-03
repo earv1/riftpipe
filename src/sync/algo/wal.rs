@@ -11,7 +11,7 @@
 //! Not yet implemented: the sync methods `todo!()` so a misconfigured manifest
 //! fails loudly rather than silently corrupting data.
 
-use crate::sync::syncer::{Kind, Syncer};
+use crate::sync::strategy::{Kind, SyncStrategy};
 
 pub struct WalDb;
 
@@ -21,7 +21,7 @@ impl WalDb {
     }
 }
 
-impl Syncer for WalDb {
+impl SyncStrategy for WalDb {
     fn kind(&self) -> Kind {
         Kind::WalDb
     }

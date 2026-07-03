@@ -17,25 +17,25 @@
 //! algorithms (a WAL tails records; rsync negotiates via block checksums).
 //!
 //! All payloads are opaque bytes: the framing layer never interprets them, so a
-//! new algorithm is a new `impl Syncer`, nothing else. Object-safe on purpose,
+//! new algorithm is a new `impl SyncStrategy`, nothing else. Object-safe on purpose,
 //! so heterogeneous resources can share one link in a
-//! `HashMap<ResourceId, Box<dyn Syncer>>`.
+//! `HashMap<ResourceId, Box<dyn SyncStrategy>>`.
 
 use serde::{Deserialize, Serialize};
 
 /// One pluggable sync algorithm bound to one resource (a file, a db, a board).
 ///
 /// Two ways state flows in/out, both driven by the session loop:
-///   * **push** — a local change is observed ([`observe`](Syncer::observe)); if
+///   * **push** — a local change is observed ([`observe`](SyncStrategy::observe)); if
 ///     the algorithm can ship eagerly it returns a delta from
-///     [`push_delta`](Syncer::push_delta). (CRDTs push; rsync can't push without
+///     [`push_delta`](SyncStrategy::push_delta). (CRDTs push; rsync can't push without
 ///     the peer's checksums, so it returns `None` and waits for the pull path.)
 ///   * **pull / reconcile** — a peer advertises its
-///     [`state_vector`](Syncer::state_vector); we answer with
-///     [`delta_since`](Syncer::delta_since); the peer folds it in via
-///     [`merge`](Syncer::merge). This runs on connect, after a settle, and on a
+///     [`state_vector`](SyncStrategy::state_vector); we answer with
+///     [`delta_since`](SyncStrategy::delta_since); the peer folds it in via
+///     [`merge`](SyncStrategy::merge). This runs on connect, after a settle, and on a
 ///     heartbeat — it is also what recovers a missed push.
-pub trait Syncer: Send {
+pub trait SyncStrategy: Send {
     /// Which algorithm this is (for diagnostics / the metrics HUD).
     fn kind(&self) -> Kind;
 
@@ -51,10 +51,10 @@ pub trait Syncer: Send {
 
     /// Compact advertisement of what we hold, for the pull/reconcile path
     /// (text: a version vector; rsync: block checksums). The peer replies with
-    /// [`delta_since`](Syncer::delta_since).
+    /// [`delta_since`](SyncStrategy::delta_since).
     fn state_vector(&self) -> Vec<u8>;
 
-    /// Given a peer's [`state_vector`](Syncer::state_vector), the delta that
+    /// Given a peer's [`state_vector`](SyncStrategy::state_vector), the delta that
     /// brings **them** up to **us** (text: the ops they lack; rsync: a token
     /// stream). `None` when they are already caught up (so we send nothing).
     fn delta_since(&self, theirs: &[u8]) -> Option<Vec<u8>>;
@@ -82,7 +82,7 @@ pub enum Kind {
 impl Kind {
     /// Construct the live algorithm for this kind, bound to `name` (the resource
     /// path — used as the CRDT agent name / log id).
-    pub fn build(self, name: &str) -> Box<dyn Syncer> {
+    pub fn build(self, name: &str) -> Box<dyn SyncStrategy> {
         use super::algo;
         match self {
             Kind::TextCrdt => Box::new(algo::text_crdt::TextCrdtSyncer::new(name)),

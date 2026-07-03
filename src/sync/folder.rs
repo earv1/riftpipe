@@ -1,5 +1,5 @@
 //! Folder mode (DESIGN.md §17) — multiplex many resources over one link, each
-//! driven by its own [`Syncer`](crate::sync::syncer::Syncer). This is the
+//! driven by its own [`SyncStrategy`](crate::sync::strategy::SyncStrategy). This is the
 //! `--pipe` reconnecting session generalized from one document to a whole
 //! [`Workspace`]: same link plumbing, same reconnect loop, but every frame is
 //! tagged with a **resource id** (the relative path) and local changes are
@@ -8,7 +8,7 @@
 //!
 //! ## Wire framing
 //! `[path_len: u16 LE][path bytes][tag: u8][payload]`. Tags:
-//!   * `DELTA`    — a patch to [`merge`](crate::sync::syncer::Syncer::merge).
+//!   * `DELTA`    — a patch to [`merge`](crate::sync::strategy::SyncStrategy::merge).
 //!   * `SYNCREQ`  — an advertisement that *expects a reply* (sent on connect,
 //!     on a local change, and on the heartbeat).
 //!   * `SYNCREP`  — an advertisement *in reply* to a `SYNCREQ` (no further
@@ -30,10 +30,10 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::net::secure::authenticate;
-use crate::sync::pipe::negotiate_session_halves;
+use crate::net::negotiate::negotiate_session_halves;
 use crate::net::transport::{accept_link, connect_link};
-use crate::net::{Counters, Result};
-use crate::sync::pipe::{PipeSink, PipeSource, Role, SessionOutcome};
+use crate::net::{Counters, Result, Sink, Source};
+use crate::sync::pipe::{Role, SessionOutcome};
 use crate::sync::workspace::Workspace;
 
 const TAG_DELTA: u8 = 0;
@@ -70,15 +70,15 @@ fn parse_frame(bytes: &[u8]) -> Option<(&str, u8, &[u8])> {
 /// can treat that as `LinkClosed`. (Self-write safe: merging a remote change
 /// stores bytes that `observe` then reports as *unchanged*, so a scan triggered
 /// by our own write is a no-op — no echo, no extra dedup needed.)
-async fn scan_local(ws: &mut Workspace, sink: &mut dyn PipeSink) -> bool {
+async fn scan_local(ws: &mut Workspace, sink: &mut dyn Sink) -> bool {
     let _ = ws.refresh_disk(); // pick up newly-created files
     for path in ws.paths() {
         // Observe under a short borrow, then send without holding it.
         let (changed, push, sv) = match ws.get_mut(&path) {
             Some(res) => {
                 let bytes = res.backing.load();
-                if res.syncer.observe(&bytes) {
-                    (true, res.syncer.push_delta(), res.syncer.state_vector())
+                if res.strategy.observe(&bytes) {
+                    (true, res.strategy.push_delta(), res.strategy.state_vector())
                 } else {
                     (false, None, Vec::new())
                 }
@@ -106,8 +106,8 @@ async fn scan_local(ws: &mut Workspace, sink: &mut dyn PipeSink) -> bool {
 pub async fn session(
     ws: &mut Workspace,
     watch_rx: &mut UnboundedReceiver<()>,
-    sink: &mut dyn PipeSink,
-    source: &mut dyn PipeSource,
+    sink: &mut dyn Sink,
+    source: &mut dyn Source,
 ) -> Result<SessionOutcome> {
     // Safety-net poll: watchers can drop events on some network/edge
     // filesystems, so we still rescan slowly. This is the fallback, NOT the
@@ -120,7 +120,7 @@ pub async fn session(
     // On connect, advertise everything we hold so the peer can reconcile.
     for path in ws.paths() {
         let sv = match ws.get_mut(&path) {
-            Some(r) => r.syncer.state_vector(),
+            Some(r) => r.strategy.state_vector(),
             None => continue,
         };
         if sink.send(frame(&path, TAG_SYNCREQ, &sv)).await.is_err() {
@@ -160,18 +160,18 @@ pub async fn session(
                 if let Some(res) = ws.ensure(&path) {
                     match tag {
                         TAG_DELTA => {
-                            if let Some(nb) = res.syncer.merge(&payload) {
+                            if let Some(nb) = res.strategy.merge(&payload) {
                                 res.backing.store(&nb);
                             }
                         }
                         TAG_SYNCREQ => {
-                            if let Some(d) = res.syncer.delta_since(&payload) {
+                            if let Some(d) = res.strategy.delta_since(&payload) {
                                 outgoing.push(frame(&path, TAG_DELTA, &d));
                             }
-                            outgoing.push(frame(&path, TAG_SYNCREP, &res.syncer.state_vector()));
+                            outgoing.push(frame(&path, TAG_SYNCREP, &res.strategy.state_vector()));
                         }
                         TAG_SYNCREP => {
-                            if let Some(d) = res.syncer.delta_since(&payload) {
+                            if let Some(d) = res.strategy.delta_since(&payload) {
                                 outgoing.push(frame(&path, TAG_DELTA, &d));
                             }
                         }
@@ -187,7 +187,7 @@ pub async fn session(
             _ = heartbeat.tick() => {
                 for path in ws.paths() {
                     let sv = match ws.get_mut(&path) {
-                        Some(r) => r.syncer.state_vector(),
+                        Some(r) => r.strategy.state_vector(),
                         None => continue,
                     };
                     if sink.send(frame(&path, TAG_SYNCREQ, &sv)).await.is_err() {
@@ -324,12 +324,12 @@ mod tests {
         let mut a = Workspace::new(&ra, Manifest::default(), false).unwrap();
         let mut b = Workspace::new(&rb, Manifest::default(), false).unwrap();
 
-        // A's poll: observe local file into its syncer, then advertise (REQ).
+        // A's poll: observe local file into its strategy, then advertise (REQ).
         let a_req = {
             let r = a.get_mut("a.bin").unwrap();
             let bytes = r.backing.load();
-            assert!(r.syncer.observe(&bytes));
-            frame("a.bin", TAG_SYNCREQ, &r.syncer.state_vector())
+            assert!(r.strategy.observe(&bytes));
+            frame("a.bin", TAG_SYNCREQ, &r.strategy.state_vector())
         };
 
         // B receives REQ: nothing to push (B is empty) -> replies REP(empty).
@@ -337,15 +337,15 @@ mod tests {
             let (path, tag, payload) = parse_frame(&a_req).unwrap();
             assert_eq!(tag, TAG_SYNCREQ);
             let r = b.ensure(path).unwrap();
-            assert!(r.syncer.delta_since(payload).is_none());
-            frame(path, TAG_SYNCREP, &r.syncer.state_vector())
+            assert!(r.strategy.delta_since(payload).is_none());
+            frame(path, TAG_SYNCREP, &r.strategy.state_vector())
         };
 
         // A receives REP: computes the rsync delta for B and pushes DELTA.
         let a_delta = {
             let (path, _tag, payload) = parse_frame(&b_rep).unwrap();
             let r = a.get_mut(path).unwrap();
-            let d = r.syncer.delta_since(payload).expect("A has content B lacks");
+            let d = r.strategy.delta_since(payload).expect("A has content B lacks");
             frame(path, TAG_DELTA, &d)
         };
 
@@ -354,7 +354,7 @@ mod tests {
             let (path, tag, payload) = parse_frame(&a_delta).unwrap();
             assert_eq!(tag, TAG_DELTA);
             let r = b.ensure(path).unwrap();
-            let nb = r.syncer.merge(payload).expect("B materializes content");
+            let nb = r.strategy.merge(payload).expect("B materializes content");
             r.backing.store(&nb);
         }
 
