@@ -7,5 +7,6 @@
 pub mod kanban;
 pub mod sync;
 pub mod text;
+pub mod wal;
 
 pub use text::EgWalkerText;
