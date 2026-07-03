@@ -134,29 +134,40 @@ pub async fn connect_board(signal: &str, room: &str, dir: &str) -> crate::net::R
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
-                w_syncer.lock().unwrap().local_lww(&rel, bytes, now)
+                Some(w_syncer.lock().unwrap().local_lww(&rel, bytes, now))
             };
-            if let Ok(b) = postcard::to_allocvec(&msg) {
-                let _ = w_sink.lock().await.send(b).await;
+            if let Some(msg) = msg {
+                if let Ok(b) = postcard::to_allocvec(&msg) {
+                    let _ = w_sink.lock().await.send(b).await;
+                }
             }
         }
     });
 
-    // Remote edits → disk.
+    // Handshake: advertise our version vectors so the peer sends what we lack.
+    if let Ok(b) = postcard::to_allocvec(&syncer.lock().unwrap().hello()) {
+        let _ = sink.lock().await.send(b).await;
+    }
+
+    // Remote edits → disk (+ any handshake replies go back out over the sink).
     while let Ok(Some(bytes)) = source.recv().await {
         let Ok(msg) = postcard::from_bytes::<SyncMsg>(&bytes) else { continue };
-        let merged = syncer.lock().unwrap().apply(msg);
-        if let Some((path, bytes)) = merged {
-            if escapes(&path) {
-                continue;
+        let (persist, replies) = syncer.lock().unwrap().apply(msg);
+        if let Some((path, bytes)) = persist {
+            if !escapes(&path) {
+                echo.lock().unwrap().insert(path.clone(), bytes.clone());
+                let full = dir.join(&path);
+                if let Some(parent) = full.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&full, &bytes);
+                println!("SYNCED:{path}");
             }
-            echo.lock().unwrap().insert(path.clone(), bytes.clone());
-            let full = dir.join(&path);
-            if let Some(parent) = full.parent() {
-                let _ = std::fs::create_dir_all(parent);
+        }
+        for reply in replies {
+            if let Ok(b) = postcard::to_allocvec(&reply) {
+                let _ = sink.lock().await.send(b).await;
             }
-            let _ = std::fs::write(&full, &bytes);
-            println!("SYNCED:{path}");
         }
     }
     drop(watcher);

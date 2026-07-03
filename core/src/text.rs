@@ -169,7 +169,16 @@ impl EgWalkerText {
         if self.oplog.iter_range_since(&frontier).next().is_none() {
             return None;
         }
-        Some(self.oplog.encode_from(ENCODE_PATCH, &frontier))
+        // A PATCH assumes the receiver holds the ancestors of `frontier`. A peer
+        // with an *empty* frontier (brand new, or none of their tips are in our
+        // history) holds nothing, so send a self-contained FULL encode — otherwise
+        // they can't reconstruct the document. A non-empty frontier means a shared
+        // base, so a PATCH delta is safe (and small).
+        if frontier.is_empty() {
+            Some(self.oplog.encode(ENCODE_FULL))
+        } else {
+            Some(self.oplog.encode_from(ENCODE_PATCH, &frontier))
+        }
     }
 
     /// Merge encoded ops from a peer. diamond-types dedupes by global op id, so

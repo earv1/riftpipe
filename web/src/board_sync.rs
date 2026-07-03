@@ -131,12 +131,14 @@ impl BoardSync {
             }
         });
         let sy = syncer.clone();
+        let ob = outbound.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut link = link;
             while let Some(bytes) = link.recv().await {
-                Self::apply_inbound(&sy, &bytes, &on_merged);
+                Self::apply_inbound(&sy, &bytes, &on_merged, &ob);
             }
         });
+        Self::greet(&syncer, &outbound);
         BoardSync { outbound, syncer }
     }
 
@@ -154,33 +156,49 @@ impl BoardSync {
             }
         });
         let sy = syncer.clone();
+        let ob = outbound.clone();
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(bytes) = source.recv().await {
-                Self::apply_inbound(&sy, &bytes, &on_merged);
+                Self::apply_inbound(&sy, &bytes, &on_merged, &ob);
             }
         });
-        // Kick the bi-stream open: iroh's accept_bi only returns once the dialer
-        // sends data, so an empty frame establishes the link before any edit. The
-        // peer's recv loop ignores it (an empty frame fails to decode).
-        let _ = outbound.unbounded_send(Vec::new());
+        Self::greet(&syncer, &outbound);
         BoardSync { outbound, syncer }
+    }
+
+    /// Send the connect handshake — advertises our version vectors so the peer
+    /// replies with anything we lack. On iroh this first frame also opens the
+    /// bi-stream (it replaces the old empty-frame kick).
+    fn greet(syncer: &Rc<RefCell<Syncer>>, outbound: &UnboundedSender<Vec<u8>>) {
+        if let Ok(bytes) = postcard::to_allocvec(&syncer.borrow().hello()) {
+            let _ = outbound.unbounded_send(bytes);
+        }
     }
 
     fn apply_inbound(
         syncer: &Rc<RefCell<Syncer>>,
         bytes: &[u8],
         on_merged: &Rc<dyn Fn(String, Vec<u8>)>,
+        outbound: &UnboundedSender<Vec<u8>>,
     ) {
-        if let Ok(msg) = postcard::from_bytes::<SyncMsg>(bytes) {
-            if let Some((path, merged)) = syncer.borrow_mut().apply(msg) {
-                on_merged(path, merged);
+        let Ok(msg) = postcard::from_bytes::<SyncMsg>(bytes) else {
+            return;
+        };
+        let (persist, replies) = syncer.borrow_mut().apply(msg);
+        if let Some((path, merged)) = persist {
+            on_merged(path, merged);
+        }
+        for reply in replies {
+            if let Ok(bytes) = postcard::to_allocvec(&reply) {
+                let _ = outbound.unbounded_send(bytes);
             }
         }
     }
 
     pub fn push_text(&self, path: &str, content: &str) {
-        let msg = self.syncer.borrow_mut().local_text(path, content);
-        self.send(&msg);
+        if let Some(msg) = self.syncer.borrow_mut().local_text(path, content) {
+            self.send(&msg);
+        }
     }
 
     pub fn push_lww(&self, path: &str, bytes: &[u8]) {
