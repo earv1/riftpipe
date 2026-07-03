@@ -22,6 +22,7 @@ use web_sys::{
 };
 
 /// The kanban "server" running in the browser (the JSON API over OPFS).
+pub mod gossip;
 pub mod iroh_link;
 pub mod kanban;
 /// Per-file sync of a board over an established WebRTC link.
