@@ -18,6 +18,8 @@ use crate::text::EgWalkerText;
 
 /// A compact per-document state vector: `(agent, seq)` tips (usually one or two).
 type Vv = Vec<(String, usize)>;
+/// A document's origin (root op id) — the reliable "same document?" identity.
+type Origin = Option<(String, usize)>;
 
 #[derive(Serialize, Deserialize)]
 pub enum SyncMsg {
@@ -25,9 +27,10 @@ pub enum SyncMsg {
     /// reply with anything I'm missing." Sent by both peers on connect (an empty
     /// list is valid and still solicits the other's docs).
     Hello { versions: Vec<(String, Vv)> },
-    /// A text delta: the ops the recipient lacks for `path`, plus the sender's
-    /// version vector so the recipient learns what the sender now has.
-    TextDelta { path: String, ops: Vec<u8>, vv: Vv },
+    /// A text delta: the ops the recipient lacks for `path`, the sender's version
+    /// vector (so the recipient learns what the sender has), and the doc's origin
+    /// (so a same-path but independently-created doc is detected, not interleaved).
+    TextDelta { path: String, ops: Vec<u8>, vv: Vv, origin: Origin },
     /// "I couldn't apply your delta for `path` (missing an ancestor) — send me the
     /// full self-contained state." The recovery path when a delta can't bridge.
     Resync { path: String },
@@ -99,8 +102,9 @@ impl Syncer {
         doc.edit_to(content);
         let ops = doc.ops_since(&peer)?;
         let vv = doc.version_vector();
+        let origin = doc.origin();
         self.advance_peer_vv(path, &vv); // optimistic: assume they'll get our ops
-        Some(SyncMsg::TextDelta { path: path.to_string(), ops, vv })
+        Some(SyncMsg::TextDelta { path: path.to_string(), ops, vv, origin })
     }
 
     /// Record a local structural write; `now` is a millisecond clock.
@@ -125,14 +129,43 @@ impl Syncer {
                 for path in paths {
                     let their_vv = their.get(&path).cloned().unwrap_or_default();
                     if let Some(ops) = self.docs.get(&path).unwrap().ops_since(&their_vv) {
-                        let vv = self.docs.get(&path).unwrap().version_vector();
+                        let doc = self.docs.get(&path).unwrap();
+                        let vv = doc.version_vector();
+                        let origin = doc.origin();
                         self.advance_peer_vv(&path, &vv);
-                        replies.push(SyncMsg::TextDelta { path, ops, vv });
+                        replies.push(SyncMsg::TextDelta { path, ops, vv, origin });
                     }
                 }
                 (None, replies)
             }
-            SyncMsg::TextDelta { path, ops, vv } => {
+            SyncMsg::TextDelta { path, ops, vv, origin } => {
+                // Independently-created conflict on a file we already hold: same
+                // path, DIFFERENT origin (root op). Don't naively merge — that
+                // interleaves two unrelated texts. Resolve deterministically by
+                // origin agent id (higher wins; both converge to it). Distinct paths
+                // never hit this, so separate cards union; a shared origin (normal
+                // concurrent editing) falls through to a clean CRDT merge.
+                if let (Some(mine), Some(theirs)) =
+                    (self.docs.get(&path).and_then(|d| d.origin()), origin.as_ref())
+                {
+                    if mine != *theirs {
+                        if mine.0.as_str() < theirs.0.as_str() {
+                            // We lose — adopt their version (their ops are a
+                            // self-contained full on a fresh conflict).
+                            let mut fresh = EgWalkerText::new(&self.agent);
+                            if fresh.merge(&ops) {
+                                let content = fresh.content().into_bytes();
+                                self.docs.insert(path.clone(), fresh);
+                                self.advance_peer_vv(&path, &vv);
+                                return (Some((path, content)), Vec::new());
+                            }
+                            return (None, vec![SyncMsg::Resync { path }]);
+                        }
+                        // We win — keep ours, ignore their ops (they adopt ours).
+                        self.advance_peer_vv(&path, &vv);
+                        return (None, Vec::new());
+                    }
+                }
                 if !self.doc(&path).merge(&ops) {
                     // Missing a causal ancestor. Ask once for a full self-contained
                     // resync; suppress repeats until it arrives so a run of
@@ -153,8 +186,9 @@ impl Syncer {
                 Some(doc) => {
                     let ops = doc.encode_full();
                     let vv = doc.version_vector();
+                    let origin = doc.origin();
                     self.advance_peer_vv(&path, &vv);
-                    (None, vec![SyncMsg::TextDelta { path, ops, vv }])
+                    (None, vec![SyncMsg::TextDelta { path, ops, vv, origin }])
                 }
                 None => (None, Vec::new()),
             },
@@ -302,6 +336,7 @@ mod tests {
             path: "card.md".into(),
             ops: probe.encode_delta(&v1), // parent (edit 1) is missing
             vv: probe.version_vector(),
+            origin: probe.origin(),
         };
 
         let mut src = Syncer::new("s");
@@ -322,6 +357,7 @@ mod tests {
             path: "card.md".into(),
             ops: probe.encode_delta(&v1),
             vv: probe.version_vector(),
+            origin: probe.origin(),
         });
         assert!(again.is_empty(), "repeated gapped deltas are suppressed");
 
@@ -329,5 +365,79 @@ mod tests {
         let (_, full) = src.apply(replies.into_iter().next().unwrap());
         let (persist, _) = dst.apply(full.into_iter().next().unwrap());
         assert_eq!(persist.unwrap().1, b"one\ntwo\n", "peer recovered via full resync");
+    }
+
+    #[test]
+    fn independent_boards_merge_union_cards_and_resolve_same_path() {
+        // Two boards created independently (disjoint histories) — as two friends
+        // who each already had a board would.
+        let mut a = Syncer::new("a");
+        let mut b = Syncer::new("b");
+        a.local_text("board.md", "# A's board\n");
+        a.local_text("tickets/aaa/card.md", "card A\n");
+        b.local_text("board.md", "# B's board\n");
+        b.local_text("tickets/bbb/card.md", "card B\n");
+
+        // Handshake: each answers the other's hello with the docs it lacks.
+        let (_, a_gives) = a.apply(b.hello());
+        let (_, b_gives) = b.apply(a.hello());
+        for m in b_gives {
+            let _ = a.apply(m);
+        }
+        for m in a_gives {
+            let _ = b.apply(m);
+        }
+
+        // Distinct cards union — both sides hold both.
+        for s in [&a, &b] {
+            assert!(s.docs.contains_key("tickets/aaa/card.md"), "has card A");
+            assert!(s.docs.contains_key("tickets/bbb/card.md"), "has card B");
+        }
+        // The same-path board.md converges to the higher agent id ("b") on both —
+        // deterministic, no interleaving of the two texts.
+        assert_eq!(a.docs["board.md"].content(), "# B's board\n");
+        assert_eq!(b.docs["board.md"].content(), "# B's board\n");
+    }
+
+    /// Full two-way state exchange between two peers (the handshake).
+    fn sync(x: &mut Syncer, y: &mut Syncer) {
+        let (xh, yh) = (x.hello(), y.hello());
+        let (_, from_y) = y.apply(xh);
+        let (_, from_x) = x.apply(yh);
+        for m in from_y {
+            let _ = x.apply(m);
+        }
+        for m in from_x {
+            let _ = y.apply(m);
+        }
+    }
+
+    #[test]
+    fn three_independent_boards_converge() {
+        // Three peers each independently create board.md. A same-path conflict
+        // resolves by a *total order* on origin agent id, so all converge to the
+        // single highest ("c") — even as an adopted version has to propagate onward
+        // (A adopts B, then must still learn C). Union of distinct cards too.
+        let mut a = Syncer::new("a");
+        let mut b = Syncer::new("b");
+        let mut c = Syncer::new("c");
+        a.local_text("board.md", "# A\n");
+        a.local_text("tickets/a/card.md", "a\n");
+        b.local_text("board.md", "# B\n");
+        c.local_text("board.md", "# C\n");
+        c.local_text("tickets/c/card.md", "c\n");
+
+        // Two rounds over all pairs so an adoption propagates to everyone.
+        for _ in 0..2 {
+            sync(&mut a, &mut b);
+            sync(&mut b, &mut c);
+            sync(&mut a, &mut c);
+        }
+
+        for s in [&a, &b, &c] {
+            assert_eq!(s.docs["board.md"].content(), "# C\n", "all converge to highest origin");
+            assert!(s.docs.contains_key("tickets/a/card.md"), "card a everywhere");
+            assert!(s.docs.contains_key("tickets/c/card.md"), "card c everywhere");
+        }
     }
 }

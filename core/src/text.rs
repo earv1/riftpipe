@@ -136,6 +136,19 @@ impl EgWalkerText {
         self.oplog.encode(ENCODE_FULL)
     }
 
+    /// The document's **origin** — the remote id of its root op (the first edit).
+    /// Two replicas that share history have the same origin; independently-created
+    /// documents have different origins. This is the reliable "same document?"
+    /// signal (the frontier is not — a shared-history doc's tips can name a
+    /// different agent than the root). `None` before any edit.
+    pub fn origin(&self) -> Option<(String, usize)> {
+        if self.oplog.local_version_ref().is_empty() {
+            return None;
+        }
+        let r = self.oplog.local_to_remote_time(0);
+        Some((r.agent.to_string(), r.seq))
+    }
+
     /// The version frontier as portable `(agent, seq)` pairs — the compact
     /// "state vector" peers exchange to reconcile after a drop/reconnect
     /// (DESIGN.md §16). Usually just one or two entries (the tips).
