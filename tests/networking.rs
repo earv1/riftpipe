@@ -35,36 +35,54 @@ const BUDGET: Duration = Duration::from_secs(60);
 
 /// Capability negotiation runs over the real iroh link and both ends agree: two
 /// native peers pick WebRTC, with exactly one designated as the offerer.
+///
+/// Rides the real n0 relay, which occasionally severs a fresh stream mid-caps
+/// ("peer sent no capabilities") — so the whole connect→auth→caps sequence
+/// retries with fresh endpoints up to 3 times before the test fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn capability_negotiation_over_real_iroh() {
-    tokio::time::timeout(BUDGET, async {
-        let server = bind_accept().await.expect("bind accept");
-        let client = bind_connect().await.expect("bind connect");
+    type Outcome = riftpipe::net::negotiate::Outcome;
+    async fn attempt() -> Result<(Outcome, Outcome), String> {
+        let server = bind_accept().await.map_err(|e| e.to_string())?;
+        let client = bind_connect().await.map_err(|e| e.to_string())?;
         let _ = tokio::time::timeout(Duration::from_secs(10), server.online()).await;
         let _ = tokio::time::timeout(Duration::from_secs(10), client.online()).await;
         let addr = local_addr(&server).await;
 
         // Each side: connect/accept → auth → caps, as one concurrent sequence.
         let server_side = async {
-            let mut la = accept_link(&server).await.expect("accept link");
-            authenticate(&mut la, &SECRET).await.expect("server auth");
-            let caps = Caps::native();
-            exchange_caps(&mut la, &caps).await.expect("server caps")
+            let mut la = accept_link(&server).await.map_err(|e| e.to_string())?;
+            authenticate(&mut la, &SECRET).await.map_err(|e| e.to_string())?;
+            exchange_caps(&mut la, &Caps::native()).await.map_err(|e| e.to_string())
         };
         let client_side = async {
-            let mut lb = connect_link(&client, addr).await.expect("connect link");
-            authenticate(&mut lb, &SECRET).await.expect("client auth");
-            let caps = Caps::native();
-            exchange_caps(&mut lb, &caps).await.expect("client caps")
+            let mut lb = connect_link(&client, addr).await.map_err(|e| e.to_string())?;
+            authenticate(&mut lb, &SECRET).await.map_err(|e| e.to_string())?;
+            exchange_caps(&mut lb, &Caps::native()).await.map_err(|e| e.to_string())
         };
         let (oa, ob) = tokio::join!(server_side, client_side);
+        Ok((oa?, ob?))
+    }
 
-        assert_eq!(oa.transport, Transport::WebrtcDirect);
-        assert_eq!(ob.transport, Transport::WebrtcDirect);
-        assert_ne!(oa.we_offer, ob.we_offer, "exactly one peer offers");
+    let (oa, ob) = tokio::time::timeout(BUDGET, async {
+        let mut last = String::new();
+        for i in 1..=3 {
+            match attempt().await {
+                Ok(pair) => return pair,
+                Err(e) => {
+                    eprintln!("caps attempt {i} failed ({e}); retrying");
+                    last = e;
+                }
+            }
+        }
+        panic!("caps negotiation failed after 3 attempts: {last}");
     })
     .await
     .expect("caps negotiation completes within budget");
+
+    assert_eq!(oa.transport, Transport::WebrtcDirect);
+    assert_eq!(ob.transport, Transport::WebrtcDirect);
+    assert_ne!(oa.we_offer, ob.we_offer, "exactly one peer offers");
 }
 
 /// The full stack: from a real authenticated iroh link, `negotiate_session_halves`

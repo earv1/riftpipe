@@ -4,8 +4,8 @@
 //!
 //!   text_crdt  eg-walker text CRDT (diamond-types)        — IMPLEMENTED
 //!   rsync      rolling-checksum block diff for files       — IMPLEMENTED
-//!   wal        append-only write-ahead-log db replication  — adapter stub
-//!              (the core primitive lives in riftpipe_core::wal)
+//!   wal        append-only write-ahead-log db replication  — IMPLEMENTED
+//!              (adapter over the riftpipe_core::wal primitive)
 //!   image      codec-aware image merge                     — PLANNED (stub)
 //!   sqlite     per-cell LWW table sync engine              — implemented +
 //!              tested, but NOT wired into `Kind`/the manifest yet

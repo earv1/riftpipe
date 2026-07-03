@@ -42,9 +42,15 @@ impl Replica {
         Self::default()
     }
 
-    /// Merge a frame in (idempotent — re-adding is a no-op).
-    pub fn add(&mut self, frame: Frame) {
-        self.frames.entry(frame.id()).or_insert(frame);
+    /// Merge a frame in (idempotent — re-adding is a no-op). Returns `true` iff
+    /// the frame was new, so callers can tell "changed" from "already had it".
+    pub fn add(&mut self, frame: Frame) -> bool {
+        let mut inserted = false;
+        self.frames.entry(frame.id()).or_insert_with(|| {
+            inserted = true;
+            frame
+        });
+        inserted
     }
 
     /// Append a new local frame for `writer`, depending on the current frontier.
@@ -169,6 +175,16 @@ mod tests {
             y.add(f.clone());
         }
         assert_eq!(order(&x), order(&y), "arrival order doesn't change the linearization");
+    }
+
+    #[test]
+    fn add_reports_new_vs_already_held() {
+        let mut src = Replica::new();
+        let f = src.append("a", b"x".to_vec());
+
+        let mut r = Replica::new();
+        assert!(r.add(f.clone()), "first add is new");
+        assert!(!r.add(f), "re-adding the same frame is a no-op");
     }
 
     #[test]

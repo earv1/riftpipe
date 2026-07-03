@@ -1,7 +1,10 @@
-# Signaling server for the browser kanban — a content-blind room relay that pairs
-# two peers by connection id so they can exchange WebRTC SDP. It never sees board
-# data. Deploy behind TLS (fly.io / Caddy / nginx) so an HTTPS page can reach it
-# over wss://. See docs/deploy-pages.md.
+# LEGACY FALLBACK — the deployed app rides iroh by default and needs NOTHING
+# hosted; this exists only for the optional `?transport=ws` WebRTC bridge
+# (docs/deploy-pages.md appendix).
+#
+# Signaling server: a content-blind room relay that pairs two peers by
+# connection id so they can exchange WebRTC SDP. It never sees board data.
+# Deploy behind TLS (fly.io / Caddy / nginx) so an HTTPS page reaches it over wss://.
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .

@@ -39,12 +39,16 @@ That's the whole deployment. No server you run, anywhere.
   but **not** your board — traffic is end-to-end encrypted. To avoid n0 entirely,
   self-host an [iroh relay](https://www.iroh.computer/docs) and point the build at
   it; that's the only reason you'd run any server.
-- **Bundle size:** ~3 MB wasm (≈1 MB gzipped) — the cost of bundling a full P2P
-  stack. One-time, then browser-cached.
-- **A host that reloads** mints a new ephemeral identity, so the old `#ticket`
-  link goes stale (persisting the host key for stable links is a future tweak).
+- **Bundle size:** ~4.5 MB wasm (≈1.8 MB gzipped) — the cost of bundling a full
+  P2P stack. One-time, then browser-cached.
+- **A host that reloads keeps its identity** — the iroh key is persisted in
+  localStorage, so share links stay valid across reloads.
 
-## Appendix: the WebSocket transport (optional, for the native bridge)
+## Appendix: the WebSocket transport (LEGACY fallback)
+
+> This path is **not** part of the normal deployment — iroh is the default and
+> needs nothing hosted. Keep reading only if you specifically need the
+> WebRTC-via-signaling bridge.
 
 A second transport exists — `?transport=ws` (or `VITE_TRANSPORT=ws` at build) — that
 uses a tiny WebSocket signaling server + WebRTC instead of iroh. You only need this

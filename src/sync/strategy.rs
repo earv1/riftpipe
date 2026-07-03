@@ -73,7 +73,8 @@ pub enum Kind {
     TextCrdt,
     /// rsync-style rolling-checksum block diff for opaque/binary files.
     RsyncFile,
-    /// append-only write-ahead-log replication for databases. Planned.
+    /// append-only write-ahead-log replication for databases; deterministic
+    /// frame linearization via `riftpipe_core::wal`. Implemented.
     WalDb,
     /// codec-aware image merge (tiles / layers). Planned.
     Image,
@@ -87,14 +88,14 @@ impl Kind {
         match self {
             Kind::TextCrdt => Box::new(algo::text_crdt::TextCrdtSyncer::new(name)),
             Kind::RsyncFile => Box::new(algo::rsync::RsyncSyncer::new(name)),
-            Kind::WalDb => Box::new(algo::wal::WalDb::new(name)),
+            Kind::WalDb => Box::new(algo::wal::WalDbSyncer::new(name)),
             Kind::Image => Box::new(algo::image::ImageSyncer::new(name)),
         }
     }
 
     /// Whether this algorithm is actually implemented yet (vs. a planned stub).
     pub fn is_implemented(self) -> bool {
-        matches!(self, Kind::TextCrdt | Kind::RsyncFile)
+        matches!(self, Kind::TextCrdt | Kind::RsyncFile | Kind::WalDb)
     }
 }
 
@@ -115,10 +116,10 @@ mod tests {
     }
 
     #[test]
-    fn text_and_rsync_are_implemented() {
+    fn implemented_kinds_are_flagged() {
         assert!(Kind::TextCrdt.is_implemented());
         assert!(Kind::RsyncFile.is_implemented());
-        assert!(!Kind::WalDb.is_implemented());
+        assert!(Kind::WalDb.is_implemented());
         assert!(!Kind::Image.is_implemented());
     }
 

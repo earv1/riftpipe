@@ -179,7 +179,7 @@ async fn main() {
             eprintln!("  riftpipe webrtc-echo <connection-id> [--signal ws://…] [--send <msg>]  # cross-stack bridge probe");
             eprintln!("\nedit the file in your $EDITOR; changes converge across peers.");
             eprintln!("a DIR syncs the whole folder: each file gets the algorithm riftpipe.toml assigns");
-            eprintln!("(text-crdt / rsync-file; wal-db & image planned). See DESIGN.md §17.");
+            eprintln!("(text-crdt / rsync-file / wal-db; image planned). See DESIGN.md §17.");
             eprintln!("--pipe     speak the editor edit-stream protocol on stdin/stdout (for bridges)");
             eprintln!("--memory   hold resources in RAM (no disk mirror); see them in the --process file");
             eprintln!("--manifest path to riftpipe.toml (default: <dir>/riftpipe.toml)");

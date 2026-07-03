@@ -62,7 +62,8 @@ jobs:
         env:
           # Project site lives at https://<user>.github.io/<repo>/
           PAGES_BASE: /${{ github.event.repository.name }}/
-          # Set these as repo variables/secrets (Settings → Secrets and variables → Actions):
+          # LEGACY fallback only (`?transport=ws`) — iroh is the default and
+          # needs none of these. Repo variables/secrets, all optional:
           VITE_SIGNAL_URL: ${{ vars.SIGNAL_URL }}
           VITE_STUN: ${{ vars.STUN_URL }}
           VITE_TURN: ${{ vars.TURN_URL }}

@@ -228,18 +228,40 @@ mod tests {
     #[test]
     fn unimplemented_kind_is_skipped_not_panicked() {
         let root = unique_dir("stub");
-        std::fs::write(root.join("save.db"), b"x").unwrap();
+        std::fs::write(root.join("photo.png"), b"x").unwrap();
         let manifest = Manifest::parse(
             r#"
             default = "rsync-file"
             [[rule]]
-            glob = "*.db"
-            algo = "wal-db"
+            glob = "*.png"
+            algo = "image"
             "#,
         )
         .unwrap();
         let ws = Workspace::new(&root, manifest, false).unwrap();
-        assert!(!ws.paths().contains(&"save.db".to_string())); // skipped
+        assert!(!ws.paths().contains(&"photo.png".to_string())); // skipped
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A manifest `wal-db` glob now gets a real adapter — including on an
+    /// empty/new file (empty log → empty replica, no panic).
+    #[test]
+    fn wal_db_resources_are_created_not_skipped() {
+        let root = unique_dir("wal");
+        std::fs::write(root.join("state/save.db"), b"").unwrap();
+        let manifest = Manifest::parse(
+            r#"
+            default = "rsync-file"
+            [[rule]]
+            glob = "state/**"
+            algo = "wal-db"
+            "#,
+        )
+        .unwrap();
+        let mut ws = Workspace::new(&root, manifest, false).unwrap();
+        let res = ws.get_mut("state/save.db").expect("wal-db resource created");
+        assert_eq!(res.kind, Kind::WalDb);
+        assert!(!res.strategy.observe(b""), "empty file is an empty replica");
         std::fs::remove_dir_all(&root).ok();
     }
 }

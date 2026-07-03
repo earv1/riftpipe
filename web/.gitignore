@@ -1,4 +1,3 @@
 /target
 /.chromedriver
-Cargo.lock
 /pkg

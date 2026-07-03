@@ -11,7 +11,8 @@
 #   text-crdt   eg-walker text CRDT — char-level concurrent merge (prose/code)
 #   rsync-file  rsync block diff — efficient replication for opaque/binary files
 #               (last-writer-wins; no concurrent merge)
-#   wal-db      append-only log replication for databases   (PLANNED — stub)
+#   wal-db      append-only log replication for databases — whole frames,
+#               deterministically linearized (multi-writer, no interleaving)
 #   image       codec-aware tile merge for images           (PLANNED — stub)
 #
 # Place this file at the root of the shared directory (or pass --manifest).
@@ -26,8 +27,8 @@ algo = "text-crdt"
 glob = "**/*.txt"
 algo = "text-crdt"
 
-# Example of keeping game/db state on a different algorithm than its view —
-# this is the "sync state separately from a view" case (still a stub):
+# Example of keeping db state on a different algorithm than its view —
+# this is the "sync state separately from a view" case:
 # [[rule]]
 # glob = "state/**"
 # algo = "wal-db"
