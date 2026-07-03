@@ -67,11 +67,13 @@ sense to do it, not strict priority.
   for N peers (`three_independent_boards_converge`). *Remaining nits:* primed
   `meta.toml` (LWW) uses wall-clock now() so a same-card meta conflict is racy
   (cards rarely collide); and pasting a share link into a **solo tab** reconnects
-  best-effort via a `hashchange` listener, but if that tab was a *solo host* the
-  old accept loop still holds a clone of the endpoint, so the same-key rebind
-  doesn't cleanly succeed — opening the link fresh (new tab / reload) works. A
-  clean in-tab reconnect needs proper session teardown (abortable accept loop +
-  drop the old endpoint), which ties into **live reconnection**.
+  best-effort via a `hashchange` listener. On reconnect we now tear down the prior
+  session (`Endpoint::close()`), which is correct and needed for live reconnection —
+  but rebinding the **same persisted key** immediately still races (relay
+  re-registration), so in-tab reconnect *from a solo host* isn't reliable yet.
+  Opening the link fresh (new tab / reload) works cleanly. The remaining fix
+  (delay/await the same-key rebind, or reuse the endpoint instead of rebinding)
+  folds into **live reconnection**.
 
 ## Smaller
 

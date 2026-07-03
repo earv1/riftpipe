@@ -67,9 +67,16 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
     let sk = load_or_create_secret_key();
     let my_id = sk.public();
 
-    // Host when there's no ticket, OR the ticket is our own — a reloaded host keeps
-    // its persisted identity, so its share link stays valid instead of going stale.
-    // Host when there's no ticket, OR the ticket is our own.
+    // Tear down any prior iroh session (e.g. reconnecting to a pasted link) so the
+    // same persisted identity rebinds cleanly — closing the endpoint also ends a
+    // still-pending accept loop that holds a clone of it.
+    if let Some(old) = IROH_EP.with(|c| c.borrow_mut().take()) {
+        old.close().await;
+    }
+    SYNC.with(|c| *c.borrow_mut() = None);
+
+    // Host when there's no ticket, OR the ticket is our own — a reloaded/pasted
+    // host keeps its persisted identity, so its share link stays valid.
     let host = ticket.is_empty() || addr_of(&ticket).map(|a| a.id == my_id).unwrap_or(false);
 
     if host {
