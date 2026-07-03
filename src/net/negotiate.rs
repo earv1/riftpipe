@@ -13,8 +13,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::net::transport::IrohLink;
-use crate::net::webrtc::upgrade_to_webrtc;
-use crate::net::{anyerr, Counters, Link, Result, Sink, Source};
+use crate::net::webrtc::{upgrade_to_webrtc, WebrtcLink};
+use crate::net::{anyerr, Counters, CountingLink, Link, Result, Sink, Source};
 
 /// Wire-format version of the capability exchange. Bumped on any breaking change
 /// to [`Caps`]; both peers are the same binary in our demos, so a mismatch is a
@@ -134,39 +134,108 @@ pub async fn exchange_caps(link: &mut dyn Link, local: &Caps) -> Result<Outcome>
     Ok(negotiate(local, &remote))
 }
 
-/// Negotiate the data transport over the (authenticated) iroh `link`, optionally
-/// upgrade to WebRTC, and return the session's send/recv halves
-/// (`docs/planned/transport-negotiation.md`). Shared by `--pipe` and folder mode.
-///
-/// On a WebRTC upgrade the iroh link is returned as the `keepalive` (control /
-/// fallback — and it keeps the QUIC connection alive so metrics' `connection_kind`
-/// still resolves); on iroh transport it's consumed into the halves. An upgrade
-/// failure transparently falls back to iroh. The returned `Transport` is what the
-/// data plane actually ended up using.
-pub async fn negotiate_session_halves(
-    mut link: IrohLink,
-    counters: Arc<Counters>,
-) -> (Box<dyn Sink>, Box<dyn Source>, Option<IrohLink>, Transport) {
-    let outcome = exchange_caps(&mut link, &Caps::native()).await;
+/// A negotiated session, split into its send/recv halves.
+pub struct NegotiatedSession {
+    pub sink: Box<dyn Sink>,
+    pub source: Box<dyn Source>,
+    /// On a WebRTC upgrade, the iroh link is retained here as control/fallback
+    /// and to keep the QUIC connection alive (metrics' `connection_kind` reads it).
+    /// Hold this for the session's lifetime — dropping it closes the connection.
+    pub keepalive: Option<IrohLink>,
+    pub transport: Transport,
+}
+
+/// A negotiated whole-`Link` session (the single-shot file-mirror path).
+pub struct NegotiatedLink {
+    pub link: Box<dyn Link>,
+    pub counters: Arc<Counters>,
+    /// See [`NegotiatedSession::keepalive`] — hold for the session's lifetime.
+    pub keepalive: Option<IrohLink>,
+    pub transport: Transport,
+}
+
+/// The shared negotiation policy: exchange caps and, if `WebrtcDirect` won,
+/// attempt the upgrade. Returns the WebRTC link on success; otherwise `None`
+/// plus the iroh rung to report — either the actually negotiated one, or
+/// iroh-direct when caps failed or the upgrade fell back (we're on the iroh
+/// link now; never report the unrealized webrtc).
+async fn upgrade_or_fallback(link: &mut IrohLink) -> (Option<WebrtcLink>, Transport) {
+    let outcome = exchange_caps(link, &Caps::native()).await;
     if let Ok(o) = &outcome {
         if o.transport == Transport::WebrtcDirect {
-            match upgrade_to_webrtc(&mut link, o.we_offer).await {
-                Ok(w) => {
-                    let (sink, source) = w.into_halves(counters);
-                    return (Box::new(sink), Box::new(source), Some(link), Transport::WebrtcDirect);
-                }
+            match upgrade_to_webrtc(link, o.we_offer).await {
+                Ok(w) => return (Some(w), Transport::WebrtcDirect),
                 Err(e) => eprintln!("[riftpipe] webrtc upgrade failed ({e}); staying on iroh"),
             }
         }
     }
-    // Either iroh was chosen, caps failed, or the WebRTC upgrade fell back. We're
-    // on the iroh link now; report iroh-direct rather than the unrealized webrtc.
     let transport = match outcome {
         Ok(o) if o.transport != Transport::WebrtcDirect => o.transport,
         _ => Transport::IrohDirect,
     };
-    let (sink, source) = link.into_halves(counters);
-    (Box::new(sink), Box::new(source), None, transport)
+    (None, transport)
+}
+
+/// Negotiate the data transport over the (authenticated) iroh `link`, optionally
+/// upgrade to WebRTC, and return the session's send/recv halves
+/// (`docs/planned/transport-negotiation.md`). Shared by `--pipe` and folder mode.
+///
+/// On a WebRTC upgrade the iroh link is returned in `keepalive`; on iroh
+/// transport it's consumed into the halves. An upgrade failure transparently
+/// falls back to iroh. The returned `transport` is what the data plane actually
+/// ended up using.
+pub async fn negotiate_session_halves(
+    mut link: IrohLink,
+    counters: Arc<Counters>,
+) -> NegotiatedSession {
+    match upgrade_or_fallback(&mut link).await {
+        (Some(w), transport) => {
+            let (sink, source) = w.into_halves(counters);
+            NegotiatedSession {
+                sink: Box::new(sink),
+                source: Box::new(source),
+                keepalive: Some(link),
+                transport,
+            }
+        }
+        (None, transport) => {
+            let (sink, source) = link.into_halves(counters);
+            NegotiatedSession {
+                sink: Box::new(sink),
+                source: Box::new(source),
+                keepalive: None,
+                transport,
+            }
+        }
+    }
+}
+
+/// Whole-`Link` variant of [`negotiate_session_halves`] — same policy (caps
+/// failure stays on iroh, actual rung reported, iroh link kept alive on
+/// upgrade), for callers that drive an unsplit `Link` (the single-shot
+/// file-mirror path). The final link is wrapped in a [`CountingLink`] whose
+/// counters are returned for the metrics writer.
+pub async fn negotiate_link(mut link: IrohLink) -> NegotiatedLink {
+    match upgrade_or_fallback(&mut link).await {
+        (Some(w), transport) => {
+            let (counting, counters) = CountingLink::new(w);
+            NegotiatedLink {
+                link: Box::new(counting),
+                counters,
+                keepalive: Some(link),
+                transport,
+            }
+        }
+        (None, transport) => {
+            let (counting, counters) = CountingLink::new(link);
+            NegotiatedLink {
+                link: Box::new(counting),
+                counters,
+                keepalive: None,
+                transport,
+            }
+        }
+    }
 }
 
 #[cfg(test)]

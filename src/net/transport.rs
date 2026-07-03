@@ -122,8 +122,15 @@ pub struct IrohSink {
     counters: Arc<Counters>,
 }
 
-impl IrohSink {
-    pub async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
+/// Receive half of a split iroh link.
+pub struct IrohSource {
+    recv: RecvStream,
+    counters: Arc<Counters>,
+}
+
+#[async_trait]
+impl crate::net::Sink for IrohSink {
+    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
         self.counters
             .sent
             .fetch_add(msg.len() as u64, Ordering::Relaxed);
@@ -135,20 +142,15 @@ impl IrohSink {
     }
 
     /// Signal end-of-data so the last message is delivered before drop.
-    pub async fn finish(&mut self) {
+    async fn finish(&mut self) {
         let _ = self.send.finish();
     }
 }
 
-/// Receive half of a split iroh link.
-pub struct IrohSource {
-    recv: RecvStream,
-    counters: Arc<Counters>,
-}
-
-impl IrohSource {
+#[async_trait]
+impl crate::net::Source for IrohSource {
     /// Await the next message — costs zero traffic/CPU while none arrives.
-    pub async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+    async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
         let mut len = [0u8; 4];
         if self.recv.read_exact(&mut len).await.is_err() {
             return Ok(None);
@@ -158,23 +160,6 @@ impl IrohSource {
         self.recv.read_exact(&mut buf).await.map_err(anyerr)?;
         self.counters.recv.fetch_add(n as u64, Ordering::Relaxed);
         Ok(Some(buf))
-    }
-}
-
-#[async_trait]
-impl crate::net::Sink for IrohSink {
-    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
-        IrohSink::send(self, msg).await
-    }
-    async fn finish(&mut self) {
-        IrohSink::finish(self).await
-    }
-}
-
-#[async_trait]
-impl crate::net::Source for IrohSource {
-    async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
-        IrohSource::recv(self).await
     }
 }
 

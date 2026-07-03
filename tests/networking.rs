@@ -97,22 +97,23 @@ async fn full_stack_upgrades_to_webrtc_and_carries_data() {
             authenticate(&mut lb, &SECRET).await.expect("client auth");
             negotiate_session_halves(lb, cb2).await
         };
-        let ((mut sink_a, mut src_a, _keep_a, ta), (mut sink_b, mut src_b, _keep_b, tb)) =
-            tokio::join!(server_side, client_side);
+        // The `NegotiatedSession`s (with their iroh keepalives) stay in scope for
+        // the whole exchange.
+        let (mut sa, mut sb) = tokio::join!(server_side, client_side);
 
         // The data plane actually upgraded to WebRTC on both ends.
-        assert_eq!(ta, Transport::WebrtcDirect, "server upgraded to webrtc");
-        assert_eq!(tb, Transport::WebrtcDirect, "client upgraded to webrtc");
+        assert_eq!(sa.transport, Transport::WebrtcDirect, "server upgraded to webrtc");
+        assert_eq!(sb.transport, Transport::WebrtcDirect, "client upgraded to webrtc");
 
         // And the negotiated transport carries traffic both ways.
-        sink_a.send(b"server->client".to_vec()).await.unwrap();
+        sa.sink.send(b"server->client".to_vec()).await.unwrap();
         assert_eq!(
-            src_b.recv().await.unwrap().expect("client receives"),
+            sb.source.recv().await.unwrap().expect("client receives"),
             b"server->client"
         );
-        sink_b.send(b"client->server".to_vec()).await.unwrap();
+        sb.sink.send(b"client->server".to_vec()).await.unwrap();
         assert_eq!(
-            src_a.recv().await.unwrap().expect("server receives"),
+            sa.source.recv().await.unwrap().expect("server receives"),
             b"client->server"
         );
 

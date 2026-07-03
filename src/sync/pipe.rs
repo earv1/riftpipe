@@ -311,14 +311,13 @@ pub async fn run_pipe_reconnecting(
                         metrics_started = true;
                     }
                 }
-                // Negotiate the transport + maybe upgrade to WebRTC. `_keep` holds
-                // the iroh link alive (control/fallback) for the session's lifetime.
-                let (mut sink, mut source, _keep, transport) =
-                    negotiate_session_halves(link, counters.clone()).await;
-                eprintln!("[riftpipe] connected — syncing ({transport:?})");
-                match session(&mut peer, &mut rx, &mut out, &mut *sink, &mut *source).await? {
+                // Negotiate the transport + maybe upgrade to WebRTC. `s` (and its
+                // keepalive) stays in scope for the session's lifetime.
+                let mut s = negotiate_session_halves(link, counters.clone()).await;
+                eprintln!("[riftpipe] connected — syncing ({:?})", s.transport);
+                match session(&mut peer, &mut rx, &mut out, &mut *s.sink, &mut *s.source).await? {
                     SessionOutcome::StdinClosed => {
-                        sink.finish().await;
+                        s.sink.finish().await;
                         return Ok(());
                     }
                     SessionOutcome::LinkClosed => {

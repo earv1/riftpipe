@@ -101,20 +101,6 @@ pub struct WebrtcSink {
     counters: Arc<Counters>,
 }
 
-impl WebrtcSink {
-    pub async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
-        self.counters
-            .sent
-            .fetch_add(msg.len() as u64, Ordering::Relaxed);
-        self.dc.send(&Bytes::from(msg)).await.map_err(anyerr)?;
-        Ok(())
-    }
-
-    pub async fn finish(&mut self) {
-        let _ = self.dc.close().await;
-    }
-}
-
 /// Receive half of a split WebRTC link.
 pub struct WebrtcSource {
     _pc: Arc<RTCPeerConnection>,
@@ -122,30 +108,29 @@ pub struct WebrtcSource {
     counters: Arc<Counters>,
 }
 
-impl WebrtcSource {
-    pub async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
-        let msg = self.inbound.recv().await;
-        if let Some(b) = &msg {
-            self.counters.recv.fetch_add(b.len() as u64, Ordering::Relaxed);
-        }
-        Ok(msg)
-    }
-}
-
 #[async_trait::async_trait]
 impl crate::net::Sink for WebrtcSink {
     async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
-        WebrtcSink::send(self, msg).await
+        self.counters
+            .sent
+            .fetch_add(msg.len() as u64, Ordering::Relaxed);
+        self.dc.send(&Bytes::from(msg)).await.map_err(anyerr)?;
+        Ok(())
     }
+
     async fn finish(&mut self) {
-        WebrtcSink::finish(self).await
+        let _ = self.dc.close().await;
     }
 }
 
 #[async_trait::async_trait]
 impl crate::net::Source for WebrtcSource {
     async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
-        WebrtcSource::recv(self).await
+        let msg = self.inbound.recv().await;
+        if let Some(b) = &msg {
+            self.counters.recv.fetch_add(b.len() as u64, Ordering::Relaxed);
+        }
+        Ok(msg)
     }
 }
 

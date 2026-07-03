@@ -5,13 +5,10 @@
 use std::sync::Arc;
 
 use riftpipe::crdt::text::EgWalkerText;
-use riftpipe::net::negotiate::{exchange_caps, Caps, Transport};
+use riftpipe::net::negotiate::negotiate_link;
 use riftpipe::net::secure::{authenticate, Ticket};
-use riftpipe::net::transport::{
-    accept_link, bind_accept, bind_connect, connect_link, local_addr, IrohLink,
-};
-use riftpipe::net::webrtc::upgrade_to_webrtc;
-use riftpipe::net::{anyerr, Counters, CountingLink, Link};
+use riftpipe::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr};
+use riftpipe::net::{anyerr, Counters};
 use riftpipe::sync::folder::run_folder_reconnecting;
 use riftpipe::sync::manifest::Manifest;
 use riftpipe::sync::mirror::TextPeer;
@@ -233,32 +230,13 @@ async fn share(file: &str, opts: &Opts) -> riftpipe::net::Result<()> {
     let mut link = accept_link(&endpoint).await?;
     authenticate(&mut link, &secret).await?;
     let peer = link.remote_id();
-    let (mut counting, counters, transport) = negotiated_file_link(link).await?;
+    // `nl` (and its iroh keepalive on a WebRTC upgrade) lives for the whole loop.
+    let mut nl = negotiate_link(link).await;
     if let Some(path) = opts.metrics.clone() {
-        riftpipe::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
+        riftpipe::monitor::metrics::spawn(endpoint.clone(), peer, nl.counters.clone(), path, basename(file).into());
     }
-    eprintln!("authenticated — live syncing {file} ({transport:?}, end-to-end encrypted). ^C to stop.");
-    live_file_loop(file, &mut *counting).await
-}
-
-/// Caps exchange + optional WebRTC upgrade for the single-shot file-mirror path —
-/// the `live_file_loop` analogue of `negotiate_session_halves`. Returns a boxed
-/// `Link` (iroh or WebRTC), its byte counters, and the realized transport.
-async fn negotiated_file_link(
-    mut link: IrohLink,
-) -> riftpipe::net::Result<(Box<dyn Link>, Arc<Counters>, Transport)> {
-    let outcome = exchange_caps(&mut link, &Caps::native()).await?;
-    if outcome.transport == Transport::WebrtcDirect {
-        match upgrade_to_webrtc(&mut link, outcome.we_offer).await {
-            Ok(w) => {
-                let (counting, counters) = CountingLink::new(w);
-                return Ok((Box::new(counting), counters, Transport::WebrtcDirect));
-            }
-            Err(e) => eprintln!("[riftpipe] webrtc upgrade failed ({e}); staying on iroh"),
-        }
-    }
-    let (counting, counters) = CountingLink::new(link);
-    Ok((Box::new(counting), counters, Transport::IrohDirect))
+    eprintln!("authenticated — live syncing {file} ({:?}, end-to-end encrypted). ^C to stop.", nl.transport);
+    live_file_loop(file, &mut *nl.link).await
 }
 
 /// Join a shared file/dir via its ticket: dial, authenticate with the secret, run.
@@ -286,12 +264,13 @@ async fn join(ticket: &str, file: &str, opts: &Opts) -> riftpipe::net::Result<()
     let mut link = connect_link(&endpoint, ticket.addr).await?;
     authenticate(&mut link, &ticket.secret).await?;
     let peer = link.remote_id();
-    let (mut counting, counters, transport) = negotiated_file_link(link).await?;
+    // `nl` (and its iroh keepalive on a WebRTC upgrade) lives for the whole loop.
+    let mut nl = negotiate_link(link).await;
     if let Some(path) = opts.metrics.clone() {
-        riftpipe::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(file).into());
+        riftpipe::monitor::metrics::spawn(endpoint.clone(), peer, nl.counters.clone(), path, basename(file).into());
     }
-    eprintln!("authenticated — live syncing {file} ({transport:?}, end-to-end encrypted). ^C to stop.");
-    live_file_loop(file, &mut *counting).await
+    eprintln!("authenticated — live syncing {file} ({:?}, end-to-end encrypted). ^C to stop.", nl.transport);
+    live_file_loop(file, &mut *nl.link).await
 }
 
 /// Short label for the HUD (file name, not the whole path).

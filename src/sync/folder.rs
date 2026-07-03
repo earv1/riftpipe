@@ -267,13 +267,12 @@ pub async fn run_folder_reconnecting(
                     }
                 }
                 // Negotiate the transport + maybe upgrade to WebRTC (shared with
-                // --pipe). `_keep` holds the iroh link alive for the session.
-                let (mut sink, mut source, _keep, transport) =
-                    negotiate_session_halves(link, counters.clone()).await;
-                eprintln!("[riftpipe] connected — syncing folder ({transport:?})");
-                match session(&mut ws, &mut watch_rx, &mut *sink, &mut *source).await? {
+                // --pipe). `s` (and its keepalive) stays in scope for the session.
+                let mut s = negotiate_session_halves(link, counters.clone()).await;
+                eprintln!("[riftpipe] connected — syncing folder ({:?})", s.transport);
+                match session(&mut ws, &mut watch_rx, &mut *s.sink, &mut *s.source).await? {
                     SessionOutcome::StdinClosed => {
-                        sink.finish().await;
+                        s.sink.finish().await;
                         return Ok(());
                     }
                     SessionOutcome::LinkClosed => {
