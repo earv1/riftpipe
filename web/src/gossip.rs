@@ -129,6 +129,14 @@ pub struct MeshKeepAlive {
     _gossip: Gossip,
 }
 
+impl MeshKeepAlive {
+    /// Close the endpoint (and await it) so a reconnect can rebind the same key
+    /// cleanly — a plain drop is async and would race the relay re-registration.
+    async fn close(self) {
+        self._endpoint.close().await;
+    }
+}
+
 /// What travels over the gossip topic: board sync messages, plus periodic presence
 /// so peers can build a routing map for debugging.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -251,6 +259,11 @@ impl GossipBoardSync {
             .map(|(k, v)| (hex32(k), v.iter().map(hex32).collect()))
             .collect()
     }
+
+    /// Leave the mesh, closing the endpoint (awaited) for a clean rebind.
+    async fn close(self) {
+        self._keep.close().await;
+    }
 }
 
 fn hex32(b: &[u8; 32]) -> String {
@@ -267,9 +280,12 @@ pub(crate) fn set_active(bs: GossipBoardSync) {
     GOSSIP.with(|c| *c.borrow_mut() = Some(bs));
 }
 
-/// Tear down any active gossip sync (drops the mesh → closes the endpoint).
-pub(crate) fn clear_active() {
-    GOSSIP.with(|c| *c.borrow_mut() = None);
+/// Tear down any active gossip sync, closing the endpoint (awaited) so a reconnect
+/// under the same persisted identity rebinds cleanly.
+pub(crate) async fn clear_active() {
+    if let Some(bs) = GOSSIP.with(|c| c.borrow_mut().take()) {
+        bs.close().await;
+    }
 }
 
 /// Route a text push to the mesh if active; `true` if it was handled.

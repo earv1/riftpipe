@@ -83,31 +83,31 @@ async fn list(dir: &FileSystemDirectoryHandle) -> Vec<String> {
     names
 }
 
-/// Push every existing OPFS board file into the active `BoardSync`, so a peer we
-/// connect to **merges with** our pre-existing board — not just live edits.
-/// Distinct cards union (distinct paths); a same-path file (`board.md`) resolves
-/// by origin in `core::sync`. Safe on a fresh board (nothing to push).
-pub async fn prime_board() {
+/// Push **every** existing OPFS file (whole tree) into the active sync, so a peer
+/// we connect to merges with our pre-existing state — not just live edits. This is
+/// **folder-generic**: `.md` files sync as text CRDTs, everything else as LWW, with
+/// no knowledge of the kanban layout. Any file-based app gets mesh sync for free.
+/// Distinct paths union; same-path files resolve by origin in `core::sync`.
+pub async fn prime_all() {
     let Ok(root) = opfs_root().await else { return };
-    if let Some(board) = read_text(&root, "board.md").await {
-        crate::board_sync::push_text("board.md", &board);
-    }
-    let Ok(tickets) = subdir(&root, "tickets", false).await else {
-        return;
-    };
-    for id in list(&tickets).await {
-        let Ok(cdir) = subdir(&tickets, &id, false).await else { continue };
-        if let Some(card) = read_text(&cdir, "card.md").await {
-            crate::board_sync::push_text(&format!("tickets/{id}/card.md"), &card);
-        }
-        if let Some(meta) = read_text(&cdir, "meta.toml").await {
-            crate::board_sync::push_lww(&format!("tickets/{id}/meta.toml"), meta.as_bytes());
-        }
-        if let Ok(comments) = subdir(&cdir, "comments", false).await {
-            for c in list(&comments).await {
-                if let Some(text) = read_text(&comments, &c).await {
-                    crate::board_sync::push_text(&format!("tickets/{id}/comments/{c}"), &text);
+    // Iterative DFS over the OPFS tree (a name is a file if it reads as one, else a
+    // subdirectory to descend into).
+    let mut stack = vec![(root, String::new())];
+    while let Some((dir, prefix)) = stack.pop() {
+        for name in list(&dir).await {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if let Some(text) = read_text(&dir, &name).await {
+                if name.ends_with(".md") {
+                    crate::board_sync::push_text(&path, &text);
+                } else {
+                    crate::board_sync::push_lww(&path, text.as_bytes());
                 }
+            } else if let Ok(sub) = subdir(&dir, &name, false).await {
+                stack.push((sub, path));
             }
         }
     }

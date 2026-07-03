@@ -34,7 +34,7 @@ pub async fn connect_and_sync(
 ) -> Result<(), JsValue> {
     let link = crate::connect_via_signaling(&ws_url, &room).await?;
     SYNC.with(|c| *c.borrow_mut() = Some(BoardSync::new(link, opfs_on_merged(on_change))));
-    wasm_bindgen_futures::spawn_local(crate::kanban::prime_board());
+    wasm_bindgen_futures::spawn_local(crate::kanban::prime_all());
     Ok(())
 }
 
@@ -68,9 +68,9 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
     let sk = load_or_create_secret_key();
     let my_id = sk.public();
 
-    // Tear down any prior mesh session (dropping it closes the old endpoint) before
+    // Tear down any prior mesh session (closes the old endpoint, awaited) before
     // rebinding under the same persisted identity.
-    crate::gossip::clear_active();
+    crate::gossip::clear_active().await;
 
     // Host when there's no ticket, OR the ticket is our own — the host defines the
     // topic; everyone else joins the same swarm and it's no longer special.
@@ -88,7 +88,7 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
     };
 
     crate::gossip::set_active(GossipBoardSync::new(mesh, on_merged));
-    wasm_bindgen_futures::spawn_local(crate::kanban::prime_board());
+    wasm_bindgen_futures::spawn_local(crate::kanban::prime_all());
 
     Ok(my_ticket.map(|t| JsValue::from_str(&t)).unwrap_or(JsValue::NULL))
 }

@@ -38,8 +38,8 @@ try {
   await b.waitForSelector(`text=${titleB}`, { timeout: 10000 });
   console.log(`B made ${titleB} while solo`);
 
-  // B opens A's link fresh (new tab / reload — the common, reliable path with a
-  // clean teardown). Same context keeps card-B in OPFS + B's identity in localStorage.
+  // B opens A's link fresh (new tab / reload — the reliable path; a full teardown
+  // of B's solo mesh). Same context keeps card-B in OPFS + B's identity.
   await b.goto(base + "#" + ticket, { waitUntil: "load" });
   await b.reload({ waitUntil: "load" });
   await b.waitForSelector(".add-card input", { timeout: 20000 });
