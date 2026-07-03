@@ -807,18 +807,30 @@ mod tests {
             "B received A's structural move (LWW)",
         );
 
-        // Concurrent edits to the SAME file from both peers converge (CRDT).
+        // Establish a SHARED board.md (A creates → B receives) so later edits share
+        // an origin and merge as a CRDT. (Two INDEPENDENTLY-created board.md are a
+        // separate, origin-resolved case — see core::sync tests.)
         sync_a.push_text("board.md", "# Board\n\n- Todo\n");
-        sync_b.push_text("board.md", "# Board\n\n- Done\n");
         for _ in 0..100 {
-            let (a, b) = (got_a.borrow().contains_key("board.md"), got_b.borrow().contains_key("board.md"));
-            if a && b { break; }
+            if got_b.borrow().contains_key("board.md") { break; }
             sleep(20).await;
         }
-        // Both peers end with the same merged board.md (deterministic CRDT result).
-        sleep(60).await;
-        let a_board = got_a.borrow().get("board.md").map(|b| String::from_utf8_lossy(b).into_owned());
-        let b_board = got_b.borrow().get("board.md").map(|b| String::from_utf8_lossy(b).into_owned());
+        // Concurrent edits on the now-shared doc converge on both peers, keeping both.
+        sync_a.push_text("board.md", "# Board\n\n- Todo\n- A\n");
+        sync_b.push_text("board.md", "# Board\n\n- Todo\n- Bee\n");
+        let mut a_board = None;
+        let mut b_board = None;
+        for _ in 0..200 {
+            a_board = got_a.borrow().get("board.md").map(|b| String::from_utf8_lossy(b).into_owned());
+            b_board = got_b.borrow().get("board.md").map(|b| String::from_utf8_lossy(b).into_owned());
+            let both = |s: &Option<String>| matches!(s, Some(x) if x.contains("- A") && x.contains("- Bee"));
+            if both(&a_board) && both(&b_board) && a_board == b_board { break; }
+            sleep(20).await;
+        }
         assert_eq!(a_board, b_board, "concurrent board.md edits converge on both peers");
+        assert!(
+            matches!(&a_board, Some(x) if x.contains("- A") && x.contains("- Bee")),
+            "both concurrent edits survive: {a_board:?}",
+        );
     }
 }
