@@ -19,11 +19,18 @@ use web_sys::FileSystemDirectoryHandle;
 // Board reading / mutations (over the file tree, via the format logic)
 // ---------------------------------------------------------------------------
 
-/// Seed `board.md` on first use so a fresh browser has columns.
-async fn ensure_seed(root: &FileSystemDirectoryHandle) {
-    if read_text(root, "board.md").await.is_none() {
-        let seed = kb::board_md("My Board", &["Todo".into(), "Doing".into(), "Done".into()]);
-        let _ = write_text(root, "board.md", &seed).await;
+/// Seed `board.md` on first use so a fresh browser has columns — and return
+/// the board text either way. If the OPFS write fails (older WebKit lacks
+/// main-thread `createWritable`), the caller still gets the seed content, so
+/// the UI shows a usable board instead of a columnless void.
+async fn ensure_seed(root: &FileSystemDirectoryHandle) -> String {
+    match read_text(root, "board.md").await {
+        Some(text) => text,
+        None => {
+            let seed = kb::board_md("My Board", &["Todo".into(), "Doing".into(), "Done".into()]);
+            let _ = write_text(root, "board.md", &seed).await;
+            seed
+        }
     }
 }
 
@@ -175,8 +182,7 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
     let body: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
 
     let root = opfs_root().await?;
-    ensure_seed(&root).await;
-    let (title, columns) = kb::parse_board_md(&read_text(&root, "board.md").await.unwrap_or_default());
+    let (title, columns) = kb::parse_board_md(&ensure_seed(&root).await);
 
     match (method, segs.as_slice()) {
         ("GET", ["api", "board"]) => {

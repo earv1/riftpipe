@@ -1,6 +1,6 @@
 import { createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, connectPeer, newBoard, onLocalChange, onSiblingChange, type Card } from "./api.ts";
+import { getBoard, addCard, patchCard, connectPeer, newBoard, onLocalChange, onSiblingChange, storageSupported, type Card } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 
 export function App() {
@@ -13,6 +13,9 @@ export function App() {
 
   const [openId, setOpenId] = createSignal<string | null>(null);
   const [detailTick, setDetailTick] = createSignal(0);
+  // OPFS failed at runtime (e.g. WebKit without working storage) — the board
+  // is view-only and nothing persists; say so instead of spinning forever.
+  const [storageBroken, setStorageBroken] = createSignal(false);
   // Drag-and-drop: which card is being dragged, and which column is hovered.
   const [draggedId, setDraggedId] = createSignal<string | null>(null);
   const [dragOverCol, setDragOverCol] = createSignal<string | null>(null);
@@ -27,7 +30,16 @@ export function App() {
       setBoard("loaded", true);
       if (openId()) setDetailTick((n) => n + 1);
     } catch (_e) {
-      // transient; next event will retry
+      // Transient once loaded — the next event retries. But if the very first
+      // load fails, storage is broken: show a default board + warning rather
+      // than an eternal spinner.
+      if (!board.loaded) {
+        setBoard("title", "My Board");
+        setBoard("columns", reconcile(["Todo", "Doing", "Done"]));
+        setBoard("cards", reconcile([], { key: "id" }));
+        setBoard("loaded", true);
+        setStorageBroken(true);
+      }
     }
   };
 
@@ -82,6 +94,13 @@ export function App() {
 
   return (
     <Show when={board.loaded} fallback={<div class="loading">loading…</div>}>
+      <Show when={!storageSupported() || storageBroken()}>
+        <div class="storage-warning">
+          This browser can't store boards (OPFS unavailable — needs Safari/iOS
+          18.4+, Chrome, Edge, or Firefox). You can look around, but edits
+          won't be saved or synced.
+        </div>
+      </Show>
       <header class="topbar">
         <h1>{board.title}</h1>
         <button

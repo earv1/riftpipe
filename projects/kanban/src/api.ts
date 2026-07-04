@@ -88,6 +88,20 @@ export function onSiblingChange(cb: () => void): void {
   _bc?.addEventListener("message", () => cb());
 }
 
+/**
+ * Can this browser persist the board? We need OPFS with main-thread
+ * `createWritable` (Chrome/Edge/Firefox; Safari/iOS 18.4+). Older WebKit has
+ * OPFS reads but not writes — the board would render yet lose every edit.
+ */
+export function storageSupported(): boolean {
+  return (
+    typeof navigator !== "undefined" &&
+    !!navigator.storage?.getDirectory &&
+    typeof globalThis.FileSystemFileHandle !== "undefined" &&
+    "createWritable" in FileSystemFileHandle.prototype
+  );
+}
+
 interface ApiResponse {
   status: number;
   body: string;

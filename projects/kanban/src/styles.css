@@ -57,6 +57,14 @@ body {
   border-color: var(--accent);
 }
 
+.storage-warning {
+  padding: 0.5rem 1.25rem;
+  background: #fff4e5;
+  color: #7a4d00;
+  border-bottom: 1px solid #f0d9b5;
+  font-size: 0.85rem;
+}
+
 .columns {
   display: flex;
   flex-wrap: wrap;
