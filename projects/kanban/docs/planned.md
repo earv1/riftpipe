@@ -89,6 +89,12 @@ Roughly priority order. Most of this is *wiring and UI*, not new sync code.
   - **VS Code** — open the card file / workspace; folder sync keeps it converged.
   - **"open in `$EDITOR`"** — the zero-effort fallback that already Just Works
     because the board is files.
+- **True multi-tab networking (single-owner endpoint)** — tabs in one browser
+  profile share OPFS *and* the persisted iroh identity. Stale-UI across tabs
+  is fixed (BroadcastChannel pings on every mutation + remote merge), but two
+  tabs still both bind the same key for networking. Proper shape: Web Locks
+  leader election — one tab owns the endpoint/mesh session, siblings proxy
+  their pushes through it over the BroadcastChannel.
 - **WebSocket-based presence** — "who's viewing/editing this card" (a separate
   channel; cursors/avatars are decorations, never part of the text/file model).
 - **History view** over `GET /api/history` — render the merged `events/*.jsonl`

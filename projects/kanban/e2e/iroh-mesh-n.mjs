@@ -131,6 +131,38 @@ try {
   }
   failures += soloFailures;
 
+  console.log("== phase 4: second tab in the SAME profile (shared OPFS + identity) ==");
+  // Same context = same browser profile: this is the reported repro — a
+  // sibling tab's edits are already in shared OPFS, but the other tab's UI
+  // must find out via BroadcastChannel, not a manual refresh.
+  const a2 = await a.context().newPage();
+  a2.on("pageerror", (e) => console.log("A2 pageerror:", e.message));
+  await a2.goto(base, { waitUntil: "load" });
+  await a2.waitForSelector(".add-card input", { timeout: 20000 });
+  const tTab = "A2-tab-" + rnd();
+  await addCard(a2, tTab);
+  let tabFailures = 0;
+  try {
+    await a.waitForSelector(`text=${tTab}`, { timeout: 15000 }); // no reload!
+    console.log("tab A1 saw sibling tab A2's card without a refresh");
+  } catch {
+    tabFailures++;
+    await diagnose("A1(sibling)", a, tTab);
+  }
+  // And the reverse: a REMOTE peer's edit must reach BOTH same-profile tabs.
+  const tRemote = "B-to-tabs-" + rnd();
+  await addCard(pages[1][1], tRemote);
+  for (const [nm, pg] of [["A1", a], ["A2", a2]]) {
+    try {
+      await pg.waitForSelector(`text=${tRemote}`, { timeout: 60000 });
+    } catch {
+      tabFailures++;
+      await diagnose(`${nm}(remote→tabs)`, pg, tRemote);
+    }
+  }
+  if (!tabFailures) console.log("remote edit reached both same-profile tabs");
+  failures += tabFailures;
+
   const rm = await a.evaluate(() => globalThis.riftpipe.routingMap()).catch(() => null);
   console.log("routing map (A's view):", JSON.stringify(rm));
 

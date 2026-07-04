@@ -69,6 +69,25 @@ export function onLocalChange(cb: () => void): void {
   _onLocalChange = cb;
 }
 
+// Tabs in the SAME browser profile share one OPFS board (and one iroh
+// identity), so a sibling tab's edit is already on "disk" — but nothing would
+// tell this tab to refetch. A BroadcastChannel bridges that gap: every local
+// mutation and every remote merge pings the siblings, which refresh from the
+// shared OPFS. (True multi-tab networking — one tab owning the endpoint,
+// siblings proxying — is tracked in docs/planned.md; this fixes the stale UI.)
+const _bc: BroadcastChannel | null =
+  typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("riftpipe:board") : null;
+function pingSiblings(): void {
+  try {
+    _bc?.postMessage("change");
+  } catch (_e) {
+    // channel closed during teardown — harmless
+  }
+}
+export function onSiblingChange(cb: () => void): void {
+  _bc?.addEventListener("message", () => cb());
+}
+
 interface ApiResponse {
   status: number;
   body: string;
@@ -83,7 +102,10 @@ async function api(
   await ready();
   const payload = body === undefined ? "" : JSON.stringify(body);
   const res = (await kanbanHandle(method, path, payload)) as ApiResponse;
-  if (method !== "GET" && res.status < 400) _onLocalChange?.();
+  if (method !== "GET" && res.status < 400) {
+    _onLocalChange?.();
+    pingSiblings();
+  }
   return { status: res.status, json: () => JSON.parse(res.body) };
 }
 
@@ -113,6 +135,11 @@ function signalUrl(): string {
  */
 export async function connectPeer(onRemote: () => void): Promise<boolean> {
   await ready();
+  // A remote merge lands in the shared OPFS — refresh this tab AND siblings.
+  const notify = () => {
+    onRemote();
+    pingSiblings();
+  };
   const transport =
     env.VITE_TRANSPORT ??
     new URLSearchParams(location.search).get("transport") ??
@@ -121,7 +148,7 @@ export async function connectPeer(onRemote: () => void): Promise<boolean> {
   if (transport === "iroh") {
     const ticket = location.hash.slice(1);
     try {
-      const result = await irohConnect(ticket, onRemote);
+      const result = await irohConnect(ticket, notify);
       // Host (empty ticket in): publish the returned ticket to the URL to share.
       if (typeof result === "string" && result) location.hash = result;
       return true;
@@ -141,7 +168,7 @@ export async function connectPeer(onRemote: () => void): Promise<boolean> {
     env.VITE_TURN_PASS ?? "",
     false,
   );
-  await connectAndSync(signalUrl(), id, onRemote);
+  await connectAndSync(signalUrl(), id, notify);
   return true;
 }
 

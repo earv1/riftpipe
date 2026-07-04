@@ -1,6 +1,6 @@
 import { createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, connectPeer, newBoard, onLocalChange, type Card } from "./api.ts";
+import { getBoard, addCard, patchCard, connectPeer, newBoard, onLocalChange, onSiblingChange, type Card } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 
 export function App() {
@@ -34,6 +34,8 @@ export function App() {
   onMount(() => {
     // A local mutation (our own add/move/edit) refreshes the board too — no SSE.
     onLocalChange(() => void refresh());
+    // Another tab in this browser profile edited the shared OPFS board.
+    onSiblingChange(() => void refresh());
 
     // Connect P2P when the URL carries a connection id / ticket; refresh on each
     // peer edit merged into local OPFS. No id => single-player, no server.
