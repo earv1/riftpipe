@@ -45,8 +45,8 @@ writes its **own** file (named by a per-machine site id in `.site`, a dotfile
 riftpipe skips), so two peers never touch the same file — the log merges across
 machines with **zero conflicts**. Board files stay the source of truth; this is
 a purely additive trail to build history/undo on later. *(The retired servers
-wrote this log; moving it into the wasm handler is tracked in
-[`docs/planned.md`](docs/planned.md).)*
+originally wrote this log; the wasm handler now writes it on every mutation and
+serves the merged trail at `GET /api/history`.)*
 
 Why split prose (`card.md`) from structure (`meta.toml`): they sync differently
 under riftpipe — prose merges (text CRDT), scalars are last-writer-wins (rsync).

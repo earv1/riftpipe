@@ -75,6 +75,70 @@ fn iso_now() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Change-event log (per-peer, append-only) — restored from the retired Deno
+// server. Every mutation appends one JSON line to `events/<site>.jsonl`; each
+// replica writes only its OWN file (named by a per-machine site id), so the log
+// merges across peers with zero conflicts. The site id lives in the `.site`
+// dotfile, which sync skips (dotfiles never cross the wire) — machine-local.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Cached site id (mirrors the handler-lifetime cache the old server kept).
+    static SITE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The per-machine site id: read `.site` from OPFS root, minting 8 lowercase
+/// hex chars on first use (same format as the old server's uuid-hex slice).
+async fn site_id(root: &FileSystemDirectoryHandle) -> String {
+    if let Some(s) = SITE.with(|s| s.borrow().clone()) {
+        return s;
+    }
+    let id = match read_text(root, ".site").await.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(existing) => existing,
+        None => {
+            let minted = format!("{:08x}", (js_sys::Math::random() * 4_294_967_296.0) as u32);
+            let _ = write_text(root, ".site", &minted).await;
+            minted
+        }
+    };
+    SITE.with(|s| *s.borrow_mut() = Some(id.clone()));
+    id
+}
+
+/// One event line, fields in the old server's exact order: ts, site, kind, ….
+fn event_line(ts: &str, site: &str, kind: &str, fields: &[(&str, serde_json::Value)]) -> String {
+    let mut line = format!(
+        "{{\"ts\":{},\"site\":{},\"kind\":{}",
+        serde_json::json!(ts),
+        serde_json::json!(site),
+        serde_json::json!(kind)
+    );
+    for (k, v) in fields {
+        line.push_str(&format!(",{}:{v}", serde_json::json!(k)));
+    }
+    line.push('}');
+    line
+}
+
+/// Append one change event to `events/<site>.jsonl` and push the updated log to
+/// peers (text-CRDT — appends merge cleanly, per the board's riftpipe.toml rule).
+/// OPFS has no append mode, so this is read + push-line + rewrite; fine at this
+/// scale (one small file per machine). Never fails the mutation — logging is
+/// purely additive history.
+async fn append_event(root: &FileSystemDirectoryHandle, kind: &str, fields: &[(&str, serde_json::Value)]) {
+    let site = site_id(root).await;
+    let Ok(events) = subdir(root, "events", true).await else { return };
+    let ts = js_sys::Date::new_0().to_iso_string().as_string().unwrap_or_default();
+    let fname = format!("{site}.jsonl");
+    let mut log = read_text(&events, &fname).await.unwrap_or_default();
+    log.push_str(&event_line(&ts, &site, kind, fields));
+    log.push('\n');
+    if write_text(&events, &fname, &log).await.is_ok() {
+        tree_sync::push_text(&format!("events/{fname}"), &log);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Request handling
 // ---------------------------------------------------------------------------
 
@@ -163,6 +227,11 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
                 &format!("tickets/{id}/meta.toml"),
                 kb::meta_toml(&column, max_pos + 1, false).as_bytes(),
             );
+            append_event(&root, "card.create", &[
+                ("id", serde_json::json!(id)),
+                ("column", serde_json::json!(column)),
+                ("title", serde_json::json!(title)),
+            ]).await;
             Ok(json_resp(&summary(&Card { id, title, column, position: max_pos + 1, done: false })))
         }
 
@@ -173,8 +242,10 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
             }
             let default_col = columns.first().map(String::as_str).unwrap_or("Todo");
             let mut card = read_card(&tickets, id, default_col).await;
+            let before = card.clone();
             let cdir = subdir(&tickets, id, false).await?;
             let (_old_title, mut description) = kb::split_card_md(&read_text(&cdir, "card.md").await.unwrap_or_default());
+            let old_description = description.clone();
 
             if let Some(c) = body.get("column").and_then(|v| v.as_str()) { card.column = c.to_string(); }
             if let Some(p) = body.get("position").and_then(|v| v.as_i64()) { card.position = p; }
@@ -196,6 +267,34 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
                 write_card(&cdir, &card.title, &description).await?;
                 tree_sync::push_text(&format!("tickets/{id}/card.md"), &kb::card_md(&card.title, &description));
             }
+
+            // Record change events (additive history) — same set as the old server.
+            if card.column != before.column {
+                append_event(&root, "card.move", &[
+                    ("id", serde_json::json!(id)),
+                    ("from", serde_json::json!(before.column)),
+                    ("to", serde_json::json!(card.column)),
+                ]).await;
+            }
+            if card.done != before.done {
+                append_event(&root, "card.check", &[
+                    ("id", serde_json::json!(id)),
+                    ("done", serde_json::json!(card.done)),
+                ]).await;
+            }
+            if card.title != before.title {
+                append_event(&root, "card.edit", &[
+                    ("id", serde_json::json!(id)),
+                    ("field", serde_json::json!("title")),
+                    ("value", serde_json::json!(card.title)),
+                ]).await;
+            }
+            if body.get("description").is_some() && description != old_description {
+                append_event(&root, "card.edit", &[
+                    ("id", serde_json::json!(id)),
+                    ("field", serde_json::json!("description")),
+                ]).await;
+            }
             Ok(json_resp(&summary(&card)))
         }
 
@@ -215,7 +314,33 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
             let comments = subdir(&cdir, "comments", true).await?;
             write_text(&comments, &format!("{name}.md"), &text).await?;
             tree_sync::push_text(&format!("tickets/{id}/comments/{name}.md"), &text);
+            append_event(&root, "comment.add", &[
+                ("id", serde_json::json!(id)),
+                ("comment", serde_json::json!(name)),
+            ]).await;
             Ok(json_resp(&Comment { id: name, author, ts, text }))
+        }
+
+        // Merged change-event log (newest last) — every events/*.jsonl, sorted by ts.
+        ("GET", ["api", "history"]) => {
+            let mut events: Vec<serde_json::Value> = Vec::new();
+            if let Ok(dir) = subdir(&root, "events", false).await {
+                for fname in list(&dir).await {
+                    if !fname.ends_with(".jsonl") {
+                        continue;
+                    }
+                    for line in read_text(&dir, &fname).await.unwrap_or_default().lines() {
+                        if let Ok(v) = serde_json::from_str(line) {
+                            events.push(v);
+                        }
+                    }
+                }
+            }
+            events.sort_by(|a, b| {
+                a.get("ts").and_then(|v| v.as_str()).unwrap_or("")
+                    .cmp(b.get("ts").and_then(|v| v.as_str()).unwrap_or(""))
+            });
+            Ok(json_resp(&events))
         }
 
         _ => Ok(resp(404, "Not Found".into())),
@@ -268,6 +393,38 @@ mod tests {
         let detail = unpack(handle("GET".into(), format!("/api/cards/{id}/detail"), String::new()).await);
         assert!(detail.1.contains("no server!"), "detail: {}", detail.1);
         assert!(detail.1.contains("hello"), "detail: {}", detail.1);
+    }
+
+    /// **Change-event log:** a mutation through `kanbanHandle` mints `.site`
+    /// (8 lowercase hex, machine-local) and appends a `card.create` line with
+    /// the old Deno server's exact fields to `events/<site>.jsonl`.
+    #[wasm_bindgen_test]
+    async fn mutation_appends_change_event() {
+        let created = unpack(
+            handle("POST".into(), "/api/cards".into(), r#"{"title":"logged card","column":"Todo"}"#.into()).await,
+        );
+        assert_eq!(created.0, 200);
+        let id = json_str(&created.1, "id");
+
+        let root = opfs_root().await.unwrap();
+        let site = read_text(&root, ".site").await.expect(".site minted").trim().to_string();
+        assert_eq!(site.len(), 8, "site id is 8 chars: {site}");
+        assert!(site.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)), "lowercase hex: {site}");
+
+        let events = subdir(&root, "events", false).await.expect("events/ exists");
+        let log = read_text(&events, &format!("{site}.jsonl")).await.expect("per-site log exists");
+        let line = log.lines().find(|l| l.contains(&id)).expect("event line for the new card");
+        let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON line");
+        assert_eq!(v["kind"], "card.create");
+        assert_eq!(v["site"], site.as_str());
+        assert_eq!(v["id"], id.as_str());
+        assert_eq!(v["column"], "Todo");
+        assert_eq!(v["title"], "logged card");
+        assert!(v["ts"].as_str().unwrap().contains('T'), "ISO timestamp: {}", v["ts"]);
+
+        // The merged history endpoint surfaces it too.
+        let history = unpack(handle("GET".into(), "/api/history".into(), String::new()).await);
+        assert!(history.1.contains(&id), "history: {}", history.1);
     }
 
     fn unpack(v: JsValue) -> (u16, String) {

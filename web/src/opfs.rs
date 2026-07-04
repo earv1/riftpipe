@@ -86,6 +86,11 @@ pub async fn prime_all() {
     let mut stack = vec![(root, String::new())];
     while let Some((dir, prefix)) = stack.pop() {
         for name in list(&dir).await {
+            // Dot-prefixed entries are machine-local (`.site`, editor droppings) and
+            // must never cross the wire — the native tree driver's `hidden()` rule.
+            if name.starts_with('.') {
+                continue;
+            }
             let path = if prefix.is_empty() {
                 name.clone()
             } else {

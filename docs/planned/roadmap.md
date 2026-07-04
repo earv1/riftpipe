@@ -146,12 +146,14 @@ entirely — the wasm payload is the app's backend. What remains:
 
 ## Iteration 2 (added 2026-07-04)
 
-17. **Events log in the wasm handler** — the per-peer change log
+17. **Events log in the wasm handler** — *done.* The per-peer change log
     (`events/<site>.jsonl` + `.site` id) lost its writer when the servers were
-    removed. Restore it inside `kanban-wasm`'s handler: mint/persist a site id,
-    append one JSON line per mutation. Dot-`.site` stays local (dotfile rule);
-    `events/*.jsonl` sync as per-peer append-only files (zero conflicts — one
-    writer each). Unblocks the history view.
+    removed; restored inside `kanban-wasm`'s handler: mints/persists the site id
+    (`.site`, 8 lowercase hex), appends one JSON line per mutation in the old
+    server's exact shape (`ts`/`site`/`kind` + fields), pushes the log to peers
+    as text-CRDT, and serves `GET /api/history` (merged, ts-sorted). Dot-`.site`
+    stays local — the web `prime_all` now skips dot-entries like the native
+    tree driver's `hidden()` rule. Unblocks the history view.
 18. **Per-resource backing in the manifest** — `riftpipe.toml` rules gain an
     optional `backing = "memory" | "file"` per glob (today `--memory` is
     all-or-nothing); `--memory` stays as the global default override.
