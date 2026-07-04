@@ -4,3 +4,4 @@ dist/
 process
 board/.site
 board/events/
+.vite/
