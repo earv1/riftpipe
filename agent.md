@@ -33,4 +33,9 @@
   `docs/planned/roadmap.md` (core roadmap), `PROJECT.md` (resume notes + TODO),
   `projects/kanban/docs/planned.md` (kanban app plans),
   `docs/architecture.md` (diagrams — validate mermaid with `mmdc`).
+- **Background agents get a 10-minute timer, max.** When spawning a background
+  subagent, also start a ~600 s background timer; when it fires and the agent
+  is still running, ping it to wrap up and report partial state — and stop it
+  (TaskStop) rather than letting it run unbounded. Prefer scoping tasks so
+  they fit inside 10 minutes (split big jobs into phases).
 - Record new durable rules in **this file**, not in session memory.

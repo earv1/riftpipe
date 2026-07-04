@@ -7,7 +7,9 @@
 //! the other lacks (`ops_since` / `encode_delta`) — not the whole history every
 //! edit. First-connect and reconnect are the same operation ("send me everything
 //! since version X"; a fresh peer is X = empty). Structural (non-text) files are
-//! last-writer-wins. No I/O, no clock — callers persist the result and pass a
+//! last-writer-wins; the same connect handshake carries their `(path, version)`
+//! inventory, so a peer that lacks or is stale on one receives it immediately —
+//! no re-touch needed. No I/O, no clock — callers persist the result and pass a
 //! millisecond `now` for LWW versions.
 
 use std::collections::{HashMap, HashSet};
@@ -23,10 +25,11 @@ type Origin = Option<(String, usize)>;
 
 #[derive(Serialize, Deserialize)]
 pub enum SyncMsg {
-    /// Connect handshake: "here are the version vectors of the text docs I have —
-    /// reply with anything I'm missing." Sent by both peers on connect (an empty
-    /// list is valid and still solicits the other's docs).
-    Hello { versions: Vec<(String, Vv)> },
+    /// Connect handshake: "here are the version vectors of the text docs I have,
+    /// and the LWW versions of my structural files — reply with anything I'm
+    /// missing or stale on." Sent by both peers on connect (empty lists are valid
+    /// and still solicit the other's files).
+    Hello { versions: Vec<(String, Vv)>, lww_versions: Vec<(String, u64)> },
     /// A text delta: the ops the recipient lacks for `path`, the sender's version
     /// vector (so the recipient learns what the sender has), and the doc's origin
     /// (so a same-path but independently-created doc is detected, not interleaved).
@@ -84,16 +87,33 @@ impl Syncer {
         }
     }
 
-    /// Messages to send on connect: advertise our version vectors so the peer
-    /// replies with what we're missing. Always send (even empty) so a fresh peer
-    /// solicits the other's docs.
+    /// Messages to send on connect: advertise our text version vectors AND our
+    /// LWW versions so the peer replies with what we're missing. Always send
+    /// (even empty) so a fresh peer solicits the other's files.
     pub fn hello(&self) -> SyncMsg {
         let versions = self
             .docs
             .iter()
             .map(|(path, doc)| (path.clone(), doc.version_vector()))
             .collect();
-        SyncMsg::Hello { versions }
+        let lww_versions = self.lww.iter().map(|(path, (v, _))| (path.clone(), *v)).collect();
+        SyncMsg::Hello { versions, lww_versions }
+    }
+
+    /// The cached LWW entries a peer with inventory `their` (path → version)
+    /// needs: every entry it lacks or holds an older version of. LWW-safe by
+    /// construction — the receiver's `apply(Lww)` still drops anything that
+    /// doesn't beat its local version, so a newer local file is never regressed.
+    fn lww_updates_for(&self, their: &HashMap<String, u64>) -> Vec<SyncMsg> {
+        self.lww
+            .iter()
+            .filter(|(path, (version, _))| their.get(*path).is_none_or(|tv| *version > *tv))
+            .map(|(path, (version, bytes))| SyncMsg::Lww {
+                path: path.clone(),
+                version: *version,
+                bytes: bytes.clone(),
+            })
+            .collect()
     }
 
     /// Record a local text edit (snapshot diff-to-ops); returns a **delta** of the
@@ -124,13 +144,7 @@ impl Syncer {
                 })
             })
             .collect();
-        for (path, (version, bytes)) in &self.lww {
-            msgs.push(SyncMsg::Lww {
-                path: path.clone(),
-                version: *version,
-                bytes: bytes.clone(),
-            });
-        }
+        msgs.extend(self.lww_updates_for(&HashMap::new()));
         msgs
     }
 
@@ -146,7 +160,7 @@ impl Syncer {
     /// back)`. A `Hello` produces reply deltas; a `TextDelta`/`Lww` produces bytes.
     pub fn apply(&mut self, msg: SyncMsg) -> (Option<(String, Vec<u8>)>, Vec<SyncMsg>) {
         match msg {
-            SyncMsg::Hello { versions } => {
+            SyncMsg::Hello { versions, lww_versions } => {
                 let their: HashMap<String, Vv> = versions.into_iter().collect();
                 for (path, vv) in &their {
                     self.advance_peer_vv(path, vv);
@@ -164,6 +178,11 @@ impl Syncer {
                         replies.push(SyncMsg::TextDelta { path, ops, vv, origin });
                     }
                 }
+                // LWW: ship any structural file the peer lacks or is stale on.
+                // One round, no storms — a Hello never provokes another Hello,
+                // and applying an Lww produces no replies.
+                let their_lww: HashMap<String, u64> = lww_versions.into_iter().collect();
+                replies.extend(self.lww_updates_for(&their_lww));
                 (None, replies)
             }
             SyncMsg::TextDelta { path, ops, vv, origin } => {
@@ -349,6 +368,61 @@ mod tests {
         assert_eq!(b.apply(newer).0.unwrap().1, b"new");
         let stale = SyncMsg::Lww { path: "state.bin".into(), version: 1, bytes: b"old".to_vec() };
         assert!(b.apply(stale).0.is_none(), "stale LWW ignored");
+    }
+
+    #[test]
+    fn hello_transfers_existing_lww_to_a_fresh_peer() {
+        // A already holds a structural file; B joins fresh over the point-to-point
+        // handshake and must receive it through hello/apply alone — no re-touch.
+        let mut a = Syncer::new("a");
+        a.local_lww("tickets/tk_1/meta.toml", b"column = \"Doing\"\n".to_vec(), 1000);
+
+        let mut b = Syncer::new("b");
+        let replies = deliver(&mut a, b.hello());
+        assert_eq!(replies.len(), 1, "A offers its one LWW file");
+        let (persisted, more) = b.apply(replies.into_iter().next().unwrap());
+        assert_eq!(persisted.unwrap().1, b"column = \"Doing\"\n");
+        assert!(more.is_empty(), "applying an Lww never produces replies (no storm)");
+    }
+
+    #[test]
+    fn hello_updates_stale_lww_peer() {
+        // B holds an old version of meta.toml; A's is newer. B's hello advertises
+        // its version, so A ships only the fresher payload and B adopts it.
+        let mut a = Syncer::new("a");
+        let mut b = Syncer::new("b");
+        b.apply(a.local_lww("meta.toml", b"column = \"Todo\"\n".to_vec(), 1000));
+        a.local_lww("meta.toml", b"column = \"Done\"\n".to_vec(), 2000); // B never sees this
+
+        let replies = deliver(&mut a, b.hello());
+        assert_eq!(replies.len(), 1, "A ships the newer LWW payload");
+        let (persisted, _) = b.apply(replies.into_iter().next().unwrap());
+        assert_eq!(persisted.unwrap().1, b"column = \"Done\"\n", "stale peer caught up");
+    }
+
+    #[test]
+    fn hello_never_clobbers_newer_local_lww() {
+        // B's local meta.toml is NEWER than A's. Neither direction of the
+        // handshake may regress it — and A must end up adopting B's.
+        let mut a = Syncer::new("a");
+        let mut b = Syncer::new("b");
+        b.apply(a.local_lww("meta.toml", b"old\n".to_vec(), 1000)); // shared base
+        b.local_lww("meta.toml", b"newer on B\n".to_vec(), 2000);
+
+        // B hello → A: A's copy is not newer than B's advertised version, so A
+        // sends nothing for it.
+        let from_a = deliver(&mut a, b.hello());
+        assert!(from_a.is_empty(), "A must not ship an LWW the peer already beats");
+
+        // A hello → B: B ships its newer copy back; A adopts it. Even if an older
+        // payload did arrive, apply(Lww) drops it — assert that too.
+        let from_b = deliver(&mut b, a.hello());
+        assert_eq!(from_b.len(), 1, "B offers its newer copy");
+        let (persisted, _) = a.apply(from_b.into_iter().next().unwrap());
+        assert_eq!(persisted.unwrap().1, b"newer on B\n", "A converges to B's newer file");
+        let stale = SyncMsg::Lww { path: "meta.toml".into(), version: 1500, bytes: b"stale\n".to_vec() };
+        assert!(b.apply(stale).0.is_none(), "an older payload never regresses B");
+        assert_eq!(b.lww["meta.toml"].1, b"newer on B\n");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import { createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, connectPeer, onLocalChange, type Card } from "./api.ts";
+import { getBoard, addCard, patchCard, connectPeer, newBoard, onLocalChange, type Card } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 
 export function App() {
@@ -82,6 +82,21 @@ export function App() {
     <Show when={board.loaded} fallback={<div class="loading">loading…</div>}>
       <header class="topbar">
         <h1>{board.title}</h1>
+        <button
+          class="new-board"
+          title="Start a fresh, empty board with a new share link"
+          onClick={() => {
+            if (
+              confirm(
+                "Start a fresh board? This clears the local board and its share link.",
+              )
+            ) {
+              void newBoard();
+            }
+          }}
+        >
+          New board
+        </button>
       </header>
       <main class="columns">
         <For each={board.columns}>

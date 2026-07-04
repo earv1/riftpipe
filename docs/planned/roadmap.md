@@ -10,19 +10,27 @@ sense to do it, not strict priority.
    lacks; a fresh peer is just an empty vector, so first-connect and reconnect
    are one code path. Lives in `core::sync`; native + browser both ride it.
 
-2. **Make delta sync bulletproof** — *mostly done.*
+2. **Make delta sync bulletproof** — *done* (one refinement parked, below).
    - ✅ Un-appliable delta (missing ancestor) → `merge` returns `false` instead of
      panicking; the receiver sends `Resync`, the sender answers with full
      self-contained state. Loop-capped (`awaiting_resync`) so a run of gapped
      deltas can't cause a resync storm. Tested in `core::sync` + `core::text`.
    - ✅ Version-vector merge is per-agent-max on both send and receive
      (`advance_peer_vv`), so a stale report can't regress what we know they hold.
-   - *Remaining:* a `Resync` is only wired for **text**, not LWW files — a fresh
-     joiner still doesn't get existing `meta.toml` state until it's re-touched
-     (needs the transport to supply file bytes; see initial-state sync). And if a
-     *full* resync itself keeps failing (transport corruption), the doc parks
-     rather than looping — acceptable, but a bounded retry/telemetry hook is the
-     next refinement.
+   - ✅ ~~A `Resync` is only wired for **text**, not LWW files~~ — LWW state now
+     rides the connect handshake: `Hello` carries the LWW inventory (`(path,
+     version)` per structural file) alongside the text version vectors, and
+     `apply(Hello)` replies with the cached payloads the peer lacks or is stale
+     on (the same bytes cache `full_state` uses — one shared `lww_updates_for`).
+     A fresh point-to-point joiner gets existing `meta.toml` with no re-touch;
+     a stale peer is updated; a newer local file is never regressed (the
+     receiver's `apply(Lww)` version check still gates). One round, no storms —
+     a Hello never provokes another Hello, and applying an `Lww` produces no
+     replies. Tested in `core::sync` (`hello_transfers_existing_lww_to_a_fresh_peer`,
+     `hello_updates_stale_lww_peer`, `hello_never_clobbers_newer_local_lww`).
+   - *Remaining:* if a *full* resync itself keeps failing (transport corruption),
+     the doc parks rather than looping — acceptable, but a bounded retry/telemetry
+     hook is the next refinement.
 
 ## Networking
 
@@ -123,8 +131,10 @@ entirely — the wasm payload is the app's backend. What remains:
 
 ## Smaller
 
-14. **"New board" UX** — a button that mints a fresh ticket instead of relying
-    on open-with-empty-hash.
+14. ~~"New board" UX~~ — *done:* a confirm-guarded topbar button wipes the
+    local OPFS board, drops the persisted iroh identity (new key ⇒ new topic
+    ⇒ fresh share ticket), clears the hash, and reloads as the host of an
+    empty board.
 15. ~~Consolidate `opfs_root` helpers~~ — *done* (one `web/src/opfs.rs` module).
 16. **TypeScript-first glue (npm wrapper)** — frontend people shouldn't need
     Rust to build on riftpipe. The seams are already language-agnostic (JSON

@@ -145,6 +145,23 @@ export async function connectPeer(onRemote: () => void): Promise<boolean> {
   return true;
 }
 
+/**
+ * Start a fresh board: wipe the local OPFS board, drop the persisted iroh
+ * identity (a new key ⇒ a new EndpointId ⇒ a new topic + share ticket), clear
+ * the URL hash, and reload — the tab comes back as the host of an empty board
+ * and writes its fresh ticket into the URL.
+ */
+export async function newBoard(): Promise<void> {
+  const root = await navigator.storage.getDirectory();
+  // deno-lint-ignore no-explicit-any — async iteration isn't in TS's lib yet
+  for await (const name of (root as any).keys()) {
+    await root.removeEntry(name, { recursive: true }).catch(() => {});
+  }
+  localStorage.removeItem("riftpipe:iroh_sk");
+  location.hash = "";
+  location.reload();
+}
+
 export async function getBoard(): Promise<Board> {
   return (await api("GET", "/api/board")).json();
 }
