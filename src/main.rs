@@ -213,7 +213,8 @@ async fn main() {
             eprintln!("a DIR syncs the whole folder: each file gets the algorithm riftpipe.toml assigns");
             eprintln!("(text-crdt / rsync-file / wal-db; image planned). See DESIGN.md §17.");
             eprintln!("--pipe     speak the editor edit-stream protocol on stdin/stdout (for bridges)");
-            eprintln!("--memory   hold resources in RAM (no disk mirror); see them in the --process file");
+            eprintln!("--memory   hold resources in RAM (no disk mirror); see them in the --process file.");
+            eprintln!("           a rule's `backing = \"memory\"|\"file\"` in riftpipe.toml overrides this per glob");
             eprintln!("--manifest path to riftpipe.toml (default: <dir>/riftpipe.toml)");
             eprintln!("--process  write size+hash of all in-memory resources to <path> (default: process)");
             eprintln!("--metrics  write a one-line status to <path> for tmux to display");

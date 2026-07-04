@@ -66,6 +66,10 @@ pub struct TreePeer {
     /// is what the fallback poll diffs against. Hashes, not bytes, so it never
     /// holds file copies.
     seen: HashMap<String, [u8; 32]>,
+    /// Paths already reported as parked (resync retries exhausted in the core
+    /// `Syncer`), so the stderr breadcrumb fires once per park — and again if a
+    /// path recovers and later parks anew.
+    parked_reported: HashSet<String>,
 }
 
 impl TreePeer {
@@ -73,7 +77,24 @@ impl TreePeer {
         TreePeer {
             syncer: Syncer::new(format!("n{:08x}", rand::random::<u32>())),
             seen: HashMap::new(),
+            parked_reported: HashSet::new(),
         }
+    }
+
+    /// Core is no-I/O, so IT records parked paths and WE print them: eprintln
+    /// for every newly-parked path, and forget recovered ones so a re-park is
+    /// reported again.
+    fn report_parked(&mut self) {
+        let now: HashSet<String> = self.syncer.parked_paths().into_iter().collect();
+        for p in &now {
+            if !self.parked_reported.contains(p) {
+                eprintln!(
+                    "[tree] {p}: full resync failed repeatedly — parked (holding local copy; \
+                     will recover when a mergeable state arrives)"
+                );
+            }
+        }
+        self.parked_reported = now;
     }
 }
 
@@ -219,6 +240,7 @@ pub async fn run(
                 };
                 let Ok(msg) = postcard::from_bytes::<SyncMsg>(&bytes) else { continue };
                 let (persist, replies) = peer.syncer.apply(msg);
+                peer.report_parked();
                 if let Some((path, bytes)) = persist {
                     // Refuse escaping paths AND dot-paths from the wire — `.site`
                     // and friends are machine-local and must not be overwritten.

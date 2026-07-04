@@ -144,6 +144,27 @@ entirely — the wasm payload is the app's backend. What remains:
     typed TS API (spawn + typed protocol wrappers). `src/<entrypoint>.rs`
     stays a ~350-line shell; all product glue can then live in TS.
 
+## Iteration 2 (added 2026-07-04)
+
+17. **Events log in the wasm handler** — the per-peer change log
+    (`events/<site>.jsonl` + `.site` id) lost its writer when the servers were
+    removed. Restore it inside `kanban-wasm`'s handler: mint/persist a site id,
+    append one JSON line per mutation. Dot-`.site` stays local (dotfile rule);
+    `events/*.jsonl` sync as per-peer append-only files (zero conflicts — one
+    writer each). Unblocks the history view.
+18. **Per-resource backing in the manifest** — `riftpipe.toml` rules gain an
+    optional `backing = "memory" | "file"` per glob (today `--memory` is
+    all-or-nothing); `--memory` stays as the global default override.
+19. **`lww-record` strategy (resolve the sqlite orphan)** — per-key LWW merge
+    for `key = value` structural files (the kanban `meta.toml` case: concurrent
+    edits to *different* fields both survive; whole-file LWW loses one). Build
+    it as a real `Kind::LwwRecord` reusing `algo/sqlite.rs`'s per-cell LWW
+    machinery — and either absorb or delete sqlite.rs so the orphan is gone.
+20. **Bounded resync retry + telemetry** — *done.* `Syncer` re-requests a
+    failing full resync up to 2 times, then parks the path — exposed via
+    `parked_paths()` (core stays no-I/O); the tree driver eprintlns once per
+    newly-parked path, and any later successful merge un-parks it.
+
 ## Deliberately NOT doing
 
 - **Migrating to Pear/Holepunch** — it's a JS/Bare stack with a log+linearizer data

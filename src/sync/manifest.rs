@@ -34,6 +34,19 @@ pub struct Manifest {
 pub struct Rule {
     pub glob: String,
     pub algo: Kind,
+    /// Where matching resources keep their bytes. Absent → inherit the run's
+    /// global mode (`--memory` or the default file mirror).
+    #[serde(default)]
+    pub backing: Option<BackingChoice>,
+}
+
+/// A rule's explicit byte-store choice (DESIGN.md §17.5): RAM (surfaced via the
+/// `process` sidecar) or a file on disk. Rule-level wins over the global flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackingChoice {
+    Memory,
+    File,
 }
 
 fn default_kind() -> Kind {
@@ -73,6 +86,17 @@ impl Manifest {
             .find(|r| glob_match(&r.glob, rel_path))
             .map(|r| r.algo)
             .unwrap_or(self.default)
+    }
+
+    /// The backing the manifest assigns to `rel_path`, if any: the first
+    /// matching rule's `backing` key (same first-match-wins rule as
+    /// [`kind_for`](Self::kind_for)). `None` — no rule matched, or the matching
+    /// rule has no `backing` — means "inherit the global `--memory` mode".
+    pub fn backing_for(&self, rel_path: &str) -> Option<BackingChoice> {
+        self.rules
+            .iter()
+            .find(|r| glob_match(&r.glob, rel_path))
+            .and_then(|r| r.backing)
     }
 }
 
@@ -158,6 +182,33 @@ mod tests {
         assert_eq!(m.kind_for("docs/readme.md"), Kind::TextCrdt);
         assert_eq!(m.kind_for("state/save.bin"), Kind::WalDb);
         assert_eq!(m.kind_for("assets/logo.png"), Kind::RsyncFile); // default
+    }
+
+    #[test]
+    fn rule_level_backing_parses_and_is_optional() {
+        let m = Manifest::parse(
+            r#"
+            default = "rsync-file"
+            [[rule]]
+            glob = "state/**"
+            algo = "wal-db"
+            backing = "memory"
+            [[rule]]
+            glob = "**/*.md"
+            algo = "text-crdt"
+            backing = "file"
+            [[rule]]
+            glob = "**/*.txt"
+            algo = "text-crdt"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(m.backing_for("state/save.db"), Some(BackingChoice::Memory));
+        assert_eq!(m.backing_for("docs/readme.md"), Some(BackingChoice::File));
+        // Absent key → None (inherit the global --memory mode)…
+        assert_eq!(m.backing_for("notes.txt"), None);
+        // …and so does an unmatched path.
+        assert_eq!(m.backing_for("blob.bin"), None);
     }
 
     #[test]

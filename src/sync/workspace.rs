@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::sync::backing::{Backing, FileBacking, MemoryRegistry};
-use crate::sync::manifest::Manifest;
+use crate::sync::manifest::{BackingChoice, Manifest};
 use crate::sync::strategy::{Kind, SyncStrategy};
 
 /// One synced thing: its algorithm + where its bytes live.
@@ -24,8 +24,9 @@ pub struct Resource {
 pub struct Workspace {
     root: PathBuf,
     manifest: Manifest,
-    /// In-memory mode: hold bytes in RAM (and surface them via the `process`
-    /// file) instead of mirroring to disk.
+    /// Global in-memory mode (`--memory`): hold bytes in RAM (and surface them
+    /// via the `process` file) instead of mirroring to disk. A rule-level
+    /// `backing` key in the manifest overrides this per glob.
     memory: bool,
     registry: MemoryRegistry,
     resources: HashMap<String, Resource>,
@@ -108,7 +109,14 @@ impl Workspace {
             return;
         }
         let strategy = kind.build(rel);
-        let backing: Box<dyn Backing> = if self.memory {
+        // A rule-level `backing` key wins over the global --memory flag; absent,
+        // the resource inherits the run's mode.
+        let use_memory = match self.manifest.backing_for(rel) {
+            Some(BackingChoice::Memory) => true,
+            Some(BackingChoice::File) => false,
+            None => self.memory,
+        };
+        let backing: Box<dyn Backing> = if use_memory {
             let mut mb = self.registry.backing(rel);
             // Seed from disk once, if the file exists (sharing a dir into RAM).
             if let Ok(bytes) = std::fs::read(self.root.join(rel)) {
@@ -222,6 +230,49 @@ mod tests {
         let ws = Workspace::new(&root, Manifest::default(), true).unwrap();
         let snap = ws.registry().snapshot();
         assert_eq!(snap, vec![("a.bin".to_string(), b"hello".to_vec())]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rule_level_backing_overrides_the_global_flag() {
+        let manifest = Manifest::parse(
+            r#"
+            default = "rsync-file"
+            [[rule]]
+            glob = "state/**"
+            algo = "rsync-file"
+            backing = "memory"
+            [[rule]]
+            glob = "**/*.md"
+            algo = "text-crdt"
+            backing = "file"
+            "#,
+        )
+        .unwrap();
+
+        // File mode (--memory absent): the memory-ruled glob still lands in RAM
+        // AND registers with the MemoryRegistry (the `process` sidecar's view).
+        let root = unique_dir("backing-file");
+        std::fs::write(root.join("state/live.bin"), b"ram").unwrap();
+        std::fs::write(root.join("docs/keep.md"), b"# disk").unwrap();
+        let ws = Workspace::new(&root, manifest.clone(), false).unwrap();
+        assert_eq!(
+            ws.registry().snapshot(),
+            vec![("state/live.bin".to_string(), b"ram".to_vec())],
+            "memory-ruled resource is in RAM (seeded) and registered; file-ruled is not",
+        );
+        std::fs::remove_dir_all(&root).ok();
+
+        // Memory mode (--memory): the file-ruled glob still writes through to disk.
+        let root = unique_dir("backing-mem");
+        std::fs::write(root.join("state/live.bin"), b"ram").unwrap();
+        std::fs::write(root.join("docs/keep.md"), b"# disk").unwrap();
+        let mut ws = Workspace::new(&root, manifest, true).unwrap();
+        let names: Vec<String> = ws.registry().snapshot().into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&"state/live.bin".to_string()));
+        assert!(!names.contains(&"docs/keep.md".to_string()), "file-ruled stays off the registry");
+        ws.get_mut("docs/keep.md").unwrap().backing.store(b"# still disk");
+        assert_eq!(std::fs::read(root.join("docs/keep.md")).unwrap(), b"# still disk");
         std::fs::remove_dir_all(&root).ok();
     }
 

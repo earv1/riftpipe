@@ -15,6 +15,11 @@
 #               deterministically linearized (multi-writer, no interleaving)
 #   image       codec-aware tile merge for images           (PLANNED — stub)
 #
+# Per-rule byte store: a rule may set `backing = "memory" | "file"` to pin
+# where matching resources live — RAM (reported in the --process sidecar) or a
+# file on disk. Absent, the resource inherits the run's global mode (--memory
+# or the default file mirror). First matching rule wins, same as `algo`.
+#
 # Place this file at the root of the shared directory (or pass --manifest).
 
 default = "rsync-file"
@@ -28,7 +33,9 @@ glob = "**/*.txt"
 algo = "text-crdt"
 
 # Example of keeping db state on a different algorithm than its view —
-# this is the "sync state separately from a view" case:
+# this is the "sync state separately from a view" case. `backing = "memory"`
+# additionally keeps it out of the disk mirror (RAM only), whatever --memory says:
 # [[rule]]
 # glob = "state/**"
 # algo = "wal-db"
+# backing = "memory"

@@ -41,6 +41,21 @@ pub enum SyncMsg {
     Lww { path: String, version: u64, bytes: Vec<u8> },
 }
 
+/// While awaiting a resync, re-ask only after this many further failed merges:
+/// the first failure is usually just the tail of the gapped-delta stream that
+/// triggered the request; a second means the full state itself didn't land.
+const RESYNC_FAILURES_PER_RETRY: u8 = 2;
+/// Total full-resync requests per path (1 initial + 2 retries) before parking.
+const MAX_RESYNC_REQUESTS: u8 = 3;
+
+/// Progress of one path's full-resync recovery (see [`Syncer::resync`]).
+struct ResyncState {
+    /// Resync requests sent so far for this path.
+    requests: u8,
+    /// Failed merges since the most recent request.
+    failures: u8,
+}
+
 /// Per-file sync state for one peer. Author under a **unique** `agent` (a shared
 /// agent id would corrupt the CRDT).
 pub struct Syncer {
@@ -49,9 +64,15 @@ pub struct Syncer {
     /// Our best knowledge of what the peer already has, per text path — so we send
     /// only deltas. Advanced optimistically on send and from the peer's reported vv.
     peer_vv: HashMap<String, Vv>,
-    /// Paths we've asked the peer to resync (full) and are still waiting on — so a
-    /// stream of un-appliable deltas can't trigger a storm of resync requests.
-    awaiting_resync: HashSet<String>,
+    /// Paths mid-resync: we've asked the peer for a full resync and count failed
+    /// merges since, so a stream of un-appliable deltas can't storm — and a full
+    /// state that itself fails to merge (corrupt transport) gets a bounded number
+    /// of re-requests instead of looping forever. Cleared on the first success.
+    resync: HashMap<String, ResyncState>,
+    /// Paths that exhausted the resync retry budget — parked (quiet) until some
+    /// merge for them succeeds. Core does no I/O, so the breadcrumb is exposed
+    /// via [`Syncer::parked_paths`] for an I/O-owning driver to report.
+    parked: HashSet<String>,
     /// Per structural path: the LWW `(version, bytes)` — bytes cached so a new mesh
     /// neighbor can be caught up with them (`full_state`).
     lww: HashMap<String, (u64, Vec<u8>)>,
@@ -63,7 +84,8 @@ impl Syncer {
             agent: agent.into(),
             docs: HashMap::new(),
             peer_vv: HashMap::new(),
-            awaiting_resync: HashSet::new(),
+            resync: HashMap::new(),
+            parked: HashSet::new(),
             lww: HashMap::new(),
         }
     }
@@ -148,6 +170,16 @@ impl Syncer {
         msgs
     }
 
+    /// Paths whose full-resync retry budget is exhausted — parked until a merge
+    /// for them succeeds. Sorted for stable reporting. Core is no-I/O, so the
+    /// driver (which owns stderr/metrics) turns a newly-parked path into a
+    /// visible breadcrumb.
+    pub fn parked_paths(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.parked.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
     /// Record a local structural write; `now` is a millisecond clock.
     pub fn local_lww(&mut self, path: &str, bytes: Vec<u8>, now: u64) -> SyncMsg {
         let entry = self.lww.entry(path.to_string()).or_insert((0, Vec::new()));
@@ -214,15 +246,36 @@ impl Syncer {
                     }
                 }
                 if !self.doc(&path).merge(&ops) {
-                    // Missing a causal ancestor. Ask once for a full self-contained
-                    // resync; suppress repeats until it arrives so a run of
-                    // un-appliable deltas can't cause a resync storm.
-                    if self.awaiting_resync.insert(path.clone()) {
-                        return (None, vec![SyncMsg::Resync { path }]);
+                    // Missing a causal ancestor (or corrupt bytes). Ask for a full
+                    // self-contained resync; suppress repeats while it's pending so
+                    // a run of un-appliable deltas can't cause a resync storm. If
+                    // the full state itself keeps failing to merge, re-ask a bounded
+                    // number of times, then PARK the path (visible via
+                    // `parked_paths`) instead of looping forever.
+                    if self.parked.contains(&path) {
+                        return (None, Vec::new()); // gave up; stay quiet
                     }
-                    return (None, Vec::new());
+                    let Some(st) = self.resync.get_mut(&path) else {
+                        self.resync
+                            .insert(path.clone(), ResyncState { requests: 1, failures: 0 });
+                        return (None, vec![SyncMsg::Resync { path }]);
+                    };
+                    st.failures += 1;
+                    if st.failures < RESYNC_FAILURES_PER_RETRY {
+                        return (None, Vec::new()); // suppressed while awaiting
+                    }
+                    if st.requests >= MAX_RESYNC_REQUESTS {
+                        // Retry budget exhausted — park and go quiet.
+                        self.resync.remove(&path);
+                        self.parked.insert(path);
+                        return (None, Vec::new());
+                    }
+                    st.requests += 1;
+                    st.failures = 0;
+                    return (None, vec![SyncMsg::Resync { path }]);
                 }
-                self.awaiting_resync.remove(&path);
+                self.resync.remove(&path);
+                self.parked.remove(&path); // any successful merge un-parks
                 let content = self.doc(&path).content().into_bytes();
                 self.advance_peer_vv(&path, &vv);
                 (Some((path, content)), Vec::new())
@@ -488,6 +541,84 @@ mod tests {
         let (_, full) = src.apply(replies.into_iter().next().unwrap());
         let (persist, _) = dst.apply(full.into_iter().next().unwrap());
         assert_eq!(persist.unwrap().1, b"one\ntwo\n", "peer recovered via full resync");
+    }
+
+    #[test]
+    fn corrupt_full_state_parks_after_bounded_retries() {
+        use crate::text::EgWalkerText;
+
+        // A delta stream that never merges (a corrupt full state behaves the
+        // same: merge returns false every time).
+        let mut probe = EgWalkerText::new("s");
+        probe.edit_to("one\n");
+        let v1 = probe.version();
+        probe.edit_to("one\ntwo\n");
+        let bad = |probe: &EgWalkerText| SyncMsg::TextDelta {
+            path: "note.md".into(),
+            ops: probe.encode_delta(&v1),
+            vv: probe.version_vector(),
+            origin: probe.origin(),
+        };
+
+        let mut dst = Syncer::new("d");
+        let (_, first) = dst.apply(bad(&probe));
+        assert!(matches!(first.as_slice(), [SyncMsg::Resync { .. }]), "initial request");
+
+        // Keep failing: the syncer re-asks a bounded number of times, then parks.
+        let mut requests = 1;
+        let mut fed = 0;
+        while dst.parked_paths().is_empty() {
+            let (_, r) = dst.apply(bad(&probe));
+            if matches!(r.as_slice(), [SyncMsg::Resync { .. }]) {
+                requests += 1;
+            }
+            fed += 1;
+            assert!(fed < 32, "must park after the cap, not loop forever");
+        }
+        assert_eq!(requests, 3, "1 initial + 2 bounded retries, no more");
+        assert_eq!(dst.parked_paths(), vec!["note.md".to_string()]);
+
+        // Parked paths stay quiet — no further requests, still reported parked.
+        let (_, after) = dst.apply(bad(&probe));
+        assert!(after.is_empty(), "a parked path never re-requests");
+        assert_eq!(dst.parked_paths(), vec!["note.md".to_string()]);
+    }
+
+    #[test]
+    fn successful_resync_retry_never_parks() {
+        use crate::text::EgWalkerText;
+
+        // Same gapped-delta setup as `gapped_delta_triggers_resync_and_recovers`,
+        // but the FIRST resync answer is "lost" and only the bounded retry's
+        // answer arrives — the doc recovers and is never parked.
+        let mut probe = EgWalkerText::new("s");
+        probe.edit_to("one\n");
+        let v1 = probe.version();
+        probe.edit_to("one\ntwo\n");
+        let gapped = |probe: &EgWalkerText| SyncMsg::TextDelta {
+            path: "note.md".into(),
+            ops: probe.encode_delta(&v1),
+            vv: probe.version_vector(),
+            origin: probe.origin(),
+        };
+
+        let mut src = Syncer::new("s");
+        src.local_text("note.md", "one\n");
+        src.local_text("note.md", "one\ntwo\n");
+
+        let mut dst = Syncer::new("d");
+        let (_, first) = dst.apply(gapped(&probe));
+        assert!(matches!(first.as_slice(), [SyncMsg::Resync { .. }])); // lost
+        let (_, sup) = dst.apply(gapped(&probe));
+        assert!(sup.is_empty(), "first repeat is suppressed");
+        let (_, retry) = dst.apply(gapped(&probe));
+        assert!(matches!(retry.as_slice(), [SyncMsg::Resync { .. }]), "bounded re-request");
+
+        // The retry's answer lands and merges → recovered, never parked.
+        let (_, full) = src.apply(retry.into_iter().next().unwrap());
+        let (persist, _) = dst.apply(full.into_iter().next().unwrap());
+        assert_eq!(persist.unwrap().1, b"one\ntwo\n", "recovered via the retry");
+        assert!(dst.parked_paths().is_empty(), "a successful retry never parks");
     }
 
     #[test]
