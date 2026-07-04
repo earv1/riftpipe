@@ -54,18 +54,22 @@ See the planning & design docs in [`docs/`](docs/planned.md).
 
 ## Run it
 
+One script drives everything (rebuilds the wasm payload only when Rust
+sources changed, and handles the macOS wasm-clang setup):
+
 ```sh
-# build the wasm payload once (the app's own crate), then the UI dev server
-(cd wasm && wasm-pack build --target web)
-deno task dev
-# open the URL Vite prints (http://localhost:5173) — the API runs in-page
+./run.sh            # dev server → http://localhost:5173 (API runs in-page)
+./run.sh build      # static bundle (wasm + vite) → dist/
+./run.sh serve      # build + host dist/ via `riftpipe serve` → :8080
+./run.sh demo       # two-browser convergence demo
+./run.sh mesh       # three-browser gossip-mesh demo
+
+WASM=force ./run.sh # rebuild the wasm even if fresh · WASM=skip to never
+PORT=9090 ./run.sh serve
 ```
 
-Production-style (a static bundle — host it anywhere):
-```sh
-deno task build                    # vite build -> dist/ (bundles the wasm)
-riftpipe serve ./dist              # …or any static host / GitHub Pages
-```
+(Manually, that's `(cd wasm && wasm-pack build --target web)` + `deno task
+dev|build`; production hosting is any static host / GitHub Pages.)
 
 ## Two-browser demo
 
