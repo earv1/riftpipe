@@ -143,6 +143,88 @@ async fn full_stack_upgrades_to_webrtc_and_carries_data() {
     .expect("full stack completes within budget");
 }
 
+/// The `riftpipe connect` native↔native path end to end over **real** loopback
+/// iroh (no signaling server): an accept side and a dial side each run the full
+/// link→auth→negotiate sequence concurrently (as `connect --accept` / `connect
+/// <ticket>` do), then drive `sync::tree::run` over the negotiated halves — and
+/// a file written on the accept side converges onto the dial side's disk.
+///
+/// Loopback-direct like `tests/iroh_real.rs` (no `online()` wait — `local_addr`
+/// yields the direct socket addrs), so there's no relay dependency. The file
+/// event is fed straight into the watcher channel rather than through a real
+/// `notify` watcher, keeping the test deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tree_sync_over_real_iroh_converges() {
+    use riftpipe::sync::tree::{self, TreePeer};
+    use std::path::PathBuf;
+
+    fn dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("riftpipe-treeit-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::canonicalize(&d).unwrap()
+    }
+
+    let da = dir("accept");
+    let db = dir("dial");
+    std::fs::create_dir_all(da.join("notes")).unwrap();
+    const BODY: &[u8] = b"# shared note\n\nconverges over iroh\n";
+    std::fs::write(da.join("notes/doc.md"), BODY).unwrap();
+
+    tokio::time::timeout(BUDGET, async {
+        let server = bind_accept().await.expect("bind accept");
+        let client = bind_connect().await.expect("bind connect");
+        let addr = local_addr(&server).await;
+
+        // Each side: link → auth → negotiate, concurrently (never barriered
+        // before auth — see the module notes above).
+        let server_side = async {
+            let mut la = accept_link(&server).await.expect("accept link");
+            authenticate(&mut la, &SECRET).await.expect("server auth");
+            negotiate_session_halves(la, Arc::new(Counters::default())).await
+        };
+        let client_side = async {
+            let mut lb = connect_link(&client, addr).await.expect("connect link");
+            authenticate(&mut lb, &SECRET).await.expect("client auth");
+            negotiate_session_halves(lb, Arc::new(Counters::default())).await
+        };
+        // The sessions (with their iroh keepalives) stay in scope for the run.
+        let (mut sa, mut sb) = tokio::join!(server_side, client_side);
+
+        // The accept side "sees" its pre-existing file as one watcher event.
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+        tx_a.send(da.join("notes/doc.md")).unwrap();
+        let (_tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+
+        let (mut pa, mut pb) = (TreePeer::new(), TreePeer::new());
+        let run_a = tree::run(&mut pa, &mut rx_a, false, &mut *sa.sink, &mut *sa.source, &da);
+        let run_b = tree::run(&mut pb, &mut rx_b, false, &mut *sb.sink, &mut *sb.source, &db);
+        tokio::pin!(run_a);
+        tokio::pin!(run_b);
+
+        // Drive both sessions until the file lands on the dial side.
+        let target = db.join("notes/doc.md");
+        loop {
+            tokio::select! {
+                r = &mut run_a => panic!("accept-side session ended early: {r:?}"),
+                r = &mut run_b => panic!("dial-side session ended early: {r:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    // Compare content, not existence — `is_file` alone could
+                    // observe a partially-written file mid-`fs::write`.
+                    if std::fs::read(&target).map(|b| b == BODY).unwrap_or(false) {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("tree sync over real iroh within budget");
+
+    std::fs::remove_dir_all(&da).ok();
+    std::fs::remove_dir_all(&db).ok();
+}
+
 /// The native end of the **browser↔native bridge**: two native `webrtc-rs` peers
 /// connect through the WebSocket signaling server — the *same* server and JSON
 /// protocol the browser uses — and exchange data over WebRTC. Since the wire is

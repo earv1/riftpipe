@@ -8,7 +8,9 @@
 //! directory is just such a tree), not the owner.
 //!
 //! Transport-blind: takes the `net::{Sink, Source}` halves, so it runs over
-//! whatever dialed the link (WebRTC via signaling today; iroh works the same).
+//! whatever dialed the link — WebRTC via signaling for browser peers, or a
+//! native authenticated+negotiated iroh session (`riftpipe connect --accept` /
+//! a ticket); `main.rs` owns that dialing, [`run_over`] is the common entry.
 //!
 //! Shape matches the sibling sessions (`folder::session`, `pipe::session`): the
 //! caller owns the state ([`TreePeer`]) and the watcher channel; [`run`] is a
@@ -240,19 +242,32 @@ pub async fn run(
     }
 }
 
-/// Dial a peer's room over WebRTC (via the signaling server) and sync `dir`
-/// both ways — the native end of browser↔native collaboration. Blocks until
-/// the link drops. If the watcher can't start, degrades to the poll fallback —
-/// never aborts.
-pub async fn connect(signal: &str, room: &str, dir: &str) -> Result<()> {
-    let link = crate::net::webrtc::connect_via_signaling(signal, room).await?;
-    let (mut sink, mut source) =
-        link.into_halves(std::sync::Arc::new(crate::net::Counters::default()));
+/// The common session entry over any established link: prepare `dir`, start
+/// the watcher (degrading to the poll fallback if it can't — never aborts),
+/// and drive [`run`] until the link closes. Both the WebRTC-via-signaling path
+/// and the native iroh ticket/accept paths end up here.
+pub async fn run_over(sink: &mut dyn Sink, source: &mut dyn Source, dir: &str) -> Result<()> {
     let dir = prepare_dir(Path::new(dir))?;
-    eprintln!("[riftpipe] connected to room '{room}'; syncing {}", dir.display());
     let (watcher, mut rx) = watch(&dir);
     let mut peer = TreePeer::new();
-    run(&mut peer, &mut rx, watcher.is_none(), &mut sink, &mut source, &dir).await
+    run(&mut peer, &mut rx, watcher.is_none(), sink, source, &dir).await
+}
+
+/// Dial a peer's room over WebRTC (via the signaling server) and sync `dir`
+/// both ways — the native end of browser↔native collaboration. Blocks until
+/// the link drops. `counters` tracks the session's bytes for the caller to
+/// report (a signaling session has no iroh `Endpoint`, so the tmux metrics
+/// side-car can't run here — the caller prints totals instead).
+pub async fn connect(
+    signal: &str,
+    room: &str,
+    dir: &str,
+    counters: std::sync::Arc<crate::net::Counters>,
+) -> Result<()> {
+    let link = crate::net::webrtc::connect_via_signaling(signal, room).await?;
+    let (mut sink, mut source) = link.into_halves(counters);
+    eprintln!("[riftpipe] connected to room '{room}' (WebRTC); syncing {dir}");
+    run_over(&mut sink, &mut source, dir).await
 }
 
 #[cfg(test)]

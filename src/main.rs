@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use riftpipe::crdt::text::EgWalkerText;
-use riftpipe::net::negotiate::negotiate_link;
+use riftpipe::net::negotiate::{negotiate_link, negotiate_session_halves};
 use riftpipe::net::secure::{authenticate, Ticket};
 use riftpipe::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr};
 use riftpipe::net::{anyerr, Counters};
@@ -16,32 +16,37 @@ use riftpipe::sync::mirror::TextPeer;
 use riftpipe::sync::pipe::{run_pipe_reconnecting, Role};
 use riftpipe::sync::workspace::Workspace;
 
-/// Parsed CLI options for `share`/`join`.
+/// Parsed CLI options for `share`/`join`/`connect`.
 struct Opts {
     pos: Vec<String>,
     pipe: bool,
     memory: bool,
+    accept: bool,
     metrics: Option<String>,
     manifest: Option<String>,
     process: Option<String>,
+    signal: Option<String>,
 }
 
 /// Parse `args[2..]` into positionals + flags. `--metrics`/`--manifest`/
-/// `--process` each take a value.
+/// `--process`/`--signal` each take a value.
 fn parse(args: &[String]) -> Opts {
     let mut o = Opts {
         pos: Vec::new(),
         pipe: false,
         memory: false,
+        accept: false,
         metrics: None,
         manifest: None,
         process: None,
+        signal: None,
     };
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--pipe" => o.pipe = true,
             "--memory" => o.memory = true,
+            "--accept" => o.accept = true,
             "--metrics" => {
                 o.metrics = args.get(i + 1).cloned();
                 i += 1;
@@ -52,6 +57,10 @@ fn parse(args: &[String]) -> Opts {
             }
             "--process" => {
                 o.process = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--signal" => {
+                o.signal = args.get(i + 1).cloned();
                 i += 1;
             }
             s if s.starts_with("--") => {}
@@ -116,12 +125,26 @@ async fn main() {
             }
         }
         "connect" => {
-            let connid = args.get(2).cloned().unwrap_or_default();
-            let dir = args.get(3).cloned().unwrap_or_default();
-            let signal = flag_value(&args, "--signal").unwrap_or_else(|| "ws://127.0.0.1:9000".to_string());
-            if connid.is_empty() || dir.is_empty() {
-                eprintln!("usage: riftpipe connect <connection-id> <dir> [--signal ws://127.0.0.1:9000]");
-            } else if let Err(e) = riftpipe::sync::tree::connect(&signal, &connid, &dir).await {
+            let opts = parse(&args);
+            let res = if opts.accept {
+                match opts.pos.first() {
+                    Some(dir) => connect_accept(dir, &opts).await,
+                    None => {
+                        eprintln!("usage: riftpipe connect --accept <dir> [--metrics <path>]");
+                        return;
+                    }
+                }
+            } else {
+                match (opts.pos.first(), opts.pos.get(1)) {
+                    (Some(target), Some(dir)) => connect_dial(target, dir, &opts).await,
+                    _ => {
+                        eprintln!("usage: riftpipe connect <ticket|connection-id> <dir> [--signal ws://…] [--metrics <path>]");
+                        eprintln!("       riftpipe connect --accept <dir> [--metrics <path>]");
+                        return;
+                    }
+                }
+            };
+            if let Err(e) = res {
                 eprintln!("[riftpipe] connect failed: {e}");
             }
         }
@@ -172,7 +195,16 @@ async fn main() {
             eprintln!("  riftpipe text                # eg-walker convergence demo (offline)");
             eprintln!("  riftpipe share <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
             eprintln!("  riftpipe join <ticket> <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
-            eprintln!("  riftpipe connect <connection-id> <dir> [--signal ws://127.0.0.1:9000]  # sync a folder with a browser peer over WebRTC");
+            eprintln!("  riftpipe connect <ticket|connection-id> <dir> [--signal ws://127.0.0.1:9000] [--metrics <path>]");
+            eprintln!("                                      # tree-sync a dir with a peer. a base32 ticket (from `connect --accept`)");
+            eprintln!("                                      # dials native↔native over iroh — no signaling server; anything else is a");
+            eprintln!("                                      # signaling connection-id — WebRTC via --signal. browser boards are joined");
+            eprintln!("                                      # via the connection-id path (or the browser's share link): the browser's");
+            eprintln!("                                      # iroh listener speaks a different ALPN with no auth handshake, so native");
+            eprintln!("                                      # iroh tickets are native↔native only. --metrics needs an iroh endpoint,");
+            eprintln!("                                      # so it applies to the ticket/--accept paths (signaling prints totals on exit)");
+            eprintln!("  riftpipe connect --accept <dir> [--metrics <path>]");
+            eprintln!("                                      # accepting side of native↔native tree sync: prints a ticket, waits for one peer");
             eprintln!("  riftpipe serve <dir> [--port 8080]  # static-host a folder + SSE change events at /events");
             eprintln!("                                      # (share/join a folder + serve = live-updating static site)");
             eprintln!("  riftpipe signal [--port 9000]       # WebRTC signaling relay for browser peers");
@@ -272,6 +304,87 @@ async fn join(ticket: &str, file: &str, opts: &Opts) -> riftpipe::net::Result<()
     }
     eprintln!("authenticated — live syncing {file} ({:?}, end-to-end encrypted). ^C to stop.", nl.transport);
     live_file_loop(file, &mut *nl.link).await
+}
+
+/// `riftpipe connect <target> <dir>`: tree-sync `dir` with a peer. `<target>`
+/// is either a riftpipe base32 [`Ticket`] (native↔native over iroh — no
+/// signaling server needed) or, when it doesn't decode as one, a signaling
+/// connection-id (WebRTC via the signaling server — the browser-board path).
+///
+/// The two paths are NOT interchangeable: a browser board listens with its own
+/// ALPN (`riftpipe/kanban/0`) and raw framed links — no auth or caps handshake
+/// — so the native iroh stack (ALPN `riftpipe/0`, auth + negotiate) cannot dial
+/// it. Browser boards are joined via the connection-id/signaling path (or the
+/// browser's own share link); tickets here come from `riftpipe connect
+/// --accept` on another native machine.
+async fn connect_dial(target: &str, dir: &str, opts: &Opts) -> riftpipe::net::Result<()> {
+    if let Ok(ticket) = Ticket::decode(target) {
+        // iroh ticket path (native↔native): dial → auth → negotiate → tree sync.
+        let endpoint = bind_connect().await?;
+        let mut link = connect_link(&endpoint, ticket.addr).await?;
+        authenticate(&mut link, &ticket.secret).await?;
+        return connect_session(endpoint, link, dir, opts).await;
+    }
+    // Connection-id path (WebRTC via signaling). There's no iroh Endpoint here,
+    // so the tmux metrics side-car (which needs one for `connection_kind`)
+    // can't run — the session's byte totals are reported when it ends instead.
+    let signal = opts
+        .signal
+        .clone()
+        .unwrap_or_else(|| "ws://127.0.0.1:9000".to_string());
+    let counters = Arc::new(Counters::default());
+    let res = riftpipe::sync::tree::connect(&signal, target, dir, counters.clone()).await;
+    eprintln!(
+        "[riftpipe] session ended — ↑{}B ↓{}B",
+        counters.sent.load(std::sync::atomic::Ordering::Relaxed),
+        counters.recv.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    res
+}
+
+/// `riftpipe connect --accept <dir>`: the accepting side of native↔native tree
+/// sync — bind, print a ticket (same shape as `share`, sidecar in
+/// `<dir>.ticket`), accept + authenticate one peer, negotiate, tree-sync. Two
+/// native machines sync a dir with zero signaling infrastructure.
+async fn connect_accept(dir: &str, opts: &Opts) -> riftpipe::net::Result<()> {
+    use std::time::Duration;
+    let endpoint = bind_accept().await?;
+    // Best-effort relay home so the ticket is dialable across networks (as in
+    // `share`); falls back to direct addresses without internet.
+    let _ = tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await;
+    let addr = local_addr(&endpoint).await;
+    let ticket = Ticket::new(addr);
+    let secret = ticket.secret;
+    let encoded = ticket.encode();
+    let _ = std::fs::write(format!("{dir}.ticket"), &encoded); // sidecar for scripts
+    eprintln!("on the other machine: riftpipe connect <ticket> <dir>\n\n{encoded}\n");
+    eprintln!("waiting for a peer to connect...");
+    let mut link = accept_link(&endpoint).await?;
+    authenticate(&mut link, &secret).await?;
+    connect_session(endpoint, link, dir, opts).await
+}
+
+/// Shared tail of both iroh connect paths: negotiate the transport over the
+/// authenticated link (maybe upgrading to WebRTC), spawn the metrics side-car
+/// if `--metrics` was given, and run tree sync. `session` — including the iroh
+/// keepalive a WebRTC upgrade leaves behind — is held for the whole run.
+async fn connect_session(
+    endpoint: iroh::Endpoint,
+    link: riftpipe::net::transport::IrohLink,
+    dir: &str,
+    opts: &Opts,
+) -> riftpipe::net::Result<()> {
+    let peer = link.remote_id();
+    let counters = Arc::new(Counters::default());
+    let mut session = negotiate_session_halves(link, counters.clone()).await;
+    if let Some(path) = opts.metrics.clone() {
+        riftpipe::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(dir).into());
+    }
+    eprintln!(
+        "authenticated — tree-syncing {dir} ({:?}, end-to-end encrypted). ^C to stop.",
+        session.transport
+    );
+    riftpipe::sync::tree::run_over(&mut *session.sink, &mut *session.source, dir).await
 }
 
 /// `riftpipe serve`: static-host `dir` (with SPA index.html fallback) plus SSE
