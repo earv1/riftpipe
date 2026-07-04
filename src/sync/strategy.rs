@@ -78,6 +78,10 @@ pub enum Kind {
     WalDb,
     /// codec-aware image merge (tiles / layers). Planned.
     Image,
+    /// per-key LWW merge for flat `key = value` structural files (kanban
+    /// `meta.toml` shape) — concurrent edits to different keys both survive.
+    /// Implemented.
+    LwwRecord,
 }
 
 impl Kind {
@@ -90,12 +94,16 @@ impl Kind {
             Kind::RsyncFile => Box::new(algo::rsync::RsyncSyncer::new(name)),
             Kind::WalDb => Box::new(algo::wal::WalDbSyncer::new(name)),
             Kind::Image => Box::new(algo::image::ImageSyncer::new(name)),
+            Kind::LwwRecord => Box::new(algo::lww_record::LwwRecordSyncer::new(name)),
         }
     }
 
     /// Whether this algorithm is actually implemented yet (vs. a planned stub).
     pub fn is_implemented(self) -> bool {
-        matches!(self, Kind::TextCrdt | Kind::RsyncFile | Kind::WalDb)
+        matches!(
+            self,
+            Kind::TextCrdt | Kind::RsyncFile | Kind::WalDb | Kind::LwwRecord
+        )
     }
 }
 
@@ -113,6 +121,10 @@ mod tests {
             serde_json::from_str::<Kind>(r#""wal-db""#).unwrap(),
             Kind::WalDb
         );
+        assert_eq!(
+            serde_json::from_str::<Kind>(r#""lww-record""#).unwrap(),
+            Kind::LwwRecord
+        );
     }
 
     #[test]
@@ -120,6 +132,7 @@ mod tests {
         assert!(Kind::TextCrdt.is_implemented());
         assert!(Kind::RsyncFile.is_implemented());
         assert!(Kind::WalDb.is_implemented());
+        assert!(Kind::LwwRecord.is_implemented());
         assert!(!Kind::Image.is_implemented());
     }
 
@@ -130,5 +143,6 @@ mod tests {
         assert_eq!(Kind::RsyncFile.build("x").kind(), Kind::RsyncFile);
         assert_eq!(Kind::WalDb.build("x").kind(), Kind::WalDb);
         assert_eq!(Kind::Image.build("x").kind(), Kind::Image);
+        assert_eq!(Kind::LwwRecord.build("x").kind(), Kind::LwwRecord);
     }
 }

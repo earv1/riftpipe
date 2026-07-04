@@ -13,6 +13,11 @@
 #               (last-writer-wins; no concurrent merge)
 #   wal-db      append-only log replication for databases — whole frames,
 #               deterministically linearized (multi-writer, no interleaving)
+#   lww-record  per-key LWW for flat `key = value` files (the kanban meta.toml
+#               shape) — concurrent edits to *different* keys both survive;
+#               same-key conflicts pick a deterministic winner. On merge the
+#               file is rewritten canonically: sorted `key = value` lines only
+#               (comments/blank/malformed lines are dropped)
 #   image       codec-aware tile merge for images           (PLANNED — stub)
 #
 # Per-rule byte store: a rule may set `backing = "memory" | "file"` to pin
@@ -31,6 +36,11 @@ algo = "text-crdt"
 [[rule]]
 glob = "**/*.txt"
 algo = "text-crdt"
+
+# Flat key = value metadata files merge per key, not per file:
+[[rule]]
+glob = "**/meta.toml"
+algo = "lww-record"
 
 # Example of keeping db state on a different algorithm than its view —
 # this is the "sync state separately from a view" case. `backing = "memory"`

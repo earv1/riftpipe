@@ -155,11 +155,15 @@ entirely — the wasm payload is the app's backend. What remains:
 18. **Per-resource backing in the manifest** — `riftpipe.toml` rules gain an
     optional `backing = "memory" | "file"` per glob (today `--memory` is
     all-or-nothing); `--memory` stays as the global default override.
-19. **`lww-record` strategy (resolve the sqlite orphan)** — per-key LWW merge
-    for `key = value` structural files (the kanban `meta.toml` case: concurrent
-    edits to *different* fields both survive; whole-file LWW loses one). Build
-    it as a real `Kind::LwwRecord` reusing `algo/sqlite.rs`'s per-cell LWW
-    machinery — and either absorb or delete sqlite.rs so the orphan is gone.
+19. **`lww-record` strategy (resolve the sqlite orphan)** — *done.* Per-key LWW
+    merge for `key = value` structural files (the kanban `meta.toml` case:
+    concurrent edits to *different* fields both survive; whole-file LWW loses
+    one). Shipped as `Kind::LwwRecord` / `algo/lww_record.rs`: `(version,
+    value-hash)` stamps per key (rsync's LWW convention), tombstoned deletes,
+    canonical sorted rematerialization. The orphaned `algo/sqlite.rs` was
+    **deleted** (and rusqlite dropped): its per-cell LWW *model* is absorbed by
+    lww_record, but its SQLite-bound machinery didn't fit the byte-snapshot
+    `SyncStrategy` seam.
 20. **Bounded resync retry + telemetry** — *done.* `Syncer` re-requests a
     failing full resync up to 2 times, then parks the path — exposed via
     `parked_paths()` (core stays no-I/O); the tree driver eprintlns once per
