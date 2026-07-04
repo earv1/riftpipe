@@ -5,7 +5,9 @@ name: Deploy kanban to GitHub Pages
 # variables — see docs/deploy-pages.md.
 on:
   push:
-    branches: [main]
+    # serverless-browser-kanban deploys directly while it's the active line of
+    # work (the default branch predates the wasm app); drop it after merging.
+    branches: [main, serverless-browser-kanban]
     paths:
       - "web/**"
       - "core/**"

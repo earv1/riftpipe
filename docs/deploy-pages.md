@@ -6,12 +6,15 @@ bundle; the peer-to-peer bootstrap *and* transport ride **n0's public relays**
 (free, end-to-end encrypted — the relay can't read your board). No signaling
 server, no STUN/TURN, no backend. Just publish the page and share a link.
 
-## 1. Turn on GitHub Pages
+## 1. GitHub Pages is on
 
-In the repo: **Settings → Pages → Build and deployment → Source: GitHub Actions**.
-The workflow `.github/workflows/pages.yml` builds the wasm core (iroh included) +
-the SolidJS bundle and deploys it on every push to `main`. Your board is then at
-`https://<user>.github.io/<repo>/`.
+Already enabled (Source: **GitHub Actions**, set via `gh api … -f
+build_type=workflow` — the UI equivalent is Settings → Pages → Source).
+The workflow `.github/workflows/pages.yml` builds the app's wasm crate
+(`projects/kanban/wasm`, iroh included) + the SolidJS bundle and deploys on
+every push to `main` **or `serverless-browser-kanban`** (the active branch —
+drop it from the trigger list after merging), plus manual runs via
+workflow_dispatch. The board lives at `https://earv1.github.io/riftpipe/`.
 
 (The build compiles iroh to WebAssembly, which needs a wasm-capable clang — the
 workflow installs it. Nothing for you to configure.)
