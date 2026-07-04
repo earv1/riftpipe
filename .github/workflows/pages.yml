@@ -9,7 +9,7 @@ on:
     paths:
       - "web/**"
       - "core/**"
-      - "projects/kanban/**"
+      - "projects/kanban/**" # includes projects/kanban/wasm (the app's wasm crate)
       - "src/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -40,7 +40,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
@@ -51,8 +51,8 @@ jobs:
           echo "CC_wasm32_unknown_unknown=clang" >> "$GITHUB_ENV"
           echo "AR_wasm32_unknown_unknown=llvm-ar" >> "$GITHUB_ENV"
 
-      - name: Build wasm package
-        run: cd web && wasm-pack build --target web --out-dir pkg
+      - name: Build wasm package (kanban-wasm bundles riftpipe-web)
+        run: cd projects/kanban/wasm && wasm-pack build --target web --out-dir pkg
 
       - uses: denoland/setup-deno@v2
         with:

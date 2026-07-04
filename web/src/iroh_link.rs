@@ -7,14 +7,14 @@
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 
-/// ALPN for the kanban sync protocol.
-pub const ALPN: &[u8] = b"riftpipe/kanban/0";
+/// ALPN for the browser tree-sync protocol.
+pub const ALPN: &[u8] = b"riftpipe/tree/0";
 
 async fn sleep_ms(ms: u32) {
     gloo_timers::future::TimeoutFuture::new(ms).await;
 }
 
-/// Bind an endpoint that accepts incoming connections (the board "host"). Binding
+/// Bind an endpoint that accepts incoming connections (the tree "host"). Binding
 /// under a *persisted* `sk` keeps the same EndpointId — and so the same shareable
 /// ticket — across page reloads.
 pub async fn bind_accept(sk: SecretKey) -> Result<Endpoint, String> {
@@ -118,7 +118,7 @@ impl IrohLink {
     }
 
     /// Split into independent send/recv halves so a peer can push and pull
-    /// concurrently (what `BoardSync` needs).
+    /// concurrently (what `TreeSync` needs).
     pub fn into_halves(self) -> (IrohSink, IrohSource) {
         (
             IrohSink { _conn: self._conn, send: self.send },

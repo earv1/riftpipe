@@ -1,4 +1,4 @@
-//! Per-file board sync over an established WebRTC link — the layer that turns
+//! Per-file tree sync over an established WebRTC link — the layer that turns
 //! "runs in a browser" into "*collaborates* in a browser". The protocol + merge
 //! state live in [`riftpipe_core::sync`] (shared with the native peer); this is
 //! the browser binding: a WebRTC link, OPFS writes via `on_merged`, and the
@@ -18,14 +18,14 @@ use wasm_bindgen::prelude::*;
 use crate::WebrtcLink;
 
 thread_local! {
-    /// The active board connection, if any (single-threaded wasm).
-    static SYNC: RefCell<Option<BoardSync>> = RefCell::new(None);
+    /// The active tree connection, if any (single-threaded wasm).
+    static SYNC: RefCell<Option<TreeSync>> = RefCell::new(None);
 }
 
 /// Connect to the peer sharing `room` (the connection id) via the signaling server,
-/// then sync the board over the link: a peer's merged file lands in OPFS and
-/// `on_change` fires so the UI refetches. Call once; the kanban handler pushes
-/// local edits automatically thereafter.
+/// then sync the file tree over the link: a peer's merged file lands in OPFS and
+/// `on_change` fires so the UI refetches. Call once; the app's local edits are
+/// pushed automatically thereafter (via [`push_text`] / [`push_lww`]).
 #[wasm_bindgen(js_name = connectAndSync)]
 pub async fn connect_and_sync(
     ws_url: String,
@@ -33,8 +33,8 @@ pub async fn connect_and_sync(
     on_change: js_sys::Function,
 ) -> Result<(), JsValue> {
     let link = crate::connect_via_signaling(&ws_url, &room).await?;
-    SYNC.with(|c| *c.borrow_mut() = Some(BoardSync::new(link, opfs_on_merged(on_change))));
-    wasm_bindgen_futures::spawn_local(crate::kanban::prime_all());
+    SYNC.with(|c| *c.borrow_mut() = Some(TreeSync::new(link, opfs_on_merged(on_change))));
+    wasm_bindgen_futures::spawn_local(crate::opfs::prime_all());
     Ok(())
 }
 
@@ -44,7 +44,7 @@ fn opfs_on_merged(on_change: js_sys::Function) -> Rc<dyn Fn(String, Vec<u8>)> {
     Rc::new(move |path: String, bytes: Vec<u8>| {
         let cb = on_change.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = crate::kanban::write_path(&path, &bytes).await;
+            let _ = crate::opfs::write_path(&path, &bytes).await;
             let _ = cb.call0(&JsValue::NULL);
         });
     })
@@ -55,14 +55,14 @@ thread_local! {
     static IROH_EP: RefCell<Option<iroh::Endpoint>> = const { RefCell::new(None) };
 }
 
-/// Connect + sync a board over **iroh** — no signaling server, no host you run
+/// Connect + sync a file tree over **iroh** — no signaling server, no host you run
 /// (traffic rides n0's relays). With an empty `ticket`, this peer becomes the
 /// host: it binds, returns its ticket (put it in the share link), and accepts a
 /// peer. With a ticket, this peer joins that host. Returns the host ticket (host)
-/// or null (joiner). The kanban handler's pushes sync automatically thereafter.
+/// or null (joiner). The app's pushes sync automatically thereafter.
 #[wasm_bindgen(js_name = irohConnect)]
 pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result<JsValue, JsValue> {
-    use crate::gossip::{GossipBoardSync, Mesh};
+    use crate::gossip::{GossipTreeSync, Mesh};
     use crate::iroh_link::{addr_of, ticket_of};
     let on_merged = opfs_on_merged(on_change);
     let sk = load_or_create_secret_key();
@@ -87,8 +87,8 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
         (mesh, None)
     };
 
-    crate::gossip::set_active(GossipBoardSync::new(mesh, on_merged));
-    wasm_bindgen_futures::spawn_local(crate::kanban::prime_all());
+    crate::gossip::set_active(GossipTreeSync::new(mesh, on_merged));
+    wasm_bindgen_futures::spawn_local(crate::opfs::prime_all());
 
     Ok(my_ticket.map(|t| JsValue::from_str(&t)).unwrap_or(JsValue::NULL))
 }
@@ -157,18 +157,18 @@ fn make_agent() -> String {
     format!("p{:08x}", (js_sys::Math::random() * 4_294_967_296.0) as u32)
 }
 
-/// Syncs a board's files over *either* transport. Local pushes are serialized to
+/// Syncs a file tree over *either* transport. Local pushes are serialized to
 /// an outbound channel that a transport-specific send loop drains; a recv loop
 /// applies remote messages and fires `on_merged(path, bytes)` (the app writes OPFS
 /// + refreshes; a test captures bytes). Same protocol regardless of transport.
-pub struct BoardSync {
+pub struct TreeSync {
     outbound: UnboundedSender<Vec<u8>>,
     syncer: Rc<RefCell<Syncer>>,
 }
 
-impl BoardSync {
+impl TreeSync {
     /// Over a WebRTC link.
-    pub fn new(link: WebrtcLink, on_merged: Rc<dyn Fn(String, Vec<u8>)>) -> BoardSync {
+    pub fn new(link: WebrtcLink, on_merged: Rc<dyn Fn(String, Vec<u8>)>) -> TreeSync {
         let syncer = Rc::new(RefCell::new(Syncer::new(make_agent())));
         let (outbound, mut rx) = unbounded::<Vec<u8>>();
         let sender = link.sender();
@@ -186,14 +186,14 @@ impl BoardSync {
             }
         });
         Self::greet(&syncer, &outbound);
-        BoardSync { outbound, syncer }
+        TreeSync { outbound, syncer }
     }
 
     /// Over a relay-brokered iroh link (no signaling server, no host).
     pub fn over_iroh(
         link: crate::iroh_link::IrohLink,
         on_merged: Rc<dyn Fn(String, Vec<u8>)>,
-    ) -> BoardSync {
+    ) -> TreeSync {
         let syncer = Rc::new(RefCell::new(Syncer::new(make_agent())));
         let (outbound, mut rx) = unbounded::<Vec<u8>>();
         let (mut sink, mut source) = link.into_halves();
@@ -210,7 +210,7 @@ impl BoardSync {
             }
         });
         Self::greet(&syncer, &outbound);
-        BoardSync { outbound, syncer }
+        TreeSync { outbound, syncer }
     }
 
     /// Send the connect handshake — advertises our version vectors so the peer

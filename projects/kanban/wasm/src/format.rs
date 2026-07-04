@@ -1,8 +1,7 @@
 //! Pure kanban board logic — parsing + serialization for the on-disk file format,
-//! with **no I/O and no clock**. Shared by the native server (`src/app/kanban.rs`,
-//! over `std::fs`) and the browser store (`riftpipe-web`, over OPFS), so the board
-//! format has ONE definition and a board is portable between a native peer and a
-//! browser peer.
+//! with **no I/O and no clock**. The board format has ONE definition here, over a
+//! plain file tree, so a board is portable to any peer that syncs the same files
+//! (the generic riftpipe tree sync carries them without knowing the layout).
 //!
 //! On-disk model:
 //!   board.md                "# Title", then "- Column" per column (ordered)
@@ -188,11 +187,14 @@ pub fn parse_comment_name(stem: &str) -> Option<(String, String)> {
     Some((stem[..sep].to_string(), stem[sep + 2..].to_string()))
 }
 
+// Pure-logic tests, run as wasm-bindgen tests so the whole crate verifies under
+// one headless-browser suite (`cargo test --target wasm32-unknown-unknown`).
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
 
-    #[test]
+    #[wasm_bindgen_test]
     fn board_and_card_roundtrip() {
         let (t, cols) = parse_board_md("# My Board\n\n- Todo\n- Doing\n- Done\n");
         assert_eq!(t, "My Board");
@@ -204,7 +206,7 @@ mod tests {
         assert_eq!(split_card_md(&card_md(&title, &desc)).0, "Hello");
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn meta_roundtrips_and_tolerates_junk() {
         let m = parse_meta(&meta_toml("In Progress", 7, true));
         assert_eq!(m.column.as_deref(), Some("In Progress"));
@@ -218,7 +220,7 @@ mod tests {
         assert_eq!(m.column.as_deref(), Some(weird));
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn authors_and_comment_names() {
         assert_eq!(sanitize_author("Alice Smith!"), "alice-smith");
         assert_eq!(sanitize_author("  "), "anon");

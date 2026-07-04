@@ -17,7 +17,7 @@ ROOM="brelay-$(openssl rand -hex 4)"
 
 echo "== building native + wasm pkg =="
 cargo build --quiet --bin riftpipe || exit 1
-( cd web && wasm-pack build --target web --out-dir pkg ) >/tmp/br-wasm.log 2>&1 || { echo "wasm build failed"; tail -5 /tmp/br-wasm.log; exit 1; }
+( cd projects/kanban/wasm && wasm-pack build --target web --out-dir pkg ) >/tmp/br-wasm.log 2>&1 || { echo "wasm build failed"; tail -5 /tmp/br-wasm.log; exit 1; }
 
 echo "== starting coturn + signaling + static server =="
 turnserver -n --lt-cred-mech --user "$TURN_USER:$TURN_PASS" --realm riftpipe \

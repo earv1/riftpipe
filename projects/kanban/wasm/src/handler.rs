@@ -1,120 +1,22 @@
 //! The kanban "server" running in the browser — the same JSON API the SolidJS UI
-//! calls, handled by wasm over **OPFS**, with **no local server**. Crucially it now
-//! uses the *same file-tree layout* as the native server (`board.md` +
-//! `tickets/<id>/{card.md,meta.toml,comments/*}`) via the shared
-//! [`riftpipe_core::kanban`] logic — so a board is byte-for-byte portable between a
-//! native peer and a browser peer, and per-card files stay independently mergeable
-//! (no monolithic-board clobbering).
+//! calls, handled by wasm over **OPFS**, with **no local server**. It uses the
+//! plain file-tree layout (`board.md` + `tickets/<id>/{card.md,meta.toml,comments/*}`)
+//! via the [`crate::format`] logic — so per-card files stay independently mergeable
+//! (no monolithic-board clobbering), and the generic riftpipe tree sync
+//! ([`riftpipe_web::tree_sync`]) carries them to peers without knowing the layout.
 //!
 //! `kanbanHandle(method, path, body)` is the entry point; a thin shim in `api.ts`
 //! routes the app's `fetch('/api/*')` here.
 
-use riftpipe_core::kanban as kb;
-use riftpipe_core::kanban::{Card, Comment};
+use crate::format as kb;
+use crate::format::{Card, Comment};
+use riftpipe_web::opfs::{list, opfs_root, read_text, subdir, write_text};
+use riftpipe_web::tree_sync;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::JsFuture;
-use web_sys::{
-    File, FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions,
-    FileSystemGetFileOptions, FileSystemWritableFileStream,
-};
+use web_sys::FileSystemDirectoryHandle;
 
 // ---------------------------------------------------------------------------
-// OPFS file-tree helpers
-// ---------------------------------------------------------------------------
-
-pub(crate) async fn opfs_root() -> Result<FileSystemDirectoryHandle, JsValue> {
-    let nav = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?.navigator();
-    Ok(JsFuture::from(nav.storage().get_directory()).await?.unchecked_into())
-}
-
-async fn subdir(parent: &FileSystemDirectoryHandle, name: &str, create: bool) -> Result<FileSystemDirectoryHandle, JsValue> {
-    let opts = FileSystemGetDirectoryOptions::new();
-    opts.set_create(create);
-    Ok(JsFuture::from(parent.get_directory_handle_with_options(name, &opts)).await?.unchecked_into())
-}
-
-async fn read_text(dir: &FileSystemDirectoryHandle, name: &str) -> Option<String> {
-    let handle: FileSystemFileHandle =
-        JsFuture::from(dir.get_file_handle(name)).await.ok()?.unchecked_into();
-    let file: File = JsFuture::from(handle.get_file()).await.ok()?.unchecked_into();
-    let buf = JsFuture::from(file.array_buffer()).await.ok()?;
-    String::from_utf8(js_sys::Uint8Array::new(&buf).to_vec()).ok()
-}
-
-async fn write_text(dir: &FileSystemDirectoryHandle, name: &str, content: &str) -> Result<(), JsValue> {
-    let opts = FileSystemGetFileOptions::new();
-    opts.set_create(true);
-    let handle: FileSystemFileHandle =
-        JsFuture::from(dir.get_file_handle_with_options(name, &opts)).await?.unchecked_into();
-    let w: FileSystemWritableFileStream =
-        JsFuture::from(handle.create_writable()).await?.unchecked_into();
-    JsFuture::from(w.write_with_u8_array(content.as_bytes())?).await?;
-    JsFuture::from(w.close()).await?;
-    Ok(())
-}
-
-/// Write bytes to an OPFS path like `tickets/<id>/card.md`, creating dirs as
-/// needed. Used by the sync layer to land a peer's merged file.
-pub async fn write_path(path: &str, bytes: &[u8]) -> Result<(), JsValue> {
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let Some((file, dirs)) = parts.split_last() else { return Ok(()) };
-    let mut dir = opfs_root().await?;
-    for d in dirs {
-        dir = subdir(&dir, d, true).await?;
-    }
-    write_text(&dir, file, &String::from_utf8_lossy(bytes)).await
-}
-
-/// Entry names in a directory (drives the OPFS `keys()` async iterator).
-async fn list(dir: &FileSystemDirectoryHandle) -> Vec<String> {
-    let mut names = Vec::new();
-    let iter = dir.keys();
-    while let Ok(promise) = iter.next() {
-        let Ok(res) = JsFuture::from(promise).await else { break };
-        let done = js_sys::Reflect::get(&res, &"done".into()).ok().and_then(|v| v.as_bool()).unwrap_or(true);
-        if done {
-            break;
-        }
-        if let Some(name) = js_sys::Reflect::get(&res, &"value".into()).ok().and_then(|v| v.as_string()) {
-            names.push(name);
-        }
-    }
-    names
-}
-
-/// Push **every** existing OPFS file (whole tree) into the active sync, so a peer
-/// we connect to merges with our pre-existing state — not just live edits. This is
-/// **folder-generic**: `.md` files sync as text CRDTs, everything else as LWW, with
-/// no knowledge of the kanban layout. Any file-based app gets mesh sync for free.
-/// Distinct paths union; same-path files resolve by origin in `core::sync`.
-pub async fn prime_all() {
-    let Ok(root) = opfs_root().await else { return };
-    // Iterative DFS over the OPFS tree (a name is a file if it reads as one, else a
-    // subdirectory to descend into).
-    let mut stack = vec![(root, String::new())];
-    while let Some((dir, prefix)) = stack.pop() {
-        for name in list(&dir).await {
-            let path = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}/{name}")
-            };
-            if let Some(text) = read_text(&dir, &name).await {
-                if name.ends_with(".md") {
-                    crate::board_sync::push_text(&path, &text);
-                } else {
-                    crate::board_sync::push_lww(&path, text.as_bytes());
-                }
-            } else if let Ok(sub) = subdir(&dir, &name, false).await {
-                stack.push((sub, path));
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Board reading / mutations (over the file tree, via core logic)
+// Board reading / mutations (over the file tree, via the format logic)
 // ---------------------------------------------------------------------------
 
 /// Seed `board.md` on first use so a fresh browser has columns.
@@ -256,8 +158,8 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
             let cdir = ensure_card_dir(&root, &id).await?;
             write_card(&cdir, &title, "").await?;
             write_meta(&cdir, &column, max_pos + 1, false).await?;
-            crate::board_sync::push_text(&format!("tickets/{id}/card.md"), &kb::card_md(&title, ""));
-            crate::board_sync::push_lww(
+            tree_sync::push_text(&format!("tickets/{id}/card.md"), &kb::card_md(&title, ""));
+            tree_sync::push_lww(
                 &format!("tickets/{id}/meta.toml"),
                 kb::meta_toml(&column, max_pos + 1, false).as_bytes(),
             );
@@ -284,15 +186,15 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
             if let Some(desc) = body.get("description").and_then(|v| v.as_str()) { description = desc.to_string(); }
 
             // Always persist structural fields; only re-serialize card.md when the
-            // title/description actually changed (mirrors native; avoids prose drift).
+            // title/description actually changed (avoids prose drift).
             write_meta(&cdir, &card.column, card.position, card.done).await?;
-            crate::board_sync::push_lww(
+            tree_sync::push_lww(
                 &format!("tickets/{id}/meta.toml"),
                 kb::meta_toml(&card.column, card.position, card.done).as_bytes(),
             );
             if touched_text {
                 write_card(&cdir, &card.title, &description).await?;
-                crate::board_sync::push_text(&format!("tickets/{id}/card.md"), &kb::card_md(&card.title, &description));
+                tree_sync::push_text(&format!("tickets/{id}/card.md"), &kb::card_md(&card.title, &description));
             }
             Ok(json_resp(&summary(&card)))
         }
@@ -312,7 +214,7 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
             let cdir = subdir(&tickets, id, false).await?;
             let comments = subdir(&cdir, "comments", true).await?;
             write_text(&comments, &format!("{name}.md"), &text).await?;
-            crate::board_sync::push_text(&format!("tickets/{id}/comments/{name}.md"), &text);
+            tree_sync::push_text(&format!("tickets/{id}/comments/{name}.md"), &text);
             Ok(json_resp(&Comment { id: name, author, ts, text }))
         }
 
@@ -334,4 +236,48 @@ async fn read_comments(cdir: &FileSystemDirectoryHandle) -> Vec<Comment> {
     }
     out.sort_by(|a, b| a.ts.cmp(&b.ts));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// **The kanban server, in the browser:** drive the same JSON API the SolidJS
+    /// UI uses — create/read/patch/comment — entirely through `kanbanHandle` over
+    /// OPFS, no localhost process. Each call reloads from OPFS, so a card created
+    /// in one call being visible in the next proves serverless persistence.
+    #[wasm_bindgen_test]
+    async fn kanban_handler_runs_in_browser_over_opfs() {
+        let created = unpack(
+            handle("POST".into(), "/api/cards".into(), r#"{"title":"made in browser","column":"Doing"}"#.into()).await,
+        );
+        assert_eq!(created.0, 200);
+        let id = json_str(&created.1, "id");
+        assert!(id.starts_with("tk_"));
+
+        // A separate call (fresh OPFS read) sees the new card.
+        let board = unpack(handle("GET".into(), "/api/board".into(), String::new()).await);
+        assert!(board.1.contains("made in browser"), "board: {}", board.1);
+
+        // Patch + comment, then detail reflects both — all serverless.
+        handle("PATCH".into(), format!("/api/cards/{id}"), r#"{"done":true,"description":"no server!"}"#.into()).await;
+        handle("POST".into(), format!("/api/cards/{id}/comments"), r#"{"author":"Claude","text":"hello"}"#.into()).await;
+        let detail = unpack(handle("GET".into(), format!("/api/cards/{id}/detail"), String::new()).await);
+        assert!(detail.1.contains("no server!"), "detail: {}", detail.1);
+        assert!(detail.1.contains("hello"), "detail: {}", detail.1);
+    }
+
+    fn unpack(v: JsValue) -> (u16, String) {
+        let status = js_sys::Reflect::get(&v, &"status".into()).unwrap().as_f64().unwrap() as u16;
+        let body = js_sys::Reflect::get(&v, &"body".into()).unwrap().as_string().unwrap();
+        (status, body)
+    }
+
+    fn json_str(json: &str, key: &str) -> String {
+        let v = js_sys::JSON::parse(json).unwrap();
+        js_sys::Reflect::get(&v, &key.into()).unwrap().as_string().unwrap()
+    }
 }

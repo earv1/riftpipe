@@ -1,4 +1,4 @@
-//! Gossip-mesh transport for the browser: a board is an **iroh-gossip topic**, and
+//! Gossip-mesh transport for the browser: a shared file tree is an **iroh-gossip topic**, and
 //! peers broadcast `SyncMsg`s epidemically — no fixed hub, the swarm self-organizes
 //! and survives any peer leaving. The N-peer-safe merge in `riftpipe_core::sync`
 //! handles convergence; this module is just the transport + membership.
@@ -17,12 +17,12 @@ use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
 
-/// The topic for a board hosted by `host` — deterministic, so all peers agree.
+/// The topic for a tree hosted by `host` — deterministic, so all peers agree.
 pub fn topic_of(host: EndpointId) -> TopicId {
     TopicId::from_bytes(*host.as_bytes())
 }
 
-/// A joined gossip mesh for one board: broadcast bytes to everyone, receive a
+/// A joined gossip mesh for one shared tree: broadcast bytes to everyone, receive a
 /// stream of events (messages + membership changes).
 pub struct Mesh {
     endpoint: Endpoint,
@@ -34,7 +34,7 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    /// Join the mesh for `host`'s board. `bootstrap` is the host's address (from the
+    /// Join the mesh for `host`'s tree. `bootstrap` is the host's address (from the
     /// ticket) for a joiner, or `None` for the host itself (it starts the swarm).
     pub async fn join(
         sk: SecretKey,
@@ -137,7 +137,7 @@ impl MeshKeepAlive {
     }
 }
 
-/// What travels over the gossip topic: board sync messages, plus periodic presence
+/// What travels over the gossip topic: tree sync messages, plus periodic presence
 /// so peers can build a routing map for debugging.
 #[derive(serde::Serialize, serde::Deserialize)]
 enum GossipMsg {
@@ -146,10 +146,10 @@ enum GossipMsg {
     Presence { id: [u8; 32], neighbors: Vec<[u8; 32]> },
 }
 
-/// Board sync over the gossip mesh. Local pushes broadcast to everyone; received
+/// File-tree sync over the gossip mesh. Local pushes broadcast to everyone; received
 /// messages merge via the N-peer-safe `Syncer`. A new neighbor is caught up by
-/// re-broadcasting our full board. Tracks direct neighbors + a gossiped routing map.
-pub struct GossipBoardSync {
+/// re-broadcasting our full tree. Tracks direct neighbors + a gossiped routing map.
+pub struct GossipTreeSync {
     syncer: std::rc::Rc<std::cell::RefCell<riftpipe_core::sync::Syncer>>,
     sender: GossipSender,
     neighbors: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<[u8; 32]>>>,
@@ -157,8 +157,8 @@ pub struct GossipBoardSync {
     _keep: MeshKeepAlive,
 }
 
-impl GossipBoardSync {
-    pub fn new(mesh: Mesh, on_merged: std::rc::Rc<dyn Fn(String, Vec<u8>)>) -> GossipBoardSync {
+impl GossipTreeSync {
+    pub fn new(mesh: Mesh, on_merged: std::rc::Rc<dyn Fn(String, Vec<u8>)>) -> GossipTreeSync {
         use std::cell::RefCell;
         use std::rc::Rc;
         let my_id = *mesh.my_id().as_bytes();
@@ -196,7 +196,7 @@ impl GossipBoardSync {
                     }
                     Event::NeighborUp(id) => {
                         nb.borrow_mut().insert(*id.as_bytes());
-                        // Catch the new neighbor up with our whole board.
+                        // Catch the new neighbor up with our whole tree.
                         let full = sy.borrow().full_state();
                         for msg in full {
                             if let Some(b) = broadcast(&GossipMsg::Sync(msg)) {
@@ -222,7 +222,7 @@ impl GossipBoardSync {
             }
         });
 
-        GossipBoardSync { syncer, sender, neighbors, routing, _keep: keep }
+        GossipTreeSync { syncer, sender, neighbors, routing, _keep: keep }
     }
 
     pub fn push_text(&self, path: &str, content: &str) {
@@ -271,12 +271,12 @@ fn hex32(b: &[u8; 32]) -> String {
 }
 
 thread_local! {
-    /// The active gossip board sync, if the app is on the mesh transport.
-    static GOSSIP: std::cell::RefCell<Option<GossipBoardSync>> = const { std::cell::RefCell::new(None) };
+    /// The active gossip tree sync, if the app is on the mesh transport.
+    static GOSSIP: std::cell::RefCell<Option<GossipTreeSync>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Install the active gossip sync (replacing any prior one).
-pub(crate) fn set_active(bs: GossipBoardSync) {
+pub(crate) fn set_active(bs: GossipTreeSync) {
     GOSSIP.with(|c| *c.borrow_mut() = Some(bs));
 }
 
@@ -380,10 +380,10 @@ mod tests {
         );
     }
 
-    /// A card pushed on one peer syncs to another over the gossip mesh — proves
-    /// board sync (not just raw bytes) works over gossip.
+    /// A file pushed on one peer syncs to another over the gossip mesh — proves
+    /// tree sync (not just raw bytes) works over gossip.
     #[wasm_bindgen_test]
-    async fn board_syncs_over_gossip_mesh() {
+    async fn tree_syncs_over_gossip_mesh() {
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -397,21 +397,21 @@ mod tests {
             sleep_ms(50).await;
         }
         let host_addr = host_mesh.addr();
-        let host_bs = GossipBoardSync::new(host_mesh, Rc::new(|_, _| {}));
+        let host_bs = GossipTreeSync::new(host_mesh, Rc::new(|_, _| {}));
 
         let join_sk = SecretKey::generate();
         let joiner_mesh = Mesh::join(join_sk, host_id, Some(host_addr)).await.expect("joiner");
         let got: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::new(RefCell::new(Vec::new()));
         let g = got.clone();
         let _joiner_bs =
-            GossipBoardSync::new(joiner_mesh, Rc::new(move |p, b| g.borrow_mut().push((p, b))));
+            GossipTreeSync::new(joiner_mesh, Rc::new(move |p, b| g.borrow_mut().push((p, b))));
 
-        // Let the swarm form, then the host pushes a card.
+        // Let the swarm form, then the host pushes a file.
         sleep_ms(2500).await;
-        host_bs.push_text("tickets/x/card.md", "# gossip card\n");
+        host_bs.push_text("notes/x/doc.md", "# gossip doc\n");
 
         for _ in 0..300 {
-            if got.borrow().iter().any(|(p, _)| p == "tickets/x/card.md") {
+            if got.borrow().iter().any(|(p, _)| p == "notes/x/doc.md") {
                 break;
             }
             sleep_ms(50).await;
@@ -419,8 +419,8 @@ mod tests {
         assert!(
             got.borrow()
                 .iter()
-                .any(|(p, b)| p == "tickets/x/card.md" && b == b"# gossip card\n"),
-            "joiner received the card over the gossip mesh: {:?}",
+                .any(|(p, b)| p == "notes/x/doc.md" && b == b"# gossip doc\n"),
+            "joiner received the file over the gossip mesh: {:?}",
             got.borrow(),
         );
     }

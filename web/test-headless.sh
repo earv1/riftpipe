@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Headless-browser verification of the web-sys WebRTC Link.
+# Headless-browser verification of the wasm crates: riftpipe-web (this dir) and
+# kanban-wasm (projects/kanban/wasm) — one chromedriver setup, both suites.
 #
 # Runs the wasm-bindgen tests in a REAL (headless) Chrome — no GUI. The wrinkle:
 # `wasm-pack test` always downloads the *latest* chromedriver, which mismatches a
@@ -56,8 +57,16 @@ trap 'kill $SIGNAL_PID 2>/dev/null' EXIT
 sleep 0.5
 
 # 5. Run, forcing OUR matching driver (wasm-pack would otherwise use its own).
-echo "running headless wasm tests..."
+echo "running headless wasm tests (riftpipe-web)..."
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$RUNNER" \
 CHROMEDRIVER="$DRIVER" \
 WASM_BINDGEN_TEST_ONLY_WEB=1 \
   cargo test --target wasm32-unknown-unknown "$@"
+
+# 6. Same setup, the kanban app crate (format + OPFS handler tests).
+echo "running headless wasm tests (kanban-wasm)..."
+( cd ../projects/kanban/wasm && \
+  CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$RUNNER" \
+  CHROMEDRIVER="$DRIVER" \
+  WASM_BINDGEN_TEST_ONLY_WEB=1 \
+    cargo test --target wasm32-unknown-unknown "$@" )

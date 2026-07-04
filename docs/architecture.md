@@ -20,9 +20,11 @@ riftpipe/
       algo/             text_crdt, rsync (real); wal, image (stubs); sqlite (unwired)
     monitor/            metrics + in-memory `process` sidecar
     app/                generic runnables: host (static + SSE), signal relay
-  web/                  riftpipe-web — wasm crate (workspace-excluded, own lockfile)
-  projects/kanban/      the showcase app: SolidJS UI over the in-page wasm API
-                        (no server) + e2e harness + seed board
+  web/                  riftpipe-web — app-generic wasm crate (workspace-excluded,
+                        own lockfile): links, gossip mesh, OPFS, tree sync
+  projects/kanban/      the showcase app: SolidJS UI + kanban-wasm crate (wasm/ —
+                        board format + OPFS handler, links riftpipe-web into the
+                        one in-page bundle; no server) + e2e harness + seed board
   nvim/                 Neovim bridge (session-local lua)
   tests/                native integration tests (mock, real iroh, full stack)
   deploy/               fly.io signaling server (legacy/fallback transport)
@@ -38,17 +40,15 @@ The two platform crates only add transport + storage; the UIs only render.
 ```mermaid
 flowchart LR
     ED["editors & scripts<br/>(stdio JSON)"] --> CLI
-    UI["SolidJS board UI<br/>(static bundle — no server)"] --> WEB
+    UI["SolidJS board UI<br/>(static bundle — no server)"] --> APP
+    APP["kanban-wasm (wasm)<br/>projects/kanban/wasm/ — board format,<br/>OPFS JSON handler (the app's backend)"] --> WEB
     CLI["riftpipe (native)<br/>src/ — generic verbs, iroh/WebRTC,<br/>folder & tree sync, host/signal"]
-    WEB["riftpipe-web (wasm)<br/>web/ — OPFS, iroh relay,<br/>gossip mesh, board API in-page"]
+    WEB["riftpipe-web (wasm)<br/>web/ — OPFS, iroh relay,<br/>gossip mesh, per-file tree sync"]
     CLI <-. "iroh QUIC · WebRTC" .-> WEB
     CLI --> CORE
     WEB --> CORE
-    CORE["riftpipe-core (pure)<br/>eg-walker CRDT · sync protocol ·<br/>kanban file format* · WAL frames"]
+    CORE["riftpipe-core (pure)<br/>eg-walker CRDT · sync protocol ·<br/>WAL frames"]
 ```
-
-\* the kanban format's presence in core is tracked debt — it belongs to the app
-(roadmap §Architecture / hygiene #8).
 
 ## Native layers (src/)
 
@@ -165,8 +165,9 @@ sequenceDiagram
 ```
 
 **2. Browser kanban (serverless)** — browser ↔ browser over the gossip mesh:
-the UI calls `kanbanHandle` (wasm) which reads/writes OPFS via
-`riftpipe_core::kanban`; every mutation is pushed through `core::sync::Syncer`
+the UI calls `kanbanHandle` (from the app's `kanban-wasm` crate) which
+reads/writes OPFS via `riftpipe_web::opfs`; every mutation is pushed through
+`core::sync::Syncer`
 (`card.md` → text-CRDT event, `meta.toml` → LWW) and broadcast on the
 iroh-gossip topic; receiving peers merge and land files back into OPFS. New
 neighbors are caught up with `full_state()` on `NeighborUp`. A native peer joins
@@ -252,8 +253,6 @@ Fixed in the July 2026 restructure + review series:
 
 Still open (tracked in `docs/planned/roadmap.md` §Architecture / hygiene):
 
-- **Kanban still inside the crates** — `riftpipe_core::kanban` (format parser)
-  and the kanban handler in `web/`; needs the wasm-crate split.
 - **Two wire protocols** (folder framing vs `core::sync` `SyncMsg`).
 - **`connect` is signaling-only** — no iroh dial/negotiation yet, counters
   unwired.

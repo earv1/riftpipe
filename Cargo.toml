@@ -37,9 +37,9 @@ webrtc = "0.17.1"
 name = "riftpipe"
 path = "src/main.rs"
 
-# The browser/wasm crate (web-sys WebRTC Link) builds on a different target and is
-# verified separately via `wasm-pack test --headless`. Excluded so it never enters
-# the native build/test.
+# The browser/wasm crates (riftpipe-web + the kanban app's kanban-wasm) build on a
+# different target and are verified separately via `web/test-headless.sh` (headless
+# Chrome, both crates). Excluded so they never enter the native build/test.
 [workspace]
 members = ["core"]
-exclude = ["web"]
+exclude = ["web", "projects/kanban/wasm"]

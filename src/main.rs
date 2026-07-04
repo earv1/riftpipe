@@ -311,8 +311,8 @@ async fn join(ticket: &str, file: &str, opts: &Opts) -> riftpipe::net::Result<()
 /// signaling server needed) or, when it doesn't decode as one, a signaling
 /// connection-id (WebRTC via the signaling server — the browser-board path).
 ///
-/// The two paths are NOT interchangeable: a browser board listens with its own
-/// ALPN (`riftpipe/kanban/0`) and raw framed links — no auth or caps handshake
+/// The two paths are NOT interchangeable: a browser peer listens with its own
+/// ALPN (`riftpipe/tree/0`) and raw framed links — no auth or caps handshake
 /// — so the native iroh stack (ALPN `riftpipe/0`, auth + negotiate) cannot dial
 /// it. Browser boards are joined via the connection-id/signaling path (or the
 /// browser's own share link); tickets here come from `riftpipe connect

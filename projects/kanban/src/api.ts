@@ -1,7 +1,8 @@
 // API layer — backed by the in-browser **Rust kanban server** (wasm + OPFS), not
 // a localhost process. The shapes are unchanged; the only difference is the
-// transport: each request is handled by `kanbanHandle` from the `riftpipe-web`
-// wasm package instead of crossing the network. No local server.
+// transport: each request is handled by `kanbanHandle` from the `kanban-wasm`
+// package instead of crossing the network. No local server. (kanban-wasm links
+// riftpipe-web, so the generic sync exports come from the same bundle.)
 //
 // (The exported function signatures are identical to the old fetch-based API, so
 // the SolidJS components don't change.)
@@ -13,7 +14,7 @@ import init, {
   irohConnect,
   connectedPeers,
   routingMap,
-} from "../../../web/pkg/riftpipe_web.js";
+} from "../wasm/pkg/kanban_wasm.js";
 
 // Debugging hooks for the gossip mesh — inspect from the console:
 //   riftpipe.connectedPeers()  → this peer's direct neighbors (hex ids)

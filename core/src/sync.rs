@@ -1,12 +1,12 @@
-//! Platform-agnostic per-file board sync: the wire messages + merge state, shared
+//! Platform-agnostic per-file tree sync: the wire messages + merge state, shared
 //! by the browser (`riftpipe-web`) and native (`riftpipe`), so both ends speak ONE
-//! protocol over whatever transport (`BoardSync` on iroh or WebRTC).
+//! protocol over whatever transport (`TreeSync` on iroh or WebRTC).
 //!
-//! Text files (`card.md`, comments, `board.md`) are eg-walker CRDTs synced as
+//! Text files (`*.md`) are eg-walker CRDTs synced as
 //! **events**: peers exchange version vectors on connect, then ship only the ops
 //! the other lacks (`ops_since` / `encode_delta`) — not the whole history every
 //! edit. First-connect and reconnect are the same operation ("send me everything
-//! since version X"; a fresh peer is X = empty). Structural files (`meta.toml`) are
+//! since version X"; a fresh peer is X = empty). Structural (non-text) files are
 //! last-writer-wins. No I/O, no clock — callers persist the result and pass a
 //! millisecond `now` for LWW versions.
 
@@ -86,7 +86,7 @@ impl Syncer {
 
     /// Messages to send on connect: advertise our version vectors so the peer
     /// replies with what we're missing. Always send (even empty) so a fresh peer
-    /// solicits the other's board.
+    /// solicits the other's docs.
     pub fn hello(&self) -> SyncMsg {
         let versions = self
             .docs
@@ -171,7 +171,7 @@ impl Syncer {
                 // path, DIFFERENT origin (root op). Don't naively merge — that
                 // interleaves two unrelated texts. Resolve deterministically by
                 // origin agent id (higher wins; both converge to it). Distinct paths
-                // never hit this, so separate cards union; a shared origin (normal
+                // never hit this, so separate documents union; a shared origin (normal
                 // concurrent editing) falls through to a clean CRDT merge.
                 if let (Some(mine), Some(theirs)) =
                     (self.docs.get(&path).and_then(|d| d.origin()), origin.as_ref())
@@ -262,7 +262,7 @@ mod tests {
         }
 
         // First edit: peer has nothing, so the delta carries the whole doc.
-        let m1 = a.local_text("card.md", &big).unwrap();
+        let m1 = a.local_text("note.md", &big).unwrap();
         let first_len = match &m1 {
             SyncMsg::TextDelta { ops, .. } => ops.len(),
             _ => panic!("expected delta"),
@@ -271,7 +271,7 @@ mod tests {
 
         // A second small edit AFTER the peer is caught up must ship a tiny delta,
         // not the whole 4000-char document again.
-        let m2 = a.local_text("card.md", &(big.clone() + "Y")).unwrap();
+        let m2 = a.local_text("note.md", &(big.clone() + "Y")).unwrap();
         let second_len = match &m2 {
             SyncMsg::TextDelta { ops, .. } => ops.len(),
             _ => panic!("expected delta"),
@@ -288,42 +288,42 @@ mod tests {
         let mut a = Syncer::new("a");
         let mut b = Syncer::new("b");
         // Shared base.
-        let m = a.local_text("board.md", "# B\n\n- Todo\n").unwrap();
+        let m = a.local_text("index.md", "# B\n\n- Todo\n").unwrap();
         b.apply(m);
 
         // Concurrent edits from the same base.
-        let ma = a.local_text("board.md", "# B\n\n- Todo\n- A\n").unwrap();
-        let mb = b.local_text("board.md", "# B\n\n- Todo\n- Bee\n").unwrap();
+        let ma = a.local_text("index.md", "# B\n\n- Todo\n- A\n").unwrap();
+        let mb = b.local_text("index.md", "# B\n\n- Todo\n- Bee\n").unwrap();
         let on_b = b.apply(ma).0.unwrap().1;
         let on_a = a.apply(mb).0.unwrap().1;
         assert_eq!(on_a, on_b, "concurrent edits converge");
     }
 
     #[test]
-    fn hello_transfers_existing_board_to_a_fresh_peer() {
-        // A already has a board; B connects fresh and must receive it via the
+    fn hello_transfers_existing_tree_to_a_fresh_peer() {
+        // A already has a tree; B connects fresh and must receive it via the
         // version-vector handshake (no edit needed).
         let mut a = Syncer::new("a");
-        a.local_text("card.md", "# existing card\n");
+        a.local_text("note.md", "# existing note\n");
 
         let mut b = Syncer::new("b");
         // B says hello (empty) → A replies with the deltas B lacks.
         let replies = deliver(&mut a, b.hello());
         assert_eq!(replies.len(), 1, "A offers its one doc");
         let (persisted, _) = b.apply(replies.into_iter().next().unwrap());
-        assert_eq!(persisted.unwrap().1, b"# existing card\n");
+        assert_eq!(persisted.unwrap().1, b"# existing note\n");
     }
 
     #[test]
     fn reconnect_replays_only_the_gap() {
         let mut a = Syncer::new("a");
         let mut b = Syncer::new("b");
-        b.apply(a.local_text("card.md", "line 1\n").unwrap()); // synced
+        b.apply(a.local_text("note.md", "line 1\n").unwrap()); // synced
 
         // "Disconnect": A makes several edits B never sees.
-        a.local_text("card.md", "line 1\nline 2\n");
-        a.local_text("card.md", "line 1\nline 2\nline 3\n");
-        let full = a.docs.get("card.md").unwrap().encode_full().len();
+        a.local_text("note.md", "line 1\nline 2\n");
+        a.local_text("note.md", "line 1\nline 2\nline 3\n");
+        let full = a.docs.get("note.md").unwrap().encode_full().len();
 
         // Reconnect: B advertises its (stale) version vector; A replies with only
         // the ops since then — smaller than the whole history.
@@ -335,7 +335,7 @@ mod tests {
         assert!(gap < full, "reconnect ships only the gap ({gap}) not full ({full})");
         b.apply(replies.into_iter().next().unwrap());
         assert_eq!(
-            b.docs.get("card.md").unwrap().content(),
+            b.docs.get("note.md").unwrap().content(),
             "line 1\nline 2\nline 3\n",
             "B caught up to A after reconnect",
         );
@@ -345,28 +345,28 @@ mod tests {
     fn lww_newest_wins() {
         let mut b = Syncer::new("b");
         let mut a = Syncer::new("a");
-        let newer = a.local_lww("meta.toml", b"new".to_vec(), 1000);
+        let newer = a.local_lww("state.bin", b"new".to_vec(), 1000);
         assert_eq!(b.apply(newer).0.unwrap().1, b"new");
-        let stale = SyncMsg::Lww { path: "meta.toml".into(), version: 1, bytes: b"old".to_vec() };
+        let stale = SyncMsg::Lww { path: "state.bin".into(), version: 1, bytes: b"old".to_vec() };
         assert!(b.apply(stale).0.is_none(), "stale LWW ignored");
     }
 
     #[test]
     fn full_state_catches_up_text_and_lww() {
         // A fresh mesh neighbor is caught up with both the text docs AND the LWW
-        // structural files (meta.toml) via full_state.
+        // structural (LWW) files via full_state.
         let mut a = Syncer::new("a");
-        a.local_text("tickets/x/card.md", "# hi\n");
-        a.local_lww("tickets/x/meta.toml", b"column=Doing\n".to_vec(), 1000);
+        a.local_text("notes/x/doc.md", "# hi\n");
+        a.local_lww("notes/x/state.bin", b"state=doing\n".to_vec(), 1000);
 
         let mut b = Syncer::new("b");
         for m in a.full_state() {
             b.apply(m);
         }
-        assert_eq!(b.docs["tickets/x/card.md"].content(), "# hi\n");
+        assert_eq!(b.docs["notes/x/doc.md"].content(), "# hi\n");
         assert_eq!(
-            b.lww.get("tickets/x/meta.toml").map(|(_, by)| by.as_slice()),
-            Some(&b"column=Doing\n"[..]),
+            b.lww.get("notes/x/state.bin").map(|(_, by)| by.as_slice()),
+            Some(&b"state=doing\n"[..]),
             "neighbor caught up the LWW meta too",
         );
     }
@@ -382,15 +382,15 @@ mod tests {
         let v1 = probe.version();
         probe.edit_to("one\ntwo\n");
         let gapped = SyncMsg::TextDelta {
-            path: "card.md".into(),
+            path: "note.md".into(),
             ops: probe.encode_delta(&v1), // parent (edit 1) is missing
             vv: probe.version_vector(),
             origin: probe.origin(),
         };
 
         let mut src = Syncer::new("s");
-        src.local_text("card.md", "one\n");
-        src.local_text("card.md", "one\ntwo\n");
+        src.local_text("note.md", "one\n");
+        src.local_text("note.md", "one\ntwo\n");
 
         // A fresh peer can't apply the gapped delta → asks for a resync.
         let mut dst = Syncer::new("d");
@@ -403,7 +403,7 @@ mod tests {
 
         // A second un-appliable delta while awaiting the resync must NOT ask again.
         let (_, again) = dst.apply(SyncMsg::TextDelta {
-            path: "card.md".into(),
+            path: "note.md".into(),
             ops: probe.encode_delta(&v1),
             vv: probe.version_vector(),
             origin: probe.origin(),
@@ -417,15 +417,15 @@ mod tests {
     }
 
     #[test]
-    fn independent_boards_merge_union_cards_and_resolve_same_path() {
-        // Two boards created independently (disjoint histories) — as two friends
-        // who each already had a board would.
+    fn independent_trees_merge_union_docs_and_resolve_same_path() {
+        // Two trees created independently (disjoint histories) — as two friends
+        // who each already had a folder would.
         let mut a = Syncer::new("a");
         let mut b = Syncer::new("b");
-        a.local_text("board.md", "# A's board\n");
-        a.local_text("tickets/aaa/card.md", "card A\n");
-        b.local_text("board.md", "# B's board\n");
-        b.local_text("tickets/bbb/card.md", "card B\n");
+        a.local_text("index.md", "# A's index\n");
+        a.local_text("notes/aaa/doc.md", "doc A\n");
+        b.local_text("index.md", "# B's index\n");
+        b.local_text("notes/bbb/doc.md", "doc B\n");
 
         // Handshake: each answers the other's hello with the docs it lacks.
         let (_, a_gives) = a.apply(b.hello());
@@ -437,15 +437,15 @@ mod tests {
             let _ = b.apply(m);
         }
 
-        // Distinct cards union — both sides hold both.
+        // Distinct docs union — both sides hold both.
         for s in [&a, &b] {
-            assert!(s.docs.contains_key("tickets/aaa/card.md"), "has card A");
-            assert!(s.docs.contains_key("tickets/bbb/card.md"), "has card B");
+            assert!(s.docs.contains_key("notes/aaa/doc.md"), "has doc A");
+            assert!(s.docs.contains_key("notes/bbb/doc.md"), "has doc B");
         }
-        // The same-path board.md converges to the higher agent id ("b") on both —
+        // The same-path index.md converges to the higher agent id ("b") on both —
         // deterministic, no interleaving of the two texts.
-        assert_eq!(a.docs["board.md"].content(), "# B's board\n");
-        assert_eq!(b.docs["board.md"].content(), "# B's board\n");
+        assert_eq!(a.docs["index.md"].content(), "# B's index\n");
+        assert_eq!(b.docs["index.md"].content(), "# B's index\n");
     }
 
     /// Full two-way state exchange between two peers (the handshake).
@@ -462,19 +462,19 @@ mod tests {
     }
 
     #[test]
-    fn three_independent_boards_converge() {
-        // Three peers each independently create board.md. A same-path conflict
+    fn three_independent_trees_converge() {
+        // Three peers each independently create index.md. A same-path conflict
         // resolves by a *total order* on origin agent id, so all converge to the
         // single highest ("c") — even as an adopted version has to propagate onward
-        // (A adopts B, then must still learn C). Union of distinct cards too.
+        // (A adopts B, then must still learn C). Union of distinct docs too.
         let mut a = Syncer::new("a");
         let mut b = Syncer::new("b");
         let mut c = Syncer::new("c");
-        a.local_text("board.md", "# A\n");
-        a.local_text("tickets/a/card.md", "a\n");
-        b.local_text("board.md", "# B\n");
-        c.local_text("board.md", "# C\n");
-        c.local_text("tickets/c/card.md", "c\n");
+        a.local_text("index.md", "# A\n");
+        a.local_text("notes/a/doc.md", "a\n");
+        b.local_text("index.md", "# B\n");
+        c.local_text("index.md", "# C\n");
+        c.local_text("notes/c/doc.md", "c\n");
 
         // Two rounds over all pairs so an adoption propagates to everyone.
         for _ in 0..2 {
@@ -484,9 +484,9 @@ mod tests {
         }
 
         for s in [&a, &b, &c] {
-            assert_eq!(s.docs["board.md"].content(), "# C\n", "all converge to highest origin");
-            assert!(s.docs.contains_key("tickets/a/card.md"), "card a everywhere");
-            assert!(s.docs.contains_key("tickets/c/card.md"), "card c everywhere");
+            assert_eq!(s.docs["index.md"].content(), "# C\n", "all converge to highest origin");
+            assert!(s.docs.contains_key("notes/a/doc.md"), "doc a everywhere");
+            assert!(s.docs.contains_key("notes/c/doc.md"), "doc c everywhere");
         }
     }
 }

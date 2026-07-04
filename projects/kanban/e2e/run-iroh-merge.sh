@@ -9,7 +9,7 @@ export CC_wasm32_unknown_unknown="${CC_wasm32_unknown_unknown:-$(brew --prefix l
 export AR_wasm32_unknown_unknown="${AR_wasm32_unknown_unknown:-$(brew --prefix llvm)/bin/llvm-ar}"
 
 echo "== build wasm (iroh) + kanban bundle =="
-( cd web && wasm-pack build --target web --out-dir pkg ) >/tmp/im-wasm.log 2>&1 || { echo "wasm build failed"; tail -8 /tmp/im-wasm.log; exit 1; }
+( cd projects/kanban/wasm && wasm-pack build --target web --out-dir pkg ) >/tmp/im-wasm.log 2>&1 || { echo "wasm build failed"; tail -8 /tmp/im-wasm.log; exit 1; }
 ( cd projects/kanban && deno task build ) >/tmp/im-build.log 2>&1 || { echo "bundle build failed"; tail -10 /tmp/im-build.log; exit 1; }
 
 echo "== serve dist =="

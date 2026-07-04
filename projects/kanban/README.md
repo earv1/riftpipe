@@ -2,10 +2,12 @@
 
 A super-simple, file-backed kanban board. **SolidJS + Vite** frontend over a
 tiny JSON file-API — and **there is no server**: `src/api.ts` calls
-`kanbanHandle` from [`web/pkg`](../../web/), the Rust kanban handler compiled
-to WebAssembly, running in the page. The board lives in the browser's private
-filesystem (OPFS); peers sync directly over iroh / the gossip mesh. The app is
-a static bundle plus a wasm payload.
+`kanbanHandle` from [`wasm/pkg`](wasm/), the app's own `kanban-wasm` crate
+(board format + OPFS handler) compiled to WebAssembly, running in the page. It
+links the generic `riftpipe-web` crate, so one bundle also exports the sync
+entries (`connectAndSync`, `irohConnect`, …). The board lives in the browser's
+private filesystem (OPFS); peers sync directly over iroh / the gossip mesh.
+The app is a static bundle plus a wasm payload.
 
 Native machines participate through riftpipe's **generic verbs** (the binary
 has no kanban code):
@@ -53,8 +55,8 @@ See the planning & design docs in [`docs/`](docs/planned.md).
 ## Run it
 
 ```sh
-# build the wasm payload once (from web/), then the UI dev server
-(cd ../../web && wasm-pack build --target web)
+# build the wasm payload once (the app's own crate), then the UI dev server
+(cd wasm && wasm-pack build --target web)
 deno task dev
 # open the URL Vite prints (http://localhost:5173) — the API runs in-page
 ```

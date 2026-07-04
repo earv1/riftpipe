@@ -45,9 +45,12 @@ RIFTPIPE_BIN=./target/debug/riftpipe RIFTPIPE_ARGS="share /path/file --pipe" \
 ```
 
 ## Module map
-Crates: `core/` (riftpipe-core: pure, wasm-safe — text CRDT, board sync
-protocol, kanban file format, wal frames), `src/` (native binary), `web/`
-(wasm/browser, workspace-excluded). See `docs/architecture.md` for the diagram.
+Crates: `core/` (riftpipe-core: pure, wasm-safe — text CRDT, tree sync
+protocol, wal frames), `src/` (native binary), `web/` (riftpipe-web:
+app-generic wasm/browser — WebRTC/iroh links, gossip mesh, `opfs`, `tree_sync`;
+workspace-excluded), `projects/kanban/wasm/` (kanban-wasm: the app's board
+format + OPFS handler; links riftpipe-web into the one app bundle). See
+`docs/architecture.md` for the diagram.
 
 src/:
 - `net/`   — link (Link trait + mock + counters), transport (iroh), webrtc
@@ -121,10 +124,9 @@ src/:
 
 ## TODO / next steps (rough priority)
 Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
-1. **Finish `wal-db`** — the core primitive landed (`core/src/wal.rs`: append-only
-   frames + deterministic linearizer, commit `630081f`); still to do: wire the
-   `Kind::WalDb` adapter (`src/sync/algo/wal.rs` is a `todo!()` stub) so a
-   manifest glob can use it.
+1. ~~Finish `wal-db`~~ — *done:* core primitive + the real `Kind::WalDb`
+   folder-mode adapter (postcard-framed frames, push + reconcile, linearized
+   materialization). Remaining design nuance lives in the roadmap.
 2. **Implement `image`** (tile merge) — eg-walker is the wrong granularity for
    pixels.
 3. **Per-resource backing in the manifest** — choose memory vs file per glob
@@ -134,10 +136,11 @@ Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
    reconstruction is rejected by hash + retried; consider basis-pinning); folder
    deletes aren't synced yet (only creates/edits).
 6. **Architecture/hygiene backlog** — see `docs/planned/roadmap.md` §"Architecture
-   / hygiene": get kanban out of `riftpipe-core`/`web/` (wasm crate split), one
-   wire protocol (folder vs tree), `connect` over iroh + negotiation, track
-   `web/Cargo.lock`, retire the signaling deploy path, de-flake the real-relay
-   test.
+   / hygiene": ~~get kanban out of `riftpipe-core`/`web/`~~ (*done:* the
+   `kanban-wasm` crate under `projects/kanban/wasm/` owns format + handler;
+   the riftpipe crates are app-generic), one wire protocol (folder vs tree),
+   `connect` over iroh + negotiation, track `web/Cargo.lock`, retire the
+   signaling deploy path, de-flake the real-relay test.
 Older/parallel: file-mirror reconnection;
 verify connect-anywhere on real networks (§14.1); domain + landing.
 

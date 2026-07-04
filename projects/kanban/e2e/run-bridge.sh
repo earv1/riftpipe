@@ -12,7 +12,7 @@ ROOM="bridge-$(openssl rand -hex 4)"
 
 echo "== building native binary + wasm pkg =="
 cargo build --quiet --bin riftpipe || exit 1
-( cd web && wasm-pack build --target web --out-dir pkg ) >/tmp/bridge-wasm.log 2>&1 || { echo "wasm build failed"; tail -5 /tmp/bridge-wasm.log; exit 1; }
+( cd projects/kanban/wasm && wasm-pack build --target web --out-dir pkg ) >/tmp/bridge-wasm.log 2>&1 || { echo "wasm build failed"; tail -5 /tmp/bridge-wasm.log; exit 1; }
 
 echo "== serving repo root (static) + signaling server on $SIGPORT =="
 ( python3 -m http.server $PORT --bind 127.0.0.1 ) >/tmp/bridge-http.log 2>&1 &

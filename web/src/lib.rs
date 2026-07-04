@@ -21,12 +21,14 @@ use web_sys::{
     RtcSdpType, RtcSessionDescriptionInit,
 };
 
-/// The kanban "server" running in the browser (the JSON API over OPFS).
 pub mod gossip;
 pub mod iroh_link;
-pub mod kanban;
-/// Per-file sync of a board over an established WebRTC link.
-pub mod board_sync;
+/// OPFS file-tree helpers — local, serverless persistence.
+pub mod opfs;
+/// Per-file sync of a shared file tree over an established WebRTC link.
+pub mod tree_sync;
+
+pub use opfs::{opfs_read, opfs_write};
 
 /// One end of a WebRTC data channel, wrapped so the rest of riftpipe can treat it
 /// as a byte pipe. Mirrors the native `WebrtcLink`: `send` writes to the channel,
@@ -192,44 +194,6 @@ impl RiftDoc {
         }
         Ok(doc)
     }
-}
-
-// ---------------------------------------------------------------------------
-// OPFS — local, serverless persistence (Origin Private File System)
-// ---------------------------------------------------------------------------
-
-use crate::kanban::opfs_root;
-
-/// Write `bytes` to OPFS file `name` (created if absent).
-pub async fn opfs_write(name: &str, bytes: &[u8]) -> Result<(), JsValue> {
-    use web_sys::{FileSystemFileHandle, FileSystemGetFileOptions, FileSystemWritableFileStream};
-    let dir = opfs_root().await?;
-    let opts = FileSystemGetFileOptions::new();
-    opts.set_create(true);
-    let handle = wasm_bindgen_futures::JsFuture::from(dir.get_file_handle_with_options(name, &opts))
-        .await?
-        .unchecked_into::<FileSystemFileHandle>();
-    let writable = wasm_bindgen_futures::JsFuture::from(handle.create_writable())
-        .await?
-        .unchecked_into::<FileSystemWritableFileStream>();
-    wasm_bindgen_futures::JsFuture::from(writable.write_with_u8_array(bytes)?).await?;
-    wasm_bindgen_futures::JsFuture::from(writable.close()).await?;
-    Ok(())
-}
-
-/// Read OPFS file `name`, or `None` if it doesn't exist.
-pub async fn opfs_read(name: &str) -> Result<Option<Vec<u8>>, JsValue> {
-    use web_sys::{File, FileSystemFileHandle};
-    let dir = opfs_root().await?;
-    let handle = match wasm_bindgen_futures::JsFuture::from(dir.get_file_handle(name)).await {
-        Ok(h) => h.unchecked_into::<FileSystemFileHandle>(),
-        Err(_) => return Ok(None), // not found
-    };
-    let file = wasm_bindgen_futures::JsFuture::from(handle.get_file())
-        .await?
-        .unchecked_into::<File>();
-    let buf = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await?;
-    Ok(Some(js_sys::Uint8Array::new(&buf).to_vec()))
 }
 
 // ---------------------------------------------------------------------------
@@ -532,8 +496,8 @@ mod tests {
     fn persisted_iroh_identity_is_stable() {
         let store = web_sys::window().unwrap().local_storage().unwrap().unwrap();
         store.remove_item("riftpipe:iroh_sk").ok();
-        let id1 = crate::board_sync::load_or_create_secret_key().public();
-        let id2 = crate::board_sync::load_or_create_secret_key().public();
+        let id1 = crate::tree_sync::load_or_create_secret_key().public();
+        let id2 = crate::tree_sync::load_or_create_secret_key().public();
         assert_eq!(id1, id2, "second call returns the persisted identity");
     }
 
@@ -659,12 +623,12 @@ mod tests {
     async fn persists_and_reloads_via_opfs() {
         let mut doc = RiftDoc::new("alice");
         doc.edit_to("first line\nsecond line\n");
-        doc.persist("riftpipe-test-board.bin".to_string())
+        doc.persist("riftpipe-test-doc.bin".to_string())
             .await
             .expect("persist to OPFS");
 
         // Fresh page load: a new doc that hydrates from OPFS.
-        let reloaded = RiftDoc::load("alice".to_string(), "riftpipe-test-board.bin".to_string())
+        let reloaded = RiftDoc::load("alice".to_string(), "riftpipe-test-doc.bin".to_string())
             .await
             .expect("load from OPFS");
         assert_eq!(reloaded.content(), "first line\nsecond line\n");
@@ -714,44 +678,6 @@ mod tests {
         assert!(a.content().contains("alice line") && a.content().contains("bob line"));
     }
 
-    /// **The kanban server, in the browser:** drive the same JSON API the SolidJS
-    /// UI uses — create/read/patch/comment — entirely through `kanbanHandle` over
-    /// OPFS, no localhost process. Each call reloads from OPFS, so a card created
-    /// in one call being visible in the next proves serverless persistence.
-    #[wasm_bindgen_test]
-    async fn kanban_handler_runs_in_browser_over_opfs() {
-        use crate::kanban::handle;
-
-        let created = unpack(
-            handle("POST".into(), "/api/cards".into(), r#"{"title":"made in browser","column":"Doing"}"#.into()).await,
-        );
-        assert_eq!(created.0, 200);
-        let id = json_str(&created.1, "id");
-        assert!(id.starts_with("tk_"));
-
-        // A separate call (fresh OPFS read) sees the new card.
-        let board = unpack(handle("GET".into(), "/api/board".into(), String::new()).await);
-        assert!(board.1.contains("made in browser"), "board: {}", board.1);
-
-        // Patch + comment, then detail reflects both — all serverless.
-        handle("PATCH".into(), format!("/api/cards/{id}"), r#"{"done":true,"description":"no server!"}"#.into()).await;
-        handle("POST".into(), format!("/api/cards/{id}/comments"), r#"{"author":"Claude","text":"hello"}"#.into()).await;
-        let detail = unpack(handle("GET".into(), format!("/api/cards/{id}/detail"), String::new()).await);
-        assert!(detail.1.contains("no server!"), "detail: {}", detail.1);
-        assert!(detail.1.contains("hello"), "detail: {}", detail.1);
-    }
-
-    fn unpack(v: JsValue) -> (u16, String) {
-        let status = js_sys::Reflect::get(&v, &"status".into()).unwrap().as_f64().unwrap() as u16;
-        let body = js_sys::Reflect::get(&v, &"body".into()).unwrap().as_string().unwrap();
-        (status, body)
-    }
-
-    fn json_str(json: &str, key: &str) -> String {
-        let v = js_sys::JSON::parse(json).unwrap();
-        js_sys::Reflect::get(&v, &key.into()).unwrap().as_string().unwrap()
-    }
-
     /// Yield to the event loop for `ms` so spawned recv tasks can run.
     async fn sleep(ms: i32) {
         let p = js_sys::Promise::new(&mut |resolve, _| {
@@ -763,19 +689,19 @@ mod tests {
         let _ = JsFuture::from(p).await;
     }
 
-    /// **Collaboration in the browser:** two `BoardSync`s, connected through the
-    /// real signaling server + WebRTC, converge per-file board state — a text file
+    /// **Collaboration in the browser:** two `TreeSync`s, connected through the
+    /// real signaling server + WebRTC, converge per-file tree state — a text file
     /// (CRDT, concurrent edits both survive) and a structural file (LWW). This is
-    /// the layer that makes the browser kanban actually *sync*, not just run.
+    /// the layer that makes a browser app actually *sync*, not just run.
     #[wasm_bindgen_test]
-    async fn two_board_syncs_collaborate_over_the_link() {
-        use crate::board_sync::BoardSync;
+    async fn two_tree_syncs_collaborate_over_the_link() {
+        use crate::tree_sync::TreeSync;
         use std::cell::RefCell;
         use std::collections::HashMap;
         use std::rc::Rc;
 
         let url = "ws://127.0.0.1:9011/";
-        let room = "boardsync-it";
+        let room = "treesync-it";
         let (la, lb) = futures_util::future::join(
             connect_via_signaling(url, room),
             connect_via_signaling(url, room),
@@ -786,14 +712,14 @@ mod tests {
         let got_a = Rc::new(RefCell::new(HashMap::<String, Vec<u8>>::new()));
         let got_b = Rc::new(RefCell::new(HashMap::<String, Vec<u8>>::new()));
         let (ga, gb) = (got_a.clone(), got_b.clone());
-        let sync_a = BoardSync::new(la, Rc::new(move |p, b| { ga.borrow_mut().insert(p, b); }));
-        let sync_b = BoardSync::new(lb, Rc::new(move |p, b| { gb.borrow_mut().insert(p, b); }));
+        let sync_a = TreeSync::new(la, Rc::new(move |p, b| { ga.borrow_mut().insert(p, b); }));
+        let sync_b = TreeSync::new(lb, Rc::new(move |p, b| { gb.borrow_mut().insert(p, b); }));
 
-        // A creates a card's prose; B receives it (CRDT) — and a structural move (LWW).
-        sync_a.push_text("tickets/x/card.md", "# Hello\n\nfrom A\n");
-        sync_a.push_lww("tickets/x/meta.toml", b"column = \"Doing\"\nposition = 0\ndone = false\n");
+        // A creates a doc's prose; B receives it (CRDT) — and a structural file (LWW).
+        sync_a.push_text("notes/x/doc.md", "# Hello\n\nfrom A\n");
+        sync_a.push_lww("notes/x/state.bin", b"state = \"doing\"\nposition = 0\n");
 
-        let key = "tickets/x/card.md".to_string();
+        let key = "notes/x/doc.md".to_string();
         for _ in 0..100 {
             if got_b.borrow().contains_key(&key) { break; }
             sleep(20).await;
@@ -801,37 +727,37 @@ mod tests {
         assert_eq!(
             got_b.borrow().get(&key).map(|b| String::from_utf8_lossy(b).into_owned()),
             Some("# Hello\n\nfrom A\n".to_string()),
-            "B received A's card prose over the link",
+            "B received A's doc prose over the link",
         );
         assert!(
-            got_b.borrow().get("tickets/x/meta.toml").map(|b| String::from_utf8_lossy(b).contains("Doing")).unwrap_or(false),
-            "B received A's structural move (LWW)",
+            got_b.borrow().get("notes/x/state.bin").map(|b| String::from_utf8_lossy(b).contains("doing")).unwrap_or(false),
+            "B received A's structural file (LWW)",
         );
 
-        // Establish a SHARED board.md (A creates → B receives) so later edits share
-        // an origin and merge as a CRDT. (Two INDEPENDENTLY-created board.md are a
+        // Establish a SHARED index.md (A creates → B receives) so later edits share
+        // an origin and merge as a CRDT. (Two INDEPENDENTLY-created index.md are a
         // separate, origin-resolved case — see core::sync tests.)
-        sync_a.push_text("board.md", "# Board\n\n- Todo\n");
+        sync_a.push_text("index.md", "# Index\n\n- Todo\n");
         for _ in 0..100 {
-            if got_b.borrow().contains_key("board.md") { break; }
+            if got_b.borrow().contains_key("index.md") { break; }
             sleep(20).await;
         }
         // Concurrent edits on the now-shared doc converge on both peers, keeping both.
-        sync_a.push_text("board.md", "# Board\n\n- Todo\n- A\n");
-        sync_b.push_text("board.md", "# Board\n\n- Todo\n- Bee\n");
-        let mut a_board = None;
-        let mut b_board = None;
+        sync_a.push_text("index.md", "# Index\n\n- Todo\n- A\n");
+        sync_b.push_text("index.md", "# Index\n\n- Todo\n- Bee\n");
+        let mut a_doc = None;
+        let mut b_doc = None;
         for _ in 0..200 {
-            a_board = got_a.borrow().get("board.md").map(|b| String::from_utf8_lossy(b).into_owned());
-            b_board = got_b.borrow().get("board.md").map(|b| String::from_utf8_lossy(b).into_owned());
+            a_doc = got_a.borrow().get("index.md").map(|b| String::from_utf8_lossy(b).into_owned());
+            b_doc = got_b.borrow().get("index.md").map(|b| String::from_utf8_lossy(b).into_owned());
             let both = |s: &Option<String>| matches!(s, Some(x) if x.contains("- A") && x.contains("- Bee"));
-            if both(&a_board) && both(&b_board) && a_board == b_board { break; }
+            if both(&a_doc) && both(&b_doc) && a_doc == b_doc { break; }
             sleep(20).await;
         }
-        assert_eq!(a_board, b_board, "concurrent board.md edits converge on both peers");
+        assert_eq!(a_doc, b_doc, "concurrent index.md edits converge on both peers");
         assert!(
-            matches!(&a_board, Some(x) if x.contains("- A") && x.contains("- Bee")),
-            "both concurrent edits survive: {a_board:?}",
+            matches!(&a_doc, Some(x) if x.contains("- A") && x.contains("- Bee")),
+            "both concurrent edits survive: {a_doc:?}",
         );
     }
 }
