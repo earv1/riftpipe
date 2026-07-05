@@ -5,3 +5,4 @@ process
 board/.site
 board/events/
 .vite/
+board-live/

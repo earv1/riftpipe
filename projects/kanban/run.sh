@@ -4,6 +4,12 @@
 #   ./run.sh            dev server (builds the wasm payload if stale) → :5173
 #   ./run.sh build      static bundle (wasm + vite) → dist/
 #   ./run.sh serve      build, then host dist/ with `riftpipe serve` → :8080
+#   ./run.sh join <share-link|ticket|room-id> [dir]
+#                       join a board from the CLI — the board materializes as
+#                       files in [dir] (default ./board-live); edit with vim,
+#                       watch SYNCED: lines. Accepts a full browser share URL,
+#                       a native ticket (connect --accept / share), or a
+#                       signaling room id (pass --signal ws://… after [dir])
 #   ./run.sh demo       two-browser convergence demo (e2e/run-iroh.sh)
 #   ./run.sh mesh       three-browser gossip-mesh demo (e2e/run-iroh-mesh.sh)
 #
@@ -65,8 +71,19 @@ case "${1:-dev}" in
     echo "== riftpipe serve dist/ → http://localhost:${PORT:-8080}"
     exec "$BIN" serve "$HERE/dist" --port "${PORT:-8080}"
     ;;
+  join)
+    LINK="${2:?usage: ./run.sh join <share-link|ticket|room-id> [board-dir] [--signal ws://…]}"
+    DIR="${3:-$HERE/board-live}"
+    BIN="$ROOT/target/debug/riftpipe"
+    [ -x "$BIN" ] || { echo "== building riftpipe"; (cd "$ROOT" && cargo build --bin riftpipe); }
+    # Pass any extra flags (e.g. --signal, --metrics) straight through.
+    EXTRA=(); [ $# -gt 3 ] && EXTRA=("${@:4}")
+    echo "== joining board → $DIR"
+    echo "   edit files there (e.g. \$EDITOR $DIR/tickets/<id>/card.md); SYNCED: lines show sync"
+    exec "$BIN" connect "$LINK" "$DIR" ${EXTRA[@]+"${EXTRA[@]}"}
+    ;;
   demo)  exec "$HERE/e2e/run-iroh.sh" ;;
   mesh)  exec "$HERE/e2e/run-iroh-mesh.sh" ;;
   *)
-    sed -n '2,13p' "$0"; exit 1 ;;
+    sed -n '2,19p' "$0"; exit 1 ;;
 esac
