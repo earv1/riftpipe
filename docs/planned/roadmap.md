@@ -112,13 +112,15 @@ entirely — the wasm payload is the app's backend. What remains:
    seam) and tree/board sync (`core::sync` `SyncMsg`, browser-compatible) are
    two protocols for overlapping jobs. Consolidating means folder mode adopting
    the core protocol (or vice versa) without breaking browser peers.
-10. ~~`riftpipe connect` transport generalization~~ — *done.* `connect
-    <ticket>` dials native↔native over iroh (auth + negotiation + WebRTC
-    upgrade); `connect --accept` mints the ticket and accepts — zero
-    signaling infra; the connection-id/signaling path stays as the browser
-    bridge (the browser's iroh listener is a different, handshake-less
-    dialect — documented, not faked). `--metrics` wired on the iroh paths;
-    byte totals on the signaling path. Real-loopback e2e test.
+10. ~~`riftpipe connect` transport generalization~~ — *done, all three
+    transports.* `connect <ticket>` dials native↔native over iroh (auth +
+    negotiation + WebRTC upgrade); `connect --accept` mints the ticket and
+    accepts; **`connect <browser-share-link>` joins the board's iroh-gossip
+    mesh natively** (`sync::mesh`, speaking `core::sync::MeshMsg` — the same
+    wire type `web`'s GossipTreeSync uses; proven by the `board-cli-mesh`
+    e2e: headless browser hosts, CLI joins the link, bidirectional sync,
+    zero servers); the connection-id/signaling path remains as fallback.
+    `--metrics` on the point-to-point iroh paths; byte totals on signaling.
 11. ~~Track `web/Cargo.lock` in git~~ — *done.*
 12. ~~Retire the signaling deploy path~~ — *done as demotion:* labeled LEGACY
     fallback in `deploy/signal.Dockerfile`, `pages.yml` vars, and the deploy
