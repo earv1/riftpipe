@@ -2,6 +2,7 @@
 name = "kanban-wasm"
 version = "0.0.0"
 edition = "2021"
+license = "Elastic-2.0"
 description = "The kanban app's wasm crate: board file format + the in-browser JSON API over OPFS. Depends on riftpipe-web (generic sync/transport), whose #[wasm_bindgen] exports surface from this one cdylib."
 
 [lib]

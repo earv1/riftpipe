@@ -2,6 +2,7 @@
 name = "riftpipe-web"
 version = "0.0.0"
 edition = "2021"
+license = "Elastic-2.0"
 description = "Browser (wasm) side of riftpipe: the web-sys WebRTC data-plane Link"
 
 [lib]

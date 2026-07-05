@@ -237,3 +237,11 @@ relay (the worst-case hostile-NAT path). `wal-db`/`image` are stubs. The one thi
 **not** yet proven is direct NAT *traversal* between two distinct public IPs, which
 needs two machines on different networks (the relay fallback there is already
 proven) — a hardware requirement, not a code gap.
+
+## License
+
+[Elastic License 2.0](LICENSE) (`Elastic-2.0`) — **source-available, not OSI
+open source.** Free to use, modify, and distribute, including inside your own
+products and for internal commercial use. The one limitation: you may **not**
+offer riftpipe to third parties as a hosted or managed service. See
+[`LICENSE`](LICENSE) for the exact terms.

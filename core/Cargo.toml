@@ -2,6 +2,7 @@
 name = "riftpipe-core"
 version = "0.0.0"
 edition = "2021"
+license = "Elastic-2.0"
 description = "Wasm-compatible core of riftpipe: the eg-walker text CRDT + delta encoding (no transport)"
 
 # Pure-Rust, target-agnostic: this is the one piece of riftpipe that compiles for

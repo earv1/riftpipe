@@ -2,6 +2,7 @@
 name = "riftpipe"
 version = "0.0.0"
 edition = "2021"
+license = "Elastic-2.0"
 description = "A Unix-like terminal construct for live, peer-to-peer collaborative text (see DESIGN.md)"
 
 [dependencies]
