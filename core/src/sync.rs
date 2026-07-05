@@ -44,10 +44,10 @@ pub enum SyncMsg {
 /// What travels over a gossip-mesh topic: tree [`SyncMsg`]s plus periodic
 /// presence, so peers can build a routing map for debugging.
 ///
-/// WIRE COMPAT: `web/src/gossip.rs`'s private `GossipMsg` must stay
-/// layout-identical to this enum (same variant order, same field shapes —
-/// postcard encodes by variant index) until phase 2 switches the web crate to
-/// use this type directly. Deployed browsers already speak this layout.
+/// This is the single wire type for the mesh: both the native transport
+/// (`src/sync/mesh.rs`) and the browser (`web/src/gossip.rs`) use it directly.
+/// WIRE COMPAT: postcard encodes by variant index, so variant order and field
+/// shapes are load-bearing — deployed browsers already speak this layout.
 #[derive(Serialize, Deserialize)]
 pub enum MeshMsg {
     /// A tree sync message, broadcast epidemically to the whole mesh.

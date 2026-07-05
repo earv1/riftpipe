@@ -137,14 +137,9 @@ impl MeshKeepAlive {
     }
 }
 
-/// What travels over the gossip topic: tree sync messages, plus periodic presence
-/// so peers can build a routing map for debugging.
-#[derive(serde::Serialize, serde::Deserialize)]
-enum GossipMsg {
-    Sync(riftpipe_core::sync::SyncMsg),
-    /// "I am `id`, directly connected to `neighbors`." Aggregated into the map.
-    Presence { id: [u8; 32], neighbors: Vec<[u8; 32]> },
-}
+/// What travels over the gossip topic — the shared wire type, single-sourced in
+/// core so native and browser peers speak the same layout.
+use riftpipe_core::sync::MeshMsg;
 
 /// File-tree sync over the gossip mesh. Local pushes broadcast to everyone; received
 /// messages merge via the N-peer-safe `Syncer`. A new neighbor is caught up by
@@ -170,26 +165,26 @@ impl GossipTreeSync {
 
         let (sy, nb, rt, snd) = (syncer.clone(), neighbors.clone(), routing.clone(), sender.clone());
         wasm_bindgen_futures::spawn_local(async move {
-            let broadcast = |gm: &GossipMsg| {
+            let broadcast = |gm: &MeshMsg| {
                 postcard::to_allocvec(gm).ok().map(|b| b.into())
             };
             while let Some(Ok(ev)) = receiver.next().await {
                 match ev {
                     Event::Received(m) => {
-                        let Ok(gm) = postcard::from_bytes::<GossipMsg>(&m.content) else { continue };
+                        let Ok(gm) = postcard::from_bytes::<MeshMsg>(&m.content) else { continue };
                         match gm {
-                            GossipMsg::Sync(msg) => {
+                            MeshMsg::Sync(msg) => {
                                 let (persist, replies) = sy.borrow_mut().apply(msg);
                                 if let Some((path, bytes)) = persist {
                                     on_merged(path, bytes);
                                 }
                                 for r in replies {
-                                    if let Some(b) = broadcast(&GossipMsg::Sync(r)) {
+                                    if let Some(b) = broadcast(&MeshMsg::Sync(r)) {
                                         let _ = snd.broadcast(b).await;
                                     }
                                 }
                             }
-                            GossipMsg::Presence { id, neighbors } => {
+                            MeshMsg::Presence { id, neighbors } => {
                                 rt.borrow_mut().insert(id, neighbors);
                             }
                         }
@@ -199,13 +194,13 @@ impl GossipTreeSync {
                         // Catch the new neighbor up with our whole tree.
                         let full = sy.borrow().full_state();
                         for msg in full {
-                            if let Some(b) = broadcast(&GossipMsg::Sync(msg)) {
+                            if let Some(b) = broadcast(&MeshMsg::Sync(msg)) {
                                 let _ = snd.broadcast(b).await;
                             }
                         }
                         let list: Vec<[u8; 32]> = nb.borrow().iter().copied().collect();
                         rt.borrow_mut().insert(my_id, list.clone());
-                        if let Some(b) = broadcast(&GossipMsg::Presence { id: my_id, neighbors: list }) {
+                        if let Some(b) = broadcast(&MeshMsg::Presence { id: my_id, neighbors: list }) {
                             let _ = snd.broadcast(b).await;
                         }
                     }
@@ -213,7 +208,7 @@ impl GossipTreeSync {
                         nb.borrow_mut().remove(id.as_bytes());
                         let list: Vec<[u8; 32]> = nb.borrow().iter().copied().collect();
                         rt.borrow_mut().insert(my_id, list.clone());
-                        if let Some(b) = broadcast(&GossipMsg::Presence { id: my_id, neighbors: list }) {
+                        if let Some(b) = broadcast(&MeshMsg::Presence { id: my_id, neighbors: list }) {
                             let _ = snd.broadcast(b).await;
                         }
                     }
@@ -227,17 +222,17 @@ impl GossipTreeSync {
 
     pub fn push_text(&self, path: &str, content: &str) {
         if let Some(msg) = self.syncer.borrow_mut().local_text(path, content) {
-            self.broadcast(GossipMsg::Sync(msg));
+            self.broadcast(MeshMsg::Sync(msg));
         }
     }
 
     pub fn push_lww(&self, path: &str, bytes: &[u8]) {
         let now = js_sys::Date::now() as u64;
         let msg = self.syncer.borrow_mut().local_lww(path, bytes.to_vec(), now);
-        self.broadcast(GossipMsg::Sync(msg));
+        self.broadcast(MeshMsg::Sync(msg));
     }
 
-    fn broadcast(&self, gm: GossipMsg) {
+    fn broadcast(&self, gm: MeshMsg) {
         if let Ok(bytes) = postcard::to_allocvec(&gm) {
             let sender = self.sender.clone();
             wasm_bindgen_futures::spawn_local(async move {

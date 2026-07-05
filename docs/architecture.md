@@ -251,15 +251,16 @@ Fixed in the July 2026 restructure + review series:
   loop with caller-owned `TreePeer`; unbounded echo map → blake3 `seen`;
   watcher failure degrades to poll; first mock-halves tests.
 
+Since fixed in later passes: `connect` speaks all three transports (native
+iroh ticket + `--accept`, a **browser share link** via the iroh-gossip mesh —
+`core::sync::MeshMsg`, one wire type for `sync::mesh` and `web`'s
+`GossipTreeSync`, proven by the `board-cli-mesh` e2e — and the signaling
+room fallback); the sqlite orphan became `Kind::LwwRecord` (sqlite.rs
+deleted); `web/Cargo.lock` is tracked.
+
 Still open (tracked in `docs/planned/roadmap.md` §Architecture / hygiene):
 
 - **Two wire protocols** (folder framing vs `core::sync` `SyncMsg`).
-- **`connect` is signaling-only** — no iroh dial/negotiation yet, counters
-  unwired.
-- **`algo/sqlite.rs` is orphaned** — complete per-cell-LWW engine, tested, but
-  not a `Kind` variant and unreachable from the binary.
-- **`web/` is workspace-excluded** with a git-ignored `Cargo.lock` — dependency
-  graphs can silently skew on wire-critical deps.
 - **Two deploy stories** — Pages ships the iroh app; `deploy/` + workflow vars
   still treat the signaling server as first-class. (The kanban servers
   themselves are gone — the wasm payload is the backend.)
