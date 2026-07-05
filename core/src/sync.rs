@@ -41,6 +41,21 @@ pub enum SyncMsg {
     Lww { path: String, version: u64, bytes: Vec<u8> },
 }
 
+/// What travels over a gossip-mesh topic: tree [`SyncMsg`]s plus periodic
+/// presence, so peers can build a routing map for debugging.
+///
+/// WIRE COMPAT: `web/src/gossip.rs`'s private `GossipMsg` must stay
+/// layout-identical to this enum (same variant order, same field shapes —
+/// postcard encodes by variant index) until phase 2 switches the web crate to
+/// use this type directly. Deployed browsers already speak this layout.
+#[derive(Serialize, Deserialize)]
+pub enum MeshMsg {
+    /// A tree sync message, broadcast epidemically to the whole mesh.
+    Sync(SyncMsg),
+    /// "I am `id`, directly connected to `neighbors`." Aggregated into the map.
+    Presence { id: [u8; 32], neighbors: Vec<[u8; 32]> },
+}
+
 /// While awaiting a resync, re-ask only after this many further failed merges:
 /// the first failure is usually just the tail of the gapped-delta stream that
 /// triggered the request; a second means the full state itself didn't land.

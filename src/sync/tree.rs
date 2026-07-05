@@ -81,6 +81,62 @@ impl TreePeer {
         }
     }
 
+    /// The push decision for one local file, shared by every driver (link +
+    /// mesh): skip dot-paths, non-files, and content whose hash we've already
+    /// pushed or persisted; otherwise record the hash and produce the outgoing
+    /// message (`.md` → text CRDT, else LWW stamped with wall-clock ms).
+    pub(crate) fn local_change(&mut self, path: &Path, dir: &Path) -> Option<SyncMsg> {
+        let rel = rel_of(path, dir)?;
+        if !path.is_file() {
+            return None;
+        }
+        let bytes = std::fs::read(path).ok()?;
+        let hash = *blake3::hash(&bytes).as_bytes();
+        // Same content we last pushed or persisted (remote-write echo / no-op event).
+        if self.seen.get(&rel) == Some(&hash) {
+            return None;
+        }
+        let msg = if rel.ends_with(".md") {
+            self.syncer.local_text(&rel, &String::from_utf8_lossy(&bytes))
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Some(self.syncer.local_lww(&rel, bytes, now))
+        };
+        self.seen.insert(rel, hash);
+        msg
+    }
+
+    /// Apply one remote message: merge, report any newly-parked paths, and
+    /// persist the merged bytes under `dir` (refusing escaping paths AND
+    /// dot-paths from the wire — `.site` and friends are machine-local and must
+    /// not be overwritten). Prints the `SYNCED:{path}` breadcrumb on persist.
+    /// Returns the replies to send back out.
+    pub(crate) fn apply_and_persist(&mut self, msg: SyncMsg, dir: &Path) -> Vec<SyncMsg> {
+        let (persist, replies) = self.syncer.apply(msg);
+        self.report_parked();
+        if let Some((path, bytes)) = persist {
+            if !escapes(&path) && !hidden(&path) {
+                self.seen.insert(path.clone(), *blake3::hash(&bytes).as_bytes());
+                let full = dir.join(&path);
+                if let Some(parent) = full.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&full, &bytes);
+                println!("SYNCED:{path}");
+            }
+        }
+        replies
+    }
+
+    /// The whole tree as self-contained messages — how a mesh driver catches a
+    /// new neighbor up (the link driver's `hello()` handshake does it lazily).
+    pub(crate) fn full_state(&self) -> Vec<SyncMsg> {
+        self.syncer.full_state()
+    }
+
     /// Core is no-I/O, so IT records parked paths and WE print them: eprintln
     /// for every newly-parked path, and forget recovered ones so a re-park is
     /// reported again.
@@ -138,27 +194,7 @@ async fn push_local(
     dir: &Path,
     sink: &mut dyn Sink,
 ) -> Result<()> {
-    let Some(rel) = rel_of(path, dir) else { return Ok(()) };
-    if !path.is_file() {
-        return Ok(());
-    }
-    let Ok(bytes) = std::fs::read(path) else { return Ok(()) };
-    let hash = *blake3::hash(&bytes).as_bytes();
-    // Same content we last pushed or persisted (remote-write echo / no-op event).
-    if peer.seen.get(&rel) == Some(&hash) {
-        return Ok(());
-    }
-    let msg = if rel.ends_with(".md") {
-        peer.syncer.local_text(&rel, &String::from_utf8_lossy(&bytes))
-    } else {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        Some(peer.syncer.local_lww(&rel, bytes, now))
-    };
-    peer.seen.insert(rel, hash);
-    if let Some(msg) = msg {
+    if let Some(msg) = peer.local_change(path, dir) {
         if let Ok(b) = postcard::to_allocvec(&msg) {
             sink.send(b).await?;
         }
@@ -168,7 +204,7 @@ async fn push_local(
 
 /// Collect every regular file under `dir`, skipping any dot-component (manual
 /// recursion — the tree is small and this avoids a walkdir dependency).
-fn scan_files(dir: &Path, out: &mut Vec<PathBuf>) {
+pub(crate) fn scan_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         if e.file_name().to_string_lossy().starts_with('.') {
@@ -239,22 +275,7 @@ pub async fn run(
                     Ok(Some(b)) => b,
                 };
                 let Ok(msg) = postcard::from_bytes::<SyncMsg>(&bytes) else { continue };
-                let (persist, replies) = peer.syncer.apply(msg);
-                peer.report_parked();
-                if let Some((path, bytes)) = persist {
-                    // Refuse escaping paths AND dot-paths from the wire — `.site`
-                    // and friends are machine-local and must not be overwritten.
-                    if !escapes(&path) && !hidden(&path) {
-                        peer.seen.insert(path.clone(), *blake3::hash(&bytes).as_bytes());
-                        let full = dir.join(&path);
-                        if let Some(parent) = full.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        let _ = std::fs::write(&full, &bytes);
-                        println!("SYNCED:{path}");
-                    }
-                }
-                for reply in replies {
+                for reply in peer.apply_and_persist(msg, dir) {
                     if let Ok(b) = postcard::to_allocvec(&reply) {
                         sink.send(b).await?;
                     }

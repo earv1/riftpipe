@@ -8,6 +8,8 @@
 //!   folder    multiplexed reconnecting session: many resources over one link
 //!   tree      the tree-sync driver: riftpipe_core::sync (the browser protocol)
 //!             bound to any file tree + a split link — native↔browser sync
+//!   mesh      the same tree protocol over the browser's iroh-gossip swarm —
+//!             how the CLI joins a browser share link natively
 //!   pipe      the editor edit-stream protocol over --pipe (text, live)
 //!   mirror    the file-mirror loop (text, single-shot)
 //!
@@ -20,6 +22,7 @@ pub mod algo;
 pub mod backing;
 pub mod folder;
 pub mod manifest;
+pub mod mesh;
 pub mod mirror;
 pub mod pipe;
 pub mod strategy;

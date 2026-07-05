@@ -138,7 +138,7 @@ async fn main() {
                 match (opts.pos.first(), opts.pos.get(1)) {
                     (Some(target), Some(dir)) => connect_dial(target, dir, &opts).await,
                     _ => {
-                        eprintln!("usage: riftpipe connect <ticket|connection-id> <dir> [--signal ws://…] [--metrics <path>]");
+                        eprintln!("usage: riftpipe connect <ticket|browser-link|connection-id> <dir> [--signal ws://…] [--metrics <path>]");
                         eprintln!("       riftpipe connect --accept <dir> [--metrics <path>]");
                         return;
                     }
@@ -195,14 +195,13 @@ async fn main() {
             eprintln!("  riftpipe text                # eg-walker convergence demo (offline)");
             eprintln!("  riftpipe share <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
             eprintln!("  riftpipe join <ticket> <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
-            eprintln!("  riftpipe connect <ticket|connection-id> <dir> [--signal ws://127.0.0.1:9000] [--metrics <path>]");
+            eprintln!("  riftpipe connect <ticket|browser-link|connection-id> <dir> [--signal ws://127.0.0.1:9000] [--metrics <path>]");
             eprintln!("                                      # tree-sync a dir with a peer. a base32 ticket (from `connect --accept`)");
-            eprintln!("                                      # dials native↔native over iroh — no signaling server; anything else is a");
-            eprintln!("                                      # signaling connection-id — WebRTC via --signal. browser boards are joined");
-            eprintln!("                                      # via the connection-id path (or the browser's share link): the browser's");
-            eprintln!("                                      # iroh listener speaks a different ALPN with no auth handshake, so native");
-            eprintln!("                                      # iroh tickets are native↔native only. --metrics needs an iroh endpoint,");
-            eprintln!("                                      # so it applies to the ticket/--accept paths (signaling prints totals on exit)");
+            eprintln!("                                      # dials native↔native over iroh — no signaling server. a browser share");
+            eprintln!("                                      # link (or its hex ticket, the part after '#') joins that board's");
+            eprintln!("                                      # iroh-gossip mesh natively. anything else is a signaling connection-id —");
+            eprintln!("                                      # WebRTC via --signal. --metrics needs a single-peer iroh endpoint, so it");
+            eprintln!("                                      # applies to the ticket/--accept paths (signaling prints totals on exit)");
             eprintln!("  riftpipe connect --accept <dir> [--metrics <path>]");
             eprintln!("                                      # accepting side of native↔native tree sync: prints a ticket, waits for one peer");
             eprintln!("  riftpipe serve <dir> [--port 8080]  # static-host a folder + SSE change events at /events");
@@ -308,23 +307,39 @@ async fn join(ticket: &str, file: &str, opts: &Opts) -> riftpipe::net::Result<()
 }
 
 /// `riftpipe connect <target> <dir>`: tree-sync `dir` with a peer. `<target>`
-/// is either a riftpipe base32 [`Ticket`] (native↔native over iroh — no
-/// signaling server needed) or, when it doesn't decode as one, a signaling
-/// connection-id (WebRTC via the signaling server — the browser-board path).
+/// resolves in order:
 ///
-/// The two paths are NOT interchangeable: a browser peer listens with its own
-/// ALPN (`riftpipe/tree/0`) and raw framed links — no auth or caps handshake
-/// — so the native iroh stack (ALPN `riftpipe/0`, auth + negotiate) cannot dial
-/// it. Browser boards are joined via the connection-id/signaling path (or the
-/// browser's own share link); tickets here come from `riftpipe connect
-/// --accept` on another native machine.
+/// 1. a browser share **link** (anything with `#`) → the fragment after the
+///    LAST `#` is the ticket, resolved by the rules below;
+/// 2. a riftpipe base32 [`Ticket`] (from `connect --accept`) → native↔native
+///    over iroh: dial → auth → negotiate → tree sync;
+/// 3. a browser mesh ticket — hex(postcard(EndpointAddr)), what a browser
+///    board's share link carries → join its iroh-gossip mesh natively (same
+///    topic + wire frames the browsers speak; no signaling server);
+/// 4. anything else → a signaling connection-id (WebRTC via `--signal`).
+///
+/// Paths 2 and 3 are NOT interchangeable: native tickets carry a secret and go
+/// through auth + caps negotiation on ALPN `riftpipe/0`; a browser mesh ticket
+/// is a bare address whose EndpointId keys the gossip topic.
 async fn connect_dial(target: &str, dir: &str, opts: &Opts) -> riftpipe::net::Result<()> {
+    // A share link carries the ticket in its URL fragment (after the LAST '#').
+    let target = target.rsplit('#').next().unwrap_or(target);
     if let Ok(ticket) = Ticket::decode(target) {
         // iroh ticket path (native↔native): dial → auth → negotiate → tree sync.
         let endpoint = bind_connect().await?;
         let mut link = connect_link(&endpoint, ticket.addr).await?;
         authenticate(&mut link, &ticket.secret).await?;
         return connect_session(endpoint, link, dir, opts).await;
+    }
+    if let Some(addr) = decode_mesh_ticket(target) {
+        // Browser mesh path: join the board's gossip swarm as a native peer.
+        // (No --metrics here yet: the metrics side-car reports a single peer's
+        // connection_kind, which doesn't fit a swarm — phase 2.)
+        let dir = riftpipe::sync::tree::prepare_dir(std::path::Path::new(dir))?;
+        let (watcher, mut rx) = riftpipe::sync::tree::watch(&dir);
+        let mut peer = riftpipe::sync::tree::TreePeer::new();
+        eprintln!("[riftpipe] joining browser mesh of {} (iroh-gossip); syncing {}", addr.id, dir.display());
+        return riftpipe::sync::mesh::join_and_run(addr, &dir, &mut peer, &mut rx, watcher.is_none()).await;
     }
     // Connection-id path (WebRTC via signaling). There's no iroh Endpoint here,
     // so the tmux metrics side-car (which needs one for `connection_kind`)
@@ -341,6 +356,19 @@ async fn connect_dial(target: &str, dir: &str, opts: &Opts) -> riftpipe::net::Re
         counters.recv.load(std::sync::atomic::Ordering::Relaxed),
     );
     res
+}
+
+/// Decode a browser mesh ticket: hex(postcard(EndpointAddr)) — the exact
+/// encoding of `web/src/iroh_link.rs::ticket_of` (a bare address, no secret).
+/// `None` if `s` isn't that (so the caller falls through to signaling).
+fn decode_mesh_ticket(s: &str) -> Option<iroh::EndpointAddr> {
+    if s.is_empty() || s.len() % 2 != 0 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes: Vec<u8> = (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+        .collect::<Option<_>>()?;
+    postcard::from_bytes(&bytes).ok()
 }
 
 /// `riftpipe connect --accept <dir>`: the accepting side of native↔native tree
