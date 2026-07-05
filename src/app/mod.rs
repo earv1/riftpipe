@@ -3,7 +3,7 @@
 //!
 //!   host     generic HTTP hosting over a live directory: static files (SPA
 //!            fallback) + SSE change events (`riftpipe serve`); app servers
-//!            like the kanban server consume it as a library
+//!            consume it as a library
 //!   signal   the content-blind WebSocket signaling relay (`riftpipe signal`)
 //!            that brokers WebRTC offer/answer between peers
 

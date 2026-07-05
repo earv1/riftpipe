@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use riftpipe::crdt::text::EgWalkerText;
-use riftpipe::net::negotiate::{negotiate_link, negotiate_session_halves};
+use riftpipe::net::negotiate::negotiate_link;
 use riftpipe::net::secure::{authenticate, Ticket};
 use riftpipe::net::transport::{accept_link, bind_accept, bind_connect, connect_link, local_addr};
 use riftpipe::net::{anyerr, Counters};
@@ -196,14 +196,13 @@ async fn main() {
             eprintln!("  riftpipe share <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
             eprintln!("  riftpipe join <ticket> <file|dir> [--pipe] [--memory] [--metrics <path>] [--manifest <path>] [--process <path>]");
             eprintln!("  riftpipe connect <ticket|browser-link|connection-id> <dir> [--signal ws://127.0.0.1:9000] [--metrics <path>]");
-            eprintln!("                                      # tree-sync a dir with a peer. a base32 ticket (from `connect --accept`)");
-            eprintln!("                                      # dials native↔native over iroh — no signaling server. a browser share");
-            eprintln!("                                      # link (or its hex ticket, the part after '#') joins that board's");
-            eprintln!("                                      # iroh-gossip mesh natively. anything else is a signaling connection-id —");
-            eprintln!("                                      # WebRTC via --signal. --metrics needs a single-peer iroh endpoint, so it");
-            eprintln!("                                      # applies to the ticket/--accept paths (signaling prints totals on exit)");
-            eprintln!("  riftpipe connect --accept <dir> [--metrics <path>]");
-            eprintln!("                                      # accepting side of native↔native tree sync: prints a ticket, waits for one peer");
+            eprintln!("                                      # tree-sync a dir with a peer. a mesh ticket (from `connect --accept`, or a");
+            eprintln!("                                      # browser share link's hex ticket after '#') joins that folder's iroh-gossip");
+            eprintln!("                                      # mesh natively — same protocol browsers speak, no signaling server. anything");
+            eprintln!("                                      # else is a signaling connection-id — WebRTC via --signal (byte totals on exit)");
+            eprintln!("  riftpipe connect --accept <dir>");
+            eprintln!("                                      # host a gossip-mesh swarm for <dir>: prints a mesh ticket a browser OR CLI");
+            eprintln!("                                      # peer joins with `connect <ticket> <dir>` — one protocol, N peers, no signaling");
             eprintln!("  riftpipe serve <dir> [--port 8080]  # static-host a folder + SSE change events at /events");
             eprintln!("                                      # (share/join a folder + serve = live-updating static site)");
             eprintln!("  riftpipe signal [--port 9000]       # WebRTC signaling relay for browser peers");
@@ -311,28 +310,15 @@ async fn join(ticket: &str, file: &str, opts: &Opts) -> riftpipe::net::Result<()
 ///
 /// 1. a browser share **link** (anything with `#`) → the fragment after the
 ///    LAST `#` is the ticket, resolved by the rules below;
-/// 2. a riftpipe base32 [`Ticket`] (from `connect --accept`) → native↔native
-///    over iroh: dial → auth → negotiate → tree sync;
-/// 3. a browser mesh ticket — hex(postcard(EndpointAddr)), what a browser
-///    board's share link carries → join its iroh-gossip mesh natively (same
-///    topic + wire frames the browsers speak; no signaling server);
-/// 4. anything else → a signaling connection-id (WebRTC via `--signal`).
-///
-/// Paths 2 and 3 are NOT interchangeable: native tickets carry a secret and go
-/// through auth + caps negotiation on ALPN `riftpipe/0`; a browser mesh ticket
-/// is a bare address whose EndpointId keys the gossip topic.
+/// 2. a mesh ticket — hex(postcard(EndpointAddr)), what `connect --accept` prints
+///    and a browser peer's share link carries → join its iroh-gossip mesh (same
+///    topic + wire frames browsers and CLI hosts speak; no signaling server);
+/// 3. anything else → a signaling connection-id (WebRTC via `--signal`).
 async fn connect_dial(target: &str, dir: &str, opts: &Opts) -> riftpipe::net::Result<()> {
     // A share link carries the ticket in its URL fragment (after the LAST '#').
     let target = target.rsplit('#').next().unwrap_or(target);
-    if let Ok(ticket) = Ticket::decode(target) {
-        // iroh ticket path (native↔native): dial → auth → negotiate → tree sync.
-        let endpoint = bind_connect().await?;
-        let mut link = connect_link(&endpoint, ticket.addr).await?;
-        authenticate(&mut link, &ticket.secret).await?;
-        return connect_session(endpoint, link, dir, opts).await;
-    }
     if let Some(addr) = decode_mesh_ticket(target) {
-        // Browser mesh path: join the board's gossip swarm as a native peer.
+        // Browser mesh path: join the folder's gossip swarm as a native peer.
         // (No --metrics here yet: the metrics side-car reports a single peer's
         // connection_kind, which doesn't fit a swarm — phase 2.)
         let dir = riftpipe::sync::tree::prepare_dir(std::path::Path::new(dir))?;
@@ -358,6 +344,18 @@ async fn connect_dial(target: &str, dir: &str, opts: &Opts) -> riftpipe::net::Re
     res
 }
 
+/// Encode our address as a mesh ticket: hex(postcard(EndpointAddr)) — the exact
+/// encoding of `web/src/iroh_link.rs::ticket_of` and the inverse of
+/// [`decode_mesh_ticket`], so a browser or CLI peer joins our swarm from the
+/// printed string (a bare address, no secret).
+fn encode_mesh_ticket(addr: &iroh::EndpointAddr) -> String {
+    postcard::to_allocvec(addr)
+        .unwrap_or_default()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Decode a browser mesh ticket: hex(postcard(EndpointAddr)) — the exact
 /// encoding of `web/src/iroh_link.rs::ticket_of` (a bare address, no secret).
 /// `None` if `s` isn't that (so the caller falls through to signaling).
@@ -371,49 +369,33 @@ fn decode_mesh_ticket(s: &str) -> Option<iroh::EndpointAddr> {
     postcard::from_bytes(&bytes).ok()
 }
 
-/// `riftpipe connect --accept <dir>`: the accepting side of native↔native tree
-/// sync — bind, print a ticket (same shape as `share`, sidecar in
-/// `<dir>.ticket`), accept + authenticate one peer, negotiate, tree-sync. Two
-/// native machines sync a dir with zero signaling infrastructure.
-async fn connect_accept(dir: &str, opts: &Opts) -> riftpipe::net::Result<()> {
+/// `riftpipe connect --accept <dir>`: the hosting side of tree sync — it
+/// **hosts a gossip-mesh swarm** for `dir` and prints a mesh ticket
+/// (sidecar in `<dir>.ticket`). This is the exact protocol a browser host
+/// speaks, so browsers and CLI peers join with the same `connect <ticket>` —
+/// one mesh, no signaling, no native-only transport. Edits on any peer
+/// converge. `_opts` (e.g. `--metrics`) is unused: the metrics side-car reports
+/// a single link's `connection_kind`, which a swarm doesn't have.
+async fn connect_accept(dir: &str, _opts: &Opts) -> riftpipe::net::Result<()> {
+    use riftpipe::sync::{mesh, tree};
     use std::time::Duration;
-    let endpoint = bind_accept().await?;
-    // Best-effort relay home so the ticket is dialable across networks (as in
-    // `share`); falls back to direct addresses without internet.
-    let _ = tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await;
-    let addr = local_addr(&endpoint).await;
-    let ticket = Ticket::new(addr);
-    let secret = ticket.secret;
-    let encoded = ticket.encode();
-    let _ = std::fs::write(format!("{dir}.ticket"), &encoded); // sidecar for scripts
-    eprintln!("on the other machine: riftpipe connect <ticket> <dir>\n\n{encoded}\n");
-    eprintln!("waiting for a peer to connect...");
-    let mut link = accept_link(&endpoint).await?;
-    authenticate(&mut link, &secret).await?;
-    connect_session(endpoint, link, dir, opts).await
-}
 
-/// Shared tail of both iroh connect paths: negotiate the transport over the
-/// authenticated link (maybe upgrading to WebRTC), spawn the metrics side-car
-/// if `--metrics` was given, and run tree sync. `session` — including the iroh
-/// keepalive a WebRTC upgrade leaves behind — is held for the whole run.
-async fn connect_session(
-    endpoint: iroh::Endpoint,
-    link: riftpipe::net::transport::IrohLink,
-    dir: &str,
-    opts: &Opts,
-) -> riftpipe::net::Result<()> {
-    let peer = link.remote_id();
-    let counters = Arc::new(Counters::default());
-    let mut session = negotiate_session_halves(link, counters.clone()).await;
-    if let Some(path) = opts.metrics.clone() {
-        riftpipe::monitor::metrics::spawn(endpoint.clone(), peer, counters, path, basename(dir).into());
-    }
-    eprintln!(
-        "authenticated — tree-syncing {dir} ({:?}, end-to-end encrypted). ^C to stop.",
-        session.transport
-    );
-    riftpipe::sync::tree::run_over(&mut *session.sink, &mut *session.source, dir).await
+    let dir = tree::prepare_dir(std::path::Path::new(dir))?;
+    let (watcher, mut rx) = tree::watch(&dir);
+    let mut peer = tree::TreePeer::new();
+
+    // Host role: bind a fresh endpoint and start the swarm on OUR own topic
+    // (`join(None, None)` keys the topic on our EndpointId — same as a browser
+    // host). Go online (best-effort relay home) so the ticket dials cross-network.
+    let conn = mesh::MeshConn::join(None, None).await?;
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn.endpoint().online()).await;
+    let addr = local_addr(conn.endpoint()).await;
+    let ticket = encode_mesh_ticket(&addr);
+    let _ = std::fs::write(format!("{}.ticket", dir.display()), &ticket); // sidecar for scripts
+    eprintln!("share this ticket — a browser or CLI joins the same mesh with `connect`:\n\n{ticket}\n");
+    eprintln!("hosting {} on the gossip mesh; waiting for peers...", dir.display());
+
+    mesh::run(conn, &dir, &mut peer, &mut rx, watcher.is_none()).await
 }
 
 /// `riftpipe serve`: static-host `dir` (with SPA index.html fallback) plus SSE

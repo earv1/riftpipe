@@ -6,8 +6,9 @@ what's honestly deferred.
 ## Resolved by the unification
 
 - **One data model.** Native (`std::fs`) and browser (OPFS) now use the *same*
-  file tree (`board.md` + `tickets/<id>/{card.md,meta.toml,comments/*}`) through
-  `riftpipe_core::kanban`. A board is portable between a native peer and a browser
+  file tree (`board.md` + `tickets/<id>/{card.md,meta.toml,comments/*}`), synced by
+  the generic `riftpipe_core::sync` tree protocol (the format itself lives in the
+  app, not the library). A board is portable between a native peer and a browser
   peer; no more `board.json` monolith. (Fixes critique #1, #2.)
 - **Structural consistency = per-file LWW, prose = CRDT** — now matches the design
   intent (`data-model.md`) on both platforms, rather than the browser silently

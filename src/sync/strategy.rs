@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One pluggable sync algorithm bound to one resource (a file, a db, a board).
+/// One pluggable sync algorithm bound to one resource (a file, a db row, a config record).
 ///
 /// Two ways state flows in/out, both driven by the session loop:
 ///   * **push** — a local change is observed ([`observe`](SyncStrategy::observe)); if
@@ -78,7 +78,7 @@ pub enum Kind {
     WalDb,
     /// codec-aware image merge (tiles / layers). Planned.
     Image,
-    /// per-key LWW merge for flat `key = value` structural files (kanban
+    /// per-key LWW merge for flat `key = value` structural files (TOML
     /// `meta.toml` shape) — concurrent edits to different keys both survive.
     /// Implemented.
     LwwRecord,

@@ -1,6 +1,6 @@
 //! Per-key LWW merge for `key = value` structural files (roadmap #19) — IMPLEMENTED.
 //!
-//! For flat, section-less files like the kanban `meta.toml`, whole-file LWW
+//! For flat, section-less files like a TOML `meta.toml`, whole-file LWW
 //! (rsync) loses one side of any concurrent edit. Here the unit of conflict is
 //! a **record**: each well-formed `key = value` line is an independent
 //! last-writer-wins register, so concurrent edits to *different* keys of the

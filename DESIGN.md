@@ -8,8 +8,8 @@ A Unix-like terminal construct for live, peer-to-peer collaborative sharing of
 text — "pipe a document to other computers and converge." Think `tee`/`tail -f`,
 but the buffer is a shared, multi-writer document that merges edits from every
 machine with no central server. Beyond text, the same substrate is a
-**programmable convergent state machine**: a board game, a permissioned column
-store, etc., are all just different *rule-sets* plugged into one engine.
+**programmable convergent state machine**: a shared task tracker, a permissioned
+column store, etc., are all just different *rule-sets* plugged into one engine.
 
 ---
 
@@ -456,9 +456,9 @@ far safer than a per-item `synced: bool` flag. `render = composite(shared,
 local_overlays)`.
 
 **Accepted limitation:** everything shared is visible to all peers — **no hidden
-shared state** (no fog-of-war, secret hands, per-player secrets). Those need (b).
-PvP TD is unaffected: both players see the whole board; ownership controls who
-may *write* each region (the guard), not who may *see* it.
+shared state** (no fog-of-war, secret hands, per-peer secrets). Those need (b).
+Anything with only public shared state is unaffected: all peers see everything;
+ownership controls who may *write* each region (the guard), not who may *see* it.
 
 **Output implication:** a flat file can't carry an overlay, so:
 - **file-mirror mode** stays as-is (no overlays, scriptable, pipe-friendly).

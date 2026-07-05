@@ -111,10 +111,10 @@ Roughly priority order. Most of this is *wiring and UI*, not new sync code.
   written by the servers — move it into the wasm handler so history survives
   serverless; (b) Vite-via-Deno remains as *build tooling only* — swap to
   plain npm/vite (or keep, it's contained) when convenient.
-- **Own the kanban code riftpipe still carries** — `riftpipe_core::kanban` (the
-  format parser) and the kanban handler in `web/` belong to this project, not
-  the riftpipe crates. Blocked on the wasm-crate split (roadmap §"Architecture
-  / hygiene" #8): a generic riftpipe wasm crate + a kanban wasm crate here.
+- ~~**Own the kanban code riftpipe still carries**~~ *(done)* — the format parser
+  and kanban handler now live in this project's own wasm crate
+  (`projects/kanban/wasm`); `riftpipe-core`/`web` are app-blind. The wasm-crate
+  split (a generic riftpipe wasm crate + a kanban wasm crate here) is complete.
 
 ### Out of scope (per the principle)
 

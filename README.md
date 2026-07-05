@@ -67,9 +67,12 @@ A serverless, end-to-end-encrypted kanban board. The board **is a directory tree
 — `board.md` plus a folder per ticket (`card.md` prose, `meta.toml` structure,
 `comments/*.md`) — synced by folder mode: prose merges with the text CRDT,
 structure is last-writer-wins per file, so concurrent edits and card moves don't
-clobber. One Rust binary serves the bundled web UI *and* syncs the files:
+clobber. The app lives in `projects/kanban/` and consumes riftpipe as a library;
+the library itself stays app-blind. Host the built bundle with the generic static
+host, and join the same tree as files from the CLI:
 ```sh
-riftpipe kanban serve ./board --port 7777
+projects/kanban/run.sh serve             # build + host the UI (→ riftpipe serve dist/)
+riftpipe connect <share-link> ./board    # join the board as a live file tree
 ```
 No database, no account — the board stays human-editable and git-friendly.
 
@@ -92,8 +95,8 @@ in, deltas out; converge with any peer over the link of your choice.
 
 ### Planned
 - **`wal-db`** — append-only write-ahead-log replication for databases (sync
-  *state* separately from a *view*, e.g. a game's authoritative state vs. its
-  rendered board).
+  *state* separately from a *view*, e.g. a database's authoritative rows vs. a
+  materialized read-model).
 - **`image`** — codec-aware tile/region merge for editing pictures live.
 - Granular editor edits, per-resource memory/file choice, folder deletes.
 
@@ -145,8 +148,8 @@ algo = "text-crdt"
 
 ### Kanban + browser
 ```sh
-# native: serve the kanban UI + JSON file-API over a board directory
-riftpipe kanban serve ./board --port 7777
+# host the built app bundle (generic static host — riftpipe stays app-blind)
+projects/kanban/run.sh serve             # → riftpipe serve dist/ on :8080
 
 # the connection broker for browser peers (self-hosted, content-blind)
 riftpipe signal --port 9000
@@ -157,8 +160,9 @@ cd web && wasm-pack build --target web && ./test-headless.sh
 # mint a shareable connection link (the id is the room two peers join)
 ./web/share-link.sh https://your-host    # -> https://your-host/#<id>
 ```
-The shared layout lives in `riftpipe-core::kanban`, so a board is byte-for-byte
-portable between the native server and the browser build.
+The kanban layout lives in the app (`projects/kanban/`), not in the library —
+riftpipe syncs the directory tree byte-for-byte and never parses a card, so the
+board is portable between the browser build and any CLI peer that joins the tree.
 
 #### Publish it & share with a friend — nothing to host
 The browser build deploys to **GitHub Pages** (`.github/workflows/pages.yml`): push
@@ -216,16 +220,16 @@ self-host a relay for production.
 
 Early/experimental (`v0.0.0`), developed against loopback and local networks.
 Working: text CRDT, rsync, folder sync, in-memory mode, reconnection, the nvim
-bridge, the native kanban server, and the browser stack — the wasm CRDT, OPFS
+bridge, and the browser stack — the wasm CRDT, OPFS
 persistence, WebRTC + link-based signaling, the in-browser kanban handler, **and
-per-file board sync over the link** (two browsers converge card prose as a CRDT
+per-file tree sync over the link** (two browsers converge card prose as a CRDT
 and structural moves as LWW). All verified headlessly in real Chrome, and the full
 **two-real-browser loop is verified end-to-end with Playwright** (a card created
 in one browser's UI appears in the other, no server in the data path). The SolidJS
 app builds as a self-contained static bundle. The **browser↔native bridge** works
 too — and **board sync between a native peer and a browser is bidirectional**: a
 card made in the browser UI lands on the native peer's disk, and editing the
-native `card.md` in any editor updates the browser (`riftpipe kanban connect`,
+native `card.md` in any editor updates the browser (`riftpipe connect`,
 shared `riftpipe_core::sync`; verified end-to-end with Playwright). The **cross-NAT
 relay fallback** is verified too — forcing relay-only ICE through a local TURN
 server, two native peers *and* a browser↔native pair connect entirely through the

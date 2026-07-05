@@ -2,7 +2,7 @@
 //! iroh-gossip topic keyed by the *host's* EndpointId, and every peer broadcasts
 //! `riftpipe_core::sync::MeshMsg`s epidemically (see `web/src/gossip.rs`, which
 //! speaks the identical wire layout). This is how `riftpipe connect` joins a
-//! board hosted by a browser: same topic, same postcard frames, same catch-up
+//! shared folder hosted by a browser: same topic, same postcard frames, same catch-up
 //! semantics — the CLI is just another swarm member.
 //!
 //! Mirrors `web/src/gossip.rs`'s `GossipTreeSync` behavior exactly:
@@ -115,7 +115,10 @@ pub async fn run(
     rx: &mut UnboundedReceiver<PathBuf>,
     poll: bool,
 ) -> Result<()> {
-    let MeshConn { sender, mut receiver, my_id, .. } = conn;
+    // Keep the endpoint/router/gossip alive for the whole loop: a host must keep
+    // its Router listening on GOSSIP_ALPN to accept joiners (a bare `..` would
+    // drop them here). Underscore-named bindings live to end of scope.
+    let MeshConn { endpoint: _endpoint, _router, _gossip, sender, mut receiver, my_id } = conn;
     let my_id_bytes = *my_id.as_bytes();
     let mut neighbors: BTreeSet<[u8; 32]> = BTreeSet::new();
     // The gossiped routing map `id -> [neighbors]` (kept for parity with the

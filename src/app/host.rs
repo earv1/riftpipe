@@ -1,6 +1,6 @@
 //! Generic HTTP hosting over a live directory — the app-agnostic serving layer
-//! any file-backed app can build on (the kanban server does; `riftpipe serve`
-//! is the plain CLI face). Two capabilities, no app routes:
+//! any file-backed app server can build on (`riftpipe serve` is the plain CLI
+//! face). Two capabilities, no app routes:
 //!
 //!   * static file serving of a directory, with an `index.html` SPA fallback
 //!     for client-side routing and a content-type map,

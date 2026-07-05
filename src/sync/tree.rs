@@ -4,13 +4,14 @@
 //! on disk, local edits (any editor touching the files) are watched and pushed.
 //! Text files (`*.md`) merge as CRDTs, everything else as LWW, and dot-paths
 //! never sync — all conflict resolution lives in `riftpipe_core::sync::Syncer`;
-//! this module is only I/O. The kanban app is the showcase consumer (its board
+//! this module is only I/O. A file-backed app is the showcase consumer (its data
 //! directory is just such a tree), not the owner.
 //!
 //! Transport-blind: takes the `net::{Sink, Source}` halves, so it runs over
-//! whatever dialed the link — WebRTC via signaling for browser peers, or a
-//! native authenticated+negotiated iroh session (`riftpipe connect --accept` /
-//! a ticket); `main.rs` owns that dialing, [`run_over`] is the common entry.
+//! whatever dialed the link — WebRTC via signaling for browser peers; `main.rs`
+//! owns that dialing, [`run_over`] is the common entry. (The gossip-mesh path —
+//! `connect --accept` and mesh tickets — drives the same `TreePeer` via
+//! [`super::mesh`] instead of a single link.)
 //!
 //! Shape matches the sibling sessions (`folder::session`, `pipe::session`): the
 //! caller owns the state ([`TreePeer`]) and the watcher channel; [`run`] is a
