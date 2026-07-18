@@ -138,6 +138,20 @@ impl TreePeer {
         self.syncer.full_state()
     }
 
+    /// Load every file already on disk into the syncer — the native mirror of
+    /// the browser's `opfs::prime_all`. Without this, files that predate the
+    /// session are invisible: the watcher only reports NEW events, so `hello()`
+    /// would advertise nothing and a mesh `full_state()` would be empty. The
+    /// produced messages are discarded — the handshake (link) or the
+    /// `NeighborUp` catch-up (mesh) does the actual transfer.
+    pub(crate) fn seed(&mut self, dir: &Path) {
+        let mut files = Vec::new();
+        scan_files(dir, &mut files);
+        for p in files {
+            let _ = self.local_change(&p, dir);
+        }
+    }
+
     /// Core is no-I/O, so IT records parked paths and WE print them: eprintln
     /// for every newly-parked path, and forget recovered ones so a re-park is
     /// reported again.
@@ -235,6 +249,10 @@ pub async fn run(
     let mut rescan = interval(Duration::from_secs(2));
     rescan.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut rx_open = true;
+
+    // Files that predate the session must be in the syncer BEFORE the
+    // handshake, or the hello advertises an empty tree.
+    peer.seed(dir);
 
     // Handshake: advertise our version vectors so the peer sends what we lack.
     if let Ok(b) = postcard::to_allocvec(&peer.syncer.hello()) {
@@ -408,6 +426,32 @@ mod tests {
             b"column = \"Todo\"\nposition = 0\n",
             "structural file arrives via LWW",
         );
+        std::fs::remove_dir_all(&da).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// Files that exist BEFORE the session starts — no watcher events, no poll
+    /// — must still transfer: `run` seeds the syncer from disk so the hello
+    /// handshake advertises them. (The bug this pins: a native mesh host whose
+    /// tree predates `connect --accept` broadcast an empty full_state.)
+    #[tokio::test]
+    async fn preexisting_files_sync_with_no_watcher_events() {
+        let da = dir("seed-a");
+        let db = dir("seed-b");
+        std::fs::create_dir_all(da.join("tickets/tk_9")).unwrap();
+        std::fs::write(da.join("tickets/tk_9/card.md"), "# was here first\n").unwrap();
+        std::fs::write(da.join("tickets/tk_9/meta.toml"), "column = \"Done\"\n").unwrap();
+
+        let (cb, mb) = (db.join("tickets/tk_9/card.md"), db.join("tickets/tk_9/meta.toml"));
+        timeout(
+            Duration::from_secs(15),
+            converge(&da, &db, &[], || cb.is_file() && mb.is_file()), // NO fed events
+        )
+        .await
+        .expect("pre-existing tree must sync via the seeded handshake");
+
+        assert_eq!(std::fs::read(cb).unwrap(), b"# was here first\n");
+        assert_eq!(std::fs::read(mb).unwrap(), b"column = \"Done\"\n");
         std::fs::remove_dir_all(&da).ok();
         std::fs::remove_dir_all(&db).ok();
     }

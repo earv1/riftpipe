@@ -129,6 +129,11 @@ pub async fn run(
     rescan.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut rx_open = true;
 
+    // Files that predate the session must be in the syncer BEFORE any
+    // NeighborUp, or the full_state() catch-up broadcasts an empty tree
+    // (the browser host primes OPFS the same way).
+    peer.seed(dir);
+
     // Broadcast one message; mesh sends are best-effort (a lagging swarm must
     // not kill the session — convergence is repaired by the next catch-up).
     async fn broadcast(sender: &GossipSender, gm: &MeshMsg) {
