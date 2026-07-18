@@ -31,7 +31,7 @@ use iroh_gossip::proto::TopicId;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, MissedTickBehavior};
 
-use riftpipe_core::sync::{MeshMsg, MAX_MESH_MSG_SIZE};
+use riftpipe_core::sync::{encode_mesh_frames, MeshAssembler, MeshMsg};
 
 use crate::net::{anyerr, Result};
 use crate::sync::tree::{scan_files, TreePeer};
@@ -76,11 +76,10 @@ impl MeshConn {
             .await
             .map_err(anyerr)?;
         let my_id = endpoint.id();
-        // The message-size limit is enforced on send AND receive, so every peer
-        // (native + browser) must configure the same shared value.
-        let gossip = Gossip::builder()
-            .max_message_size(MAX_MESH_MSG_SIZE)
-            .spawn(endpoint.clone());
+        // The library's 4 KiB frame limit stays at its default: big messages are
+        // chunked (`core::sync::encode_mesh_frames`) so no peer — however old —
+        // ever receives an over-limit frame.
+        let gossip = Gossip::builder().spawn(endpoint.clone());
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
             .spawn();
@@ -144,11 +143,11 @@ pub async fn run(
     // (the browser host primes OPFS the same way).
     peer.seed(dir);
 
-    // A failed or oversized send must not kill the session (convergence is
-    // repaired by the next catch-up), but it must be VISIBLE — a silently
-    // dropped broadcast reads as "synced" when it isn't.
+    // A failed send must not kill the session (convergence is repaired by the
+    // next catch-up), but it must be VISIBLE — a silently dropped broadcast
+    // reads as "synced" when it isn't. Big messages go out as chunk frames.
     async fn broadcast(sender: &GossipSender, gm: &MeshMsg) {
-        if let Ok(b) = postcard::to_allocvec(gm) {
+        for b in encode_mesh_frames(gm) {
             let n = b.len();
             if let Err(e) = sender.broadcast(b.into()).await {
                 eprintln!("[mesh] broadcast of {n} bytes failed: {e}");
@@ -161,13 +160,16 @@ pub async fn run(
     /// our full tree on every join is pure waste — the epidemic layer spreads
     /// anything the rest actually lacks via the normal reply path.
     async fn broadcast_neighbors(sender: &GossipSender, gm: &MeshMsg) {
-        if let Ok(b) = postcard::to_allocvec(gm) {
+        for b in encode_mesh_frames(gm) {
             let n = b.len();
             if let Err(e) = sender.broadcast_neighbors(b.into()).await {
                 eprintln!("[mesh] neighbor broadcast of {n} bytes failed: {e}");
             }
         }
     }
+
+    // Reassembles incoming chunk frames into whole messages.
+    let mut assembler = MeshAssembler::new();
 
     loop {
         tokio::select! {
@@ -211,7 +213,8 @@ pub async fn run(
                 };
                 match ev {
                     Event::Received(m) => {
-                        let Ok(gm) = postcard::from_bytes::<MeshMsg>(&m.content) else { continue };
+                        // Plain frames pass through; chunk frames buffer until whole.
+                        let Some(gm) = assembler.feed(&m.content) else { continue };
                         match gm {
                             MeshMsg::Sync(msg) => {
                                 // `apply_and_persist` prints SYNCED:{path} on persist.
@@ -222,6 +225,8 @@ pub async fn run(
                             MeshMsg::Presence { id, neighbors } => {
                                 routing.insert(id, neighbors);
                             }
+                            // feed() never yields a Chunk (it refuses nesting).
+                            MeshMsg::Chunk { .. } => {}
                         }
                     }
                     Event::NeighborUp(id) => {

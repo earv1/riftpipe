@@ -173,15 +173,21 @@ entirely — the wasm payload is the app's backend. What remains:
   Fix candidates: a recv-idle timeout in `folder::session`, or surfacing
   data-channel close from the WebRTC transport as a link error.
 
-- ~~Mesh messages over 4 KiB are silently lost~~ — *fixed.* Both drivers now
-  configure `Gossip::builder().max_message_size(core::sync::MAX_MESH_MSG_SIZE)`
-  (1 MiB, single-sourced in core because the limit is enforced on send AND
-  receive, so every peer must agree), and broadcast failures are logged
-  (stderr / console.warn) instead of `let _ =`-swallowed. Verified: the 10 KB
-  `big.md` that previously never crossed a CLI mesh now arrives byte-identical.
-  *Compat note:* an old browser tab (built with the 4 KiB default) receiving a
-  >4 KiB frame from a new peer errors — redeploying Pages ships the new limit;
-  stale open tabs should be reloaded.
+- ~~Mesh messages over 4 KiB are silently lost~~ — *fixed, by chunking (no
+  reload needed).* Rather than raising iroh-gossip's 4 KiB frame limit (it's
+  enforced on receive too, so already-open tabs would error on bigger frames
+  until reloaded), every frame stays under the default: `core::sync` gained an
+  APPENDED `MeshMsg::Chunk` variant plus `encode_mesh_frames` /
+  `MeshAssembler` (content-hash ids so re-broadcasts are idempotent; bounded
+  slots + total cap so bogus headers can't balloon memory; nested chunks
+  refused), and both drivers broadcast via frames and receive via the
+  assembler. A pre-chunking peer skips the unknown variant cleanly — it just
+  keeps missing big files, exactly as it always did, and never errors
+  (`mesh_msg_indexes_pinned_and_legacy_peers_skip_chunks` pins this). No size
+  cap anymore either (~15 MiB reassembly guard). Broadcast failures are
+  logged (stderr / console.warn) instead of `let _ =`-swallowed. Verified: a
+  60 KB `big.md` (≈16 chunk frames) crosses a CLI mesh byte-identical; the
+  browser↔CLI `board-cli-mesh` e2e passes with chunking peers on both ends.
 - ~~Mesh drivers: adopt what iroh-gossip already provides~~ — *done.* Both
   drivers source neighbors from `GossipReceiver::neighbors()` (the hand-kept
   sets are gone; the web cell is a mirror for the `connectedPeers()` debug

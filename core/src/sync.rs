@@ -18,14 +18,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::text::EgWalkerText;
 
-/// Max encoded [`MeshMsg`] both mesh drivers configure on iroh-gossip
-/// (`Gossip::builder().max_message_size(...)`). The library default is 4 KiB
-/// and it's enforced on SEND AND RECEIVE, so this must be identical on every
-/// peer (native + web, single-sourced here) — a peer with a smaller limit
-/// errors on receiving a bigger frame. 1 MiB comfortably covers a full_state
-/// TextDelta for large documents; drivers log (not silently drop) a broadcast
-/// that still exceeds it.
-pub const MAX_MESH_MSG_SIZE: usize = 1024 * 1024;
+/// Per-chunk payload budget for [`encode_mesh_frames`]. iroh-gossip's message
+/// limit defaults to 4096 bytes and is enforced on SEND AND RECEIVE — so
+/// rather than raising it (which would make every already-deployed peer error
+/// on receiving a bigger frame, forcing reloads), we keep EVERY frame under
+/// the default and split big messages into [`MeshMsg::Chunk`]s. A peer that
+/// predates chunking skips the unknown variant cleanly — it just misses big
+/// files, exactly as it always did. 3800 leaves room for the chunk envelope
+/// (postcard varints + id) and the gossip header inside 4096.
+pub const MESH_CHUNK_PAYLOAD: usize = 3800;
+/// Reassembly cap: reject a `total` beyond this (~15 MiB) so a bogus header
+/// can't balloon memory.
+const MESH_MAX_CHUNKS: u32 = 4096;
+/// Concurrent in-flight reassemblies per peer; oldest is evicted beyond this.
+const MESH_ASSEMBLY_SLOTS: usize = 32;
 
 /// A compact per-document state vector: `(agent, seq)` tips (usually one or two).
 type Vv = Vec<(String, usize)>;
@@ -79,6 +85,116 @@ pub enum MeshMsg {
     Sync(SyncMsg),
     /// "I am `id`, directly connected to `neighbors`." Aggregated into the map.
     Presence { id: [u8; 32], neighbors: Vec<[u8; 32]> },
+    /// One piece of a message too big for a single gossip frame (the library
+    /// caps frames at 4 KiB): `bytes` is `chunk_index`'th slice of an encoded
+    /// `MeshMsg` split by [`encode_mesh_frames`]; [`MeshAssembler`] reassembles.
+    /// `id` is a content hash, so a re-broadcast reuses the same reassembly
+    /// slot. APPENDED variant: peers that predate it skip it cleanly.
+    Chunk { id: u64, index: u32, total: u32, bytes: Vec<u8> },
+}
+
+/// FNV-1a 64-bit — a tiny, dependency-free content hash for chunk ids. Not
+/// cryptographic; a collision only merges two identical-id reassemblies, and
+/// the resulting decode failure is dropped like any corrupt frame.
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
+/// Encode `msg` as ready-to-broadcast gossip frames: one plain frame when it
+/// fits the per-frame budget, else a series of [`MeshMsg::Chunk`]s. Every
+/// returned frame stays under iroh-gossip's 4 KiB default, so no peer — however
+/// old — ever receives an over-limit frame.
+pub fn encode_mesh_frames(msg: &MeshMsg) -> Vec<Vec<u8>> {
+    let Ok(encoded) = postcard::to_allocvec(msg) else { return Vec::new() };
+    if encoded.len() <= MESH_CHUNK_PAYLOAD {
+        return vec![encoded];
+    }
+    let id = fnv64(&encoded);
+    let total = encoded.len().div_ceil(MESH_CHUNK_PAYLOAD) as u32;
+    encoded
+        .chunks(MESH_CHUNK_PAYLOAD)
+        .enumerate()
+        .filter_map(|(index, part)| {
+            postcard::to_allocvec(&MeshMsg::Chunk {
+                id,
+                index: index as u32,
+                total,
+                bytes: part.to_vec(),
+            })
+            .ok()
+        })
+        .collect()
+}
+
+/// One in-flight chunked message being reassembled.
+struct Assembly {
+    total: u32,
+    parts: Vec<Option<Vec<u8>>>,
+    received: u32,
+}
+
+/// Turns incoming gossip frames back into [`MeshMsg`]s: plain messages pass
+/// straight through; [`MeshMsg::Chunk`]s are buffered per content id and the
+/// whole message is returned when the last piece lands. Bounded: at most
+/// [`MESH_ASSEMBLY_SLOTS`] concurrent reassemblies (oldest evicted — gossip is
+/// best-effort, the catch-up paths repair a dropped message) and a `total` cap
+/// so a bogus header can't balloon memory.
+#[derive(Default)]
+pub struct MeshAssembler {
+    slots: HashMap<u64, Assembly>,
+    /// Insertion order for eviction (ids, oldest first).
+    order: Vec<u64>,
+}
+
+impl MeshAssembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one received frame; returns a complete message if this frame
+    /// finished one (or WAS one). Undecodable frames return `None`.
+    pub fn feed(&mut self, frame: &[u8]) -> Option<MeshMsg> {
+        let msg = postcard::from_bytes::<MeshMsg>(frame).ok()?;
+        let MeshMsg::Chunk { id, index, total, bytes } = msg else {
+            return Some(msg);
+        };
+        if total == 0 || total > MESH_MAX_CHUNKS || index >= total {
+            return None;
+        }
+        if !self.slots.contains_key(&id) {
+            if self.order.len() >= MESH_ASSEMBLY_SLOTS {
+                let evict = self.order.remove(0);
+                self.slots.remove(&evict);
+            }
+            self.order.push(id);
+            self.slots
+                .insert(id, Assembly { total, parts: vec![None; total as usize], received: 0 });
+        }
+        let slot = self.slots.get_mut(&id)?;
+        if slot.total != total {
+            return None; // id collision with a different shape — drop
+        }
+        if slot.parts[index as usize].is_none() {
+            slot.parts[index as usize] = Some(bytes);
+            slot.received += 1;
+        }
+        if slot.received < slot.total {
+            return None;
+        }
+        let assembly = self.slots.remove(&id)?;
+        self.order.retain(|x| *x != id);
+        let whole: Vec<u8> = assembly.parts.into_iter().flatten().flatten().collect();
+        match postcard::from_bytes::<MeshMsg>(&whole).ok()? {
+            // A chunked chunk is nonsense — refuse the recursion.
+            MeshMsg::Chunk { .. } => None,
+            inner => Some(inner),
+        }
+    }
 }
 
 /// While awaiting a resync, re-ask only after this many further failed merges:
@@ -408,6 +524,37 @@ mod wire_compat {
         ));
     }
 
+    /// Pin `MeshMsg`'s variant indexes too (Sync=0, Presence=1, Chunk=2) and
+    /// prove a pre-chunking peer skips `Chunk` frames cleanly — that's what
+    /// lets deployed browser tabs coexist with chunking peers, no reload.
+    #[test]
+    fn mesh_msg_indexes_pinned_and_legacy_peers_skip_chunks() {
+        let cases: Vec<(MeshMsg, u8)> = vec![
+            (MeshMsg::Sync(SyncMsg::Resync { path: "p".into() }), 0),
+            (MeshMsg::Presence { id: [0; 32], neighbors: vec![] }, 1),
+            (MeshMsg::Chunk { id: 1, index: 0, total: 2, bytes: vec![9] }, 2),
+        ];
+        for (msg, index) in cases {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            assert_eq!(bytes[0], index, "MeshMsg variant index moved");
+        }
+
+        /// The mesh wire enum exactly as pre-chunking peers know it.
+        #[derive(serde::Deserialize)]
+        enum LegacyMeshMsg {
+            #[allow(dead_code)]
+            Sync(SyncMsg),
+            #[allow(dead_code)]
+            Presence { id: [u8; 32], neighbors: Vec<[u8; 32]> },
+        }
+        let chunk = MeshMsg::Chunk { id: 7, index: 0, total: 1, bytes: vec![1, 2] };
+        let bytes = postcard::to_allocvec(&chunk).unwrap();
+        assert!(
+            postcard::from_bytes::<LegacyMeshMsg>(&bytes).is_err(),
+            "legacy peers must reject (and thus skip) chunk frames",
+        );
+    }
+
     /// The text/LWW `Syncer` ignores the strategy channel: no persist, no reply.
     #[test]
     fn syncer_ignores_strategy_channel_messages() {
@@ -419,6 +566,123 @@ mod wire_compat {
         let (persist, replies) =
             s.apply(SyncMsg::StratDelta { path: "x.bin".into(), bytes: vec![1] });
         assert!(persist.is_none() && replies.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod chunking {
+    use super::*;
+
+    fn big_sync_msg() -> MeshMsg {
+        // ~20 KiB of low-compressibility payload rides an Lww so the encoded
+        // frame decisively exceeds one chunk.
+        let mut bytes = Vec::with_capacity(20_000);
+        let mut x: u32 = 0x1234_5678;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            bytes.push((x >> 24) as u8);
+        }
+        MeshMsg::Sync(SyncMsg::Lww { path: "big.bin".into(), version: 9, bytes })
+    }
+
+    #[test]
+    fn small_messages_stay_plain_frames() {
+        let msg = MeshMsg::Sync(SyncMsg::Resync { path: "p".into() });
+        let frames = encode_mesh_frames(&msg);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], postcard::to_allocvec(&msg).unwrap(), "byte-identical to plain");
+        assert!(matches!(
+            MeshAssembler::new().feed(&frames[0]),
+            Some(MeshMsg::Sync(SyncMsg::Resync { .. }))
+        ));
+    }
+
+    #[test]
+    fn big_message_chunks_under_the_limit_and_reassembles() {
+        let msg = big_sync_msg();
+        let frames = encode_mesh_frames(&msg);
+        assert!(frames.len() > 1, "a 20 KiB message must chunk");
+        for f in &frames {
+            assert!(f.len() <= 4096, "every frame under iroh-gossip's default: {}", f.len());
+        }
+        let mut asm = MeshAssembler::new();
+        let mut out = None;
+        for f in &frames {
+            let got = asm.feed(f);
+            assert!(out.is_none() || got.is_none(), "completes exactly once");
+            out = out.or(got);
+        }
+        match out.expect("reassembled") {
+            MeshMsg::Sync(SyncMsg::Lww { path, version, bytes }) => {
+                assert_eq!((path.as_str(), version, bytes.len()), ("big.bin", 9, 20_000));
+            }
+            _ => panic!("wrong message out"),
+        }
+    }
+
+    #[test]
+    fn out_of_order_and_interleaved_senders_reassemble() {
+        let a = big_sync_msg();
+        let b = MeshMsg::Sync(SyncMsg::Lww {
+            path: "other.bin".into(),
+            version: 1,
+            bytes: vec![0xAB; 10_000],
+        });
+        let (mut fa, fb) = (encode_mesh_frames(&a), encode_mesh_frames(&b));
+        fa.reverse(); // out of order
+        let mut asm = MeshAssembler::new();
+        let mut done = 0;
+        // Interleave the two chunk streams.
+        let mut it_a = fa.iter();
+        let mut it_b = fb.iter();
+        loop {
+            let (na, nb) = (it_a.next(), it_b.next());
+            for f in [na, nb].into_iter().flatten() {
+                if asm.feed(f).is_some() {
+                    done += 1;
+                }
+            }
+            if na.is_none() && nb.is_none() {
+                break;
+            }
+        }
+        assert_eq!(done, 2, "both interleaved messages reassemble");
+    }
+
+    #[test]
+    fn duplicate_chunks_and_rebroadcasts_are_idempotent() {
+        let frames = encode_mesh_frames(&big_sync_msg());
+        let mut asm = MeshAssembler::new();
+        // Feed the first chunk twice, then the rest — still completes once.
+        assert!(asm.feed(&frames[0]).is_none());
+        assert!(asm.feed(&frames[0]).is_none());
+        let mut out = 0;
+        for f in &frames[1..] {
+            if asm.feed(f).is_some() {
+                out += 1;
+            }
+        }
+        assert_eq!(out, 1);
+        // A full re-broadcast (same content hash id) reassembles again fine.
+        let mut again = 0;
+        for f in &frames {
+            if asm.feed(f).is_some() {
+                again += 1;
+            }
+        }
+        assert_eq!(again, 1, "re-broadcast reuses the id and still completes");
+    }
+
+    #[test]
+    fn bogus_headers_and_junk_are_dropped() {
+        let mut asm = MeshAssembler::new();
+        assert!(asm.feed(b"\xff\xff\xff").is_none(), "junk frame");
+        let zero = MeshMsg::Chunk { id: 1, index: 0, total: 0, bytes: vec![] };
+        assert!(asm.feed(&postcard::to_allocvec(&zero).unwrap()).is_none(), "total=0");
+        let huge = MeshMsg::Chunk { id: 2, index: 0, total: u32::MAX, bytes: vec![1] };
+        assert!(asm.feed(&postcard::to_allocvec(&huge).unwrap()).is_none(), "total cap");
+        let oob = MeshMsg::Chunk { id: 3, index: 5, total: 2, bytes: vec![1] };
+        assert!(asm.feed(&postcard::to_allocvec(&oob).unwrap()).is_none(), "index >= total");
     }
 }
 

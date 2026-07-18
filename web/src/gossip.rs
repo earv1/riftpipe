@@ -59,11 +59,10 @@ impl Mesh {
             .bind()
             .await
             .map_err(|e| e.to_string())?;
-        // The message-size limit is enforced on send AND receive, so every peer
-        // (native + browser) must configure the same shared value.
-        let gossip = Gossip::builder()
-            .max_message_size(riftpipe_core::sync::MAX_MESH_MSG_SIZE)
-            .spawn(endpoint.clone());
+        // The library's 4 KiB frame limit stays at its default: big messages are
+        // chunked (`core::sync::encode_mesh_frames`) so no peer — however old —
+        // ever receives an over-limit frame.
+        let gossip = Gossip::builder().spawn(endpoint.clone());
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
             .spawn();
@@ -177,20 +176,22 @@ impl GossipTreeSync {
 
         let (sy, nb, rt, snd) = (syncer.clone(), neighbors.clone(), routing.clone(), sender.clone());
         wasm_bindgen_futures::spawn_local(async move {
-            // A failed or oversized send must not kill the session, but it must
-            // be VISIBLE — a silently dropped broadcast reads as "synced".
+            // A failed send must not kill the session, but it must be VISIBLE —
+            // a silently dropped broadcast reads as "synced". Big messages go
+            // out as chunk frames, each under the library's 4 KiB limit.
             async fn send(snd: &GossipSender, gm: &MeshMsg, neighbors_only: bool) {
-                let Ok(b) = postcard::to_allocvec(gm) else { return };
-                let n = b.len();
-                let r = if neighbors_only {
-                    snd.broadcast_neighbors(b.into()).await
-                } else {
-                    snd.broadcast(b.into()).await
-                };
-                if let Err(e) = r {
-                    web_sys::console::warn_1(
-                        &format!("[mesh] broadcast of {n} bytes failed: {e}").into(),
-                    );
+                for b in riftpipe_core::sync::encode_mesh_frames(gm) {
+                    let n = b.len();
+                    let r = if neighbors_only {
+                        snd.broadcast_neighbors(b.into()).await
+                    } else {
+                        snd.broadcast(b.into()).await
+                    };
+                    if let Err(e) = r {
+                        web_sys::console::warn_1(
+                            &format!("[mesh] broadcast of {n} bytes failed: {e}").into(),
+                        );
+                    }
                 }
             }
             // Mirror the library's authoritative neighbor set into the shared
@@ -198,10 +199,13 @@ impl GossipTreeSync {
             let snapshot = |receiver: &GossipReceiver| -> Vec<[u8; 32]> {
                 receiver.neighbors().map(|n| *n.as_bytes()).collect()
             };
+            // Reassembles incoming chunk frames into whole messages.
+            let mut assembler = riftpipe_core::sync::MeshAssembler::new();
             while let Some(Ok(ev)) = receiver.next().await {
                 match ev {
                     Event::Received(m) => {
-                        let Ok(gm) = postcard::from_bytes::<MeshMsg>(&m.content) else { continue };
+                        // Plain frames pass through; chunk frames buffer until whole.
+                        let Some(gm) = assembler.feed(&m.content) else { continue };
                         match gm {
                             MeshMsg::Sync(msg) => {
                                 let (persist, replies) = sy.borrow_mut().apply(msg);
@@ -215,6 +219,8 @@ impl GossipTreeSync {
                             MeshMsg::Presence { id, neighbors } => {
                                 rt.borrow_mut().insert(id, neighbors);
                             }
+                            // feed() never yields a Chunk (it refuses nesting).
+                            MeshMsg::Chunk { .. } => {}
                         }
                     }
                     Event::NeighborUp(_) => {
@@ -269,12 +275,18 @@ impl GossipTreeSync {
     }
 
     fn broadcast(&self, gm: MeshMsg) {
-        if let Ok(bytes) = postcard::to_allocvec(&gm) {
-            let sender = self.sender.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let _ = sender.broadcast(bytes.into()).await;
-            });
-        }
+        let frames = riftpipe_core::sync::encode_mesh_frames(&gm);
+        let sender = self.sender.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            for b in frames {
+                let n = b.len();
+                if let Err(e) = sender.broadcast(b.into()).await {
+                    web_sys::console::warn_1(
+                        &format!("[mesh] broadcast of {n} bytes failed: {e}").into(),
+                    );
+                }
+            }
+        });
     }
 
     /// Direct neighbors in the swarm (this peer's connected peers), as hex ids.
