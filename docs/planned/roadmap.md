@@ -149,13 +149,21 @@ entirely — the wasm payload is the app's backend. What remains:
     ⇒ fresh share ticket), clears the hash, and reloads as the host of an
     empty board.
 15. ~~Consolidate `opfs_root` helpers~~ — *done* (one `web/src/opfs.rs` module).
-16. **TypeScript-first glue (npm wrapper)** — frontend people shouldn't need
-    Rust to build on riftpipe. The seams are already language-agnostic (JSON
-    lines on stdio for `--pipe`, `SYNCED:` lines from `connect`, HTTP+SSE from
-    `host`, the wasm API in the browser); package them the esbuild/biome way:
-    an npm package that ships the prebuilt `riftpipe` binary and exposes a
-    typed TS API (spawn + typed protocol wrappers). `src/<entrypoint>.rs`
-    stays a ~350-line shell; all product glue can then live in TS.
+16. ~~TypeScript-first glue (npm wrapper)~~ — *done (local package; publishing
+    is release engineering for later).* `npm/`: zero-runtime-dependency
+    TypeScript package typing the language-agnostic seams — `PipeSession`
+    (the `--pipe` JSON-lines editor stream, `EditOp` typed as the wire's
+    serde shape), `TreeSession` (`connect`/`connect --accept`, `SYNCED:`
+    breadcrumbs as events, `ticket()` from the stderr banner), `Serve`
+    (spawn + readiness probe + typed SSE `/events` client). Binary resolution:
+    `$RIFTPIPE_BIN` → packaged `bin/` → enclosing cargo `target/{release,debug}`
+    → `$PATH` (the esbuild model — `npm/` mirrors its layout). e2e tests spawn
+    the real binary through the built `dist/` exports. Building the wrapper
+    ALSO surfaced and fixed a real `serve` bug: SSE frames were padded to
+    1200 bytes to defeat tiny_http's 1 KiB `BufWriter`, but the binding buffer
+    is `chunked_transfer`'s 8192-byte chunk (which only emits on overflow, not
+    exact fill) — events reached clients ~7 stale. Frames now pad to two
+    chunks so each event's data line is forced out by its own padding.
 
 - **Folder-mode dead-link detection is slow** (observed 2026-07-18 while
   verifying the wire unification): a sharer whose WebRTC-direct joiner dies
