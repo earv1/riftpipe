@@ -173,6 +173,31 @@ entirely — the wasm payload is the app's backend. What remains:
   Fix candidates: a recv-idle timeout in `folder::session`, or surfacing
   data-channel close from the WebRTC transport as a link error.
 
+- **Mesh messages over 4 KiB are silently lost** (found + reproduced
+  2026-07-18): iroh-gossip's `DEFAULT_MAX_MESSAGE_SIZE` is 4096 bytes and
+  neither driver raises it (`Gossip::builder().spawn(...)` in `src/sync/mesh.rs`
+  and `web/src/gossip.rs`) — so a `full_state`/`TextDelta`/`Lww` for any file
+  whose encoded `MeshMsg` exceeds 4 KiB never crosses the mesh, and our
+  best-effort broadcasts swallow the error. Verified: a 10 KB `big.md` never
+  reaches a CLI joiner while `small.md` syncs. Fix is
+  `Gossip::builder().max_message_size(...)` — but the limit is enforced on
+  receive too, so it's a coordinated bump (native + web + redeploy) or
+  app-level chunking; and the send paths should at least log a dropped
+  broadcast instead of `let _ =`.
+- **Mesh drivers: adopt what iroh-gossip already provides** (from the
+  2026-07-18 API review): use `GossipReceiver::neighbors()` instead of
+  hand-tracking a neighbor set from Up/Down events; use
+  `broadcast_neighbors()` for the `NeighborUp` full_state catch-up (today it
+  floods the whole swarm on every join — direct neighbors are enough, the
+  epidemic layer spreads the rest); use `subscribe_and_join`/`joined()`
+  instead of manual first-NeighborUp waits. Keep what the library
+  deliberately doesn't do: late-joiner state catch-up (gossip is ephemeral),
+  the Presence routing map (library only knows local neighbors), author
+  identity (`delivered_from` is the relay, not the author). Also note:
+  hyparview heals only from its passive view — after a TOTAL neighbor loss
+  the app must `join_peers()` the bootstrap again (folds into live
+  reconnection).
+
 ## Iteration 2 (added 2026-07-04)
 
 17. **Events log in the wasm handler** — *done.* The per-peer change log
