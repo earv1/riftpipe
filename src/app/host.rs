@@ -162,15 +162,19 @@ struct SseReader {
     pos: usize,
 }
 
-/// tiny_http writes every response through a fixed 1 KiB `BufWriter` and only
-/// flushes it after the body is fully copied — which never happens on an
-/// endless stream, so a bare frame (and the response headers before it!) would
-/// sit in that buffer indefinitely and the client would see nothing. Pad every
-/// frame past the buffer size with an SSE comment (clients ignore `:` lines);
-/// a single write ≥ the buffer capacity bypasses it, pushing the frame — and
-/// anything buffered before it — out immediately.
+/// tiny_http drives a chunked body via `io::copy` into `chunked_transfer`'s
+/// `Encoder`, which accumulates a full **8192-byte chunk** before writing and
+/// only emits when a write arrives with the chunk already full (an exact fill
+/// doesn't send; there is no flush until the body ends — never, on an endless
+/// stream). So a bare frame would sit buffered indefinitely, and one-chunk
+/// padding still lags a full frame behind. Pad every frame to exactly TWO
+/// chunks with an SSE comment (clients ignore `:` lines): the frame's data
+/// line lives in the first chunk, and the frame's own trailing padding writes
+/// force that chunk out — whatever the copy loop's read size. Only the final
+/// all-padding chunk lags, flushed by the next frame or keepalive. (The 1 KiB
+/// socket `BufWriter` under the encoder is bypassed by every ≥1 KiB chunk.)
 fn pad_to_flush(mut frame: Vec<u8>) -> Vec<u8> {
-    const FLUSH: usize = 1200; // > tiny_http's 1024-byte BufWriter
+    const FLUSH: usize = 2 * 8192; // two chunked_transfer chunk buffers
     if frame.len() < FLUSH {
         frame.push(b':');
         frame.resize(FLUSH - 2, b' ');
