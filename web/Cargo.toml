@@ -41,6 +41,8 @@ features = [
     "RtcIceGatheringState",
     "MessageEvent",
     "Event",
+    # console.warn for dropped/oversized mesh broadcasts
+    "console",
     # WebSocket signaling (connection id in the URL → a room on the signal server).
     "WebSocket",
     "Location",

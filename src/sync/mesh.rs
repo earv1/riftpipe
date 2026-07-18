@@ -16,7 +16,7 @@
 //! sync tasks. The push-decision and persist logic are the shared `TreePeer`
 //! methods, so link-sync and mesh-sync can't drift.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ use iroh_gossip::proto::TopicId;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, MissedTickBehavior};
 
-use riftpipe_core::sync::MeshMsg;
+use riftpipe_core::sync::{MeshMsg, MAX_MESH_MSG_SIZE};
 
 use crate::net::{anyerr, Result};
 use crate::sync::tree::{scan_files, TreePeer};
@@ -51,6 +51,10 @@ pub struct MeshConn {
     sender: GossipSender,
     receiver: GossipReceiver,
     my_id: EndpointId,
+    /// The peer we bootstrapped off (`None` when we host the swarm) — kept so
+    /// a TOTAL neighbor loss can re-join it: hyparview heals only from its
+    /// passive view and never re-dials the original bootstrap on its own.
+    bootstrap: Option<EndpointId>,
 }
 
 impl MeshConn {
@@ -72,16 +76,21 @@ impl MeshConn {
             .await
             .map_err(anyerr)?;
         let my_id = endpoint.id();
-        let gossip = Gossip::builder().spawn(endpoint.clone());
+        // The message-size limit is enforced on send AND receive, so every peer
+        // (native + browser) must configure the same shared value.
+        let gossip = Gossip::builder()
+            .max_message_size(MAX_MESH_MSG_SIZE)
+            .spawn(endpoint.clone());
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
             .spawn();
+        let bootstrap = boot.first().copied();
         let topic = gossip
             .subscribe(topic_of(host.unwrap_or(my_id)), boot)
             .await
             .map_err(anyerr)?;
         let (sender, receiver) = topic.split();
-        Ok(MeshConn { endpoint, _router: router, _gossip: gossip, sender, receiver, my_id })
+        Ok(MeshConn { endpoint, _router: router, _gossip: gossip, sender, receiver, my_id, bootstrap })
     }
 
     /// The underlying endpoint (for `online()` / address sharing in tests).
@@ -118,11 +127,12 @@ pub async fn run(
     // Keep the endpoint/router/gossip alive for the whole loop: a host must keep
     // its Router listening on GOSSIP_ALPN to accept joiners (a bare `..` would
     // drop them here). Underscore-named bindings live to end of scope.
-    let MeshConn { endpoint: _endpoint, _router, _gossip, sender, mut receiver, my_id } = conn;
+    let MeshConn { endpoint: _endpoint, _router, _gossip, sender, mut receiver, my_id, bootstrap } =
+        conn;
     let my_id_bytes = *my_id.as_bytes();
-    let mut neighbors: BTreeSet<[u8; 32]> = BTreeSet::new();
     // The gossiped routing map `id -> [neighbors]` (kept for parity with the
-    // browser's debug map; phase 2 will surface it).
+    // browser's debug map; phase 2 will surface it). Our own entry is sourced
+    // from `receiver.neighbors()` — the library's authoritative set.
     let mut routing: BTreeMap<[u8; 32], Vec<[u8; 32]>> = BTreeMap::new();
 
     let mut rescan = interval(Duration::from_secs(2));
@@ -134,11 +144,28 @@ pub async fn run(
     // (the browser host primes OPFS the same way).
     peer.seed(dir);
 
-    // Broadcast one message; mesh sends are best-effort (a lagging swarm must
-    // not kill the session — convergence is repaired by the next catch-up).
+    // A failed or oversized send must not kill the session (convergence is
+    // repaired by the next catch-up), but it must be VISIBLE — a silently
+    // dropped broadcast reads as "synced" when it isn't.
     async fn broadcast(sender: &GossipSender, gm: &MeshMsg) {
         if let Ok(b) = postcard::to_allocvec(gm) {
-            let _ = sender.broadcast(b.into()).await;
+            let n = b.len();
+            if let Err(e) = sender.broadcast(b.into()).await {
+                eprintln!("[mesh] broadcast of {n} bytes failed: {e}");
+            }
+        }
+    }
+
+    /// Direct-neighbor-only send for the `NeighborUp` catch-up: the newcomer is
+    /// (or is about to be) a direct neighbor, so flooding the whole swarm with
+    /// our full tree on every join is pure waste — the epidemic layer spreads
+    /// anything the rest actually lacks via the normal reply path.
+    async fn broadcast_neighbors(sender: &GossipSender, gm: &MeshMsg) {
+        if let Ok(b) = postcard::to_allocvec(gm) {
+            let n = b.len();
+            if let Err(e) = sender.broadcast_neighbors(b.into()).await {
+                eprintln!("[mesh] neighbor broadcast of {n} bytes failed: {e}");
+            }
         }
     }
 
@@ -199,19 +226,32 @@ pub async fn run(
                     }
                     Event::NeighborUp(id) => {
                         eprintln!("[mesh] neighbor up: {id}");
-                        neighbors.insert(*id.as_bytes());
-                        // Catch the new neighbor up with our whole tree.
+                        // Catch the new neighbor up with our whole tree —
+                        // direct neighbors only; the swarm doesn't need it.
                         for msg in peer.full_state() {
-                            broadcast(&sender, &MeshMsg::Sync(msg)).await;
+                            broadcast_neighbors(&sender, &MeshMsg::Sync(msg)).await;
                         }
-                        let list: Vec<[u8; 32]> = neighbors.iter().copied().collect();
+                        let list: Vec<[u8; 32]> =
+                            receiver.neighbors().map(|n| *n.as_bytes()).collect();
                         routing.insert(my_id_bytes, list.clone());
                         broadcast(&sender, &MeshMsg::Presence { id: my_id_bytes, neighbors: list }).await;
                     }
                     Event::NeighborDown(id) => {
                         eprintln!("[mesh] neighbor down: {id}");
-                        neighbors.remove(id.as_bytes());
-                        let list: Vec<[u8; 32]> = neighbors.iter().copied().collect();
+                        let list: Vec<[u8; 32]> =
+                            receiver.neighbors().map(|n| *n.as_bytes()).collect();
+                        // Total neighbor loss: hyparview refills only from its
+                        // passive view — it never re-dials the original
+                        // bootstrap. We still hold its address (MemoryLookup),
+                        // so ask the swarm to re-join it.
+                        if list.is_empty() {
+                            if let Some(b) = bootstrap {
+                                eprintln!("[mesh] all neighbors lost — re-joining bootstrap {b}");
+                                if let Err(e) = sender.join_peers(vec![b]).await {
+                                    eprintln!("[mesh] re-join failed: {e}");
+                                }
+                            }
+                        }
                         routing.insert(my_id_bytes, list.clone());
                         broadcast(&sender, &MeshMsg::Presence { id: my_id_bytes, neighbors: list }).await;
                     }

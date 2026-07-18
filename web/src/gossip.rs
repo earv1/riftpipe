@@ -31,6 +31,10 @@ pub struct Mesh {
     sender: GossipSender,
     receiver: GossipReceiver,
     my_id: EndpointId,
+    /// The peer we bootstrapped off (`None` when we host) — kept so a TOTAL
+    /// neighbor loss can re-join it: hyparview heals only from its passive
+    /// view and never re-dials the original bootstrap on its own.
+    bootstrap: Option<EndpointId>,
 }
 
 impl Mesh {
@@ -55,10 +59,15 @@ impl Mesh {
             .bind()
             .await
             .map_err(|e| e.to_string())?;
-        let gossip = Gossip::builder().spawn(endpoint.clone());
+        // The message-size limit is enforced on send AND receive, so every peer
+        // (native + browser) must configure the same shared value.
+        let gossip = Gossip::builder()
+            .max_message_size(riftpipe_core::sync::MAX_MESH_MSG_SIZE)
+            .spawn(endpoint.clone());
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
             .spawn();
+        let bootstrap = boot.first().copied();
         let topic = gossip
             .subscribe(topic_of(host), boot)
             .await
@@ -71,6 +80,7 @@ impl Mesh {
             sender,
             receiver,
             my_id,
+            bootstrap,
         })
     }
 
@@ -111,12 +121,14 @@ impl Mesh {
         }
     }
 
-    /// Split into a broadcast sender, an event receiver, and a keep-alive handle
+    /// Split into a broadcast sender, an event receiver, the bootstrap peer
+    /// (for a re-join after total neighbor loss), and a keep-alive handle
     /// (the endpoint/router/gossip must outlive both).
-    fn into_parts(self) -> (GossipSender, GossipReceiver, MeshKeepAlive) {
+    fn into_parts(self) -> (GossipSender, GossipReceiver, Option<EndpointId>, MeshKeepAlive) {
         (
             self.sender,
             self.receiver,
+            self.bootstrap,
             MeshKeepAlive { _endpoint: self.endpoint, _router: self._router, _gossip: self._gossip },
         )
     }
@@ -157,7 +169,7 @@ impl GossipTreeSync {
         use std::cell::RefCell;
         use std::rc::Rc;
         let my_id = *mesh.my_id().as_bytes();
-        let (sender, mut receiver, keep) = mesh.into_parts();
+        let (sender, mut receiver, bootstrap, keep) = mesh.into_parts();
         let agent = format!("g{:08x}", (js_sys::Math::random() * 4_294_967_296.0) as u32);
         let syncer = Rc::new(RefCell::new(riftpipe_core::sync::Syncer::new(agent)));
         let neighbors = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
@@ -165,8 +177,26 @@ impl GossipTreeSync {
 
         let (sy, nb, rt, snd) = (syncer.clone(), neighbors.clone(), routing.clone(), sender.clone());
         wasm_bindgen_futures::spawn_local(async move {
-            let broadcast = |gm: &MeshMsg| {
-                postcard::to_allocvec(gm).ok().map(|b| b.into())
+            // A failed or oversized send must not kill the session, but it must
+            // be VISIBLE — a silently dropped broadcast reads as "synced".
+            async fn send(snd: &GossipSender, gm: &MeshMsg, neighbors_only: bool) {
+                let Ok(b) = postcard::to_allocvec(gm) else { return };
+                let n = b.len();
+                let r = if neighbors_only {
+                    snd.broadcast_neighbors(b.into()).await
+                } else {
+                    snd.broadcast(b.into()).await
+                };
+                if let Err(e) = r {
+                    web_sys::console::warn_1(
+                        &format!("[mesh] broadcast of {n} bytes failed: {e}").into(),
+                    );
+                }
+            }
+            // Mirror the library's authoritative neighbor set into the shared
+            // cell (for the `connectedPeers()` debug accessor + Presence).
+            let snapshot = |receiver: &GossipReceiver| -> Vec<[u8; 32]> {
+                receiver.neighbors().map(|n| *n.as_bytes()).collect()
             };
             while let Some(Ok(ev)) = receiver.next().await {
                 match ev {
@@ -179,9 +209,7 @@ impl GossipTreeSync {
                                     on_merged(path, bytes);
                                 }
                                 for r in replies {
-                                    if let Some(b) = broadcast(&MeshMsg::Sync(r)) {
-                                        let _ = snd.broadcast(b).await;
-                                    }
+                                    send(&snd, &MeshMsg::Sync(r), false).await;
                                 }
                             }
                             MeshMsg::Presence { id, neighbors } => {
@@ -189,28 +217,36 @@ impl GossipTreeSync {
                             }
                         }
                     }
-                    Event::NeighborUp(id) => {
-                        nb.borrow_mut().insert(*id.as_bytes());
-                        // Catch the new neighbor up with our whole tree.
+                    Event::NeighborUp(_) => {
+                        // Catch the new neighbor up with our whole tree —
+                        // direct neighbors only; the swarm doesn't need it.
                         let full = sy.borrow().full_state();
                         for msg in full {
-                            if let Some(b) = broadcast(&MeshMsg::Sync(msg)) {
-                                let _ = snd.broadcast(b).await;
+                            send(&snd, &MeshMsg::Sync(msg), true).await;
+                        }
+                        let list = snapshot(&receiver);
+                        *nb.borrow_mut() = list.iter().copied().collect();
+                        rt.borrow_mut().insert(my_id, list.clone());
+                        send(&snd, &MeshMsg::Presence { id: my_id, neighbors: list }, false).await;
+                    }
+                    Event::NeighborDown(_) => {
+                        let list = snapshot(&receiver);
+                        *nb.borrow_mut() = list.iter().copied().collect();
+                        // Total neighbor loss: hyparview refills only from its
+                        // passive view — it never re-dials the original
+                        // bootstrap. We still hold its address (MemoryLookup),
+                        // so ask the swarm to re-join it.
+                        if list.is_empty() {
+                            if let Some(b) = bootstrap {
+                                if let Err(e) = snd.join_peers(vec![b]).await {
+                                    web_sys::console::warn_1(
+                                        &format!("[mesh] re-join failed: {e}").into(),
+                                    );
+                                }
                             }
                         }
-                        let list: Vec<[u8; 32]> = nb.borrow().iter().copied().collect();
                         rt.borrow_mut().insert(my_id, list.clone());
-                        if let Some(b) = broadcast(&MeshMsg::Presence { id: my_id, neighbors: list }) {
-                            let _ = snd.broadcast(b).await;
-                        }
-                    }
-                    Event::NeighborDown(id) => {
-                        nb.borrow_mut().remove(id.as_bytes());
-                        let list: Vec<[u8; 32]> = nb.borrow().iter().copied().collect();
-                        rt.borrow_mut().insert(my_id, list.clone());
-                        if let Some(b) = broadcast(&MeshMsg::Presence { id: my_id, neighbors: list }) {
-                            let _ = snd.broadcast(b).await;
-                        }
+                        send(&snd, &MeshMsg::Presence { id: my_id, neighbors: list }, false).await;
                     }
                     Event::Lagged => {}
                 }

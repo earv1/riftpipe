@@ -18,6 +18,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::text::EgWalkerText;
 
+/// Max encoded [`MeshMsg`] both mesh drivers configure on iroh-gossip
+/// (`Gossip::builder().max_message_size(...)`). The library default is 4 KiB
+/// and it's enforced on SEND AND RECEIVE, so this must be identical on every
+/// peer (native + web, single-sourced here) — a peer with a smaller limit
+/// errors on receiving a bigger frame. 1 MiB comfortably covers a full_state
+/// TextDelta for large documents; drivers log (not silently drop) a broadcast
+/// that still exceeds it.
+pub const MAX_MESH_MSG_SIZE: usize = 1024 * 1024;
+
 /// A compact per-document state vector: `(agent, seq)` tips (usually one or two).
 type Vv = Vec<(String, usize)>;
 /// A document's origin (root op id) — the reliable "same document?" identity.

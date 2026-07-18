@@ -173,30 +173,30 @@ entirely — the wasm payload is the app's backend. What remains:
   Fix candidates: a recv-idle timeout in `folder::session`, or surfacing
   data-channel close from the WebRTC transport as a link error.
 
-- **Mesh messages over 4 KiB are silently lost** (found + reproduced
-  2026-07-18): iroh-gossip's `DEFAULT_MAX_MESSAGE_SIZE` is 4096 bytes and
-  neither driver raises it (`Gossip::builder().spawn(...)` in `src/sync/mesh.rs`
-  and `web/src/gossip.rs`) — so a `full_state`/`TextDelta`/`Lww` for any file
-  whose encoded `MeshMsg` exceeds 4 KiB never crosses the mesh, and our
-  best-effort broadcasts swallow the error. Verified: a 10 KB `big.md` never
-  reaches a CLI joiner while `small.md` syncs. Fix is
-  `Gossip::builder().max_message_size(...)` — but the limit is enforced on
-  receive too, so it's a coordinated bump (native + web + redeploy) or
-  app-level chunking; and the send paths should at least log a dropped
-  broadcast instead of `let _ =`.
-- **Mesh drivers: adopt what iroh-gossip already provides** (from the
-  2026-07-18 API review): use `GossipReceiver::neighbors()` instead of
-  hand-tracking a neighbor set from Up/Down events; use
-  `broadcast_neighbors()` for the `NeighborUp` full_state catch-up (today it
-  floods the whole swarm on every join — direct neighbors are enough, the
-  epidemic layer spreads the rest); use `subscribe_and_join`/`joined()`
-  instead of manual first-NeighborUp waits. Keep what the library
-  deliberately doesn't do: late-joiner state catch-up (gossip is ephemeral),
-  the Presence routing map (library only knows local neighbors), author
-  identity (`delivered_from` is the relay, not the author). Also note:
-  hyparview heals only from its passive view — after a TOTAL neighbor loss
-  the app must `join_peers()` the bootstrap again (folds into live
-  reconnection).
+- ~~Mesh messages over 4 KiB are silently lost~~ — *fixed.* Both drivers now
+  configure `Gossip::builder().max_message_size(core::sync::MAX_MESH_MSG_SIZE)`
+  (1 MiB, single-sourced in core because the limit is enforced on send AND
+  receive, so every peer must agree), and broadcast failures are logged
+  (stderr / console.warn) instead of `let _ =`-swallowed. Verified: the 10 KB
+  `big.md` that previously never crossed a CLI mesh now arrives byte-identical.
+  *Compat note:* an old browser tab (built with the 4 KiB default) receiving a
+  >4 KiB frame from a new peer errors — redeploying Pages ships the new limit;
+  stale open tabs should be reloaded.
+- ~~Mesh drivers: adopt what iroh-gossip already provides~~ — *done.* Both
+  drivers source neighbors from `GossipReceiver::neighbors()` (the hand-kept
+  sets are gone; the web cell is a mirror for the `connectedPeers()` debug
+  accessor); the `NeighborUp` full_state catch-up uses `broadcast_neighbors()`
+  (direct neighbors only — the join no longer floods the whole swarm with the
+  tree); and on TOTAL neighbor loss a joiner `join_peers()`s its bootstrap
+  again (hyparview only refills from its passive view; the bootstrap address
+  is still in the MemoryLookup — this is the swarm half of live reconnection;
+  exercising it end-to-end needs a persistent-identity host restart, still
+  open below). `joined()`/`subscribe_and_join` deliberately NOT adopted: it
+  consumes the first `NeighborUp`, which our catch-up logic depends on — the
+  library's own docs point to exactly our track-the-stream pattern. Kept
+  app-level by design: late-joiner catch-up (gossip is ephemeral), the
+  Presence routing map (the library only knows local neighbors), author
+  identity (`delivered_from` is the relay, not the author).
 
 ## Iteration 2 (added 2026-07-04)
 
