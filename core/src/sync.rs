@@ -23,6 +23,11 @@ type Vv = Vec<(String, usize)>;
 /// A document's origin (root op id) — the reliable "same document?" identity.
 type Origin = Option<(String, usize)>;
 
+/// WIRE COMPAT: postcard encodes by variant index, so variant order and field
+/// shapes are load-bearing — deployed peers already speak this layout. New
+/// variants may only be APPENDED (an old peer fails to decode an unknown index
+/// and skips the message — every driver already does); existing variants must
+/// never change shape or position. Guarded by `wire_compat` tests below.
 #[derive(Serialize, Deserialize)]
 pub enum SyncMsg {
     /// Connect handshake: "here are the version vectors of the text docs I have,
@@ -39,6 +44,17 @@ pub enum SyncMsg {
     Resync { path: String },
     /// A whole-file last-writer-wins update; newest version wins.
     Lww { path: String, version: u64, bytes: Vec<u8> },
+    /// The generic **strategy channel** (folder mode's multi-algorithm sync —
+    /// rsync, wal-db, lww-record, …): an advertisement of what the sender holds
+    /// for `path`, as the resource's algorithm encodes it (`sv` is opaque —
+    /// a version vector, block checksums, a WAL watermark). `reply: true` asks
+    /// the peer to advertise back (sent on connect, local change, heartbeat);
+    /// `reply: false` is that answer, so the exchange can't ping-pong forever.
+    /// [`Syncer`] ignores these — the workspace/strategy layer drives them.
+    StratAdvert { path: String, sv: Vec<u8>, reply: bool },
+    /// A strategy-channel delta for `path`, opaque to the wire: whatever the
+    /// resource's algorithm `merge`s (rsync token stream, WAL frames, …).
+    StratDelta { path: String, bytes: Vec<u8> },
 }
 
 /// What travels over a gossip-mesh topic: tree [`SyncMsg`]s plus periodic
@@ -317,7 +333,83 @@ impl Syncer {
                     (None, Vec::new())
                 }
             }
+            // The strategy channel belongs to the workspace/strategy layer
+            // (folder mode); a text/LWW syncer has nothing to do with it.
+            SyncMsg::StratAdvert { .. } | SyncMsg::StratDelta { .. } => (None, Vec::new()),
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_compat {
+    use super::*;
+
+    /// Postcard encodes an enum as a varint of its variant index, so the FIRST
+    /// byte of every encoded `SyncMsg` is its wire index (all six fit in one
+    /// varint byte). Deployed peers already speak indexes 0–3 — this pins the
+    /// full table so a reorder/insertion fails loudly, not on live browsers.
+    #[test]
+    fn variant_indexes_are_pinned() {
+        let cases: Vec<(SyncMsg, u8)> = vec![
+            (SyncMsg::Hello { versions: vec![], lww_versions: vec![] }, 0),
+            (SyncMsg::TextDelta { path: "p".into(), ops: vec![], vv: vec![], origin: None }, 1),
+            (SyncMsg::Resync { path: "p".into() }, 2),
+            (SyncMsg::Lww { path: "p".into(), version: 1, bytes: vec![] }, 3),
+            (SyncMsg::StratAdvert { path: "p".into(), sv: vec![], reply: true }, 4),
+            (SyncMsg::StratDelta { path: "p".into(), bytes: vec![] }, 5),
+        ];
+        for (msg, index) in cases {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            assert_eq!(bytes[0], index, "variant index moved — deployed peers would misdecode");
+        }
+    }
+
+    /// An old peer (built before the strategy channel) decodes the appended
+    /// variants as an ERROR, not as garbage — and every driver skips messages
+    /// that fail to decode, so mixed-version meshes stay safe.
+    #[test]
+    fn legacy_decoder_rejects_appended_variants_cleanly() {
+        /// The wire enum exactly as deployed peers know it.
+        #[derive(serde::Deserialize)]
+        enum LegacySyncMsg {
+            #[allow(dead_code)]
+            Hello { versions: Vec<(String, Vv)>, lww_versions: Vec<(String, u64)> },
+            #[allow(dead_code)]
+            TextDelta { path: String, ops: Vec<u8>, vv: Vv, origin: Origin },
+            #[allow(dead_code)]
+            Resync { path: String },
+            #[allow(dead_code)]
+            Lww { path: String, version: u64, bytes: Vec<u8> },
+        }
+
+        let advert = SyncMsg::StratAdvert { path: "a.bin".into(), sv: vec![1, 2], reply: true };
+        let delta = SyncMsg::StratDelta { path: "a.bin".into(), bytes: vec![3] };
+        for msg in [advert, delta] {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            assert!(
+                postcard::from_bytes::<LegacySyncMsg>(&bytes).is_err(),
+                "legacy peers must reject (and thus skip) strategy-channel messages",
+            );
+        }
+        // And a legacy-shaped message still round-trips through the new enum.
+        let hello = postcard::to_allocvec(&SyncMsg::Hello { versions: vec![], lww_versions: vec![] }).unwrap();
+        assert!(matches!(
+            postcard::from_bytes::<SyncMsg>(&hello),
+            Ok(SyncMsg::Hello { .. })
+        ));
+    }
+
+    /// The text/LWW `Syncer` ignores the strategy channel: no persist, no reply.
+    #[test]
+    fn syncer_ignores_strategy_channel_messages() {
+        let mut s = Syncer::new("a");
+        s.local_text("note.md", "hi\n");
+        let (persist, replies) =
+            s.apply(SyncMsg::StratAdvert { path: "x.bin".into(), sv: vec![], reply: true });
+        assert!(persist.is_none() && replies.is_empty());
+        let (persist, replies) =
+            s.apply(SyncMsg::StratDelta { path: "x.bin".into(), bytes: vec![1] });
+        assert!(persist.is_none() && replies.is_empty());
     }
 }
 

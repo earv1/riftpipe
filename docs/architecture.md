@@ -258,9 +258,14 @@ iroh ticket + `--accept`, a **browser share link** via the iroh-gossip mesh —
 room fallback); the sqlite orphan became `Kind::LwwRecord` (sqlite.rs
 deleted); `web/Cargo.lock` is tracked.
 
+Since then: the wire protocols were unified — folder mode's bespoke framing is
+gone; it speaks postcard-encoded `core::sync::SyncMsg` via the appended
+strategy-channel variants (`StratAdvert`/`StratDelta`), wire-compatible with
+deployed peers (old peers skip unknown variants; guarded by `wire_compat`
+tests in `core::sync`).
+
 Still open (tracked in `docs/planned/roadmap.md` §Architecture / hygiene):
 
-- **Two wire protocols** (folder framing vs `core::sync` `SyncMsg`).
 - **Two deploy stories** — Pages ships the iroh app; `deploy/` + workflow vars
   still treat the signaling server as first-class. (The kanban servers
   themselves are gone — the wasm payload is the backend.)

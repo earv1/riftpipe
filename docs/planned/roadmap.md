@@ -108,10 +108,21 @@ entirely — the wasm payload is the app's backend. What remains:
    (which links `riftpipe-web`, so both crates' wasm exports surface);
    `api.ts`/e2e/`pages.yml` point at `projects/kanban/wasm/pkg`, and
    `web/test-headless.sh` runs both crates' headless suites.
-9. **One wire protocol** — folder mode (`sync::folder` framing + `SyncStrategy`
-   seam) and tree/board sync (`core::sync` `SyncMsg`, browser-compatible) are
-   two protocols for overlapping jobs. Consolidating means folder mode adopting
-   the core protocol (or vice versa) without breaking browser peers.
+9. ~~One wire protocol~~ — *done.* Folder mode adopted the core protocol:
+   `core::sync::SyncMsg` gained two APPENDED variants — `StratAdvert { path,
+   sv, reply }` (unifying `SYNCREQ`/`SYNCREP`) and `StratDelta { path, bytes }`
+   — carrying the `SyncStrategy` seam's opaque payloads, and `sync::folder` now
+   speaks postcard-encoded `SyncMsg` like tree/mesh; the bespoke
+   `[path_len][path][tag]` framing is deleted. Wire-safe for deployed browsers:
+   variants were appended (old peers decode-fail and skip; every driver already
+   does), guarded by `core::sync::wire_compat` tests that pin all variant
+   indexes and prove a legacy 4-variant decoder rejects the new ones cleanly.
+   The text/LWW `Syncer` ignores strategy messages and folder sessions ignore
+   tree messages — one envelope, two dialects. Moving the strategy channel
+   into core is also the prerequisite for item 6's "browser peers speak WAL".
+   *Follow-up (not blocking):* folder-mode text resources still ride the
+   strategy channel rather than `TextDelta`; deep-merging them onto the tree
+   dialect would let a folder session and a browser peer share text docs.
 10. ~~`riftpipe connect` transport generalization~~ — *done, all three
     transports.* `connect <ticket>` dials native↔native over iroh (auth +
     negotiation + WebRTC upgrade); `connect --accept` mints the ticket and
@@ -145,6 +156,14 @@ entirely — the wasm payload is the app's backend. What remains:
     an npm package that ships the prebuilt `riftpipe` binary and exposes a
     typed TS API (spawn + typed protocol wrappers). `src/<entrypoint>.rs`
     stays a ~350-line shell; all product glue can then live in TS.
+
+- **Folder-mode dead-link detection is slow** (observed 2026-07-18 while
+  verifying the wire unification): a sharer whose WebRTC-direct joiner dies
+  stays in the dead session well past 45s — heartbeat sends don't error
+  promptly on a dead data channel — so a NEW joiner can't connect until it
+  notices. Reconnect + catch-up work once it does (and across full restarts).
+  Fix candidates: a recv-idle timeout in `folder::session`, or surfacing
+  data-channel close from the WebRTC transport as a link error.
 
 ## Iteration 2 (added 2026-07-04)
 

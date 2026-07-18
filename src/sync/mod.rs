@@ -15,8 +15,10 @@
 //!
 //! (* planned stubs.) `pipe`/`mirror` are the original text-only paths;
 //! `strategy`/`algo`/`backing`/`manifest`/`workspace`/`folder` are folder-wide,
-//! per-resource, multi-algorithm sync (DESIGN.md §17). `tree` rides the shared
-//! core protocol instead, for wire-compatibility with browser peers.
+//! per-resource, multi-algorithm sync (DESIGN.md §17). `folder`, `tree`, and
+//! `mesh` all speak ONE wire protocol — postcard-encoded `core::sync::SyncMsg`
+//! (browser-compatible): tree/mesh use the text/LWW dialect, folder the
+//! strategy-channel dialect (`StratAdvert`/`StratDelta`).
 
 pub mod algo;
 pub mod backing;

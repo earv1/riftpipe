@@ -3556,6 +3556,7 @@ version = "0.0.0"
 dependencies = [
  "diamond-types",
  "getrandom 0.2.17",
+ "postcard",
  "serde",
  "similar",
 ]

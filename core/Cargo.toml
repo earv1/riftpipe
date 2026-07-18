@@ -13,6 +13,10 @@ diamond-types = "1.0.0"
 similar = "3.1.1"
 serde = { version = "1", features = ["derive"] }
 
+[dev-dependencies]
+# The wire-compat tests pin `SyncMsg`'s postcard layout (what deployed peers speak).
+postcard = { version = "1", features = ["alloc"] }
+
 # On wasm32, diamond-types' transitive `getrandom` (0.2) needs a browser entropy
 # source — enable its `js` backend. Native targets are unaffected.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

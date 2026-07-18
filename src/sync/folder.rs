@@ -6,20 +6,25 @@
 //! discovered by **watching** the filesystem (an OS event nudges a rescan;
 //! a slow poll stays on as a safety net) rather than read from stdin.
 //!
-//! ## Wire framing
-//! `[path_len: u16 LE][path bytes][tag: u8][payload]`. Tags:
-//!   * `DELTA`    — a patch to [`merge`](crate::sync::strategy::SyncStrategy::merge).
-//!   * `SYNCREQ`  — an advertisement that *expects a reply* (sent on connect,
-//!     on a local change, and on the heartbeat).
-//!   * `SYNCREP`  — an advertisement *in reply* to a `SYNCREQ` (no further
+//! ## Wire messages
+//! Folder mode speaks the ONE shared wire protocol — postcard-encoded
+//! [`riftpipe_core::sync::SyncMsg`], same as the tree/mesh drivers — via its
+//! **strategy channel**:
+//!   * `StratDelta`               — a patch to [`merge`](crate::sync::strategy::SyncStrategy::merge).
+//!   * `StratAdvert reply: true`  — an advertisement that *expects a reply*
+//!     (sent on connect, on a local change, and on the heartbeat).
+//!   * `StratAdvert reply: false` — an advertisement *in reply* (no further
 //!     reply, so the exchange can't ping-pong forever).
 //!
+//! Non-strategy variants (`Hello`, `TextDelta`, …) are ignored here, as the
+//! text/LWW `Syncer` ignores strategy messages — one envelope, two dialects.
+//!
 //! Why request/reply: a push-capable algorithm (text CRDT) ships its change
-//! immediately as a `DELTA`. A pull-only one (rsync) can't — it needs the
-//! peer's signatures first. So a local change also sends a `SYNCREQ`; the peer
-//! answers with a `SYNCREP` carrying *its* signatures, and we then compute and
-//! push the rsync `DELTA`. Receiving an unknown path auto-creates the resource
-//! (peer-driven discovery).
+//! immediately as a `StratDelta`. A pull-only one (rsync) can't — it needs the
+//! peer's signatures first. So a local change also sends an advert; the peer
+//! answers with *its* signatures, and we then compute and push the rsync
+//! delta. Receiving an unknown path auto-creates the resource (peer-driven
+//! discovery).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +34,8 @@ use notify::{RecursiveMode, Watcher};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, MissedTickBehavior};
 
+use riftpipe_core::sync::SyncMsg;
+
 use crate::net::secure::authenticate;
 use crate::net::negotiate::negotiate_session_halves;
 use crate::net::transport::{accept_link, connect_link};
@@ -36,37 +43,23 @@ use crate::net::{Counters, Result, Sink, Source};
 use crate::sync::pipe::{Role, SessionOutcome};
 use crate::sync::workspace::Workspace;
 
-const TAG_DELTA: u8 = 0;
-const TAG_SYNCREQ: u8 = 1;
-const TAG_SYNCREP: u8 = 2;
-
-fn frame(path: &str, tag: u8, payload: &[u8]) -> Vec<u8> {
-    let p = path.as_bytes();
-    let mut v = Vec::with_capacity(p.len() + payload.len() + 3);
-    v.extend_from_slice(&(p.len() as u16).to_le_bytes());
-    v.extend_from_slice(p);
-    v.push(tag);
-    v.extend_from_slice(payload);
-    v
+fn advert(path: &str, sv: Vec<u8>, reply: bool) -> Vec<u8> {
+    encode(&SyncMsg::StratAdvert { path: path.to_string(), sv, reply })
 }
 
-fn parse_frame(bytes: &[u8]) -> Option<(&str, u8, &[u8])> {
-    if bytes.len() < 3 {
-        return None;
-    }
-    let plen = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
-    if bytes.len() < 2 + plen + 1 {
-        return None;
-    }
-    let path = std::str::from_utf8(&bytes[2..2 + plen]).ok()?;
-    let tag = bytes[2 + plen];
-    Some((path, tag, &bytes[2 + plen + 1..]))
+fn delta(path: &str, bytes: Vec<u8>) -> Vec<u8> {
+    encode(&SyncMsg::StratDelta { path: path.to_string(), bytes })
+}
+
+fn encode(msg: &SyncMsg) -> Vec<u8> {
+    // postcard on an in-memory Vec cannot fail for these shapes.
+    postcard::to_allocvec(msg).expect("SyncMsg encodes")
 }
 
 /// Scan local backings for changes and push them — the shared body of the
 /// filesystem-watch arm and the fallback poll. Picks up newly-created files,
 /// then for each resource `observe`s its bytes; on a real change it pushes a
-/// `DELTA` and a `SYNCREQ`. Returns `false` if a send failed, so the caller
+/// delta and a reply-expecting advert. Returns `false` if a send failed, so the caller
 /// can treat that as `LinkClosed`. (Self-write safe: merging a remote change
 /// stores bytes that `observe` then reports as *unchanged*, so a scan triggered
 /// by our own write is a no-op — no echo, no extra dedup needed.)
@@ -87,11 +80,11 @@ async fn scan_local(ws: &mut Workspace, sink: &mut dyn Sink) -> bool {
         };
         if changed {
             if let Some(d) = push {
-                if sink.send(frame(&path, TAG_DELTA, &d)).await.is_err() {
+                if sink.send(delta(&path, d)).await.is_err() {
                     return false;
                 }
             }
-            if sink.send(frame(&path, TAG_SYNCREQ, &sv)).await.is_err() {
+            if sink.send(advert(&path, sv, true)).await.is_err() {
                 return false;
             }
         }
@@ -123,7 +116,7 @@ pub async fn session(
             Some(r) => r.strategy.state_vector(),
             None => continue,
         };
-        if sink.send(frame(&path, TAG_SYNCREQ, &sv)).await.is_err() {
+        if sink.send(advert(&path, sv, true)).await.is_err() {
             return Ok(SessionOutcome::LinkClosed);
         }
     }
@@ -153,30 +146,30 @@ pub async fn session(
                     Err(_) | Ok(None) => return Ok(SessionOutcome::LinkClosed),
                     Ok(Some(b)) => b,
                 };
-                let Some((path, tag, payload)) = parse_frame(&bytes) else { continue };
-                let path = path.to_string();
-                let payload = payload.to_vec();
+                // Undecodable or non-strategy messages are skipped, exactly as
+                // the tree/mesh drivers skip strategy messages — one envelope,
+                // two dialects, no cross-talk.
+                let Ok(msg) = postcard::from_bytes::<SyncMsg>(&bytes) else { continue };
                 let mut outgoing: Vec<Vec<u8>> = Vec::new();
-                if let Some(res) = ws.ensure(&path) {
-                    match tag {
-                        TAG_DELTA => {
-                            if let Some(nb) = res.strategy.merge(&payload) {
+                match msg {
+                    SyncMsg::StratDelta { path, bytes } => {
+                        if let Some(res) = ws.ensure(&path) {
+                            if let Some(nb) = res.strategy.merge(&bytes) {
                                 res.backing.store(&nb);
                             }
                         }
-                        TAG_SYNCREQ => {
-                            if let Some(d) = res.strategy.delta_since(&payload) {
-                                outgoing.push(frame(&path, TAG_DELTA, &d));
-                            }
-                            outgoing.push(frame(&path, TAG_SYNCREP, &res.strategy.state_vector()));
-                        }
-                        TAG_SYNCREP => {
-                            if let Some(d) = res.strategy.delta_since(&payload) {
-                                outgoing.push(frame(&path, TAG_DELTA, &d));
-                            }
-                        }
-                        _ => {}
                     }
+                    SyncMsg::StratAdvert { path, sv, reply } => {
+                        if let Some(res) = ws.ensure(&path) {
+                            if let Some(d) = res.strategy.delta_since(&sv) {
+                                outgoing.push(delta(&path, d));
+                            }
+                            if reply {
+                                outgoing.push(advert(&path, res.strategy.state_vector(), false));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 for f in outgoing {
                     if sink.send(f).await.is_err() {
@@ -190,7 +183,7 @@ pub async fn session(
                         Some(r) => r.strategy.state_vector(),
                         None => continue,
                     };
-                    if sink.send(frame(&path, TAG_SYNCREQ, &sv)).await.is_err() {
+                    if sink.send(advert(&path, sv, true)).await.is_err() {
                         return Ok(SessionOutcome::LinkClosed);
                     }
                 }
@@ -300,19 +293,27 @@ mod tests {
     }
 
     #[test]
-    fn frame_round_trips() {
-        let f = frame("docs/a.md", TAG_DELTA, b"payload");
-        let (p, t, pl) = parse_frame(&f).unwrap();
-        assert_eq!(p, "docs/a.md");
-        assert_eq!(t, TAG_DELTA);
-        assert_eq!(pl, b"payload");
-        // truncated frames don't panic
-        assert!(parse_frame(&f[..2]).is_some() || parse_frame(&f[..1]).is_none());
-        assert!(parse_frame(b"").is_none());
+    fn strategy_messages_round_trip_and_junk_is_skippable() {
+        let f = delta("docs/a.md", b"payload".to_vec());
+        match postcard::from_bytes::<SyncMsg>(&f).unwrap() {
+            SyncMsg::StratDelta { path, bytes } => {
+                assert_eq!(path, "docs/a.md");
+                assert_eq!(bytes, b"payload");
+            }
+            _ => panic!("expected StratDelta"),
+        }
+        let f = advert("docs/a.md", b"sv".to_vec(), true);
+        assert!(matches!(
+            postcard::from_bytes::<SyncMsg>(&f).unwrap(),
+            SyncMsg::StratAdvert { reply: true, .. }
+        ));
+        // Truncated/junk frames decode-fail (the session skips them, no panic).
+        assert!(postcard::from_bytes::<SyncMsg>(&f[..1]).is_err());
+        assert!(postcard::from_bytes::<SyncMsg>(&[0xff, 0xff]).is_err());
     }
 
-    /// Walk the REQ -> REP -> DELTA exchange (what `session` does) by hand and
-    /// confirm a file A holds lands on B's disk via rsync.
+    /// Walk the advert -> reply -> delta exchange (what `session` does) by hand
+    /// and confirm a file A holds lands on B's disk via rsync.
     #[test]
     fn one_file_syncs_from_a_to_b() {
         let ra = dir("a");
@@ -323,42 +324,68 @@ mod tests {
         let mut a = Workspace::new(&ra, Manifest::default(), false).unwrap();
         let mut b = Workspace::new(&rb, Manifest::default(), false).unwrap();
 
-        // A's poll: observe local file into its strategy, then advertise (REQ).
+        // A's poll: observe local file into its strategy, then advertise.
         let a_req = {
             let r = a.get_mut("a.bin").unwrap();
             let bytes = r.backing.load();
             assert!(r.strategy.observe(&bytes));
-            frame("a.bin", TAG_SYNCREQ, &r.strategy.state_vector())
+            advert("a.bin", r.strategy.state_vector(), true)
         };
 
-        // B receives REQ: nothing to push (B is empty) -> replies REP(empty).
+        // B receives the advert: nothing to push (B is empty) -> replies with
+        // its own (empty) advertisement.
         let b_rep = {
-            let (path, tag, payload) = parse_frame(&a_req).unwrap();
-            assert_eq!(tag, TAG_SYNCREQ);
-            let r = b.ensure(path).unwrap();
-            assert!(r.strategy.delta_since(payload).is_none());
-            frame(path, TAG_SYNCREP, &r.strategy.state_vector())
+            let Ok(SyncMsg::StratAdvert { path, sv, reply: true }) =
+                postcard::from_bytes::<SyncMsg>(&a_req)
+            else {
+                panic!("expected a reply-expecting StratAdvert")
+            };
+            let r = b.ensure(&path).unwrap();
+            assert!(r.strategy.delta_since(&sv).is_none());
+            advert(&path, r.strategy.state_vector(), false)
         };
 
-        // A receives REP: computes the rsync delta for B and pushes DELTA.
+        // A receives the reply: computes the rsync delta for B and pushes it.
         let a_delta = {
-            let (path, _tag, payload) = parse_frame(&b_rep).unwrap();
-            let r = a.get_mut(path).unwrap();
-            let d = r.strategy.delta_since(payload).expect("A has content B lacks");
-            frame(path, TAG_DELTA, &d)
+            let Ok(SyncMsg::StratAdvert { path, sv, reply: false }) =
+                postcard::from_bytes::<SyncMsg>(&b_rep)
+            else {
+                panic!("expected a no-reply StratAdvert")
+            };
+            let r = a.get_mut(&path).unwrap();
+            let d = r.strategy.delta_since(&sv).expect("A has content B lacks");
+            delta(&path, d)
         };
 
-        // B receives DELTA: merges and writes to disk.
+        // B receives the delta: merges and writes to disk.
         {
-            let (path, tag, payload) = parse_frame(&a_delta).unwrap();
-            assert_eq!(tag, TAG_DELTA);
-            let r = b.ensure(path).unwrap();
-            let nb = r.strategy.merge(payload).expect("B materializes content");
+            let Ok(SyncMsg::StratDelta { path, bytes }) = postcard::from_bytes::<SyncMsg>(&a_delta)
+            else {
+                panic!("expected StratDelta")
+            };
+            let r = b.ensure(&path).unwrap();
+            let nb = r.strategy.merge(&bytes).expect("B materializes content");
             r.backing.store(&nb);
         }
 
         assert_eq!(std::fs::read(rb.join("a.bin")).unwrap(), content);
         std::fs::remove_dir_all(&ra).ok();
         std::fs::remove_dir_all(&rb).ok();
+    }
+
+    /// A non-strategy message (the tree dialect) arriving on a folder session
+    /// must be ignored — no resource created, no reply. (The session loop's
+    /// `_ => {}` arm; here we just pin that the dialects are distinguishable.)
+    #[test]
+    fn tree_dialect_messages_are_not_strategy_messages() {
+        let hello = postcard::to_allocvec(&SyncMsg::Hello {
+            versions: vec![],
+            lww_versions: vec![],
+        })
+        .unwrap();
+        assert!(!matches!(
+            postcard::from_bytes::<SyncMsg>(&hello).unwrap(),
+            SyncMsg::StratAdvert { .. } | SyncMsg::StratDelta { .. }
+        ));
     }
 }

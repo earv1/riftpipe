@@ -601,15 +601,17 @@ something else reads it.
 - **Workspace** (`sync::workspace`) — scans the tree (skips dotfiles, the
   manifest, `.ticket`s), binds each file to a `SyncStrategy` + a backing; unimplemented
   kinds are skipped (a stub never panics a live session).
-- **Multiplexed session** (`sync::folder`) — one link, many resources. Frame =
-  `[path_len u16][path][tag][payload]`; tags `DELTA` / `SYNCREQ` / `SYNCREP`.
-  Local changes are found by **polling** the backings (200ms); an unknown path in
-  an inbound frame **auto-creates** the resource (peer-driven discovery). Same
+- **Multiplexed session** (`sync::folder`) — one link, many resources. Speaks
+  the shared wire protocol (postcard-encoded `core::sync::SyncMsg`) via its
+  **strategy channel**: `StratDelta` (opaque patch → merge) and `StratAdvert`
+  (opaque state advertisement, with a reply-expected flag). Local changes are
+  found by **watching** the tree (slow poll as fallback); an unknown path in an
+  inbound message **auto-creates** the resource (peer-driven discovery). Same
   reconnect loop as `--pipe`.
-- **Request/reply advertising** — a local change sends `SYNCREQ`; the peer
-  answers `SYNCREP` with *its* signatures so a pull-only algorithm (rsync) can
-  then push its `DELTA`. `REP` is never replied to, so it can't ping-pong; the
-  heartbeat re-`REQ`s every 5s.
+- **Request/reply advertising** — a local change sends a reply-expecting
+  advert; the peer answers with *its* signatures (`reply: false`) so a
+  pull-only algorithm (rsync) can then push its delta. A reply is never replied
+  to, so it can't ping-pong; the heartbeat re-advertises every 5s.
 - **`--memory`** holds resources in RAM (seeded once from disk) instead of
   mirroring to disk; **`--process <path>`** writes the §17.6 size+hash file.
 
