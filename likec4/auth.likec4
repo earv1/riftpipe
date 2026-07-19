@@ -1,0 +1,58 @@
+// Planned auth model: centralized ISSUANCE (a provider vouches for who you are,
+// touched once to get a capability) + decentralized OFFLINE VERIFICATION (peers
+// check the capability locally, data stays P2P). Rendered by `npm run diagrams`
+// and embedded in docs/planned/auth.md. NOT built yet.
+
+// Element kinds (actor/system/component/artifact) are declared once, project-wide,
+// in security.likec4 — LikeC4 treats all files here as one model.
+
+model {
+  enduser = actor 'User' {
+    description 'Brings an identity they already have. Never registers a riftpipe account.'
+  }
+
+  issuance = system 'Control plane — issuance (touched once, to get a capability)' {
+    passkey = component 'Passkey / WebAuthn — DEFAULT' {
+      description 'No company, no setup, in every browser + OS. A device-held keypair = a self-sovereign identity. Verified in-core with pure-Rust p256/ed25519-dalek (ES256/EdDSA). The cemented not-big-tech default.'
+    }
+    nostr = component 'Nostr (NIP-07) — optional' {
+      description 'Bring-your-own-key: a portable, cross-app self-sovereign secp256k1 identity via a browser extension. Verified pure-Rust via k256. For when cross-app portability matters.'
+    }
+    google = component 'Google (OIDC + PKCE) — optional' {
+      description 'Only for real-account gating. Public client_id (safe to commit), NO secret, NO server. ID token verified offline against Google JWKS.'
+    }
+    capability = artifact 'Capability (Biscuit)' {
+      description 'Signed by a ROOT key. Binds a role (e.g. board:X writer) to the user identity keypair. Offline-verifiable, attenuable, delegatable.'
+    }
+  }
+
+  meshplane = system 'Data plane — P2P (offline, never needs a provider)' {
+    verify = component 'Offline capability verify' {
+      description 'core (wasm + native) checks the Biscuit against the embedded ROOT public key. No server round-trip.'
+    }
+    signedwrites = component 'Signed writes' {
+      description 'Each write signed by the identity keypair; peers accept only what the capability authorizes.'
+    }
+    sealedmesh = component 'Sealed mesh (shipped)' {
+      description 'topic = H(secret), AEAD frames (SECURITY.md). Sync is P2P over iroh — no server in the data path.'
+    }
+  }
+
+  enduser -> issuance.passkey 'holds a passkey (default)'
+  enduser -> issuance.nostr 'or brings a Nostr key'
+  enduser -> issuance.google 'or a Google account'
+  issuance.passkey -> issuance.capability 'identity → sign a capability'
+  issuance.nostr -> issuance.capability 'identity → sign a capability'
+  issuance.google -> issuance.capability 'identity → sign a capability'
+  issuance.capability -> meshplane.verify 'presented to peers'
+  meshplane.verify -> meshplane.signedwrites 'gates'
+  meshplane.signedwrites -> meshplane.sealedmesh 'ride the sealed mesh'
+}
+
+views {
+  view auth_planes {
+    title 'Auth (planned): centralized issuance, decentralized offline verification'
+    include enduser, issuance, issuance.*, meshplane, meshplane.*
+    autoLayout LeftRight
+  }
+}

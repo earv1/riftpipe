@@ -257,6 +257,14 @@ entirely — the wasm payload is the app's backend. What remains:
   via the origin-conflict rule. A per-message Ed25519 signature makes
   authorship provable; a signing key distinct from the read/seal key enables
   view-only links. See `SECURITY.md` §"the insider gap".
+- **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md) (not built).
+  Two planes: centralized *issuance* (an identity vouches for you, touched once)
+  + decentralized *offline* verification (peers check a Biscuit capability
+  against a root public key; data stays P2P). **Cemented identity: passkeys /
+  WebAuthn** — no company, no hosting, no committed secret, verified in-core with
+  pure-Rust `p256`/`ed25519-dalek`; **Google (OIDC + PKCE)** optional for
+  real-account gating. Build order: signing → Biscuit capabilities → passkey
+  front door → membership/roles → read-key rotation.
 
 ## Iteration 2 (added 2026-07-04)
 
