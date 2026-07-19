@@ -199,6 +199,9 @@ export async function newBoard(): Promise<void> {
     await root.removeEntry(name, { recursive: true }).catch(() => {});
   }
   localStorage.removeItem("riftpipe:iroh_sk");
+  // Drop the board secret too: a new board must mint a fresh secret, so it gets
+  // a new topic (H(secret)) and a brand-new, unrelated share link.
+  localStorage.removeItem("riftpipe:board_secret");
   location.hash = "";
   location.reload();
 }

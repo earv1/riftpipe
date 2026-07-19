@@ -34,7 +34,11 @@ pub fn is_text_path(path: &str) -> bool {
 /// v0 is implicit — peers that predate versioning never announce (detected
 /// via [`VersionMonitor::on_presence`]). v1: the strategy channel
 /// (`StratAdvert`/`StratDelta`), mesh chunking, and version announcements.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2: mesh security (`crypto`) — topic = `H(secret)` and AEAD-sealed frames;
+/// a v2 board's topic differs from v1's, so v1/v2 peers land on different
+/// topics and simply don't meet (changing the rendezvous is inherent to
+/// blinding it), rather than meeting and mismatching.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Per-chunk payload budget for [`encode_mesh_frames`]. iroh-gossip's message
 /// limit defaults to 4096 bytes and is enforced on SEND AND RECEIVE — so

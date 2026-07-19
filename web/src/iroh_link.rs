@@ -48,14 +48,18 @@ pub async fn wait_for_addr(ep: &Endpoint) -> EndpointAddr {
     ep.addr()
 }
 
-/// Encode a dialable address as a shareable ticket string (postcard + hex).
-pub fn ticket_of(addr: &EndpointAddr) -> String {
-    let bytes = postcard::to_allocvec(addr).unwrap_or_default();
+/// Encode a share ticket: `hex(postcard((secret, addr)))`. The 32-byte board
+/// **secret** both names the gossip topic (`H(secret)`) and keys the frame
+/// cipher, so possession of the ticket is what grants access (see `SECURITY.md`).
+/// Byte-identical to the native `encode_mesh_ticket`, so a browser link opens on
+/// the CLI and vice versa.
+pub fn ticket_of(secret: &[u8; 32], addr: &EndpointAddr) -> String {
+    let bytes = postcard::to_allocvec(&(secret, addr)).unwrap_or_default();
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Decode a ticket string back into a dialable address.
-pub fn addr_of(ticket: &str) -> Result<EndpointAddr, String> {
+/// Decode a share ticket into `(secret, addr)` — the inverse of [`ticket_of`].
+pub fn parse_ticket(ticket: &str) -> Result<([u8; 32], EndpointAddr), String> {
     let bytes: Vec<u8> = (0..ticket.len() / 2)
         .map(|i| u8::from_str_radix(&ticket[i * 2..i * 2 + 2], 16))
         .collect::<Result<_, _>>()

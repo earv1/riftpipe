@@ -63,7 +63,7 @@ thread_local! {
 #[wasm_bindgen(js_name = irohConnect)]
 pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result<JsValue, JsValue> {
     use crate::gossip::{GossipTreeSync, Mesh};
-    use crate::iroh_link::{addr_of, ticket_of};
+    use crate::iroh_link::{parse_ticket, ticket_of};
     let on_merged = opfs_on_merged(on_change);
     let sk = load_or_create_secret_key();
     let my_id = sk.public();
@@ -72,18 +72,31 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
     // rebinding under the same persisted identity.
     crate::gossip::clear_active().await;
 
-    // Host when there's no ticket, OR the ticket is our own — the host defines the
-    // topic; everyone else joins the same swarm and it's no longer special.
-    let host = ticket.is_empty() || addr_of(&ticket).map(|a| a.id == my_id).unwrap_or(false);
+    // Parse an incoming link into (board secret, host address). We host when
+    // there's no link, OR the link is our OWN (its address is us — a reloaded
+    // host recognizing its share link). The board SECRET — not our endpoint id —
+    // now defines the topic + frame cipher.
+    let parsed = if ticket.is_empty() { None } else { parse_ticket(&ticket).ok() };
+    let is_host = match &parsed {
+        Some((_, addr)) => addr.id == my_id,
+        None => true,
+    };
 
-    let (mesh, my_ticket) = if host {
-        let mesh = Mesh::join(sk, my_id, None).await.map_err(|e| JsValue::from_str(&e))?;
+    let (mesh, my_ticket) = if is_host {
+        // Our own link is authoritative for the secret if present (survives a
+        // localStorage wipe that kept the URL); else persist-or-mint one.
+        let secret = match &parsed {
+            Some((s, _)) => *s,
+            None => load_or_create_board_secret(),
+        };
+        persist_board_secret(&secret);
+        let mesh = Mesh::join(sk, secret, None).await.map_err(|e| JsValue::from_str(&e))?;
         let addr = mesh.wait_for_addr().await;
-        (mesh, Some(ticket_of(&addr)))
+        (mesh, Some(ticket_of(&secret, &addr)))
     } else {
-        let addr = addr_of(&ticket).map_err(|e| JsValue::from_str(&e))?;
-        let host_id = addr.id;
-        let mesh = Mesh::join(sk, host_id, Some(addr)).await.map_err(|e| JsValue::from_str(&e))?;
+        // Joiner: the link carries everything — the secret and the host to dial.
+        let (secret, addr) = parsed.unwrap();
+        let mesh = Mesh::join(sk, secret, Some(addr)).await.map_err(|e| JsValue::from_str(&e))?;
         (mesh, None)
     };
 
@@ -110,6 +123,35 @@ pub(crate) fn load_or_create_secret_key() -> iroh::SecretKey {
         let _ = store.set_item(STORE_KEY, &to_hex(&sk.to_bytes()));
     }
     sk
+}
+
+/// localStorage key for the persisted board secret.
+const BOARD_SECRET_KEY: &str = "riftpipe:board_secret";
+
+/// Load the host's persisted board secret from localStorage, or mint + store
+/// one. Persisting it keeps the board's topic (`H(secret)`) — and so the share
+/// link — stable across reloads, exactly as [`load_or_create_secret_key`] keeps
+/// the endpoint identity stable.
+pub(crate) fn load_or_create_board_secret() -> [u8; 32] {
+    let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
+    if let Some(store) = &storage {
+        if let Ok(Some(hex)) = store.get_item(BOARD_SECRET_KEY) {
+            if let Some(bytes) = hex32(&hex) {
+                return bytes;
+            }
+        }
+    }
+    let secret = riftpipe_core::crypto::generate_secret();
+    persist_board_secret(&secret);
+    secret
+}
+
+/// Persist `secret` as the board secret (so a reloaded host keeps the same
+/// topic + link).
+pub(crate) fn persist_board_secret(secret: &[u8; 32]) {
+    if let Some(store) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = store.set_item(BOARD_SECRET_KEY, &to_hex(secret));
+    }
 }
 
 fn to_hex(bytes: &[u8]) -> String {

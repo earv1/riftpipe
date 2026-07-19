@@ -234,29 +234,29 @@ entirely — the wasm payload is the app's backend. What remains:
   tickets, identity, reconnect, merge all live in the library; the TS app
   only renders.
 
-## Security / trust (thinking, deliberately not built yet)
+## Security / trust — see `SECURITY.md`
 
-- **Board access control is possession of the share link, nothing more** —
-  and the mesh link is weaker than the point-to-point one. `share`/`join`
-  tickets carry a secret and the link runs `authenticate()` (challenge +
-  E2E encryption); the MESH ticket is a bare `EndpointAddr` — no secret —
-  and the topic id is just the host's public EndpointId. Anyone holding the
-  link (or, once DHT/pkarr discovery lands, anyone who learns the host's
-  id) can join, read everything, and write anything. Within the swarm there
-  is no authorization or authenticity either: gossip's `delivered_from` is
-  the relay, not the author, so any member can forge `Presence`/`Version`
-  for others, clobber structural files by broadcasting `Lww` with
-  `version=u64::MAX` (a permanent freeze — LWW versions are unvalidated
-  wall-clock ms), or replace a whole text doc via the origin-conflict
-  adoption rule (craft a doc with a higher origin agent id). Candidate
-  directions when we build this: put a symmetric secret in the link
-  fragment and derive the topic id from a hash of it (unguessable topic,
-  closes the DHT-discovery hole) + AEAD every `MeshMsg` with it (relay sees
-  nothing, non-holders can't inject); sign messages with the endpoint key
-  for authorship; split read vs write capabilities (two keys); clamp
-  received LWW versions to `now + ε`; rekey (new secret ⇒ new topic ⇒ new
-  link) as revocation. Nothing here is load-bearing yet — today the honest
-  answer is: the URL is the only lock, guard it accordingly.
+- ~~Mesh sealing (first cut): secret-derived topic + AEAD frames~~ — *done
+  (2026-07-19, `PROTOCOL_VERSION` 2).* The share ticket now carries a 32-byte
+  random **secret** (`hex(postcard((secret, addr)))`, native + browser
+  identical). `core::crypto`: `topic = blake3::derive_key(…, secret)` (blinds
+  the rendezvous — a stranger with the host's public key, or a future DHT,
+  can't derive the topic) and every gossip frame is AEAD-sealed with a
+  domain-separated `KDF(secret)` (XChaCha20-Poly1305, random 192-bit nonce, no
+  cross-peer coordination). Both mesh drivers seal on send / open on receive,
+  after chunking so it composes with the 4 KiB framing. The web host persists
+  `riftpipe:board_secret` so the topic is stable across reloads; "New board"
+  clears it (new secret ⇒ new topic ⇒ new link — the rotation-as-revocation
+  shape). Verified: a wrong-secret ticket lands on a different topic and never
+  syncs; a 12 KB file syncs sealed+chunked; the browser↔CLI `board-cli-mesh`
+  e2e passes end-to-end sealed.
+- **Signing (insider authenticity) + read/write split** — the next step, NOT
+  yet built. Sealing stops outsiders, but one shared symmetric key means any
+  *holder* can still forge `Presence`/`Version`, freeze a file (`Lww`
+  `version=u64::MAX` — clamp received LWW to `now + ε` too), or replace a doc
+  via the origin-conflict rule. A per-message Ed25519 signature makes
+  authorship provable; a signing key distinct from the read/seal key enables
+  view-only links. See `SECURITY.md` §"the insider gap".
 
 ## Iteration 2 (added 2026-07-04)
 

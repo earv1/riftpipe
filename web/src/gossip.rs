@@ -3,10 +3,13 @@
 //! and survives any peer leaving. The N-peer-safe merge in `riftpipe_core::sync`
 //! handles convergence; this module is just the transport + membership.
 //!
-//! Topology: the topic is the *host* EndpointId (32 bytes), so everyone opening the
-//! same share link lands on the same topic. A joiner seeds the host's address (from
-//! the ticket) into a memory lookup and bootstraps off it; after that, gossip
-//! membership spreads and the host is no longer special.
+//! Topology: the topic is `H(board secret)` (32 bytes), so everyone opening the
+//! same share link lands on the same topic — and a stranger who only knows the
+//! host's public key cannot derive it (see `core::crypto` / `SECURITY.md`). A
+//! joiner seeds the host's address (from the ticket) into a memory lookup and
+//! bootstraps off it; after that, gossip membership spreads and the host is no
+//! longer special. Every frame is AEAD-sealed with a key derived from the same
+//! secret, so the relay and non-holders see only ciphertext.
 
 use futures_util::StreamExt;
 use iroh::address_lookup::MemoryLookup;
@@ -17,9 +20,10 @@ use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
 
-/// The topic for a tree hosted by `host` — deterministic, so all peers agree.
-pub fn topic_of(host: EndpointId) -> TopicId {
-    TopicId::from_bytes(*host.as_bytes())
+/// The gossip topic for a board secret — `H(secret)`, underivable without the
+/// share link. Identical to the native `sync::mesh::topic_of`.
+pub fn topic_of(secret: &[u8; 32]) -> TopicId {
+    TopicId::from_bytes(riftpipe_core::crypto::topic_from_secret(secret))
 }
 
 /// A joined gossip mesh for one shared tree: broadcast bytes to everyone, receive a
@@ -35,14 +39,19 @@ pub struct Mesh {
     /// neighbor loss can re-join it: hyparview heals only from its passive
     /// view and never re-dials the original bootstrap on its own.
     bootstrap: Option<EndpointId>,
+    /// Seals/opens every gossip frame with the key derived from the board
+    /// secret — the relay and non-holders see only ciphertext.
+    cipher: riftpipe_core::crypto::MeshCipher,
 }
 
 impl Mesh {
-    /// Join the mesh for `host`'s tree. `bootstrap` is the host's address (from the
-    /// ticket) for a joiner, or `None` for the host itself (it starts the swarm).
+    /// Join the board identified by `secret`. `bootstrap` is the host's address
+    /// (from the ticket) for a joiner, or `None` for the host itself (it starts
+    /// the swarm). The `secret` both names the topic (`H(secret)`) and keys the
+    /// frame cipher, so only link-holders find and can read the board.
     pub async fn join(
         sk: SecretKey,
-        host: EndpointId,
+        secret: [u8; 32],
         bootstrap: Option<EndpointAddr>,
     ) -> Result<Mesh, String> {
         let my_id = sk.public();
@@ -68,10 +77,11 @@ impl Mesh {
             .spawn();
         let bootstrap = boot.first().copied();
         let topic = gossip
-            .subscribe(topic_of(host), boot)
+            .subscribe(topic_of(&secret), boot)
             .await
             .map_err(|e| e.to_string())?;
         let (sender, receiver) = topic.split();
+        let cipher = riftpipe_core::crypto::MeshCipher::from_secret(&secret);
         Ok(Mesh {
             endpoint,
             _router: router,
@@ -80,6 +90,7 @@ impl Mesh {
             receiver,
             my_id,
             bootstrap,
+            cipher,
         })
     }
 
@@ -121,13 +132,23 @@ impl Mesh {
     }
 
     /// Split into a broadcast sender, an event receiver, the bootstrap peer
-    /// (for a re-join after total neighbor loss), and a keep-alive handle
-    /// (the endpoint/router/gossip must outlive both).
-    fn into_parts(self) -> (GossipSender, GossipReceiver, Option<EndpointId>, MeshKeepAlive) {
+    /// (for a re-join after total neighbor loss), the frame cipher (shared —
+    /// the recv task and the push path both seal/open with it), and a keep-alive
+    /// handle (the endpoint/router/gossip must outlive both).
+    fn into_parts(
+        self,
+    ) -> (
+        GossipSender,
+        GossipReceiver,
+        Option<EndpointId>,
+        std::rc::Rc<riftpipe_core::crypto::MeshCipher>,
+        MeshKeepAlive,
+    ) {
         (
             self.sender,
             self.receiver,
             self.bootstrap,
+            std::rc::Rc::new(self.cipher),
             MeshKeepAlive { _endpoint: self.endpoint, _router: self._router, _gossip: self._gossip },
         )
     }
@@ -158,6 +179,7 @@ use riftpipe_core::sync::MeshMsg;
 pub struct GossipTreeSync {
     syncer: std::rc::Rc<std::cell::RefCell<riftpipe_core::sync::Syncer>>,
     sender: GossipSender,
+    cipher: std::rc::Rc<riftpipe_core::crypto::MeshCipher>,
     neighbors: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<[u8; 32]>>>,
     routing: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<[u8; 32], Vec<[u8; 32]>>>>,
     versions: std::rc::Rc<std::cell::RefCell<riftpipe_core::sync::VersionMonitor>>,
@@ -195,26 +217,39 @@ impl GossipTreeSync {
         use std::cell::RefCell;
         use std::rc::Rc;
         let my_id = *mesh.my_id().as_bytes();
-        let (sender, mut receiver, bootstrap, keep) = mesh.into_parts();
+        let (sender, mut receiver, bootstrap, cipher, keep) = mesh.into_parts();
         let agent = format!("g{:08x}", (js_sys::Math::random() * 4_294_967_296.0) as u32);
         let syncer = Rc::new(RefCell::new(riftpipe_core::sync::Syncer::new(agent)));
         let neighbors = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
         let routing = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
         let versions = Rc::new(RefCell::new(riftpipe_core::sync::VersionMonitor::new()));
 
-        let (sy, nb, rt, vs, snd) =
-            (syncer.clone(), neighbors.clone(), routing.clone(), versions.clone(), sender.clone());
+        let (sy, nb, rt, vs, snd, cph) = (
+            syncer.clone(),
+            neighbors.clone(),
+            routing.clone(),
+            versions.clone(),
+            sender.clone(),
+            cipher.clone(),
+        );
         wasm_bindgen_futures::spawn_local(async move {
             // A failed send must not kill the session, but it must be VISIBLE —
             // a silently dropped broadcast reads as "synced". Big messages go
-            // out as chunk frames, each under the library's 4 KiB limit.
-            async fn send(snd: &GossipSender, gm: &MeshMsg, neighbors_only: bool) {
+            // out as chunk frames (each under the 4 KiB limit), and every frame
+            // is AEAD-sealed so only link-holders can read/inject.
+            async fn send(
+                snd: &GossipSender,
+                cph: &riftpipe_core::crypto::MeshCipher,
+                gm: &MeshMsg,
+                neighbors_only: bool,
+            ) {
                 for b in riftpipe_core::sync::encode_mesh_frames(gm) {
-                    let n = b.len();
+                    let sealed = cph.seal(&b);
+                    let n = sealed.len();
                     let r = if neighbors_only {
-                        snd.broadcast_neighbors(b.into()).await
+                        snd.broadcast_neighbors(sealed.into()).await
                     } else {
-                        snd.broadcast(b.into()).await
+                        snd.broadcast(sealed.into()).await
                     };
                     if let Err(e) = r {
                         web_sys::console::warn_1(
@@ -233,8 +268,11 @@ impl GossipTreeSync {
             while let Some(Ok(ev)) = receiver.next().await {
                 match ev {
                     Event::Received(m) => {
-                        // Plain frames pass through; chunk frames buffer until whole.
-                        let Some(gm) = assembler.feed(&m.content) else { continue };
+                        // Open the sealed frame (an outsider's or a corrupt frame
+                        // won't decrypt — drop it). Then plain frames pass through
+                        // and chunk frames buffer until whole.
+                        let Some(plain) = cph.open(&m.content) else { continue };
+                        let Some(gm) = assembler.feed(&plain) else { continue };
                         match gm {
                             MeshMsg::Sync(msg) => {
                                 let (persist, replies) = sy.borrow_mut().apply(msg);
@@ -242,7 +280,7 @@ impl GossipTreeSync {
                                     on_merged(path, bytes);
                                 }
                                 for r in replies {
-                                    send(&snd, &MeshMsg::Sync(r), false).await;
+                                    send(&snd, &cph, &MeshMsg::Sync(r), false).await;
                                 }
                             }
                             MeshMsg::Presence { id, neighbors } => {
@@ -270,21 +308,21 @@ impl GossipTreeSync {
                         // that ordering is what lets peers deduce "Presence
                         // but no Version = pre-versioning peer".
                         let ours = riftpipe_core::sync::PROTOCOL_VERSION;
-                        send(&snd, &MeshMsg::Version { id: my_id, proto: ours }, false).await;
+                        send(&snd, &cph, &MeshMsg::Version { id: my_id, proto: ours }, false).await;
                         // Catch the new neighbor up with our whole tree —
                         // direct neighbors only; the swarm doesn't need it.
                         let full = sy.borrow().full_state();
                         for msg in full {
-                            send(&snd, &MeshMsg::Sync(msg), true).await;
+                            send(&snd, &cph, &MeshMsg::Sync(msg), true).await;
                         }
                         let list = snapshot(&receiver);
                         *nb.borrow_mut() = list.iter().copied().collect();
                         rt.borrow_mut().insert(my_id, list.clone());
-                        send(&snd, &MeshMsg::Presence { id: my_id, neighbors: list }, false).await;
+                        send(&snd, &cph, &MeshMsg::Presence { id: my_id, neighbors: list }, false).await;
                     }
                     Event::NeighborDown(_) => {
                         let ours = riftpipe_core::sync::PROTOCOL_VERSION;
-                        send(&snd, &MeshMsg::Version { id: my_id, proto: ours }, false).await;
+                        send(&snd, &cph, &MeshMsg::Version { id: my_id, proto: ours }, false).await;
                         let list = snapshot(&receiver);
                         *nb.borrow_mut() = list.iter().copied().collect();
                         // Total neighbor loss: hyparview refills only from its
@@ -301,7 +339,7 @@ impl GossipTreeSync {
                             }
                         }
                         rt.borrow_mut().insert(my_id, list.clone());
-                        send(&snd, &MeshMsg::Presence { id: my_id, neighbors: list }, false).await;
+                        send(&snd, &cph, &MeshMsg::Presence { id: my_id, neighbors: list }, false).await;
                     }
                     Event::Lagged => {}
                 }
@@ -322,7 +360,7 @@ impl GossipTreeSync {
             }
         });
 
-        GossipTreeSync { syncer, sender, neighbors, routing, versions, _keep: keep }
+        GossipTreeSync { syncer, sender, cipher, neighbors, routing, versions, _keep: keep }
     }
 
     pub fn push_text(&self, path: &str, content: &str) {
@@ -340,10 +378,12 @@ impl GossipTreeSync {
     fn broadcast(&self, gm: MeshMsg) {
         let frames = riftpipe_core::sync::encode_mesh_frames(&gm);
         let sender = self.sender.clone();
+        let cipher = self.cipher.clone();
         wasm_bindgen_futures::spawn_local(async move {
             for b in frames {
-                let n = b.len();
-                if let Err(e) = sender.broadcast(b.into()).await {
+                let sealed = cipher.seal(&b);
+                let n = sealed.len();
+                if let Err(e) = sender.broadcast(sealed.into()).await {
                     web_sys::console::warn_1(
                         &format!("[mesh] broadcast of {n} bytes failed: {e}").into(),
                     );
@@ -482,9 +522,11 @@ mod tests {
     /// over n0's relay. Needs network.
     #[wasm_bindgen_test]
     async fn gossip_roundtrip_two_peers() {
+        // A shared board secret (would ride the share link) derives the topic +
+        // frame cipher for both peers.
+        let secret = riftpipe_core::crypto::generate_secret();
         let host_sk = SecretKey::generate();
-        let host_id = host_sk.public();
-        let mut host = Mesh::join(host_sk, host_id, None).await.expect("host join");
+        let mut host = Mesh::join(host_sk, secret, None).await.expect("host join");
         for _ in 0..200 {
             if !host.addr().addrs.is_empty() {
                 break;
@@ -493,7 +535,7 @@ mod tests {
         }
 
         let join_sk = SecretKey::generate();
-        let mut joiner = Mesh::join(join_sk, host_id, Some(host.addr()))
+        let mut joiner = Mesh::join(join_sk, secret, Some(host.addr()))
             .await
             .expect("joiner join");
 
@@ -527,9 +569,9 @@ mod tests {
         use std::cell::RefCell;
         use std::rc::Rc;
 
+        let secret = riftpipe_core::crypto::generate_secret();
         let host_sk = SecretKey::generate();
-        let host_id = host_sk.public();
-        let host_mesh = Mesh::join(host_sk, host_id, None).await.expect("host");
+        let host_mesh = Mesh::join(host_sk, secret, None).await.expect("host");
         for _ in 0..200 {
             if !host_mesh.addr().addrs.is_empty() {
                 break;
@@ -540,7 +582,7 @@ mod tests {
         let host_bs = GossipTreeSync::new(host_mesh, Rc::new(|_, _| {}));
 
         let join_sk = SecretKey::generate();
-        let joiner_mesh = Mesh::join(join_sk, host_id, Some(host_addr)).await.expect("joiner");
+        let joiner_mesh = Mesh::join(join_sk, secret, Some(host_addr)).await.expect("joiner");
         let got: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::new(RefCell::new(Vec::new()));
         let g = got.clone();
         let _joiner_bs =

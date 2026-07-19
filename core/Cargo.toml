@@ -14,6 +14,12 @@ similar = "3.1.1"
 serde = { version = "1", features = ["derive"] }
 # The mesh chunker encodes/splits `MeshMsg` frames; also pins wire compat in tests.
 postcard = { version = "1", features = ["alloc"] }
+# Mesh crypto (SECURITY.md "first cut"): board secret -> topic + sealed frames.
+# blake3 for domain-separated key derivation; XChaCha20-Poly1305 (24-byte nonce,
+# so random per-message nonces are safe with no cross-peer coordination) for AEAD.
+blake3 = { version = "1", default-features = false }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+getrandom = "0.2"
 
 # On wasm32, diamond-types' transitive `getrandom` (0.2) needs a browser entropy
 # source — enable its `js` backend. Native targets are unaffected.

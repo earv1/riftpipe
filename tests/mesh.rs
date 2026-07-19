@@ -28,8 +28,12 @@ async fn native_peers_converge_over_gossip_mesh() {
     let da = dir("a");
     let db = dir("b");
 
-    // Peer A = the browser-host role: swarm keyed by its own id, no bootstrap.
-    let host = MeshConn::join(None, None).await.expect("host join");
+    // A shared board secret: it derives the topic (H(secret)) and the frame
+    // cipher, so both peers must hold the same one — exactly what the share
+    // ticket carries. Peer A = host role (no bootstrap); B joins with the same
+    // secret + A's address.
+    let secret = riftpipe_core::crypto::generate_secret();
+    let host = MeshConn::join(secret, None).await.expect("host join");
     // Acquire a relay home + direct addresses so the addr is dialable, like the
     // browser's wait_for_addr / networking.rs's online() preamble.
     let _ = tokio::time::timeout(Duration::from_secs(10), host.endpoint().online()).await;
@@ -65,7 +69,7 @@ async fn native_peers_converge_over_gossip_mesh() {
     let (db_task, addr) = (db.clone(), host_addr.clone());
     let b_task = tokio::spawn(async move {
         let mut peer = TreePeer::new();
-        let _ = riftpipe::sync::mesh::join_and_run(addr, &db_task, &mut peer, &mut rx_b, false).await;
+        let _ = riftpipe::sync::mesh::join_and_run(secret, addr, &db_task, &mut peer, &mut rx_b, false).await;
     });
 
     // Converged when A's file is on B's disk and B's file on A's.

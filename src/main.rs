@@ -317,15 +317,16 @@ async fn join(ticket: &str, file: &str, opts: &Opts) -> riftpipe::net::Result<()
 async fn connect_dial(target: &str, dir: &str, opts: &Opts) -> riftpipe::net::Result<()> {
     // A share link carries the ticket in its URL fragment (after the LAST '#').
     let target = target.rsplit('#').next().unwrap_or(target);
-    if let Some(addr) = decode_mesh_ticket(target) {
-        // Browser mesh path: join the folder's gossip swarm as a native peer.
+    if let Some((secret, addr)) = decode_mesh_ticket(target) {
+        // Browser mesh path: join the board's sealed gossip swarm as a native
+        // peer. The secret from the ticket derives the topic + frame cipher.
         // (No --metrics here yet: the metrics side-car reports a single peer's
         // connection_kind, which doesn't fit a swarm — phase 2.)
         let dir = riftpipe::sync::tree::prepare_dir(std::path::Path::new(dir))?;
         let (watcher, mut rx) = riftpipe::sync::tree::watch(&dir);
         let mut peer = riftpipe::sync::tree::TreePeer::new();
-        eprintln!("[riftpipe] joining browser mesh of {} (iroh-gossip); syncing {}", addr.id, dir.display());
-        return riftpipe::sync::mesh::join_and_run(addr, &dir, &mut peer, &mut rx, watcher.is_none()).await;
+        eprintln!("[riftpipe] joining sealed board (host {}); syncing {}", addr.id, dir.display());
+        return riftpipe::sync::mesh::join_and_run(secret, addr, &dir, &mut peer, &mut rx, watcher.is_none()).await;
     }
     // Connection-id path (WebRTC via signaling). There's no iroh Endpoint here,
     // so the tmux metrics side-car (which needs one for `connection_kind`)
@@ -344,22 +345,23 @@ async fn connect_dial(target: &str, dir: &str, opts: &Opts) -> riftpipe::net::Re
     res
 }
 
-/// Encode our address as a mesh ticket: hex(postcard(EndpointAddr)) — the exact
-/// encoding of `web/src/iroh_link.rs::ticket_of` and the inverse of
-/// [`decode_mesh_ticket`], so a browser or CLI peer joins our swarm from the
-/// printed string (a bare address, no secret).
-fn encode_mesh_ticket(addr: &iroh::EndpointAddr) -> String {
-    postcard::to_allocvec(addr)
+/// Encode a mesh ticket: `hex(postcard((secret, addr)))` — the exact encoding of
+/// `web/src/iroh_link.rs::ticket_of` and the inverse of [`decode_mesh_ticket`],
+/// so a browser or CLI peer joins our board from the printed string. The 32-byte
+/// **secret** both names the topic (`H(secret)`) and keys the frame cipher, so
+/// possession of the ticket is what grants access (see `SECURITY.md`).
+fn encode_mesh_ticket(secret: &[u8; 32], addr: &iroh::EndpointAddr) -> String {
+    postcard::to_allocvec(&(secret, addr))
         .unwrap_or_default()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
 }
 
-/// Decode a browser mesh ticket: hex(postcard(EndpointAddr)) — the exact
-/// encoding of `web/src/iroh_link.rs::ticket_of` (a bare address, no secret).
-/// `None` if `s` isn't that (so the caller falls through to signaling).
-fn decode_mesh_ticket(s: &str) -> Option<iroh::EndpointAddr> {
+/// Decode a mesh ticket into `(secret, addr)` — the inverse of
+/// [`encode_mesh_ticket`], matching `web/src/iroh_link.rs`. `None` if `s` isn't
+/// a valid such ticket (so the caller falls through to signaling).
+fn decode_mesh_ticket(s: &str) -> Option<([u8; 32], iroh::EndpointAddr)> {
     if s.is_empty() || s.len() % 2 != 0 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
@@ -384,16 +386,17 @@ async fn connect_accept(dir: &str, _opts: &Opts) -> riftpipe::net::Result<()> {
     let (watcher, mut rx) = tree::watch(&dir);
     let mut peer = tree::TreePeer::new();
 
-    // Host role: bind a fresh endpoint and start the swarm on OUR own topic
-    // (`join(None, None)` keys the topic on our EndpointId — same as a browser
-    // host). Go online (best-effort relay home) so the ticket dials cross-network.
-    let conn = mesh::MeshConn::join(None, None).await?;
+    // Host role: mint a fresh board secret (names the topic `H(secret)` + keys
+    // the frame cipher), bind an endpoint, and start the sealed swarm. Go online
+    // (best-effort relay home) so the ticket dials cross-network.
+    let secret = riftpipe_core::crypto::generate_secret();
+    let conn = mesh::MeshConn::join(secret, None).await?;
     let _ = tokio::time::timeout(Duration::from_secs(5), conn.endpoint().online()).await;
     let addr = local_addr(conn.endpoint()).await;
-    let ticket = encode_mesh_ticket(&addr);
+    let ticket = encode_mesh_ticket(&secret, &addr);
     let _ = std::fs::write(format!("{}.ticket", dir.display()), &ticket); // sidecar for scripts
-    eprintln!("share this ticket — a browser or CLI joins the same mesh with `connect`:\n\n{ticket}\n");
-    eprintln!("hosting {} on the gossip mesh; waiting for peers...", dir.display());
+    eprintln!("share this ticket — a browser or CLI joins the same sealed board with `connect`:\n\n{ticket}\n");
+    eprintln!("hosting {} on the gossip mesh (sealed); waiting for peers...", dir.display());
 
     mesh::run(conn, &dir, &mut peer, &mut rx, watcher.is_none()).await
 }
