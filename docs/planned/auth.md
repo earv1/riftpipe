@@ -192,13 +192,61 @@ needed yet — but adopting Biscuit's format up front avoids a migration.
   root) authorizes that path/role. This is the same seam the LWW-freeze and
   origin-replace abuses in `SECURITY.md` are exploited through, so it's exactly
   where the fix belongs.
-- **Membership / roles.** A signed, append-only membership log (genesis =
-  self-signed board creator, or the hosted root) records add/remove/delegate.
-  It's replicated like any file; peers verify signatures on apply.
+- **Membership / roles / devices.** A signed, append-only log (genesis =
+  self-signed board creator, or the hosted root) records add/remove/delegate for
+  both *people* and *devices* — an identity is a set of device keys, and each is
+  a signed entry. Replicated like any file; peers verify signatures on apply.
 - **Revocation.** Short capability TTLs plus an optional signed revocation list
   (gossiped like any file). Per-person *read* revocation still needs seal-key
   rotation (the group-key-rotation frontier) — deferred until actually needed;
   "New board" (new secret ⇒ new link) is the blunt version we already have.
+
+## Device linking & recovery
+
+An identity is **not one key — it's a set of device keys.** A passkey is
+origin-bound and device-resident, and the app-level signing key it gates lives
+in local storage; neither transfers automatically. So a second device needs to
+be *linked*, and we do it the secure way — **per-device keys + a signed
+delegation**, never by copying a private key between devices.
+
+### Linking a new device (both devices present)
+
+1. **New device generates its own** signing keypair + passkey for the app
+   origin. It has a fresh key but **zero authority** on any board.
+2. **New device shows its public key out-of-band** — a QR code (or short
+   numeric/emoji code) carrying its pubkey + a nonce.
+3. **Original device scans/confirms it.** This is the security crux and the
+   reason both devices must be present: the QR/short-code binds the new key to a
+   *physical action by someone who already controls an authorized device* —
+   without it, anyone on the mesh could ask to be authorized.
+4. **Original device signs a delegation** — "new pubkey is a device of identity
+   I, role R" — and appends it to the signed device/membership log.
+5. **It replicates over the mesh** like any other data; every peer now accepts
+   the new device's writes, transitively vouched by the original.
+
+This is the Signal/WhatsApp "scan the QR to link a device" flow and Matrix's SAS
+(compare the short code) — familiar UX, and the transport is already built (the
+two devices link over the existing iroh mesh, or a purely local QR scan with no
+network at all).
+
+**Payoff — single-device revocation for free.** Because each device has its own
+key, losing one device means appending a signed "remove device N" from any other
+device; every other device keeps working and the lost one is locked out of
+future writes. A shared/copied key can't do this.
+
+### Linking ≠ recovery (decide recovery up front)
+
+- **Linking** adds a device *while you have* an authorized one — above.
+- **Recovery** is regaining access with *zero* devices (lost/wiped). Linking
+  can't help — there's no device left to vouch. This needs a **separate**
+  mechanism: an offline **recovery key** (a keypair whose seed phrase the user
+  backs up) recorded as an authorized device at setup, or **social recovery** (a
+  trusted contact re-vouches you). Without one, losing your last device loses the
+  identity — correct by design (nobody can impersonate you), but you'd
+  re-provision as a fresh identity and be re-authorized.
+
+Both are just more signed entries in the same device/membership log — no new
+machinery beyond the verification seam.
 
 ## Build order
 
@@ -210,8 +258,10 @@ needed yet — but adopting Biscuit's format up front avoids a migration.
    root = self-signed genesis to start (pure P2P, zero infra).
 3. **Identity front door** — wire passkeys (then Google/PKCE) so a real or
    self-sovereign identity vouches for the signing key.
-4. **Membership + roles** — the signed log; role-gated writes; invite-based
-   onboarding (single-use tokens, à la `@localfirst/auth`'s Seitan pattern).
+4. **Membership + roles + device linking** — the signed log; role-gated writes;
+   invite-based onboarding (single-use tokens, à la `@localfirst/auth`'s Seitan
+   pattern); per-device keys with QR/short-code linking + single-device
+   revocation; a recovery-key path for the zero-devices case.
 5. **Read revocation** — seal-key rotation on removal. The hard, frontier rung;
    defer.
 
