@@ -1,0 +1,24 @@
+{
+  "name": "riftpipe",
+  "version": "1.0.0",
+  "description": "**Open a rift, pipe through it.** Live, peer-to-peer sync for text and files — no server, no account, end-to-end encrypted. Two machines converge on the same content; edit either side and both stay in sync.",
+  "private": true,
+  "scripts": {
+    "diagrams": "bash likec4/generate.sh",
+    "diagrams:watch": "chokidar 'likec4/**/*.likec4' -c 'bash likec4/generate.sh' --initial"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/earv1/riftpipe.git"
+  },
+  "license": "Elastic-2.0",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/earv1/riftpipe/issues"
+  },
+  "homepage": "https://github.com/earv1/riftpipe#readme",
+  "devDependencies": {
+    "chokidar-cli": "^3.0.0",
+    "likec4": "^1.58.0"
+  }
+}

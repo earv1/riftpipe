@@ -2,3 +2,10 @@
 *.ticket
 .DS_Store
 .claude/settings.json
+
+# JS tooling at the repo root (diagram pipeline)
+/node_modules
+/likec4/dist
+
+# LikeC4 auto whole-model landscape view (not referenced; the named views are)
+/docs/diagrams/index.png

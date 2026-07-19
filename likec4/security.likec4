@@ -1,0 +1,100 @@
+// The sharing / trust architecture: what a share link grants today, and the
+// planned capability model. Rendered into docs/diagrams/ by `npm run diagrams`
+// and embedded in SECURITY.md.
+
+specification {
+  element actor {
+    style {
+      shape person
+    }
+  }
+  element system
+  element component
+  element artifact {
+    style {
+      shape storage
+    }
+  }
+  element boundary {
+    style {
+      color muted
+      opacity 20%
+    }
+  }
+}
+
+model {
+  holder = actor 'Link holder' {
+    description 'Anyone who has the share URL (invited or not — a bearer capability)'
+  }
+  stranger = actor 'Stranger' {
+    description 'No link; may still learn the host EndpointId (a public key) from discovery infrastructure'
+  }
+
+  sharelink = artifact 'Share link (today)' {
+    description 'URL fragment = bare ticket: host EndpointId + relay addresses. No secret.'
+  }
+
+  mesh = system 'Board mesh (today)' {
+    topic = component 'Gossip topic' {
+      description 'TopicId = host EndpointId — derivable from PUBLIC identity'
+    }
+    browser = component 'Browser peer' {
+      description 'riftpipe-web wasm; OPFS tree'
+    }
+    cli = component 'CLI peer' {
+      description 'riftpipe connect; plain file tree'
+    }
+    msgs = component 'MeshMsg traffic' {
+      description 'Postcard frames: unsigned, unencrypted at app layer; LWW versions are unvalidated wall-clock'
+    }
+  }
+
+  relay = system 'n0 relay / discovery' {
+    description 'Routes QUIC; sees connection metadata and (transport-encrypted) traffic between peers'
+  }
+
+  holder -> sharelink 'possesses'
+  sharelink -> mesh.topic 'names the topic + bootstrap address'
+  mesh.browser -> mesh.msgs 'broadcasts / merges'
+  mesh.cli -> mesh.msgs 'broadcasts / merges'
+  mesh.msgs -> relay 'transits (QUIC-encrypted per hop)'
+  stranger -> mesh.topic 'can derive the topic from the host public key (DHT discovery would close the address gap)'
+  holder -> mesh 'full read + write: no roles, no revocation, forgeable authorship'
+
+  planned = system 'Board mesh (planned capability model)' {
+    psharelink = artifact 'Share link (planned)' {
+      description 'URL fragment carries a random SECRET (never sent to any server)'
+    }
+    ptopic = component 'Gossip topic' {
+      description 'TopicId = H(secret) — underivable without the link'
+    }
+    penc = component 'AEAD envelope' {
+      description 'Every MeshMsg sealed with a key derived from the secret; signed for authorship'
+    }
+    ppeers = component 'Peers' {
+      description 'Browser + CLI, unchanged UX: open link, join any time'
+    }
+
+    psharelink -> ptopic 'topic = H(secret)'
+    psharelink -> penc 'key = KDF(secret)'
+    ppeers -> penc 'seal / open + verify'
+  }
+
+  planned.penc -> relay 'transits as ciphertext (relay learns nothing)'
+  stranger -> planned.ptopic 'cannot derive or read: no secret, no topic, no key'
+}
+
+views {
+  view sharing_today {
+    title 'Sharing model today: the URL is the only lock'
+    include holder, stranger, sharelink, mesh, mesh.*, relay
+    autoLayout TopBottom
+  }
+
+  view sharing_planned {
+    title 'Planned: secret-derived topic + sealed messages'
+    include stranger, relay, planned, planned.*
+    autoLayout TopBottom
+  }
+}
