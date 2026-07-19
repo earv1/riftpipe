@@ -43,6 +43,9 @@ features = [
     "Event",
     # console.warn for dropped/oversized mesh broadcasts
     "console",
+    # the riftpipe:protocol-mismatch event any app can listen for
+    "CustomEvent",
+    "CustomEventInit",
     # WebSocket signaling (connection id in the URL → a room on the signal server).
     "WebSocket",
     "Location",

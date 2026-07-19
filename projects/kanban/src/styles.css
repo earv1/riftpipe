@@ -65,6 +65,14 @@ body {
   font-size: 0.85rem;
 }
 
+.version-warning {
+  padding: 0.5rem 1.25rem;
+  background: #fdecea;
+  color: #8a1f11;
+  border-bottom: 1px solid #f5c6c0;
+  font-size: 0.85rem;
+}
+
 .columns {
   display: flex;
   flex-wrap: wrap;

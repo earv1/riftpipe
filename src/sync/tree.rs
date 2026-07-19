@@ -97,7 +97,7 @@ impl TreePeer {
         if self.seen.get(&rel) == Some(&hash) {
             return None;
         }
-        let msg = if rel.ends_with(".md") {
+        let msg = if riftpipe_core::sync::is_text_path(&rel) {
             self.syncer.local_text(&rel, &String::from_utf8_lossy(&bytes))
         } else {
             let now = std::time::SystemTime::now()
@@ -254,7 +254,13 @@ pub async fn run(
     // handshake, or the hello advertises an empty tree.
     peer.seed(dir);
 
-    // Handshake: advertise our version vectors so the peer sends what we lack.
+    // Announce our protocol version, then the handshake: advertise our
+    // version vectors so the peer sends what we lack.
+    if let Ok(b) =
+        postcard::to_allocvec(&SyncMsg::Version { proto: riftpipe_core::sync::PROTOCOL_VERSION })
+    {
+        sink.send(b).await?;
+    }
     if let Ok(b) = postcard::to_allocvec(&peer.syncer.hello()) {
         sink.send(b).await?;
     }
@@ -294,6 +300,16 @@ pub async fn run(
                     Ok(Some(b)) => b,
                 };
                 let Ok(msg) = postcard::from_bytes::<SyncMsg>(&bytes) else { continue };
+                if let SyncMsg::Version { proto } = msg {
+                    if proto != riftpipe_core::sync::PROTOCOL_VERSION {
+                        eprintln!(
+                            "[tree] protocol-mismatch theirs={proto} ours={} — \
+                             sync may be incomplete",
+                            riftpipe_core::sync::PROTOCOL_VERSION,
+                        );
+                    }
+                    continue;
+                }
                 for reply in peer.apply_and_persist(msg, dir) {
                     if let Ok(b) = postcard::to_allocvec(&reply) {
                         sink.send(b).await?;

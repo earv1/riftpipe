@@ -204,6 +204,60 @@ entirely — the wasm payload is the app's backend. What remains:
   Presence routing map (the library only knows local neighbors), author
   identity (`delivered_from` is the relay, not the author).
 
+- **Protocol version announcements** — *done (2026-07-19).*
+  `core::sync::PROTOCOL_VERSION` (v1; v0 = implicit pre-versioning) rides two
+  appended variants: `SyncMsg::Version` (sent with the connect handshake on
+  the tree link + folder sessions) and `MeshMsg::Version` (broadcast right
+  BEFORE every `Presence`). The shared `core::sync::VersionMonitor` (no I/O,
+  no clock — callers pass ms) flags a peer once when: it announces a
+  different version; a second bare `Presence` arrives with no announcement;
+  or the 10 s grace expires (drivers tick it — a quiet 2-peer mesh sees only
+  one presence from an old host). Surfacing is library-level and
+  app-agnostic: native prints one stable stderr line per peer
+  (`protocol-mismatch peer=<hex> theirs=<n> ours=<n>`, parsed by the npm
+  wrapper's `onProtocolMismatch`); the browser fires a
+  `riftpipe:protocol-mismatch` CustomEvent on `window` + exposes
+  `riftpipe.protocolStatus()`. Kanban only renders the event (a banner).
+  Verified live: an old (pre-versioning) binary hosting a mesh is flagged
+  `theirs=0 ours=1` by a new joiner while files still sync; two new peers
+  stay quiet.
+- **Text-vs-LWW classification single-sourced** — *done (2026-07-19; found by
+  the kanban/library parity review).* The rule (`.md` → text CRDT, else LWW)
+  now lives in `core::sync::is_text_path`, used by the native driver, the
+  browser's `prime_all`, and a new unified `tree_sync::push(path, bytes)` —
+  the app-facing entry; `push_text`/`push_lww` went crate-private. Fixes a
+  real divergence: kanban pushed `events/<site>.jsonl` as text-CRDT while
+  the CLI and `prime_all` classified it LWW — one path, two merge semantics,
+  so a CLI relay could regress event lines. Now every peer classifies
+  identically (events ride LWW: one writer per site file, so whole-file
+  newest-wins converges). Rest of the parity review was clean: priming,
+  tickets, identity, reconnect, merge all live in the library; the TS app
+  only renders.
+
+## Security / trust (thinking, deliberately not built yet)
+
+- **Board access control is possession of the share link, nothing more** —
+  and the mesh link is weaker than the point-to-point one. `share`/`join`
+  tickets carry a secret and the link runs `authenticate()` (challenge +
+  E2E encryption); the MESH ticket is a bare `EndpointAddr` — no secret —
+  and the topic id is just the host's public EndpointId. Anyone holding the
+  link (or, once DHT/pkarr discovery lands, anyone who learns the host's
+  id) can join, read everything, and write anything. Within the swarm there
+  is no authorization or authenticity either: gossip's `delivered_from` is
+  the relay, not the author, so any member can forge `Presence`/`Version`
+  for others, clobber structural files by broadcasting `Lww` with
+  `version=u64::MAX` (a permanent freeze — LWW versions are unvalidated
+  wall-clock ms), or replace a whole text doc via the origin-conflict
+  adoption rule (craft a doc with a higher origin agent id). Candidate
+  directions when we build this: put a symmetric secret in the link
+  fragment and derive the topic id from a hash of it (unguessable topic,
+  closes the DHT-discovery hole) + AEAD every `MeshMsg` with it (relay sees
+  nothing, non-holders can't inject); sign messages with the endpoint key
+  for authorship; split read vs write capabilities (two keys); clamp
+  received LWW versions to `now + ε`; rekey (new secret ⇒ new topic ⇒ new
+  link) as revocation. Nothing here is load-bearing yet — today the honest
+  answer is: the URL is the only lock, guard it accordingly.
+
 ## Iteration 2 (added 2026-07-04)
 
 17. **Events log in the wasm handler** — *done.* The per-peer change log

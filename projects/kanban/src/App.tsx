@@ -16,6 +16,9 @@ export function App() {
   // OPFS failed at runtime (e.g. WebKit without working storage) — the board
   // is view-only and nothing persists; say so instead of spinning forever.
   const [storageBroken, setStorageBroken] = createSignal(false);
+  // A mesh peer announced a different riftpipe protocol version (or predates
+  // versioning). Detection lives in the library; we only render its event.
+  const [versionMismatch, setVersionMismatch] = createSignal<{ theirs: number; ours: number } | null>(null);
   // Drag-and-drop: which card is being dragged, and which column is hovered.
   const [draggedId, setDraggedId] = createSignal<string | null>(null);
   const [dragOverCol, setDragOverCol] = createSignal<string | null>(null);
@@ -70,6 +73,16 @@ export function App() {
 
     // Pasting a share link into this tab changes the hash — reconnect to it.
     window.addEventListener("hashchange", () => void connect());
+
+    // The library fires this when a peer speaks a different protocol version.
+    window.addEventListener("riftpipe:protocol-mismatch", (e) => {
+      try {
+        const d = JSON.parse((e as CustomEvent<string>).detail);
+        setVersionMismatch({ theirs: d.theirs, ours: d.ours });
+      } catch (_e) {
+        setVersionMismatch({ theirs: -1, ours: -1 });
+      }
+    });
   });
 
   const cardsIn = (col: string): Card[] =>
@@ -100,6 +113,16 @@ export function App() {
           18.4+, Chrome, Edge, or Firefox). You can look around, but edits
           won't be saved or synced.
         </div>
+      </Show>
+      <Show when={versionMismatch()}>
+        {(m) => (
+          <div class="version-warning">
+            A connected peer runs a different riftpipe version
+            {m().theirs >= 0 ? ` (theirs v${m().theirs}, yours v${m().ours})` : ""} —
+            sync with it may be incomplete. Everyone should reload or update to
+            the same version.
+          </div>
+        )}
       </Show>
       <header class="topbar">
         <h1>{board.title}</h1>

@@ -10,6 +10,13 @@ export interface TreeSessionOpts {
   signal?: string;
 }
 
+/** A peer speaking a different riftpipe protocol version (0 = pre-versioning). */
+export interface ProtocolMismatch {
+  peer: string;
+  theirs: number;
+  ours: number;
+}
+
 /** A live tree-sync session over `dir`. */
 export class TreeSession {
   /**
@@ -32,6 +39,7 @@ export class TreeSession {
 
   #proc: ReturnType<typeof spawnRiftpipe>;
   #syncedCbs: Array<(path: string) => void> = [];
+  #mismatchCbs: Array<(m: ProtocolMismatch) => void> = [];
 
   private constructor(args: string[], opts: TreeSessionOpts) {
     this.#proc = spawnRiftpipe(args, opts);
@@ -39,6 +47,15 @@ export class TreeSession {
       if (line.startsWith("SYNCED:")) {
         const path = line.slice("SYNCED:".length);
         for (const cb of this.#syncedCbs) cb(path);
+      }
+    });
+    // The CLI prints one stable line per mismatched peer:
+    //   [mesh] protocol-mismatch peer=<hex> theirs=<n> ours=<n> — ...
+    this.#proc.stderrLines((line) => {
+      const m = line.match(/protocol-mismatch peer=([0-9a-f]+) theirs=(\d+) ours=(\d+)/);
+      if (m) {
+        const ev = { peer: m[1], theirs: Number(m[2]), ours: Number(m[3]) };
+        for (const cb of this.#mismatchCbs) cb(ev);
       }
     });
   }
@@ -51,6 +68,11 @@ export class TreeSession {
   /** Subscribe to remote-write breadcrumbs: fires with each synced rel path. */
   onSynced(cb: (path: string) => void): void {
     this.#syncedCbs.push(cb);
+  }
+
+  /** Fires once per peer whose riftpipe protocol version differs from ours. */
+  onProtocolMismatch(cb: (m: ProtocolMismatch) => void): void {
+    this.#mismatchCbs.push(cb);
   }
 
   /** Wait until `path` (relative to the dir) has been synced from a peer. */

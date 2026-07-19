@@ -97,11 +97,9 @@ pub async fn prime_all() {
                 format!("{prefix}/{name}")
             };
             if let Some(text) = read_text(&dir, &name).await {
-                if name.ends_with(".md") {
-                    crate::tree_sync::push_text(&path, &text);
-                } else {
-                    crate::tree_sync::push_lww(&path, text.as_bytes());
-                }
+                // The text-vs-LWW channel comes from the library's single
+                // classification rule, inside `push`.
+                crate::tree_sync::push(&path, text.as_bytes());
             } else if let Ok(sub) = subdir(&dir, &name, false).await {
                 stack.push((sub, path));
             }

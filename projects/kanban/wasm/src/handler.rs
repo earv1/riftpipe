@@ -141,7 +141,9 @@ async fn append_event(root: &FileSystemDirectoryHandle, kind: &str, fields: &[(&
     log.push_str(&event_line(&ts, &site, kind, fields));
     log.push('\n');
     if write_text(&events, &fname, &log).await.is_ok() {
-        tree_sync::push_text(&format!("events/{fname}"), &log);
+        // Channel (text vs LWW) is the library's call — one writer per site
+        // file, so whole-file LWW converges; a CLI peer classifies identically.
+        tree_sync::push(&format!("events/{fname}"), log.as_bytes());
     }
 }
 
@@ -228,8 +230,8 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
             let cdir = ensure_card_dir(&root, &id).await?;
             write_card(&cdir, &title, "").await?;
             write_meta(&cdir, &column, max_pos + 1, false).await?;
-            tree_sync::push_text(&format!("tickets/{id}/card.md"), &kb::card_md(&title, ""));
-            tree_sync::push_lww(
+            tree_sync::push(&format!("tickets/{id}/card.md"), kb::card_md(&title, "").as_bytes());
+            tree_sync::push(
                 &format!("tickets/{id}/meta.toml"),
                 kb::meta_toml(&column, max_pos + 1, false).as_bytes(),
             );
@@ -265,13 +267,16 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
             // Always persist structural fields; only re-serialize card.md when the
             // title/description actually changed (avoids prose drift).
             write_meta(&cdir, &card.column, card.position, card.done).await?;
-            tree_sync::push_lww(
+            tree_sync::push(
                 &format!("tickets/{id}/meta.toml"),
                 kb::meta_toml(&card.column, card.position, card.done).as_bytes(),
             );
             if touched_text {
                 write_card(&cdir, &card.title, &description).await?;
-                tree_sync::push_text(&format!("tickets/{id}/card.md"), &kb::card_md(&card.title, &description));
+                tree_sync::push(
+                    &format!("tickets/{id}/card.md"),
+                    kb::card_md(&card.title, &description).as_bytes(),
+                );
             }
 
             // Record change events (additive history) — same set as the old server.
@@ -319,7 +324,7 @@ async fn route(method: &str, path: &str, body: &str) -> Result<JsValue, JsValue>
             let cdir = subdir(&tickets, id, false).await?;
             let comments = subdir(&cdir, "comments", true).await?;
             write_text(&comments, &format!("{name}.md"), &text).await?;
-            tree_sync::push_text(&format!("tickets/{id}/comments/{name}.md"), &text);
+            tree_sync::push(&format!("tickets/{id}/comments/{name}.md"), text.as_bytes());
             append_event(&root, "comment.add", &[
                 ("id", serde_json::json!(id)),
                 ("comment", serde_json::json!(name)),

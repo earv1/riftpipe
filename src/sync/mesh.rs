@@ -31,7 +31,9 @@ use iroh_gossip::proto::TopicId;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, MissedTickBehavior};
 
-use riftpipe_core::sync::{encode_mesh_frames, MeshAssembler, MeshMsg};
+use riftpipe_core::sync::{
+    encode_mesh_frames, MeshAssembler, MeshMsg, PeerVersion, VersionMonitor, PROTOCOL_VERSION,
+};
 
 use crate::net::{anyerr, Result};
 use crate::sync::tree::{scan_files, TreePeer};
@@ -170,6 +172,28 @@ pub async fn run(
 
     // Reassembles incoming chunk frames into whole messages.
     let mut assembler = MeshAssembler::new();
+    // Flags peers whose announced protocol version differs (or who never
+    // announce — pre-versioning peers). One stable stderr line per peer, so
+    // scripts (and the npm wrapper) can parse it.
+    let mut versions = VersionMonitor::new();
+    fn report_mismatch(p: &PeerVersion) {
+        let hex: String = p.id.iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!(
+            "[mesh] protocol-mismatch peer={hex} theirs={} ours={PROTOCOL_VERSION} — \
+             sync with that peer may be incomplete",
+            p.proto,
+        );
+    }
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+    // A quiet mesh may only ever see ONE presence from a pre-versioning peer —
+    // this tick fires the grace-expiry path.
+    let mut version_tick = interval(Duration::from_secs(5));
+    version_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -202,6 +226,12 @@ pub async fn run(
                     }
                 }
             }
+            // Grace expiry for announcement-less (pre-versioning) peers.
+            _ = version_tick.tick() => {
+                for p in versions.tick(now_ms()) {
+                    report_mismatch(&p);
+                }
+            }
             // Mesh events: remote edits → disk, membership → catch-up + presence.
             ev = receiver.next() => {
                 let ev = match ev {
@@ -223,7 +253,19 @@ pub async fn run(
                                 }
                             }
                             MeshMsg::Presence { id, neighbors } => {
+                                if id != my_id_bytes {
+                                    if let Some(p) = versions.on_presence(id, now_ms()) {
+                                        report_mismatch(&p);
+                                    }
+                                }
                                 routing.insert(id, neighbors);
+                            }
+                            MeshMsg::Version { id, proto } => {
+                                if id != my_id_bytes {
+                                    if let Some(p) = versions.on_version(id, proto) {
+                                        report_mismatch(&p);
+                                    }
+                                }
                             }
                             // feed() never yields a Chunk (it refuses nesting).
                             MeshMsg::Chunk { .. } => {}
@@ -231,6 +273,14 @@ pub async fn run(
                     }
                     Event::NeighborUp(id) => {
                         eprintln!("[mesh] neighbor up: {id}");
+                        // Announce our protocol version BEFORE the Presence —
+                        // that ordering is what lets peers deduce "Presence
+                        // but no Version = pre-versioning peer".
+                        broadcast(
+                            &sender,
+                            &MeshMsg::Version { id: my_id_bytes, proto: PROTOCOL_VERSION },
+                        )
+                        .await;
                         // Catch the new neighbor up with our whole tree —
                         // direct neighbors only; the swarm doesn't need it.
                         for msg in peer.full_state() {
@@ -258,6 +308,11 @@ pub async fn run(
                             }
                         }
                         routing.insert(my_id_bytes, list.clone());
+                        broadcast(
+                            &sender,
+                            &MeshMsg::Version { id: my_id_bytes, proto: PROTOCOL_VERSION },
+                        )
+                        .await;
                         broadcast(&sender, &MeshMsg::Presence { id: my_id_bytes, neighbors: list }).await;
                     }
                     Event::Lagged => {}

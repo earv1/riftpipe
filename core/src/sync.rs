@@ -18,6 +18,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::text::EgWalkerText;
 
+/// THE text-vs-LWW classification: `.md` files merge as text CRDTs, everything
+/// else as whole-file LWW. Single-sourced here because every peer must agree —
+/// the same path riding both channels (one peer pushing text deltas, another
+/// LWW) gives two conflicting merge semantics for one file. Native drivers,
+/// the browser's priming, and the browser's live-push entry all call this;
+/// apps never pick a channel themselves.
+pub fn is_text_path(path: &str) -> bool {
+    path.ends_with(".md")
+}
+
+/// The riftpipe wire-protocol version, announced to peers so a mismatch can
+/// be SURFACED (a warning in the app / on stderr) instead of silently
+/// degrading. Bump on any protocol change worth telling users about.
+/// v0 is implicit — peers that predate versioning never announce (detected
+/// via [`VersionMonitor::on_presence`]). v1: the strategy channel
+/// (`StratAdvert`/`StratDelta`), mesh chunking, and version announcements.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Per-chunk payload budget for [`encode_mesh_frames`]. iroh-gossip's message
 /// limit defaults to 4096 bytes and is enforced on SEND AND RECEIVE — so
 /// rather than raising it (which would make every already-deployed peer error
@@ -70,6 +88,10 @@ pub enum SyncMsg {
     /// A strategy-channel delta for `path`, opaque to the wire: whatever the
     /// resource's algorithm `merge`s (rsync token stream, WAL frames, …).
     StratDelta { path: String, bytes: Vec<u8> },
+    /// "I speak protocol `proto`" — sent alongside the connect handshake so
+    /// the driver can warn when the peer's version differs. [`Syncer`]
+    /// ignores it; drivers intercept.
+    Version { proto: u32 },
 }
 
 /// What travels over a gossip-mesh topic: tree [`SyncMsg`]s plus periodic
@@ -91,6 +113,11 @@ pub enum MeshMsg {
     /// `id` is a content hash, so a re-broadcast reuses the same reassembly
     /// slot. APPENDED variant: peers that predate it skip it cleanly.
     Chunk { id: u64, index: u32, total: u32, bytes: Vec<u8> },
+    /// "Peer `id` speaks protocol `proto`" — broadcast right BEFORE every
+    /// `Presence`, so a `Presence` from a peer that never announced marks a
+    /// pre-versioning (v0) peer. Fed to [`VersionMonitor`]; drivers surface
+    /// what it flags.
+    Version { id: [u8; 32], proto: u32 },
 }
 
 /// FNV-1a 64-bit — a tiny, dependency-free content hash for chunk ids. Not
@@ -194,6 +221,111 @@ impl MeshAssembler {
             MeshMsg::Chunk { .. } => None,
             inner => Some(inner),
         }
+    }
+}
+
+/// One peer's announced protocol version (0 = never announced, i.e. a peer
+/// that predates versioning).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerVersion {
+    pub id: [u8; 32],
+    pub proto: u32,
+}
+
+/// How long a peer may go announcement-less after its first `Presence` before
+/// it is deemed pre-versioning (v0). Long enough that a reordered
+/// Version/Presence pair can't false-flag; short enough to surface promptly.
+pub const VERSION_GRACE_MS: u64 = 10_000;
+
+/// Tracks peers' announced protocol versions and flags mismatches — shared by
+/// the native and browser mesh drivers so the detection logic can't drift.
+/// Pure state, no I/O or clock: callers pass a millisecond `now` and surface
+/// what this returns (stderr line, browser event). Detection:
+///   * a [`MeshMsg::Version`] announcing `proto != PROTOCOL_VERSION` flags
+///     immediately;
+///   * version-aware peers announce right BEFORE every `Presence`, so a peer
+///     whose `Presence` arrives with no announcement on record is suspect —
+///     flagged v0 on a SECOND bare presence (one gap tolerates gossip
+///     reordering), or when [`VERSION_GRACE_MS`] passes without an
+///     announcement (a quiet two-peer mesh may only ever see one presence) —
+///     the driver calls [`tick`](Self::tick) periodically for that.
+/// Each peer is flagged at most once.
+#[derive(Default)]
+pub struct VersionMonitor {
+    /// Announced versions, per peer.
+    versions: HashMap<[u8; 32], u32>,
+    /// Peers seen via `Presence` only: (first-seen ms, presence count).
+    presence_only: HashMap<[u8; 32], (u64, u8)>,
+    /// Peers already reported — flag once.
+    flagged: HashSet<[u8; 32]>,
+}
+
+impl VersionMonitor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an announcement. Returns the peer the FIRST time it proves
+    /// mismatched, for the driver to surface.
+    pub fn on_version(&mut self, id: [u8; 32], proto: u32) -> Option<PeerVersion> {
+        self.presence_only.remove(&id);
+        self.versions.insert(id, proto);
+        (proto != PROTOCOL_VERSION && self.flagged.insert(id)).then_some(PeerVersion { id, proto })
+    }
+
+    /// Record a `Presence` from `id` at `now` (ms). Returns the peer the first
+    /// time it is deemed pre-versioning (v0).
+    pub fn on_presence(&mut self, id: [u8; 32], now: u64) -> Option<PeerVersion> {
+        if self.versions.contains_key(&id) {
+            return None;
+        }
+        let (first, strikes) = self.presence_only.entry(id).or_insert((now, 0));
+        *strikes = strikes.saturating_add(1);
+        let overdue = now.saturating_sub(*first) >= VERSION_GRACE_MS;
+        ((*strikes >= 2 || overdue) && self.flagged.insert(id))
+            .then_some(PeerVersion { id, proto: 0 })
+    }
+
+    /// Flag every announcement-less peer whose grace expired by `now` (ms).
+    /// Drivers call this on a periodic tick so a quiet mesh still surfaces a
+    /// pre-versioning peer.
+    pub fn tick(&mut self, now: u64) -> Vec<PeerVersion> {
+        let overdue: Vec<[u8; 32]> = self
+            .presence_only
+            .iter()
+            .filter(|(id, (first, _))| {
+                now.saturating_sub(*first) >= VERSION_GRACE_MS && !self.flagged.contains(*id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        overdue
+            .into_iter()
+            .filter(|id| self.flagged.insert(*id))
+            .map(|id| PeerVersion { id, proto: 0 })
+            .collect()
+    }
+
+    /// Every peer with a known-or-deduced version (announced, or flagged v0).
+    /// Sorted by id for stable output.
+    pub fn peers(&self) -> Vec<PeerVersion> {
+        let mut v: Vec<PeerVersion> = self
+            .versions
+            .iter()
+            .map(|(id, proto)| PeerVersion { id: *id, proto: *proto })
+            .chain(
+                self.flagged
+                    .iter()
+                    .filter(|id| !self.versions.contains_key(*id))
+                    .map(|id| PeerVersion { id: *id, proto: 0 }),
+            )
+            .collect();
+        v.sort_by_key(|p| p.id);
+        v
+    }
+
+    /// The subset of [`peers`](Self::peers) whose version differs from ours.
+    pub fn mismatched(&self) -> Vec<PeerVersion> {
+        self.peers().into_iter().filter(|p| p.proto != PROTOCOL_VERSION).collect()
     }
 }
 
@@ -459,8 +591,11 @@ impl Syncer {
                 }
             }
             // The strategy channel belongs to the workspace/strategy layer
-            // (folder mode); a text/LWW syncer has nothing to do with it.
-            SyncMsg::StratAdvert { .. } | SyncMsg::StratDelta { .. } => (None, Vec::new()),
+            // (folder mode), and version announcements to the driver; a
+            // text/LWW syncer has nothing to do with either.
+            SyncMsg::StratAdvert { .. } | SyncMsg::StratDelta { .. } | SyncMsg::Version { .. } => {
+                (None, Vec::new())
+            }
         }
     }
 }
@@ -482,6 +617,7 @@ mod wire_compat {
             (SyncMsg::Lww { path: "p".into(), version: 1, bytes: vec![] }, 3),
             (SyncMsg::StratAdvert { path: "p".into(), sv: vec![], reply: true }, 4),
             (SyncMsg::StratDelta { path: "p".into(), bytes: vec![] }, 5),
+            (SyncMsg::Version { proto: 1 }, 6),
         ];
         for (msg, index) in cases {
             let bytes = postcard::to_allocvec(&msg).unwrap();
@@ -533,6 +669,7 @@ mod wire_compat {
             (MeshMsg::Sync(SyncMsg::Resync { path: "p".into() }), 0),
             (MeshMsg::Presence { id: [0; 32], neighbors: vec![] }, 1),
             (MeshMsg::Chunk { id: 1, index: 0, total: 2, bytes: vec![9] }, 2),
+            (MeshMsg::Version { id: [0; 32], proto: 1 }, 3),
         ];
         for (msg, index) in cases {
             let bytes = postcard::to_allocvec(&msg).unwrap();
@@ -548,11 +685,73 @@ mod wire_compat {
             Presence { id: [u8; 32], neighbors: Vec<[u8; 32]> },
         }
         let chunk = MeshMsg::Chunk { id: 7, index: 0, total: 1, bytes: vec![1, 2] };
-        let bytes = postcard::to_allocvec(&chunk).unwrap();
-        assert!(
-            postcard::from_bytes::<LegacyMeshMsg>(&bytes).is_err(),
-            "legacy peers must reject (and thus skip) chunk frames",
+        let version = MeshMsg::Version { id: [1; 32], proto: 1 };
+        for msg in [chunk, version] {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            assert!(
+                postcard::from_bytes::<LegacyMeshMsg>(&bytes).is_err(),
+                "legacy peers must reject (and thus skip) post-v0 frames",
+            );
+        }
+    }
+
+    /// The mismatch detector: an announced different version flags once;
+    /// presence-without-announcement flags v0 on the second strike OR after
+    /// the grace period; matching versions never flag; an announcement clears
+    /// suspicion.
+    #[test]
+    fn version_monitor_flags_mismatches_and_v0_peers() {
+        let mut m = VersionMonitor::new();
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+
+        // Matching version: never flagged.
+        assert!(m.on_version(a, PROTOCOL_VERSION).is_none());
+        assert!(m.on_presence(a, 0).is_none() && m.on_presence(a, 0).is_none());
+
+        // Different version: flagged exactly once.
+        assert_eq!(m.on_version(b, 99), Some(PeerVersion { id: b, proto: 99 }));
+        assert!(m.on_version(b, 99).is_none(), "flag once");
+
+        // Presence-only peer: first strike tolerated (reordering), second flags v0.
+        assert!(m.on_presence(c, 0).is_none());
+        assert_eq!(m.on_presence(c, 1), Some(PeerVersion { id: c, proto: 0 }));
+        assert!(m.on_presence(c, 2).is_none(), "flag once");
+
+        assert_eq!(
+            m.mismatched(),
+            vec![PeerVersion { id: b, proto: 99 }, PeerVersion { id: c, proto: 0 }],
         );
+        assert_eq!(m.peers().len(), 3);
+
+        // A late announcement upgrades a suspect before the second strike.
+        let mut m2 = VersionMonitor::new();
+        assert!(m2.on_presence(a, 0).is_none());
+        assert!(m2.on_version(a, PROTOCOL_VERSION).is_none());
+        assert!(m2.on_presence(a, 1).is_none(), "announced peer never strikes");
+        assert!(m2.mismatched().is_empty());
+    }
+
+    /// A quiet two-peer mesh sees only ONE presence from an old host — the
+    /// grace tick must still flag it, and must not flag inside the grace.
+    #[test]
+    fn version_monitor_grace_tick_flags_quiet_v0_peer() {
+        let mut m = VersionMonitor::new();
+        let old = [7u8; 32];
+        assert!(m.on_presence(old, 1_000).is_none(), "single presence: not yet");
+        assert!(m.tick(1_000 + VERSION_GRACE_MS - 1).is_empty(), "inside grace");
+        assert_eq!(
+            m.tick(1_000 + VERSION_GRACE_MS),
+            vec![PeerVersion { id: old, proto: 0 }],
+            "grace expiry flags the quiet pre-versioning peer",
+        );
+        assert!(m.tick(1_000 + 2 * VERSION_GRACE_MS).is_empty(), "flag once");
+
+        // An announcement inside the grace prevents the flag entirely.
+        let mut m2 = VersionMonitor::new();
+        let new = [8u8; 32];
+        assert!(m2.on_presence(new, 1_000).is_none());
+        assert!(m2.on_version(new, PROTOCOL_VERSION).is_none());
+        assert!(m2.tick(1_000 + 2 * VERSION_GRACE_MS).is_empty(), "announced in time");
     }
 
     /// The text/LWW `Syncer` ignores the strategy channel: no persist, no reply.

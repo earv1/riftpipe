@@ -127,9 +127,23 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Push a text file's new content to peers — to the gossip mesh if active, else the
-/// point-to-point link (no-op if neither is connected).
-pub fn push_text(path: &str, content: &str) {
+/// Push one file's new content to peers — mesh if active, else the
+/// point-to-point link (no-op if neither is connected). THE app-facing entry:
+/// the text-vs-LWW channel is chosen by the library's single classification
+/// rule (`core::sync::is_text_path`), the same one the native CLI and
+/// `prime_all` use — an app never picks a channel, so it can never diverge
+/// from what a UI-less CLI peer does with the same path.
+pub fn push(path: &str, bytes: &[u8]) {
+    if riftpipe_core::sync::is_text_path(path) {
+        push_text(path, &String::from_utf8_lossy(bytes));
+    } else {
+        push_lww(path, bytes);
+    }
+}
+
+/// Text-channel push (mesh if active, else link). Crate-internal: callers go
+/// through [`push`] so classification stays single-sourced.
+pub(crate) fn push_text(path: &str, content: &str) {
     if crate::gossip::try_push_text(path, content) {
         return;
     }
@@ -140,8 +154,9 @@ pub fn push_text(path: &str, content: &str) {
     });
 }
 
-/// Push a structural file (LWW) to peers (mesh if active, else the link).
-pub fn push_lww(path: &str, bytes: &[u8]) {
+/// LWW-channel push (mesh if active, else link). Crate-internal: callers go
+/// through [`push`] so classification stays single-sourced.
+pub(crate) fn push_lww(path: &str, bytes: &[u8]) {
     if crate::gossip::try_push_lww(path, bytes) {
         return;
     }

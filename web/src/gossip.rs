@@ -160,7 +160,34 @@ pub struct GossipTreeSync {
     sender: GossipSender,
     neighbors: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<[u8; 32]>>>,
     routing: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<[u8; 32], Vec<[u8; 32]>>>>,
+    versions: std::rc::Rc<std::cell::RefCell<riftpipe_core::sync::VersionMonitor>>,
     _keep: MeshKeepAlive,
+}
+
+/// Surface a flagged peer: console.warn + a `riftpipe:protocol-mismatch`
+/// CustomEvent on `window` (detail: `{peer, theirs, ours}` JSON string), so
+/// ANY app on the library can show it — nothing app-specific here.
+fn report_mismatch(p: &riftpipe_core::sync::PeerVersion) {
+    let ours = riftpipe_core::sync::PROTOCOL_VERSION;
+    let peer = hex32(&p.id);
+    web_sys::console::warn_1(
+        &format!(
+            "[mesh] protocol-mismatch peer={peer} theirs={} ours={ours} — \
+             sync with that peer may be incomplete",
+            p.proto,
+        )
+        .into(),
+    );
+    if let Some(w) = web_sys::window() {
+        let detail = format!(r#"{{"peer":"{peer}","theirs":{},"ours":{ours}}}"#, p.proto);
+        let init = web_sys::CustomEventInit::new();
+        init.set_detail(&wasm_bindgen::JsValue::from_str(&detail));
+        if let Ok(ev) =
+            web_sys::CustomEvent::new_with_event_init_dict("riftpipe:protocol-mismatch", &init)
+        {
+            let _ = w.dispatch_event(&ev);
+        }
+    }
 }
 
 impl GossipTreeSync {
@@ -173,8 +200,10 @@ impl GossipTreeSync {
         let syncer = Rc::new(RefCell::new(riftpipe_core::sync::Syncer::new(agent)));
         let neighbors = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
         let routing = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
+        let versions = Rc::new(RefCell::new(riftpipe_core::sync::VersionMonitor::new()));
 
-        let (sy, nb, rt, snd) = (syncer.clone(), neighbors.clone(), routing.clone(), sender.clone());
+        let (sy, nb, rt, vs, snd) =
+            (syncer.clone(), neighbors.clone(), routing.clone(), versions.clone(), sender.clone());
         wasm_bindgen_futures::spawn_local(async move {
             // A failed send must not kill the session, but it must be VISIBLE —
             // a silently dropped broadcast reads as "synced". Big messages go
@@ -217,13 +246,31 @@ impl GossipTreeSync {
                                 }
                             }
                             MeshMsg::Presence { id, neighbors } => {
+                                if id != my_id {
+                                    let now = js_sys::Date::now() as u64;
+                                    if let Some(p) = vs.borrow_mut().on_presence(id, now) {
+                                        report_mismatch(&p);
+                                    }
+                                }
                                 rt.borrow_mut().insert(id, neighbors);
+                            }
+                            MeshMsg::Version { id, proto } => {
+                                if id != my_id {
+                                    if let Some(p) = vs.borrow_mut().on_version(id, proto) {
+                                        report_mismatch(&p);
+                                    }
+                                }
                             }
                             // feed() never yields a Chunk (it refuses nesting).
                             MeshMsg::Chunk { .. } => {}
                         }
                     }
                     Event::NeighborUp(_) => {
+                        // Announce our protocol version BEFORE the Presence —
+                        // that ordering is what lets peers deduce "Presence
+                        // but no Version = pre-versioning peer".
+                        let ours = riftpipe_core::sync::PROTOCOL_VERSION;
+                        send(&snd, &MeshMsg::Version { id: my_id, proto: ours }, false).await;
                         // Catch the new neighbor up with our whole tree —
                         // direct neighbors only; the swarm doesn't need it.
                         let full = sy.borrow().full_state();
@@ -236,6 +283,8 @@ impl GossipTreeSync {
                         send(&snd, &MeshMsg::Presence { id: my_id, neighbors: list }, false).await;
                     }
                     Event::NeighborDown(_) => {
+                        let ours = riftpipe_core::sync::PROTOCOL_VERSION;
+                        send(&snd, &MeshMsg::Version { id: my_id, proto: ours }, false).await;
                         let list = snapshot(&receiver);
                         *nb.borrow_mut() = list.iter().copied().collect();
                         // Total neighbor loss: hyparview refills only from its
@@ -259,7 +308,21 @@ impl GossipTreeSync {
             }
         });
 
-        GossipTreeSync { syncer, sender, neighbors, routing, _keep: keep }
+        // Grace expiry for announcement-less (pre-versioning) peers: a quiet
+        // mesh may only ever see ONE presence from an old peer. The loop holds
+        // a Weak so it dies with the sync (no timer leak past teardown).
+        let weak_vs = Rc::downgrade(&versions);
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                gloo_timers::future::TimeoutFuture::new(5_000).await;
+                let Some(vs) = weak_vs.upgrade() else { break };
+                for p in vs.borrow_mut().tick(js_sys::Date::now() as u64) {
+                    report_mismatch(&p);
+                }
+            }
+        });
+
+        GossipTreeSync { syncer, sender, neighbors, routing, versions, _keep: keep }
     }
 
     pub fn push_text(&self, path: &str, content: &str) {
@@ -292,6 +355,21 @@ impl GossipTreeSync {
     /// Direct neighbors in the swarm (this peer's connected peers), as hex ids.
     pub fn peers(&self) -> Vec<String> {
         self.neighbors.borrow().iter().map(hex32).collect()
+    }
+
+    /// Protocol-version status as JSON: our version, every peer's known (or
+    /// deduced-v0) version, and the mismatched subset.
+    pub fn protocol_status(&self) -> String {
+        let vs = self.versions.borrow();
+        let peers: std::collections::BTreeMap<String, u32> =
+            vs.peers().into_iter().map(|p| (hex32(&p.id), p.proto)).collect();
+        let mismatched: Vec<String> = vs.mismatched().iter().map(|p| hex32(&p.id)).collect();
+        serde_json::json!({
+            "ours": riftpipe_core::sync::PROTOCOL_VERSION,
+            "peers": peers,
+            "mismatched": mismatched,
+        })
+        .to_string()
     }
 
     /// The gossiped routing map: `id -> [neighbor ids]` across the whole mesh.
@@ -359,6 +437,25 @@ pub fn connected_peers() -> String {
     GOSSIP.with(|c| {
         let peers = c.borrow().as_ref().map(|bs| bs.peers()).unwrap_or_default();
         serde_json::to_string(&peers).unwrap_or_else(|_| "[]".into())
+    })
+}
+
+/// Protocol-version status for the active mesh, as JSON:
+/// `{"ours":N,"peers":{"<hexid>":M,...},"mismatched":["<hexid>",...]}`.
+/// (Apps can also just listen for the `riftpipe:protocol-mismatch`
+/// CustomEvent on `window` instead of polling this.)
+#[wasm_bindgen::prelude::wasm_bindgen(js_name = protocolStatus)]
+pub fn protocol_status() -> String {
+    GOSSIP.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|bs| bs.protocol_status())
+            .unwrap_or_else(|| {
+                format!(
+                    r#"{{"ours":{},"peers":{{}},"mismatched":[]}}"#,
+                    riftpipe_core::sync::PROTOCOL_VERSION,
+                )
+            })
     })
 }
 

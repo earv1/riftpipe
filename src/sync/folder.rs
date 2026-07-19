@@ -110,6 +110,14 @@ pub async fn session(
     let mut heartbeat = interval(Duration::from_secs(5));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // Announce our protocol version first, so a mismatched peer is surfaced.
+    if sink
+        .send(encode(&SyncMsg::Version { proto: riftpipe_core::sync::PROTOCOL_VERSION }))
+        .await
+        .is_err()
+    {
+        return Ok(SessionOutcome::LinkClosed);
+    }
     // On connect, advertise everything we hold so the peer can reconcile.
     for path in ws.paths() {
         let sv = match ws.get_mut(&path) {
@@ -167,6 +175,15 @@ pub async fn session(
                             if reply {
                                 outgoing.push(advert(&path, res.strategy.state_vector(), false));
                             }
+                        }
+                    }
+                    SyncMsg::Version { proto } => {
+                        if proto != riftpipe_core::sync::PROTOCOL_VERSION {
+                            eprintln!(
+                                "[folder] protocol-mismatch theirs={proto} ours={} — \
+                                 sync may be incomplete",
+                                riftpipe_core::sync::PROTOCOL_VERSION,
+                            );
                         }
                     }
                     _ => {}

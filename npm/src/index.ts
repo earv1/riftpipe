@@ -5,6 +5,6 @@
 
 export { riftpipeBinary } from "./binary.js";
 export { PipeSession, applyEditOp, type EditOp, type PipeSessionOpts } from "./pipe.js";
-export { TreeSession, type TreeSessionOpts } from "./tree.js";
+export { TreeSession, type TreeSessionOpts, type ProtocolMismatch } from "./tree.js";
 export { Serve, type ChangeEvent, type ServeOpts } from "./serve.js";
 export { spawnRiftpipe, type SpawnHandle } from "./process.js";

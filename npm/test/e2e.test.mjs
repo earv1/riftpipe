@@ -74,12 +74,20 @@ test("serve: static files + SSE change events, dotfiles silent", async (t) => {
   const ac = new AbortController();
   t.after(() => ac.abort());
   const events = site.events(ac.signal);
-  const first = within(20_000, events.next(), "first SSE change event");
-  // A dotfile change must never be announced; a real file must.
+  // A dotfile change must never be announced; a real file must. (FSEvents may
+  // also replay writes from just before the watch started — e.g. index.html —
+  // so scan the stream rather than assuming data.txt arrives first.)
   writeFileSync(join(dir, ".hidden"), "no event for me");
   setTimeout(() => writeFileSync(join(dir, "data.txt"), "fresh"), 500);
-  const { value } = await first;
-  assert.deepEqual(value, { type: "change", path: "data.txt" });
+  const sawDataTxt = (async () => {
+    for await (const ev of events) {
+      assert.equal(ev.type, "change");
+      assert.ok(!ev.path.startsWith("."), `dotfile announced: ${ev.path}`);
+      if (ev.path === "data.txt") return true;
+    }
+    return false;
+  })();
+  assert.equal(await within(20_000, sawDataTxt, "data.txt SSE change event"), true);
 });
 
 test("tree: mesh host + joiner converge, SYNCED breadcrumbs fire", async (t) => {
