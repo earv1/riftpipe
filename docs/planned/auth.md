@@ -67,20 +67,23 @@ one-time registration exists only to *start* a login and stamp the token's
 audience. So: no secret committed, nothing hosted, and the login flow runs
 entirely in the browser.
 
-## Decision: Nostr now (required, interim) → Google (WIP) → passkeys (planned)
+## Decision: passkeys (chosen default) · Nostr optional · Google WIP
 
-**Current priority (2026-07-20):** **Nostr (NIP-07)** is the *required interim*
-identity — it's the fastest to ship (a self-sovereign secp256k1 key from a
-browser extension via `window.nostr`, verified in-core pure-Rust with `k256`),
-needs no company and no hosting, and is mandatory until Google OIDC is built.
-**Google (OIDC + PKCE)** is **WIP** — the future real-account option. **Passkeys
-/ WebAuthn** remain **planned** (still the strongest no-company option long-term;
-its wasm verification path is proven, below), but no longer the day-one default.
+**Chosen identity (2026-07-20): passkeys / WebAuthn.** Picked for reach and
+safety-by-default — zero install (in every browser + OS), Face ID / Touch ID UX,
+hardware-backed keys, and platform-handled backup/recovery (the thing users get
+wrong). Verified in-core with pure-Rust `p256`/`ed25519-dalek`; no company, no
+hosting, no committed secret. **Nostr (NIP-07)** stays an **optional**
+bring-your-own-key for portable cross-app identity (pure-Rust `k256` verify).
+**Google (OIDC + PKCE)** is **WIP** — the future real-account-gating option.
 
-All three are interchangeable at the root of trust — each just vouches for the
-same self-generated signing keypair — so this is a sequencing choice, not an
-architectural one: Nostr ships first, Google and passkeys plug in later behind
-the same verifier.
+Trade-off accepted: passkeys are *more work* than Nostr (a custom WebAuthn
+verifier — `webauthn-rs` is OpenSSL-bound, native-only — plus the PRF extension
+to protect the at-rest device key), and their cross-device *sync* usually rides a
+platform credential manager (iCloud/Google). We take that for the mass-adoption
+UX and recovery story. All three vouch for the same self-generated signing
+keypair behind one verifier, so this is a front-door choice, not an
+architectural one.
 
 ### Passkeys / WebAuthn — the identity
 

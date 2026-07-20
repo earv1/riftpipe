@@ -12,11 +12,11 @@ model {
   }
 
   issuance = system 'Control plane — issuance (touched once, to get a capability)' {
-    nostr = component 'Nostr (NIP-07) — REQUIRED (interim)' {
-      description 'The current identity: a self-sovereign secp256k1 key via a browser extension (window.nostr). Verified in-core, pure-Rust via k256. Mandatory until Google OIDC lands.'
+    passkey = component 'Passkey / WebAuthn — DEFAULT (chosen)' {
+      description 'The chosen identity: no company, no setup, in every browser + OS; Face ID / Touch ID, hardware-backed, platform-synced backup. A device-held keypair verified in-core with pure-Rust p256/ed25519-dalek (ES256/EdDSA).'
     }
-    passkey = component 'Passkey / WebAuthn — planned' {
-      description 'No company, no setup, in every browser + OS. A device-held keypair verified in-core with pure-Rust p256/ed25519-dalek (ES256/EdDSA). Planned.'
+    nostr = component 'Nostr (NIP-07) — optional' {
+      description 'Optional bring-your-own-key: a portable, cross-app self-sovereign secp256k1 identity via a browser extension. Verified in-core, pure-Rust via k256.'
     }
     google = component 'Google (OIDC + PKCE) — WIP' {
       description 'Work in progress. For real-account gating: public client_id (safe to commit), NO secret, NO server; ID token verified offline against Google JWKS.'
@@ -38,11 +38,11 @@ model {
     }
   }
 
-  enduser -> issuance.nostr 'brings a Nostr key (required now)'
-  enduser -> issuance.passkey 'passkey (planned)'
-  enduser -> issuance.google 'Google account (WIP)'
-  issuance.nostr -> issuance.capability 'identity → sign a capability'
+  enduser -> issuance.passkey 'authenticates with a passkey (default)'
+  enduser -> issuance.nostr 'or a Nostr key (optional)'
+  enduser -> issuance.google 'or Google (WIP)'
   issuance.passkey -> issuance.capability 'identity → sign a capability'
+  issuance.nostr -> issuance.capability 'identity → sign a capability'
   issuance.google -> issuance.capability 'identity → sign a capability'
   issuance.capability -> meshplane.verify 'presented to peers'
   meshplane.verify -> meshplane.signedwrites 'gates'
