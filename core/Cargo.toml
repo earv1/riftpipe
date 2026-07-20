@@ -20,6 +20,9 @@ postcard = { version = "1", features = ["alloc"] }
 blake3 = { version = "1", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 getrandom = "0.2"
+# Device-linking auth: Ed25519 signing identities + the signed trust log.
+# Pure-Rust, wasm-clean. Keys are generated from a getrandom seed (no rng feature).
+ed25519-dalek = { version = "2", default-features = false }
 
 # On wasm32, diamond-types' transitive `getrandom` (0.2) needs a browser entropy
 # source — enable its `js` backend. Native targets are unaffected.
