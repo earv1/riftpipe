@@ -12,6 +12,7 @@
 // so the wasm bundle stays a generic file-sync library with nothing kanban-
 // specific baked in.)
 import { read, write, list } from "./fs.ts";
+import { logEvent } from "./events.ts";
 
 export interface Card {
   id: string;
@@ -271,6 +272,7 @@ export async function addCard(column: string, title: string): Promise<Card> {
   const finalTitle = title && title.length ? title : id;
   await write(`tickets/${id}/card.md`, cardMd(finalTitle, ""));
   await write(`tickets/${id}/meta.toml`, metaToml(col, maxPos + 1, false));
+  await logEvent("card.create", { id, column: col, title: finalTitle });
   return { id, title: finalTitle, column: col, position: maxPos + 1, done: false };
 }
 
@@ -280,7 +282,10 @@ export async function patchCard(
 ): Promise<Card> {
   const { columns } = parseBoardMd(await ensureSeed());
   const card = await readCard(id, columns[0] ?? "Todo");
-  let { description } = splitCardMd((await read(`tickets/${id}/card.md`)) ?? "");
+  const before = { ...card };
+  const oldCardMd = (await read(`tickets/${id}/card.md`)) ?? "";
+  let { description } = splitCardMd(oldCardMd);
+  const oldDescription = description;
 
   if (patch.column !== undefined) card.column = patch.column;
   if (patch.position !== undefined) card.position = patch.position;
@@ -293,6 +298,14 @@ export async function patchCard(
   // description changed (avoids prose drift).
   await write(`tickets/${id}/meta.toml`, metaToml(card.column, card.position, card.done));
   if (touchedText) await write(`tickets/${id}/card.md`, cardMd(card.title, description));
+
+  // Record semantic history — the same events the old server logged.
+  if (card.column !== before.column) await logEvent("card.move", { id, from: before.column, to: card.column });
+  if (card.done !== before.done) await logEvent("card.check", { id, done: card.done });
+  if (card.title !== before.title) await logEvent("card.edit", { id, field: "title", value: card.title });
+  if (patch.description !== undefined && description !== oldDescription) {
+    await logEvent("card.edit", { id, field: "description" });
+  }
   return card;
 }
 
@@ -302,5 +315,6 @@ export async function addComment(id: string, text: string, author?: string): Pro
   const ts = isoNow();
   const name = `${ts}__${auth}`;
   await write(`tickets/${id}/comments/${name}.md`, clean);
+  await logEvent("comment.add", { id, comment: name });
   return { id: name, author: auth, ts, text: clean };
 }

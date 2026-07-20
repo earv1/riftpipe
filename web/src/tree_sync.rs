@@ -47,6 +47,11 @@ fn opfs_on_merged(on_change: js_sys::Function) -> Rc<dyn Fn(String, Vec<u8>)> {
         let cb = on_change.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let _ = crate::opfs::write_path(&path, &bytes).await;
+            // Record the merge for history/debugging — but NOT for the event
+            // files themselves, or logging a merged log would recurse forever.
+            if !path.starts_with("events/") {
+                crate::events::log("mesh.merge", serde_json::json!({ "path": path }));
+            }
             dispatch_file_changed(&path);
             let _ = cb.call0(&JsValue::NULL);
         });
@@ -157,7 +162,12 @@ pub fn device_id() -> String {
 /// `false` if the board already has an author.
 #[wasm_bindgen(js_name = lockBoard)]
 pub fn lock_board() -> bool {
-    crate::gossip::active_lock()
+    let ok = crate::gossip::active_lock();
+    if ok {
+        let device = load_or_create_device().id().iter().map(|b| format!("{b:02x}")).collect::<String>();
+        crate::events::log("auth.claim", serde_json::json!({ "device": device }));
+    }
+    ok
 }
 
 /// **Grant** a device (its hex id) write access on this board. Only the author
@@ -166,7 +176,13 @@ pub fn lock_board() -> bool {
 #[wasm_bindgen(js_name = grantDevice)]
 pub fn grant_device(hex_id: String) -> bool {
     match hex32(&hex_id) {
-        Some(id) => crate::gossip::active_grant(id),
+        Some(id) => {
+            let ok = crate::gossip::active_grant(id);
+            if ok {
+                crate::events::log("auth.grant", serde_json::json!({ "device": hex_id }));
+            }
+            ok
+        }
         None => false,
     }
 }
@@ -176,7 +192,12 @@ pub fn grant_device(hex_id: String) -> bool {
 /// a request went out, `false` if the board is open or we're already authorized.
 #[wasm_bindgen(js_name = requestAccess)]
 pub fn request_access() -> bool {
-    crate::gossip::active_request_access()
+    let ok = crate::gossip::active_request_access();
+    if ok {
+        let device = load_or_create_device().id().iter().map(|b| format!("{b:02x}")).collect::<String>();
+        crate::events::log("auth.request", serde_json::json!({ "device": device }));
+    }
+    ok
 }
 
 /// Pending access requests awaiting this device's approval, as a JSON array of

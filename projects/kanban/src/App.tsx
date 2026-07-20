@@ -64,8 +64,9 @@ export function App() {
   onMount(() => {
     // One subscription for every change to the synced tree — our own edits, a
     // peer's merged edit, or another tab in this profile. All funnel through the
-    // file API's `watch`; each just re-reads the board. No SSE, no server.
-    watch(() => void refresh());
+    // file API's `watch`; each re-reads the board. The event log lives under
+    // events/ and doesn't affect the board view, so skip those. No SSE, no server.
+    watch((path) => { if (!path.startsWith("events/")) void refresh(); });
 
     // Connect P2P when the URL carries a connection id / ticket. No id =>
     // single-player, no server. Merges arrive via `watch` above.

@@ -21,6 +21,7 @@ import {
   authState,
 } from "../wasm/pkg/kanban_wasm.js";
 import { ready, watch } from "./fs.ts";
+import { readEvents } from "./events.ts";
 
 // Domain model + types (Board, Card, Comment, CardDetail, getBoard, addCard,
 // patchCard, getCardDetail, addComment, …) — over the file API.
@@ -28,6 +29,8 @@ export * from "./board.ts";
 // The file-tree change subscription: fires on local writes, remote merges, and
 // sibling-tab edits. The app calls `watch(() => refresh())` once.
 export { watch, read as readFile, write as writeFile, list as listDir } from "./fs.ts";
+// The synced, cross-peer event log (history + debugging).
+export { logEvent, readEvents, onEvent, type RiftEvent } from "./events.ts";
 
 // The auth surface, backed entirely by the lib (wasm). Also on window.riftpipe
 // for console use:
@@ -63,6 +66,7 @@ export const auth = {
   pendingRequests: () => JSON.parse(pendingRequests()),
   grantDevice: (id: string) => grantDevice(id),
   authState: () => JSON.parse(authState()),
+  readEvents: () => readEvents(),
 };
 
 // Build-time config (Vite env). Set these for a deployed/cross-network build:
