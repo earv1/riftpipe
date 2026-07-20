@@ -23,6 +23,9 @@ getrandom = "0.2"
 # Device-linking auth: Ed25519 signing identities + the signed trust log.
 # Pure-Rust, wasm-clean. Keys are generated from a getrandom seed (no rng feature).
 ed25519-dalek = { version = "2", default-features = false }
+# Read revocation: per-client X25519 encryption keys for epoch-key wrapping.
+# Pure-Rust, wasm-clean; secrets are built from a getrandom/KDF seed (no rng feature).
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
 # On wasm32, diamond-types' transitive `getrandom` (0.2) needs a browser entropy
 # source — enable its `js` backend. Native targets are unaffected.

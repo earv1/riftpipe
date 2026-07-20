@@ -3584,6 +3584,7 @@ dependencies = [
  "postcard",
  "serde",
  "similar",
+ "x25519-dalek",
 ]
 
 [[package]]
