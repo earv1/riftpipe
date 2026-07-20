@@ -67,16 +67,20 @@ one-time registration exists only to *start* a login and stamp the token's
 audience. So: no secret committed, nothing hosted, and the login flow runs
 entirely in the browser.
 
-## Decision: passkeys (non-big-tech default) + Google (optional reach)
+## Decision: Nostr now (required, interim) → Google (WIP) → passkeys (planned)
 
-**The cemented non-big-tech identity is passkeys / WebAuthn.** It is the only
-option that satisfies *every* constraint at once: owned by **no company** (a
-FIDO Alliance / W3C open standard), already built into **every current browser
-and OS** ("built for anyone to use already"), **nothing to host**, **nothing to
-register**, **no secret to commit**, and it yields exactly the **self-sovereign
-keypair** the capability model wants. **Google (OIDC + PKCE)** is an *optional*
-add-on for boards that specifically need real-world accounts — not the default,
-and never required.
+**Current priority (2026-07-20):** **Nostr (NIP-07)** is the *required interim*
+identity — it's the fastest to ship (a self-sovereign secp256k1 key from a
+browser extension via `window.nostr`, verified in-core pure-Rust with `k256`),
+needs no company and no hosting, and is mandatory until Google OIDC is built.
+**Google (OIDC + PKCE)** is **WIP** — the future real-account option. **Passkeys
+/ WebAuthn** remain **planned** (still the strongest no-company option long-term;
+its wasm verification path is proven, below), but no longer the day-one default.
+
+All three are interchangeable at the root of trust — each just vouches for the
+same self-generated signing keypair — so this is a sequencing choice, not an
+architectural one: Nostr ships first, Google and passkeys plug in later behind
+the same verifier.
 
 ### Passkeys / WebAuthn — the identity
 
