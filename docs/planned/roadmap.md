@@ -234,7 +234,15 @@ entirely — the wasm payload is the app's backend. What remains:
   tickets, identity, reconnect, merge all live in the library; the TS app
   only renders.
 
-## Security / trust — see `SECURITY.md`
+## Security / trust — see `SECURITY.md` + `docs/security/`
+
+> Consolidated model: [`docs/security/architecture.md`](../security/architecture.md)
+> + [`docs/security/user-flows.md`](../security/user-flows.md) (LikeC4-backed).
+> Read/write capability split, per-client keys + epoch-key wrapping (read
+> revocation), the general-access dial (Restricted / Anyone-with-link
+> Viewer/Editor), and the create / open-link / request-access / link-device /
+> revoke flows.
+
 
 - ~~Mesh sealing (first cut): secret-derived topic + AEAD frames~~ — *done
   (2026-07-19, `PROTOCOL_VERSION` 2).* The share ticket now carries a 32-byte

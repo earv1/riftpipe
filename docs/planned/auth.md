@@ -6,6 +6,12 @@ threats (secret-derived topic + AEAD frames) is shipped — see
 layer: **who** a peer is, and **what** they're allowed to do — without hosting a
 server or committing a secret.
 
+> The consolidated model now lives in [`docs/security/`](../security/architecture.md)
+> ([architecture](../security/architecture.md) + [user flows](../security/user-flows.md)),
+> including per-client keys, epoch-key wrapping, the request-to-join flow, and the
+> **general-access** dial (Restricted / Anyone-with-link Viewer / Editor). This
+> file remains the device-linking + identity-provider deep-dive.
+
 Diagram generated from [`likec4/auth.likec4`](../../likec4/auth.likec4) via
 `npm run diagrams`.
 
