@@ -100,54 +100,14 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
         (mesh, None)
     };
 
-    // Device-linking auth (open by default; `configureAuth` opts into
-    // restricted). A restricted founder self-signs genesis + grants the
-    // configured device ids; a restricted joiner just signs its writes and
-    // learns the trust log from the founder's catch-up.
-    let auth = build_auth(is_host);
+    // Device-linking auth: always carry this device's identity + the persisted
+    // trust log. The board is "open" until someone locks it (adds a genesis);
+    // `lockBoard()` does that live. See `web::gossip::Auth`.
+    let auth = crate::gossip::Auth::load(load_or_create_device());
     crate::gossip::set_active(GossipTreeSync::new(mesh, on_merged, auth));
     wasm_bindgen_futures::spawn_local(crate::opfs::prime_all());
 
     Ok(my_ticket.map(|t| JsValue::from_str(&t)).unwrap_or(JsValue::NULL))
-}
-
-const AUTH_STORE_KEY: &str = "riftpipe:auth";
-
-/// Read the persisted auth config: `Some((true, grant_ids))` for restricted
-/// mode, else `None` (open). Stored as `"1|<hexid>,<hexid>,…"` so it survives a
-/// reload and the app's first connect picks it up (no racy in-tab reconnect).
-fn read_auth_config() -> Option<(bool, Vec<[u8; 32]>)> {
-    let store = web_sys::window().and_then(|w| w.local_storage().ok().flatten())?;
-    let v = store.get_item(AUTH_STORE_KEY).ok().flatten()?;
-    let rest = v.strip_prefix("1|")?;
-    let grants = rest.split(',').filter(|s| !s.is_empty()).filter_map(hex32).collect();
-    Some((true, grants))
-}
-
-/// Build the [`Auth`](crate::gossip::Auth) for this session from the persisted
-/// config. Open mode unless `configureAuth(true, …)` was called first.
-fn build_auth(is_host: bool) -> crate::gossip::Auth {
-    use riftpipe_core::identity::Role;
-    match read_auth_config() {
-        Some((true, grants)) => {
-            let key = load_or_create_device();
-            // Build the founder's trust entries while we still hold the key,
-            // then move it into the Auth (DeviceKey isn't Clone).
-            let mut entries = Vec::new();
-            if is_host {
-                entries.push(key.genesis());
-                for gid in grants {
-                    entries.push(key.grant(gid, Role::Member, rand_nonce()));
-                }
-            }
-            let mut auth = crate::gossip::Auth::restricted(key);
-            for e in entries {
-                auth.add_trust(e);
-            }
-            auth
-        }
-        _ => crate::gossip::Auth::open(),
-    }
 }
 
 /// This device's persisted signing identity (localStorage `riftpipe:device`),
@@ -170,40 +130,37 @@ pub(crate) fn load_or_create_device() -> riftpipe_core::identity::DeviceKey {
     key
 }
 
-/// 16 random bytes for a trust-entry nonce (reuses core's CSPRNG).
-fn rand_nonce() -> [u8; 16] {
-    let mut n = [0u8; 16];
-    n.copy_from_slice(&riftpipe_core::crypto::generate_secret()[..16]);
-    n
-}
-
 /// This browser's device id (hex), creating + persisting the identity if needed.
-/// Share it so a founder can authorize this device (`configureAuth` grants).
+/// Share it so a board's author can authorize (grant) this device.
 #[wasm_bindgen(js_name = deviceId)]
 pub fn device_id() -> String {
     load_or_create_device().id().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Persist device-linking **restricted** mode for this board: sign our writes
-/// and (as a founder) authorize `grants` — a JS array of hex device ids. Takes
-/// effect on the next connect / reload (stored in localStorage so it survives a
-/// fresh load rather than a racy in-tab reconnect). `restricted=false` clears it
-/// back to open mode.
-#[wasm_bindgen(js_name = configureAuth)]
-pub fn configure_auth(restricted: bool, grants: JsValue) {
-    let Some(store) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
-        return;
-    };
-    if !restricted {
-        let _ = store.remove_item(AUTH_STORE_KEY);
-        return;
+/// **Lock this board**: become its author (the first opener locks it). Broadcasts
+/// the genesis live so every peer starts enforcing. Returns `true` if it locked,
+/// `false` if the board already has an author.
+#[wasm_bindgen(js_name = lockBoard)]
+pub fn lock_board() -> bool {
+    crate::gossip::active_lock()
+}
+
+/// **Grant** a device (its hex id) write access on this board. Only the author
+/// (Admin) can; broadcasts the grant live. `false` if we can't grant or the id
+/// is malformed.
+#[wasm_bindgen(js_name = grantDevice)]
+pub fn grant_device(hex_id: String) -> bool {
+    match hex32(&hex_id) {
+        Some(id) => crate::gossip::active_grant(id),
+        None => false,
     }
-    let ids: Vec<String> = js_sys::Array::from(&grants)
-        .iter()
-        .filter_map(|v| v.as_string())
-        .filter(|s| hex32(s).is_some())
-        .collect();
-    let _ = store.set_item(AUTH_STORE_KEY, &format!("1|{}", ids.join(",")));
+}
+
+/// Auth state of the active board as JSON:
+/// `{locked, device, authorized, isAuthor, author}` — what the login UI renders.
+#[wasm_bindgen(js_name = authState)]
+pub fn auth_state() -> String {
+    crate::gossip::active_auth_state()
 }
 
 /// Load the browser's persisted iroh identity from localStorage, or generate +

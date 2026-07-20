@@ -1,6 +1,6 @@
 import { createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, connectPeer, newBoard, onLocalChange, onSiblingChange, storageSupported, type Card } from "./api.ts";
+import { getBoard, addCard, patchCard, connectPeer, newBoard, onLocalChange, onSiblingChange, storageSupported, auth, type AuthState, type Card } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 
 export function App() {
@@ -16,6 +16,23 @@ export function App() {
   // OPFS failed at runtime (e.g. WebKit without working storage) — the board
   // is view-only and nothing persists; say so instead of spinning forever.
   const [storageBroken, setStorageBroken] = createSignal(false);
+  // Auth/login state (from the lib): whether the board is locked (has an
+  // author), and whether this device is the author / authorized to write.
+  const [authState, setAuthState] = createSignal<AuthState>(
+    { locked: false, device: "", authorized: false, isAuthor: false, author: "" },
+  );
+  const [grantId, setGrantId] = createSignal("");
+  const [copied, setCopied] = createSignal(false);
+  const refreshAuth = () => setAuthState(auth.state());
+  const lock = () => { auth.lockBoard(); refreshAuth(); };
+  const grant = () => {
+    if (auth.grantDevice(grantId().trim())) setGrantId("");
+    refreshAuth();
+  };
+  const copyDeviceId = async () => {
+    try { await navigator.clipboard.writeText(authState().device); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* no clipboard */ }
+  };
+
   // A mesh peer announced a different riftpipe protocol version (or predates
   // versioning). Detection lives in the library; we only render its event.
   const [versionMismatch, setVersionMismatch] = createSignal<{ theirs: number; ours: number } | null>(null);
@@ -69,7 +86,12 @@ export function App() {
     (async () => {
       await refresh();
       await connect();
+      refreshAuth();
     })();
+
+    // Poll the lib's auth state — it changes as the board is locked or as
+    // grants/genesis arrive from peers over the mesh.
+    setInterval(refreshAuth, 2000);
 
     // Pasting a share link into this tab changes the hash — reconnect to it.
     window.addEventListener("hashchange", () => void connect());
@@ -142,6 +164,42 @@ export function App() {
           New board
         </button>
       </header>
+      <div class="auth-bar">
+        <Show when={!authState().locked}>
+          <button
+            class="lock-btn"
+            title="Become this board's owner — only you (and people you grant) can edit; others can view"
+            onClick={lock}
+          >
+            🔓 Lock board (you become the owner)
+          </button>
+          <span class="auth-hint">anyone with the link can edit until you lock it</span>
+        </Show>
+        <Show when={authState().locked && authState().isAuthor}>
+          <span class="auth-status owner">🔒 You own this board</span>
+          <input
+            class="grant-input"
+            placeholder="paste a device id to let them edit…"
+            value={grantId()}
+            onInput={(e) => setGrantId(e.currentTarget.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") grant(); }}
+          />
+          <button class="grant-btn" onClick={grant} disabled={grantId().trim().length !== 64}>
+            Grant edit access
+          </button>
+        </Show>
+        <Show when={authState().locked && authState().authorized && !authState().isAuthor}>
+          <span class="auth-status editor">🔒 Locked · you can edit</span>
+        </Show>
+        <Show when={authState().locked && !authState().authorized}>
+          <span class="auth-status viewer">
+            🔒 Locked · view only — send your device id to the owner to get edit access
+          </span>
+        </Show>
+        <button class="device-id" title="your device id — share it to be granted edit access" onClick={copyDeviceId}>
+          id: {authState().device.slice(0, 10)}… {copied() ? "✓ copied" : "📋"}
+        </button>
+      </div>
       <main class="columns">
         <For each={board.columns}>
           {(col) => (

@@ -15,21 +15,37 @@ import init, {
   connectedPeers,
   routingMap,
   deviceId,
-  configureAuth,
+  lockBoard,
+  grantDevice,
+  authState,
 } from "../wasm/pkg/kanban_wasm.js";
 
-// Debugging + auth hooks for the gossip mesh — inspect/drive from the console:
-//   riftpipe.connectedPeers()          → this peer's direct neighbors (hex ids)
-//   riftpipe.routingMap()              → the whole mesh topology { id: [neighbors] }
-//   riftpipe.deviceId()                → this browser's device id (to be granted)
-//   riftpipe.configureAuth(true, [id]) → next connect is restricted; grant ids
-//   riftpipe.irohConnect(ticket, cb)   → (re)establish the mesh session
+// The auth surface, backed entirely by the lib (wasm). Also on window.riftpipe
+// for console use:
+//   riftpipe.deviceId()          → this browser's device id (share it to be granted)
+//   riftpipe.lockBoard()         → become this board's author (locks it)
+//   riftpipe.grantDevice(id)     → author-only: authorize a device to write
+//   riftpipe.authState()         → { locked, device, authorized, isAuthor, author }
+export type AuthState = {
+  locked: boolean;
+  device: string;
+  authorized: boolean;
+  isAuthor: boolean;
+  author: string;
+};
+export const auth = {
+  deviceId: (): string => deviceId(),
+  lockBoard: (): boolean => lockBoard(),
+  grantDevice: (id: string): boolean => grantDevice(id),
+  state: (): AuthState => JSON.parse(authState()),
+};
 (globalThis as any).riftpipe = {
   connectedPeers: () => JSON.parse(connectedPeers()),
   routingMap: () => JSON.parse(routingMap()),
   deviceId: () => deviceId(),
-  configureAuth: (restricted: boolean, grants: string[]) => configureAuth(restricted, grants),
-  irohConnect: (ticket: string, cb: () => void) => irohConnect(ticket, cb ?? (() => {})),
+  lockBoard: () => lockBoard(),
+  grantDevice: (id: string) => grantDevice(id),
+  authState: () => JSON.parse(authState()),
 };
 
 // Build-time config (Vite env). Set these for a deployed/cross-network build:

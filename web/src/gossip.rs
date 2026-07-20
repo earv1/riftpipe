@@ -173,62 +173,97 @@ impl MeshKeepAlive {
 /// core so native and browser peers speak the same layout.
 use riftpipe_core::sync::MeshMsg;
 
-use riftpipe_core::identity::{DeviceKey, TrustEntry, TrustLog};
+use riftpipe_core::identity::{DeviceKey, Role, TrustEntry, TrustLog};
 
-/// Device-linking auth state for a mesh session — the browser mirror of the
-/// native `TreePeer`'s auth fields. `open()` = today's default (unsigned, no
-/// enforcement); `restricted(key)` signs our writes and, when `require_signed`,
-/// rejects unsigned or unauthorized writes. See `docs/security/`.
+const TRUST_STORE_KEY: &str = "riftpipe:trust";
+
+/// Device-linking auth for a browser mesh session. The model is **lock =
+/// authorship**: a board is *locked* exactly when it has an author (a genesis
+/// in the trust log). The first opener locks it by adding their genesis, which
+/// broadcasts live; from then on every peer signs its writes and rejects
+/// unsigned or unauthorized ones. Before that (no author) the board is open —
+/// plain unsigned writes, anyone with the link edits. The device identity is
+/// always present (persisted); the trust log persists too, so a locked board
+/// stays locked across reloads. See `docs/security/`.
 pub struct Auth {
-    identity: Option<DeviceKey>,
+    identity: DeviceKey,
     trust: TrustLog,
     entries: Vec<TrustEntry>,
     seen: std::collections::HashSet<[u8; 32]>,
-    require_signed: bool,
 }
 
 impl Auth {
-    /// Open mode: unsigned writes, no enforcement (the default).
-    pub fn open() -> Self {
-        Auth {
-            identity: None,
-            trust: TrustLog::new(),
-            entries: Vec::new(),
-            seen: std::collections::HashSet::new(),
-            require_signed: false,
+    /// Build from this device's identity, restoring any persisted trust log so
+    /// a locked board stays locked across reloads.
+    pub fn load(identity: DeviceKey) -> Self {
+        let mut a =
+            Auth { identity, trust: TrustLog::new(), entries: Vec::new(), seen: Default::default() };
+        for e in load_trust_entries() {
+            a.add_trust(e);
         }
+        a
     }
 
-    /// Restricted mode: sign our writes with `key` and reject unsigned /
-    /// unauthorized ones.
-    pub fn restricted(key: DeviceKey) -> Self {
-        Auth {
-            identity: Some(key),
-            trust: TrustLog::new(),
-            entries: Vec::new(),
-            seen: std::collections::HashSet::new(),
-            require_signed: true,
-        }
-    }
-
-    /// Ingest a trust entry (idempotent) + remember it for neighbor catch-up.
+    /// Ingest a trust entry (idempotent), remember it for neighbor catch-up, and
+    /// persist. The wire/load is the source; we persist our own converged view.
     pub fn add_trust(&mut self, e: TrustEntry) {
         let id = *blake3::hash(&postcard::to_allocvec(&e).unwrap_or_default()).as_bytes();
-        if self.seen.insert(id) {
+        let fresh = self.seen.insert(id);
+        if fresh {
             self.entries.push(e.clone());
         }
         self.trust.apply(e);
+        if fresh {
+            persist_trust_entries(&self.entries);
+        }
     }
 
-    /// Wrap an outgoing write: a `SignedSync` if we have an identity, else a
-    /// plain `Sync`.
+    /// A board is locked once it has an author (genesis).
+    fn locked(&self) -> bool {
+        self.trust.founder().is_some()
+    }
+    fn my_id(&self) -> [u8; 32] {
+        self.identity.id()
+    }
+    fn authorized(&self) -> bool {
+        self.trust.is_authorized(&self.my_id())
+    }
+    fn is_author(&self) -> bool {
+        self.trust.founder() == Some(self.my_id())
+    }
+
+    /// Become the board's author (lock it) if it has none yet. Returns the
+    /// genesis entry to broadcast.
+    fn lock_as_author(&mut self) -> Option<TrustEntry> {
+        if self.locked() {
+            return None;
+        }
+        let g = self.identity.genesis();
+        self.add_trust(g.clone());
+        Some(g)
+    }
+
+    /// Grant `device` Member write access (we must be an Admin). Returns the
+    /// grant entry to broadcast.
+    fn make_grant(&mut self, device: [u8; 32]) -> Option<TrustEntry> {
+        if self.trust.role(&self.my_id()) != Some(Role::Admin) {
+            return None;
+        }
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&riftpipe_core::crypto::generate_secret()[..16]);
+        let e = self.identity.grant(device, Role::Member, nonce);
+        self.add_trust(e.clone());
+        Some(e)
+    }
+
+    /// Wrap an outgoing write: a `SignedSync` when the board is locked, else a
+    /// plain `Sync` (open collaboration).
     fn sign(&self, msg: riftpipe_core::sync::SyncMsg) -> MeshMsg {
-        match &self.identity {
-            Some(key) => {
-                let payload = postcard::to_allocvec(&msg).unwrap_or_default();
-                MeshMsg::SignedSync(key.sign_write(payload))
-            }
-            None => MeshMsg::Sync(msg),
+        if self.locked() {
+            let payload = postcard::to_allocvec(&msg).unwrap_or_default();
+            MeshMsg::SignedSync(self.identity.sign_write(payload))
+        } else {
+            MeshMsg::Sync(msg)
         }
     }
 
@@ -237,21 +272,21 @@ impl Auth {
         self.entries.iter().cloned().map(MeshMsg::Trust).collect()
     }
 
-    /// Auth-aware receive for a data message (`Sync`/`SignedSync`/`Trust`):
-    /// enforce signing, verify, and return the inner `SyncMsg` to apply — or
-    /// `None` if it was a trust entry (ingested) or was rejected.
+    /// Auth-aware receive for a data message: ingest a trust entry, or enforce +
+    /// return the inner `SyncMsg` to apply. `None` = handled or rejected.
     fn accept(&mut self, gm: MeshMsg) -> Option<riftpipe_core::sync::SyncMsg> {
         match gm {
             MeshMsg::Trust(e) => {
                 self.add_trust(e);
                 None
             }
-            MeshMsg::Sync(s) => (!self.require_signed).then_some(s),
+            // Unsigned writes are accepted only on an unlocked board.
+            MeshMsg::Sync(s) => (!self.locked()).then_some(s),
             MeshMsg::SignedSync(sw) => {
-                let ok = if self.require_signed {
-                    sw.verified(&self.trust).is_some()
+                let ok = if self.locked() {
+                    sw.verified(&self.trust).is_some() // authorized writer
                 } else {
-                    sw.author_verified().is_some()
+                    sw.author_verified().is_some() // open: any authentic signature
                 };
                 ok.then(|| postcard::from_bytes::<riftpipe_core::sync::SyncMsg>(&sw.payload).ok())
                     .flatten()
@@ -259,6 +294,27 @@ impl Auth {
             _ => None,
         }
     }
+}
+
+/// Persist the converged trust log (postcard→hex in localStorage) so a locked
+/// board — and its author + grants — survives a reload.
+fn persist_trust_entries(entries: &[TrustEntry]) {
+    if let Some(store) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let bytes = postcard::to_allocvec(entries).unwrap_or_default();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let _ = store.set_item(TRUST_STORE_KEY, &hex);
+    }
+}
+
+fn load_trust_entries() -> Vec<TrustEntry> {
+    let Some(store) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
+        return Vec::new();
+    };
+    let Ok(Some(hex)) = store.get_item(TRUST_STORE_KEY) else { return Vec::new() };
+    let bytes: Vec<u8> = (0..hex.len() / 2)
+        .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+        .collect();
+    postcard::from_bytes(&bytes).unwrap_or_default()
 }
 
 /// File-tree sync over the gossip mesh. Local pushes broadcast to everyone; received
@@ -482,6 +538,43 @@ impl GossipTreeSync {
         self.broadcast(self.auth.borrow().sign(msg));
     }
 
+    /// Lock the board: become its author (genesis) if it has none, and broadcast
+    /// the genesis live so every peer starts enforcing. `false` if already locked.
+    pub fn lock(&self) -> bool {
+        match self.auth.borrow_mut().lock_as_author() {
+            Some(g) => {
+                self.broadcast(MeshMsg::Trust(g));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Grant `device` write access (we must be the author/Admin) and broadcast
+    /// the grant live. `false` if we can't grant.
+    pub fn grant_device(&self, device: [u8; 32]) -> bool {
+        match self.auth.borrow_mut().make_grant(device) {
+            Some(e) => {
+                self.broadcast(MeshMsg::Trust(e));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// JSON snapshot for the UI: `{locked, device, authorized, isAuthor, author}`.
+    pub fn auth_state(&self) -> String {
+        let a = self.auth.borrow();
+        serde_json::json!({
+            "locked": a.locked(),
+            "device": hex32(&a.my_id()),
+            "authorized": a.authorized(),
+            "isAuthor": a.is_author(),
+            "author": a.trust.founder().map(|f| hex32(&f)).unwrap_or_default(),
+        })
+        .to_string()
+    }
+
     fn broadcast(&self, gm: MeshMsg) {
         let frames = riftpipe_core::sync::encode_mesh_frames(&gm);
         let sender = self.sender.clone();
@@ -575,6 +668,25 @@ pub(crate) fn try_push_lww(path: &str, bytes: &[u8]) -> bool {
             true
         }
         None => false,
+    })
+}
+
+/// Lock the active board (become its author) — the login/auth surface.
+pub(crate) fn active_lock() -> bool {
+    GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.lock()).unwrap_or(false))
+}
+
+/// Grant a device (hex id) write access on the active board.
+pub(crate) fn active_grant(device: [u8; 32]) -> bool {
+    GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.grant_device(device)).unwrap_or(false))
+}
+
+/// Auth state of the active board (JSON), or a safe default when not connected.
+pub(crate) fn active_auth_state() -> String {
+    GOSSIP.with(|c| {
+        c.borrow().as_ref().map(|bs| bs.auth_state()).unwrap_or_else(|| {
+            r#"{"locked":false,"device":"","authorized":false,"isAuthor":false,"author":""}"#.into()
+        })
     })
 }
 
@@ -686,14 +798,14 @@ mod tests {
             sleep_ms(50).await;
         }
         let host_addr = host_mesh.addr();
-        let host_bs = GossipTreeSync::new(host_mesh, Rc::new(|_, _| {}), crate::gossip::Auth::open());
+        let host_bs = GossipTreeSync::new(host_mesh, Rc::new(|_, _| {}), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32])));
 
         let join_sk = SecretKey::generate();
         let joiner_mesh = Mesh::join(join_sk, secret, Some(host_addr)).await.expect("joiner");
         let got: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::new(RefCell::new(Vec::new()));
         let g = got.clone();
         let _joiner_bs =
-            GossipTreeSync::new(joiner_mesh, Rc::new(move |p, b| g.borrow_mut().push((p, b))), crate::gossip::Auth::open());
+            GossipTreeSync::new(joiner_mesh, Rc::new(move |p, b| g.borrow_mut().push((p, b))), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32])));
 
         // Let the swarm form, then the host pushes a file.
         sleep_ms(2500).await;
