@@ -135,6 +135,11 @@ pub enum MeshMsg {
     /// verifies it against the trust log before applying; an open-mode peer that
     /// predates auth skips the unknown variant. APPENDED.
     SignedSync(crate::identity::SignedWrite),
+    /// A signed **request to join** a locked board, broadcast by a would-be
+    /// writer (the Google-Docs "request access" flow). An admin peer collects it
+    /// and — on approval — replies with a `Trust` grant. Self-authenticating via
+    /// its signature; peers that predate it skip the unknown variant. APPENDED.
+    Request(crate::onboard::JoinRequest),
 }
 
 /// FNV-1a 64-bit — a tiny, dependency-free content hash for chunk ids. Not

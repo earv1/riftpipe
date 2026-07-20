@@ -1,6 +1,6 @@
 import { createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, connectPeer, newBoard, onLocalChange, onSiblingChange, storageSupported, auth, type AuthState, type Card } from "./api.ts";
+import { getBoard, addCard, patchCard, connectPeer, newBoard, onLocalChange, onSiblingChange, storageSupported, auth, type AuthState, type PendingRequest, type Card } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 
 export function App() {
@@ -19,19 +19,17 @@ export function App() {
   // Auth/login state (from the lib): whether the board is locked (has an
   // author), and whether this device is the author / authorized to write.
   const [authState, setAuthState] = createSignal<AuthState>(
-    { locked: false, device: "", authorized: false, isAuthor: false, author: "" },
+    { locked: false, device: "", authorized: false, isAuthor: false, author: "", requested: false },
   );
-  const [grantId, setGrantId] = createSignal("");
-  const [copied, setCopied] = createSignal(false);
-  const refreshAuth = () => setAuthState(auth.state());
+  // The author's inbox: who has asked for write access (device id + safety code).
+  const [pending, setPending] = createSignal<PendingRequest[]>([]);
+  const refreshAuth = () => {
+    setAuthState(auth.state());
+    setPending(auth.pending());
+  };
   const lock = () => { auth.lockBoard(); refreshAuth(); };
-  const grant = () => {
-    if (auth.grantDevice(grantId().trim())) setGrantId("");
-    refreshAuth();
-  };
-  const copyDeviceId = async () => {
-    try { await navigator.clipboard.writeText(authState().device); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* no clipboard */ }
-  };
+  const askForAccess = () => { auth.requestAccess(); refreshAuth(); };
+  const approve = (device: string) => { auth.grantDevice(device); refreshAuth(); };
 
   // A mesh peer announced a different riftpipe protocol version (or predates
   // versioning). Detection lives in the library; we only render its event.
@@ -177,28 +175,38 @@ export function App() {
         </Show>
         <Show when={authState().locked && authState().isAuthor}>
           <span class="auth-status owner">🔒 You own this board</span>
-          <input
-            class="grant-input"
-            placeholder="paste a device id to let them edit…"
-            value={grantId()}
-            onInput={(e) => setGrantId(e.currentTarget.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") grant(); }}
-          />
-          <button class="grant-btn" onClick={grant} disabled={grantId().trim().length !== 64}>
-            Grant edit access
-          </button>
+          <Show
+            when={pending().length > 0}
+            fallback={<span class="auth-hint">no access requests — people who ask will show up here</span>}
+          >
+            <span class="auth-hint">access requests:</span>
+            <For each={pending()}>
+              {(req) => (
+                <span class="req">
+                  <span class="req-id" title={`device ${req.device}\nsafety code ${req.safety}`}>
+                    {req.name || "someone"} · {req.device.slice(0, 8)}… · {req.safety}
+                  </span>
+                  <button class="approve-btn" onClick={() => approve(req.device)}>Approve</button>
+                </span>
+              )}
+            </For>
+          </Show>
         </Show>
         <Show when={authState().locked && authState().authorized && !authState().isAuthor}>
           <span class="auth-status editor">🔒 Claimed · you can edit</span>
         </Show>
         <Show when={authState().locked && !authState().authorized}>
-          <span class="auth-status viewer">
-            🔒 Claimed · view only — send your device id to the owner to get edit access
-          </span>
+          <span class="auth-status viewer">🔒 Claimed · view only</span>
+          <Show
+            when={!authState().requested}
+            fallback={<span class="auth-hint">✓ access requested — waiting for the owner to approve</span>}
+          >
+            <button class="ask-btn" onClick={askForAccess}>Ask for edit access</button>
+          </Show>
         </Show>
-        <button class="device-id" title="your device id — share it to be granted edit access" onClick={copyDeviceId}>
-          id: {authState().device.slice(0, 10)}… {copied() ? "✓ copied" : "📋"}
-        </button>
+        <span class="device-id" title="this browser's device id">
+          id: {authState().device.slice(0, 10)}…
+        </span>
       </div>
       <main class="columns">
         <For each={board.columns}>

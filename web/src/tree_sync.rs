@@ -156,8 +156,24 @@ pub fn grant_device(hex_id: String) -> bool {
     }
 }
 
+/// **Ask for access**: request write access on a locked board. Broadcasts a
+/// signed join request so the author sees it in their approval inbox. `true` if
+/// a request went out, `false` if the board is open or we're already authorized.
+#[wasm_bindgen(js_name = requestAccess)]
+pub fn request_access() -> bool {
+    crate::gossip::active_request_access()
+}
+
+/// Pending access requests awaiting this device's approval, as a JSON array of
+/// `{device, name, safety}` — the author's "someone asked" inbox.
+#[wasm_bindgen(js_name = pendingRequests)]
+pub fn pending_requests() -> String {
+    crate::gossip::active_pending_requests()
+}
+
 /// Auth state of the active board as JSON:
-/// `{locked, device, authorized, isAuthor, author}` — what the login UI renders.
+/// `{locked, device, authorized, isAuthor, author, requested}` — what the login
+/// UI renders.
 #[wasm_bindgen(js_name = authState)]
 pub fn auth_state() -> String {
     crate::gossip::active_auth_state()

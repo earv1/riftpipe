@@ -17,25 +17,33 @@ import init, {
   deviceId,
   lockBoard,
   grantDevice,
+  requestAccess,
+  pendingRequests,
   authState,
 } from "../wasm/pkg/kanban_wasm.js";
 
 // The auth surface, backed entirely by the lib (wasm). Also on window.riftpipe
 // for console use:
-//   riftpipe.deviceId()          → this browser's device id (share it to be granted)
+//   riftpipe.deviceId()          → this browser's device id
 //   riftpipe.lockBoard()         → become this board's author (locks it)
-//   riftpipe.grantDevice(id)     → author-only: authorize a device to write
-//   riftpipe.authState()         → { locked, device, authorized, isAuthor, author }
+//   riftpipe.requestAccess()     → ask the author for write access
+//   riftpipe.pendingRequests()   → author-only: who's asking [{device,name,safety}]
+//   riftpipe.grantDevice(id)     → author-only: approve a device to write
+//   riftpipe.authState()         → { locked, device, authorized, isAuthor, author, requested }
 export type AuthState = {
   locked: boolean;
   device: string;
   authorized: boolean;
   isAuthor: boolean;
   author: string;
+  requested: boolean;
 };
+export type PendingRequest = { device: string; name: string; safety: string };
 export const auth = {
   deviceId: (): string => deviceId(),
   lockBoard: (): boolean => lockBoard(),
+  requestAccess: (): boolean => requestAccess(),
+  pending: (): PendingRequest[] => JSON.parse(pendingRequests()),
   grantDevice: (id: string): boolean => grantDevice(id),
   state: (): AuthState => JSON.parse(authState()),
 };
@@ -44,6 +52,8 @@ export const auth = {
   routingMap: () => JSON.parse(routingMap()),
   deviceId: () => deviceId(),
   lockBoard: () => lockBoard(),
+  requestAccess: () => requestAccess(),
+  pendingRequests: () => JSON.parse(pendingRequests()),
   grantDevice: (id: string) => grantDevice(id),
   authState: () => JSON.parse(authState()),
 };

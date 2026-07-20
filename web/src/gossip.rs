@@ -174,6 +174,7 @@ impl MeshKeepAlive {
 use riftpipe_core::sync::MeshMsg;
 
 use riftpipe_core::identity::{DeviceKey, Role, TrustEntry, TrustLog};
+use riftpipe_core::onboard::JoinRequest;
 
 const TRUST_STORE_KEY: &str = "riftpipe:trust";
 
@@ -190,14 +191,26 @@ pub struct Auth {
     trust: TrustLog,
     entries: Vec<TrustEntry>,
     seen: std::collections::HashSet<[u8; 32]>,
+    /// Access requests received from would-be writers (owner side), deduped by
+    /// requesting device id — the "someone asked" inbox the UI renders.
+    requests: Vec<JoinRequest>,
+    /// Our own outstanding access request (viewer side), re-announced to new
+    /// neighbors so a late-arriving owner still sees it. Cleared once granted.
+    my_request: Option<JoinRequest>,
 }
 
 impl Auth {
     /// Build from this device's identity, restoring any persisted trust log so
     /// a locked board stays locked across reloads.
     pub fn load(identity: DeviceKey) -> Self {
-        let mut a =
-            Auth { identity, trust: TrustLog::new(), entries: Vec::new(), seen: Default::default() };
+        let mut a = Auth {
+            identity,
+            trust: TrustLog::new(),
+            entries: Vec::new(),
+            seen: Default::default(),
+            requests: Vec::new(),
+            my_request: None,
+        };
         for e in load_trust_entries() {
             a.add_trust(e);
         }
@@ -215,6 +228,13 @@ impl Auth {
         self.trust.apply(e);
         if fresh {
             persist_trust_entries(&self.entries);
+        }
+        // A grant may have resolved pending asks: drop any request whose device
+        // is now authorized, and clear our own once we're in.
+        let trust = &self.trust;
+        self.requests.retain(|r| !trust.is_authorized(&r.device_id));
+        if self.trust.is_authorized(&self.my_id()) {
+            self.my_request = None;
         }
     }
 
@@ -267,9 +287,45 @@ impl Auth {
         }
     }
 
-    /// The trust entries to catch a neighbor up (gossip is ephemeral).
+    /// Ask to become a writer on a locked board: build a signed join request
+    /// (idempotent — reuses ours), remember it for re-announce, and return it to
+    /// broadcast. `None` when there's nothing to ask (open board, or we're
+    /// already authorized).
+    fn request_access(&mut self) -> Option<MeshMsg> {
+        if !self.locked() || self.authorized() {
+            return None;
+        }
+        let req = JoinRequest::create(&self.identity, String::new());
+        self.my_request = Some(req.clone());
+        Some(MeshMsg::Request(req))
+    }
+
+    /// Record an incoming access request (owner side): keep it if it's
+    /// authentically signed and not already authorized/known. Deduped by device.
+    fn ingest_request(&mut self, req: JoinRequest) {
+        if !req.verify() || self.trust.is_authorized(&req.device_id) {
+            return;
+        }
+        if !self.requests.iter().any(|r| r.device_id == req.device_id) {
+            self.requests.push(req);
+        }
+    }
+
+    /// Pending asks awaiting our approval (only meaningful when we can grant).
+    fn pending(&self) -> &[JoinRequest] {
+        &self.requests
+    }
+
+    /// The messages to catch a neighbor up (gossip is ephemeral): every trust
+    /// entry, plus our own outstanding ask so a late-arriving owner sees it.
     fn catchup(&self) -> Vec<MeshMsg> {
-        self.entries.iter().cloned().map(MeshMsg::Trust).collect()
+        let mut out: Vec<MeshMsg> = self.entries.iter().cloned().map(MeshMsg::Trust).collect();
+        if !self.authorized() {
+            if let Some(req) = &self.my_request {
+                out.push(MeshMsg::Request(req.clone()));
+            }
+        }
+        out
     }
 
     /// Auth-aware receive for a data message: ingest a trust entry, or enforce +
@@ -278,6 +334,10 @@ impl Auth {
         match gm {
             MeshMsg::Trust(e) => {
                 self.add_trust(e);
+                None
+            }
+            MeshMsg::Request(req) => {
+                self.ingest_request(req);
                 None
             }
             // Unsigned writes are accepted only on an unlocked board.
@@ -562,7 +622,39 @@ impl GossipTreeSync {
         }
     }
 
-    /// JSON snapshot for the UI: `{locked, device, authorized, isAuthor, author}`.
+    /// Ask to become a writer on a locked board — broadcast a signed join
+    /// request so the owner sees it and can approve. `false` when there's
+    /// nothing to ask (open board, or already authorized).
+    pub fn request_access(&self) -> bool {
+        match self.auth.borrow_mut().request_access() {
+            Some(m) => {
+                self.broadcast(m);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Pending access requests awaiting our approval, as a JSON array of
+    /// `{device, name, safety}` — what the owner's "someone asked" inbox renders.
+    pub fn pending_requests(&self) -> String {
+        let a = self.auth.borrow();
+        let items: Vec<serde_json::Value> = a
+            .pending()
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "device": hex32(&r.device_id),
+                    "name": r.name,
+                    "safety": r.safety_code(),
+                })
+            })
+            .collect();
+        serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// JSON snapshot for the UI: `{locked, device, authorized, isAuthor, author,
+    /// requested}` — `requested` is true once we've asked and are still waiting.
     pub fn auth_state(&self) -> String {
         let a = self.auth.borrow();
         serde_json::json!({
@@ -571,6 +663,7 @@ impl GossipTreeSync {
             "authorized": a.authorized(),
             "isAuthor": a.is_author(),
             "author": a.trust.founder().map(|f| hex32(&f)).unwrap_or_default(),
+            "requested": a.my_request.is_some(),
         })
         .to_string()
     }
@@ -681,11 +774,21 @@ pub(crate) fn active_grant(device: [u8; 32]) -> bool {
     GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.grant_device(device)).unwrap_or(false))
 }
 
+/// Ask for write access on the active (locked) board.
+pub(crate) fn active_request_access() -> bool {
+    GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.request_access()).unwrap_or(false))
+}
+
+/// Pending access requests on the active board (JSON array).
+pub(crate) fn active_pending_requests() -> String {
+    GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.pending_requests()).unwrap_or_else(|| "[]".into()))
+}
+
 /// Auth state of the active board (JSON), or a safe default when not connected.
 pub(crate) fn active_auth_state() -> String {
     GOSSIP.with(|c| {
         c.borrow().as_ref().map(|bs| bs.auth_state()).unwrap_or_else(|| {
-            r#"{"locked":false,"device":"","authorized":false,"isAuthor":false,"author":""}"#.into()
+            r#"{"locked":false,"device":"","authorized":false,"isAuthor":false,"author":"","requested":false}"#.into()
         })
     })
 }

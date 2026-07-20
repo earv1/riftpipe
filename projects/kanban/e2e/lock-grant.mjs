@@ -1,14 +1,16 @@
-// End-to-end test of the "lock = authorship" auth UI over the real sealed mesh.
+// End-to-end test of the "claim = authorship" + ask/approve auth UI over the
+// real sealed mesh.
 //
 // Flow:
-//   1. Window A hosts an empty board (unlocked). Its auth bar shows a Lock
+//   1. Window A hosts an empty board (unlocked). Its auth bar shows a Claim
 //      button; anyone can edit.
 //   2. Window B joins A's share link. While unlocked, B can add a card and it
 //      syncs to A (open edit).
-//   3. A clicks "Lock board" → A becomes the author. B, still un-granted, drops
+//   3. A clicks "Claim board" → A becomes the author. B, un-authorized, drops
 //      to "view only"; a card B writes now must NOT appear on A.
-//   4. A grants B's device id. B returns to "you can edit"; a card B writes now
-//      DOES appear on A.
+//   4. B clicks "Ask for edit access" → the request appears in A's inbox. A
+//      clicks "Approve". B returns to "you can edit"; a card B writes now DOES
+//      appear on A.
 //
 // Run: node e2e/lock-grant.mjs   (needs `./run.sh serve` on PORT, default 8140)
 import { chromium } from "playwright";
@@ -62,39 +64,48 @@ try {
   if (!(await waitCard(a, "open-edit"))) fail("unlocked: B's card should sync to A");
   console.log("✓ unlocked: B's edit synced to A");
 
-  // 3. A locks → becomes author; B drops to view-only.
+  // 3. A claims → becomes author; B drops to view-only.
   await a.locator(".lock-btn").click();
   await wait(2500);
   const aState = await authState(a);
-  if (!aState.locked || !aState.isAuthor) fail(`A should be locked author, got ${JSON.stringify(aState)}`);
-  console.log("✓ A locked the board and is the author");
+  if (!aState.locked || !aState.isAuthor) fail(`A should be claimed author, got ${JSON.stringify(aState)}`);
+  console.log("✓ A claimed the board and is the author");
 
   const bState = await authState(b);
-  if (!bState.locked) fail("B should observe the board is now locked");
-  if (bState.authorized) fail("B should be un-authorized right after A locks");
+  if (!bState.locked) fail("B should observe the board is now claimed");
+  if (bState.authorized) fail("B should be un-authorized right after A claims");
   await b.waitForSelector(".auth-status.viewer", { timeout: 5000 });
-  console.log("✓ B dropped to view-only after lock");
+  console.log("✓ B dropped to view-only after claim");
 
   // B's write must be rejected by A now.
   await addCard(b, "blocked-write");
   await wait(3000);
-  if (await hasCard(a, "blocked-write")) fail("locked: un-granted B's card must NOT reach A");
-  console.log("✓ locked: un-granted B's write was rejected by A");
+  if (await hasCard(a, "blocked-write")) fail("claimed: un-granted B's card must NOT reach A");
+  console.log("✓ claimed: un-granted B's write was rejected by A");
 
-  // 4. A grants B → B can edit again.
-  await a.locator(".grant-input").fill(bId);
-  await a.locator(".grant-btn").click();
+  // 4. B asks for access → shows up in A's inbox → A approves.
+  await b.locator(".ask-btn").click();
+  await wait(500);
+  if (!(await authState(b)).requested) fail("B should be in 'requested' state after asking");
+  await b.waitForSelector(".auth-hint:has-text('access requested')", { timeout: 5000 });
+  console.log("✓ B asked for access (waiting state shown)");
+
+  // A's inbox should surface B's request (by device id) — approve it.
+  const approveBtn = a.locator(".req", { hasText: bId.slice(0, 8) }).locator(".approve-btn");
+  await approveBtn.waitFor({ timeout: 8000 });
+  console.log("✓ B's request appeared in A's approval inbox");
+  await approveBtn.click();
   await wait(2500);
   const bAfter = await authState(b);
-  if (!bAfter.authorized) fail(`B should be authorized after grant, got ${JSON.stringify(bAfter)}`);
+  if (!bAfter.authorized) fail(`B should be authorized after approval, got ${JSON.stringify(bAfter)}`);
   await b.waitForSelector(".auth-status.editor", { timeout: 5000 });
-  console.log("✓ B authorized after grant");
+  console.log("✓ B authorized after approval");
 
   await addCard(b, "granted-write");
   if (!(await waitCard(a, "granted-write"))) fail("granted: B's card should now sync to A");
   console.log("✓ granted: B's write synced to A");
 
-  console.log("\nPASS — lock=authorship + grant flow works end to end over the mesh");
+  console.log("\nPASS — claim=authorship + ask/approve flow works end to end over the mesh");
 } finally {
   await browser.close();
 }
