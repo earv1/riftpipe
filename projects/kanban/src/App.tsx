@@ -171,9 +171,9 @@ export function App() {
             title="Become this board's owner — only you (and people you grant) can edit; others can view"
             onClick={lock}
           >
-            🔓 Lock board (you become the owner)
+            🔓 Claim board (you become the owner)
           </button>
-          <span class="auth-hint">anyone with the link can edit until you lock it</span>
+          <span class="auth-hint">anyone with the link can edit until you claim it</span>
         </Show>
         <Show when={authState().locked && authState().isAuthor}>
           <span class="auth-status owner">🔒 You own this board</span>
@@ -189,11 +189,11 @@ export function App() {
           </button>
         </Show>
         <Show when={authState().locked && authState().authorized && !authState().isAuthor}>
-          <span class="auth-status editor">🔒 Locked · you can edit</span>
+          <span class="auth-status editor">🔒 Claimed · you can edit</span>
         </Show>
         <Show when={authState().locked && !authState().authorized}>
           <span class="auth-status viewer">
-            🔒 Locked · view only — send your device id to the owner to get edit access
+            🔒 Claimed · view only — send your device id to the owner to get edit access
           </span>
         </Show>
         <button class="device-id" title="your device id — share it to be granted edit access" onClick={copyDeviceId}>
