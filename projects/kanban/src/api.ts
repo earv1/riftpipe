@@ -14,14 +14,22 @@ import init, {
   irohConnect,
   connectedPeers,
   routingMap,
+  deviceId,
+  configureAuth,
 } from "../wasm/pkg/kanban_wasm.js";
 
-// Debugging hooks for the gossip mesh — inspect from the console:
-//   riftpipe.connectedPeers()  → this peer's direct neighbors (hex ids)
-//   riftpipe.routingMap()      → the whole mesh topology { id: [neighbors] }
+// Debugging + auth hooks for the gossip mesh — inspect/drive from the console:
+//   riftpipe.connectedPeers()          → this peer's direct neighbors (hex ids)
+//   riftpipe.routingMap()              → the whole mesh topology { id: [neighbors] }
+//   riftpipe.deviceId()                → this browser's device id (to be granted)
+//   riftpipe.configureAuth(true, [id]) → next connect is restricted; grant ids
+//   riftpipe.irohConnect(ticket, cb)   → (re)establish the mesh session
 (globalThis as any).riftpipe = {
   connectedPeers: () => JSON.parse(connectedPeers()),
   routingMap: () => JSON.parse(routingMap()),
+  deviceId: () => deviceId(),
+  configureAuth: (restricted: boolean, grants: string[]) => configureAuth(restricted, grants),
+  irohConnect: (ticket: string, cb: () => void) => irohConnect(ticket, cb ?? (() => {})),
 };
 
 // Build-time config (Vite env). Set these for a deployed/cross-network build:

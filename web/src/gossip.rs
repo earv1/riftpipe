@@ -173,6 +173,94 @@ impl MeshKeepAlive {
 /// core so native and browser peers speak the same layout.
 use riftpipe_core::sync::MeshMsg;
 
+use riftpipe_core::identity::{DeviceKey, TrustEntry, TrustLog};
+
+/// Device-linking auth state for a mesh session — the browser mirror of the
+/// native `TreePeer`'s auth fields. `open()` = today's default (unsigned, no
+/// enforcement); `restricted(key)` signs our writes and, when `require_signed`,
+/// rejects unsigned or unauthorized writes. See `docs/security/`.
+pub struct Auth {
+    identity: Option<DeviceKey>,
+    trust: TrustLog,
+    entries: Vec<TrustEntry>,
+    seen: std::collections::HashSet<[u8; 32]>,
+    require_signed: bool,
+}
+
+impl Auth {
+    /// Open mode: unsigned writes, no enforcement (the default).
+    pub fn open() -> Self {
+        Auth {
+            identity: None,
+            trust: TrustLog::new(),
+            entries: Vec::new(),
+            seen: std::collections::HashSet::new(),
+            require_signed: false,
+        }
+    }
+
+    /// Restricted mode: sign our writes with `key` and reject unsigned /
+    /// unauthorized ones.
+    pub fn restricted(key: DeviceKey) -> Self {
+        Auth {
+            identity: Some(key),
+            trust: TrustLog::new(),
+            entries: Vec::new(),
+            seen: std::collections::HashSet::new(),
+            require_signed: true,
+        }
+    }
+
+    /// Ingest a trust entry (idempotent) + remember it for neighbor catch-up.
+    pub fn add_trust(&mut self, e: TrustEntry) {
+        let id = *blake3::hash(&postcard::to_allocvec(&e).unwrap_or_default()).as_bytes();
+        if self.seen.insert(id) {
+            self.entries.push(e.clone());
+        }
+        self.trust.apply(e);
+    }
+
+    /// Wrap an outgoing write: a `SignedSync` if we have an identity, else a
+    /// plain `Sync`.
+    fn sign(&self, msg: riftpipe_core::sync::SyncMsg) -> MeshMsg {
+        match &self.identity {
+            Some(key) => {
+                let payload = postcard::to_allocvec(&msg).unwrap_or_default();
+                MeshMsg::SignedSync(key.sign_write(payload))
+            }
+            None => MeshMsg::Sync(msg),
+        }
+    }
+
+    /// The trust entries to catch a neighbor up (gossip is ephemeral).
+    fn catchup(&self) -> Vec<MeshMsg> {
+        self.entries.iter().cloned().map(MeshMsg::Trust).collect()
+    }
+
+    /// Auth-aware receive for a data message (`Sync`/`SignedSync`/`Trust`):
+    /// enforce signing, verify, and return the inner `SyncMsg` to apply — or
+    /// `None` if it was a trust entry (ingested) or was rejected.
+    fn accept(&mut self, gm: MeshMsg) -> Option<riftpipe_core::sync::SyncMsg> {
+        match gm {
+            MeshMsg::Trust(e) => {
+                self.add_trust(e);
+                None
+            }
+            MeshMsg::Sync(s) => (!self.require_signed).then_some(s),
+            MeshMsg::SignedSync(sw) => {
+                let ok = if self.require_signed {
+                    sw.verified(&self.trust).is_some()
+                } else {
+                    sw.author_verified().is_some()
+                };
+                ok.then(|| postcard::from_bytes::<riftpipe_core::sync::SyncMsg>(&sw.payload).ok())
+                    .flatten()
+            }
+            _ => None,
+        }
+    }
+}
+
 /// File-tree sync over the gossip mesh. Local pushes broadcast to everyone; received
 /// messages merge via the N-peer-safe `Syncer`. A new neighbor is caught up by
 /// re-broadcasting our full tree. Tracks direct neighbors + a gossiped routing map.
@@ -183,6 +271,9 @@ pub struct GossipTreeSync {
     neighbors: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<[u8; 32]>>>,
     routing: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<[u8; 32], Vec<[u8; 32]>>>>,
     versions: std::rc::Rc<std::cell::RefCell<riftpipe_core::sync::VersionMonitor>>,
+    /// Device-linking auth (shared with the recv task): signs pushes and gates
+    /// incoming writes.
+    auth: std::rc::Rc<std::cell::RefCell<Auth>>,
     _keep: MeshKeepAlive,
 }
 
@@ -213,7 +304,7 @@ fn report_mismatch(p: &riftpipe_core::sync::PeerVersion) {
 }
 
 impl GossipTreeSync {
-    pub fn new(mesh: Mesh, on_merged: std::rc::Rc<dyn Fn(String, Vec<u8>)>) -> GossipTreeSync {
+    pub fn new(mesh: Mesh, on_merged: std::rc::Rc<dyn Fn(String, Vec<u8>)>, auth: Auth) -> GossipTreeSync {
         use std::cell::RefCell;
         use std::rc::Rc;
         let my_id = *mesh.my_id().as_bytes();
@@ -223,14 +314,16 @@ impl GossipTreeSync {
         let neighbors = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
         let routing = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
         let versions = Rc::new(RefCell::new(riftpipe_core::sync::VersionMonitor::new()));
+        let auth = Rc::new(RefCell::new(auth));
 
-        let (sy, nb, rt, vs, snd, cph) = (
+        let (sy, nb, rt, vs, snd, cph, au) = (
             syncer.clone(),
             neighbors.clone(),
             routing.clone(),
             versions.clone(),
             sender.clone(),
             cipher.clone(),
+            auth.clone(),
         );
         wasm_bindgen_futures::spawn_local(async move {
             // A failed send must not kill the session, but it must be VISIBLE —
@@ -274,15 +367,6 @@ impl GossipTreeSync {
                         let Some(plain) = cph.open(&m.content) else { continue };
                         let Some(gm) = assembler.feed(&plain) else { continue };
                         match gm {
-                            MeshMsg::Sync(msg) => {
-                                let (persist, replies) = sy.borrow_mut().apply(msg);
-                                if let Some((path, bytes)) = persist {
-                                    on_merged(path, bytes);
-                                }
-                                for r in replies {
-                                    send(&snd, &cph, &MeshMsg::Sync(r), false).await;
-                                }
-                            }
                             MeshMsg::Presence { id, neighbors } => {
                                 if id != my_id {
                                     let now = js_sys::Date::now() as u64;
@@ -301,12 +385,23 @@ impl GossipTreeSync {
                             }
                             // feed() never yields a Chunk (it refuses nesting).
                             MeshMsg::Chunk { .. } => {}
-                            // Device-linking auth (v3): the browser runs open
-                            // mode for now, so it ignores replicated trust
-                            // entries and signed writes (only restricted-mode
-                            // native boards emit these). Wiring the browser into
-                            // signed/restricted boards is the follow-on.
-                            MeshMsg::Trust(_) | MeshMsg::SignedSync(_) => {}
+                            // Data messages (Sync / SignedSync / Trust) — auth
+                            // decides: a trust entry is ingested; a write is
+                            // verified/enforced and, if accepted, applied. Any
+                            // replies are signed on the way back out.
+                            other => {
+                                let inner = au.borrow_mut().accept(other);
+                                if let Some(msg) = inner {
+                                    let (persist, replies) = sy.borrow_mut().apply(msg);
+                                    if let Some((path, bytes)) = persist {
+                                        on_merged(path, bytes);
+                                    }
+                                    for r in replies {
+                                        let mm = au.borrow().sign(r);
+                                        send(&snd, &cph, &mm, false).await;
+                                    }
+                                }
+                            }
                         }
                     }
                     Event::NeighborUp(_) => {
@@ -315,11 +410,17 @@ impl GossipTreeSync {
                         // but no Version = pre-versioning peer".
                         let ours = riftpipe_core::sync::PROTOCOL_VERSION;
                         send(&snd, &cph, &MeshMsg::Version { id: my_id, proto: ours }, false).await;
-                        // Catch the new neighbor up with our whole tree —
-                        // direct neighbors only; the swarm doesn't need it.
+                        // Catch the new neighbor up: the trust log first (so it
+                        // learns the authorized set — gossip is ephemeral), then
+                        // our whole (signed) tree. Direct neighbors only.
+                        let catchup = au.borrow().catchup();
+                        for m in catchup {
+                            send(&snd, &cph, &m, true).await;
+                        }
                         let full = sy.borrow().full_state();
                         for msg in full {
-                            send(&snd, &cph, &MeshMsg::Sync(msg), true).await;
+                            let mm = au.borrow().sign(msg);
+                            send(&snd, &cph, &mm, true).await;
                         }
                         let list = snapshot(&receiver);
                         *nb.borrow_mut() = list.iter().copied().collect();
@@ -366,19 +467,19 @@ impl GossipTreeSync {
             }
         });
 
-        GossipTreeSync { syncer, sender, cipher, neighbors, routing, versions, _keep: keep }
+        GossipTreeSync { syncer, sender, cipher, neighbors, routing, versions, auth, _keep: keep }
     }
 
     pub fn push_text(&self, path: &str, content: &str) {
         if let Some(msg) = self.syncer.borrow_mut().local_text(path, content) {
-            self.broadcast(MeshMsg::Sync(msg));
+            self.broadcast(self.auth.borrow().sign(msg));
         }
     }
 
     pub fn push_lww(&self, path: &str, bytes: &[u8]) {
         let now = js_sys::Date::now() as u64;
         let msg = self.syncer.borrow_mut().local_lww(path, bytes.to_vec(), now);
-        self.broadcast(MeshMsg::Sync(msg));
+        self.broadcast(self.auth.borrow().sign(msg));
     }
 
     fn broadcast(&self, gm: MeshMsg) {
@@ -585,14 +686,14 @@ mod tests {
             sleep_ms(50).await;
         }
         let host_addr = host_mesh.addr();
-        let host_bs = GossipTreeSync::new(host_mesh, Rc::new(|_, _| {}));
+        let host_bs = GossipTreeSync::new(host_mesh, Rc::new(|_, _| {}), crate::gossip::Auth::open());
 
         let join_sk = SecretKey::generate();
         let joiner_mesh = Mesh::join(join_sk, secret, Some(host_addr)).await.expect("joiner");
         let got: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::new(RefCell::new(Vec::new()));
         let g = got.clone();
         let _joiner_bs =
-            GossipTreeSync::new(joiner_mesh, Rc::new(move |p, b| g.borrow_mut().push((p, b))));
+            GossipTreeSync::new(joiner_mesh, Rc::new(move |p, b| g.borrow_mut().push((p, b))), crate::gossip::Auth::open());
 
         // Let the swarm form, then the host pushes a file.
         sleep_ms(2500).await;

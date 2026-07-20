@@ -22,6 +22,8 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1", features = ["alloc"] }
+# Dedup id for replicated trust entries (wasm-clean; already transitive via core).
+blake3 = { version = "1", default-features = false }
 gloo-timers = { version = "0.3", features = ["futures"] }
 
 [dependencies.web-sys]
