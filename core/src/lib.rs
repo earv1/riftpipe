@@ -7,6 +7,7 @@
 pub mod crypto;
 pub mod identity;
 pub mod keywrap;
+pub mod onboard;
 pub mod sync;
 pub mod text;
 pub mod wal;
