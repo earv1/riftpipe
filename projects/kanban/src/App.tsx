@@ -1,6 +1,6 @@
 import { createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, connectPeer, newBoard, onLocalChange, onSiblingChange, storageSupported, auth, type AuthState, type PendingRequest, type Card } from "./api.ts";
+import { getBoard, addCard, patchCard, connectPeer, newBoard, watch, storageSupported, auth, type AuthState, type PendingRequest, type Card } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 
 export function App() {
@@ -62,19 +62,19 @@ export function App() {
   };
 
   onMount(() => {
-    // A local mutation (our own add/move/edit) refreshes the board too — no SSE.
-    onLocalChange(() => void refresh());
-    // Another tab in this browser profile edited the shared OPFS board.
-    onSiblingChange(() => void refresh());
+    // One subscription for every change to the synced tree — our own edits, a
+    // peer's merged edit, or another tab in this profile. All funnel through the
+    // file API's `watch`; each just re-reads the board. No SSE, no server.
+    watch(() => void refresh());
 
-    // Connect P2P when the URL carries a connection id / ticket; refresh on each
-    // peer edit merged into local OPFS. No id => single-player, no server.
+    // Connect P2P when the URL carries a connection id / ticket. No id =>
+    // single-player, no server. Merges arrive via `watch` above.
     let lastHash: string | null = null; // null => never connected (empty hash is valid)
     const connect = async () => {
       if (location.hash === lastHash) return; // e.g. the host writing its own ticket
       lastHash = location.hash;
       try {
-        await connectPeer(() => void refresh());
+        await connectPeer();
       } catch (_e) {
         // no peer / signaling unavailable — runs fine solo
       }

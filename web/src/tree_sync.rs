@@ -38,16 +38,31 @@ pub async fn connect_and_sync(
     Ok(())
 }
 
-/// A merge handler that lands the file in OPFS and nudges the UI to refetch.
+/// A merge handler that lands the file in OPFS, fires a per-path
+/// `riftpipe:file-changed` event (the file API's `watch`), and nudges the UI to
+/// refetch via the legacy `on_change` callback.
 fn opfs_on_merged(on_change: js_sys::Function) -> Rc<dyn Fn(String, Vec<u8>)> {
     let on_change = Rc::new(on_change);
     Rc::new(move |path: String, bytes: Vec<u8>| {
         let cb = on_change.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let _ = crate::opfs::write_path(&path, &bytes).await;
+            dispatch_file_changed(&path);
             let _ = cb.call0(&JsValue::NULL);
         });
     })
+}
+
+/// Fire a `riftpipe:file-changed` CustomEvent on `window` (detail: the path), so
+/// an app can `watch` the synced tree per path — nothing app-specific here.
+fn dispatch_file_changed(path: &str) {
+    if let Some(w) = web_sys::window() {
+        let init = web_sys::CustomEventInit::new();
+        init.set_detail(&JsValue::from_str(path));
+        if let Ok(ev) = web_sys::CustomEvent::new_with_event_init_dict("riftpipe:file-changed", &init) {
+            let _ = w.dispatch_event(&ev);
+        }
+    }
 }
 
 thread_local! {

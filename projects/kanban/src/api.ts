@@ -1,13 +1,12 @@
-// API layer — backed by the in-browser **Rust kanban server** (wasm + OPFS), not
-// a localhost process. The shapes are unchanged; the only difference is the
-// transport: each request is handled by `kanbanHandle` from the `kanban-wasm`
-// package instead of crossing the network. No local server. (kanban-wasm links
-// riftpipe-web, so the generic sync exports come from the same bundle.)
-//
-// (The exported function signatures are identical to the old fetch-based API, so
-// the SolidJS components don't change.)
-import init, {
-  kanbanHandle,
+// The app-facing API barrel. There is **no server and no domain logic here**:
+//   - the board model (getBoard/addCard/patchCard/…) lives in `board.ts`, built
+//     on the generic file API (`fs.ts`) — read/write/list/watch over the synced
+//     OPFS tree, the same file layout the native CLI materializes;
+//   - this module adds transport/lifecycle (connect, start-fresh), the change
+//     subscription (`watch`), and the auth surface.
+// riftpipe's wasm bundle is a generic file-sync library; nothing kanban-specific
+// is baked into it.
+import {
   connectAndSync,
   connectionId,
   configureIce,
@@ -21,6 +20,14 @@ import init, {
   pendingRequests,
   authState,
 } from "../wasm/pkg/kanban_wasm.js";
+import { ready, watch } from "./fs.ts";
+
+// Domain model + types (Board, Card, Comment, CardDetail, getBoard, addCard,
+// patchCard, getCardDetail, addComment, …) — over the file API.
+export * from "./board.ts";
+// The file-tree change subscription: fires on local writes, remote merges, and
+// sibling-tab edits. The app calls `watch(() => refresh())` once.
+export { watch, read as readFile, write as writeFile, list as listDir } from "./fs.ts";
 
 // The auth surface, backed entirely by the lib (wasm). Also on window.riftpipe
 // for console use:
@@ -64,64 +71,6 @@ export const auth = {
 //   VITE_TURN/_USER/_PASS — optional relay for hostile NATs
 const env: Record<string, string | undefined> = (import.meta as any).env || {};
 
-export interface Card {
-  id: string;
-  title: string;
-  column: string;
-  position: number;
-  done: boolean;
-}
-
-export interface Board {
-  title: string;
-  columns: string[];
-  cards: Card[];
-}
-
-export interface Comment {
-  id: string;
-  author: string;
-  ts: string;
-  text: string;
-}
-
-export interface CardDetail extends Card {
-  description: string;
-  comments: Comment[];
-}
-
-// Initialize the wasm module once, lazily.
-let _ready: Promise<unknown> | null = null;
-function ready(): Promise<unknown> {
-  return (_ready ??= init());
-}
-
-// Without a server there's no SSE; a successful local mutation notifies the app
-// to refresh (remote peer merges notify via connectPeer's callback).
-let _onLocalChange: (() => void) | null = null;
-export function onLocalChange(cb: () => void): void {
-  _onLocalChange = cb;
-}
-
-// Tabs in the SAME browser profile share one OPFS board (and one iroh
-// identity), so a sibling tab's edit is already on "disk" — but nothing would
-// tell this tab to refetch. A BroadcastChannel bridges that gap: every local
-// mutation and every remote merge pings the siblings, which refresh from the
-// shared OPFS. (True multi-tab networking — one tab owning the endpoint,
-// siblings proxying — is tracked in docs/planned.md; this fixes the stale UI.)
-const _bc: BroadcastChannel | null =
-  typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("riftpipe:board") : null;
-function pingSiblings(): void {
-  try {
-    _bc?.postMessage("change");
-  } catch (_e) {
-    // channel closed during teardown — harmless
-  }
-}
-export function onSiblingChange(cb: () => void): void {
-  _bc?.addEventListener("message", () => cb());
-}
-
 /**
  * Can this browser persist the board? We need OPFS with main-thread
  * `createWritable` (Chrome/Edge/Firefox; Safari/iOS 18.4+). Older WebKit has
@@ -134,27 +83,6 @@ export function storageSupported(): boolean {
     typeof globalThis.FileSystemFileHandle !== "undefined" &&
     "createWritable" in FileSystemFileHandle.prototype
   );
-}
-
-interface ApiResponse {
-  status: number;
-  body: string;
-}
-
-/** Call the in-browser handler; returns a tiny Response-like object. */
-async function api(
-  method: string,
-  path: string,
-  body?: unknown,
-): Promise<{ status: number; json: () => any }> {
-  await ready();
-  const payload = body === undefined ? "" : JSON.stringify(body);
-  const res = (await kanbanHandle(method, path, payload)) as ApiResponse;
-  if (method !== "GET" && res.status < 400) {
-    _onLocalChange?.();
-    pingSiblings();
-  }
-  return { status: res.status, json: () => JSON.parse(res.body) };
 }
 
 /**
@@ -172,8 +100,9 @@ function signalUrl(): string {
 }
 
 /**
- * Connect peer-to-peer and sync the board. `onRemote` fires whenever a peer's
- * edit is merged into local OPFS, so the caller can refetch.
+ * Connect peer-to-peer and sync the board. A peer's merged edit lands in the
+ * synced OPFS tree and fires `riftpipe:file-changed`, which `watch` delivers —
+ * so connecting needs no callback; the caller just `watch`es.
  *
  * Default transport is **iroh** — no signaling server, no host you run (traffic
  * rides n0's free relays). The URL hash carries the host's ticket; an empty hash
@@ -181,13 +110,11 @@ function signalUrl(): string {
  * shareable. `?transport=ws` (or `VITE_TRANSPORT=ws`) selects the WebSocket-
  * signaling + WebRTC path instead (used by the native bridge).
  */
-export async function connectPeer(onRemote: () => void): Promise<boolean> {
+export async function connectPeer(): Promise<boolean> {
   await ready();
-  // A remote merge lands in the shared OPFS — refresh this tab AND siblings.
-  const notify = () => {
-    onRemote();
-    pingSiblings();
-  };
+  // The lib nudges the app on every merge via `riftpipe:file-changed`; connect
+  // just needs a callback argument, so pass a no-op.
+  const noop = () => {};
   const transport =
     env.VITE_TRANSPORT ??
     new URLSearchParams(location.search).get("transport") ??
@@ -196,7 +123,7 @@ export async function connectPeer(onRemote: () => void): Promise<boolean> {
   if (transport === "iroh") {
     const ticket = location.hash.slice(1);
     try {
-      const result = await irohConnect(ticket, notify);
+      const result = await irohConnect(ticket, noop);
       // Host (empty ticket in): publish the returned ticket to the URL to share.
       if (typeof result === "string" && result) location.hash = result;
       return true;
@@ -216,12 +143,12 @@ export async function connectPeer(onRemote: () => void): Promise<boolean> {
     env.VITE_TURN_PASS ?? "",
     false,
   );
-  await connectAndSync(signalUrl(), id, notify);
+  await connectAndSync(signalUrl(), id, noop);
   return true;
 }
 
 /**
- * Start a fresh board: wipe the local OPFS board, drop the persisted iroh
+ * Start a fresh board: wipe the local OPFS tree, drop the persisted iroh
  * identity (a new key ⇒ a new EndpointId ⇒ a new topic + share ticket), clear
  * the URL hash, and reload — the tab comes back as the host of an empty board
  * and writes its fresh ticket into the URL.
@@ -238,38 +165,4 @@ export async function newBoard(): Promise<void> {
   localStorage.removeItem("riftpipe:board_secret");
   location.hash = "";
   location.reload();
-}
-
-export async function getBoard(): Promise<Board> {
-  return (await api("GET", "/api/board")).json();
-}
-
-export async function getCard(id: string): Promise<Card | null> {
-  const r = await api("GET", `/api/cards/${id}`);
-  return r.status === 404 ? null : r.json();
-}
-
-export async function getCardDetail(id: string): Promise<CardDetail | null> {
-  const r = await api("GET", `/api/cards/${id}/detail`);
-  return r.status === 404 ? null : r.json();
-}
-
-export async function addComment(
-  id: string,
-  text: string,
-  author?: string,
-): Promise<Comment> {
-  const body = author === undefined ? { text } : { author, text };
-  return (await api("POST", `/api/cards/${id}/comments`, body)).json();
-}
-
-export async function addCard(column: string, title: string): Promise<Card> {
-  return (await api("POST", "/api/cards", { column, title })).json();
-}
-
-export async function patchCard(
-  id: string,
-  patch: Partial<Card> & { description?: string },
-): Promise<Card> {
-  return (await api("PATCH", `/api/cards/${id}`, patch)).json();
 }

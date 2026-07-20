@@ -57,6 +57,33 @@ pub async fn write_path(path: &str, bytes: &[u8]) -> Result<(), JsValue> {
     write_text(&dir, file, &String::from_utf8_lossy(bytes)).await
 }
 
+/// Read an OPFS file at a nested `path` like `tickets/<id>/card.md` as text, or
+/// `None` if it doesn't exist (or isn't UTF-8). The path-addressed read that the
+/// generic file API (`readFile`) exposes to JS.
+pub async fn read_path(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (file, dirs) = parts.split_last()?;
+    let mut dir = opfs_root().await.ok()?;
+    for d in dirs {
+        dir = subdir(&dir, d, false).await.ok()?;
+    }
+    read_text(&dir, file).await
+}
+
+/// Entry names directly under a nested directory `path` (`""` = root). Empty if
+/// the directory doesn't exist. Powers the generic `listDir` JS export.
+pub async fn list_path(path: &str) -> Vec<String> {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Ok(mut dir) = opfs_root().await else { return Vec::new() };
+    for d in parts {
+        match subdir(&dir, d, false).await {
+            Ok(sub) => dir = sub,
+            Err(_) => return Vec::new(),
+        }
+    }
+    list(&dir).await
+}
+
 /// Entry names in a directory (drives the OPFS `keys()` async iterator).
 pub async fn list(dir: &FileSystemDirectoryHandle) -> Vec<String> {
     let mut names = Vec::new();
