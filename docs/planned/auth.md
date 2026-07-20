@@ -67,23 +67,22 @@ one-time registration exists only to *start* a login and stamp the token's
 audience. So: no secret committed, nothing hosted, and the login flow runs
 entirely in the browser.
 
-## Decision: passkeys (chosen default) · Nostr optional · Google WIP
+## Decision: passkeys (chosen) · Google WIP
 
 **Chosen identity (2026-07-20): passkeys / WebAuthn.** Picked for reach and
 safety-by-default — zero install (in every browser + OS), Face ID / Touch ID UX,
 hardware-backed keys, and platform-handled backup/recovery (the thing users get
 wrong). Verified in-core with pure-Rust `p256`/`ed25519-dalek`; no company, no
-hosting, no committed secret. **Nostr (NIP-07)** stays an **optional**
-bring-your-own-key for portable cross-app identity (pure-Rust `k256` verify).
-**Google (OIDC + PKCE)** is **WIP** — the future real-account-gating option.
+hosting, no committed secret. **Google (OIDC + PKCE)** is **WIP** — the future
+real-account-gating option.
 
-Trade-off accepted: passkeys are *more work* than Nostr (a custom WebAuthn
-verifier — `webauthn-rs` is OpenSSL-bound, native-only — plus the PRF extension
-to protect the at-rest device key), and their cross-device *sync* usually rides a
-platform credential manager (iCloud/Google). We take that for the mass-adoption
-UX and recovery story. All three vouch for the same self-generated signing
-keypair behind one verifier, so this is a front-door choice, not an
-architectural one.
+Trade-off accepted: a passkey front door needs a custom WebAuthn verifier
+(`webauthn-rs` is OpenSSL-bound, native-only, so we verify the ES256/EdDSA
+assertion ourselves) plus the PRF extension to protect the at-rest device key,
+and its cross-device *sync* usually rides a platform credential manager
+(iCloud/Google). We take that for the mass-adoption UX and recovery story. Both
+front doors vouch for the same self-generated signing keypair behind one
+verifier, so this is a front-door choice, not an architectural one.
 
 ### Passkeys / WebAuthn — the identity
 
@@ -139,37 +138,18 @@ verify the ID token **offline against Google's JWKS**.
 - **Caveat:** Google signs **RS256** (pure-Rust `rsa` crate — heavier than
   Ed25519 but wasm-fine).
 
-### Nostr — the optional portable, cross-app identity
+- **Caveat — portability:** a passkey is bound to one origin, so it authenticates
+  *for this app*, not as an identity the user carries across apps. That's an
+  accepted limitation of the passkey choice; the device-linking model doesn't
+  need cross-app identity, and other providers can be added later behind the same
+  verifier if it's ever wanted.
 
-The one place passkeys are structurally weak is **portability**: a passkey is
-bound to one origin, so it's an authenticator *for this app*, not an identity a
-user carries across apps. If that matters to the P2P vision, **Nostr** is the
-best complement and the only reviewed option that beats passkeys on that axis:
+### Other providers (later, if wanted)
 
-- The identity is a raw self-sovereign **secp256k1 keypair**; a NIP-07 browser
-  extension (Alby, nos2x) exposes `window.nostr.getPublicKey` / `signEvent`, so
-  integration is trivial and there's **no hosting and no company**.
-- Verification is **pure-Rust wasm-clean via `k256`** (RustCrypto, BIP-340
-  Schnorr) — no `ring`/`openssl`.
-- Trade-off: assumes the user has a Nostr extension (no native OS UX), and key
-  backup is the user's problem (no Secure Enclave / iCloud escrow). Adoption is
-  niche today.
-
-Offer it as an *optional* "bring-your-own-key" identity alongside passkeys, not
-the default.
-
-### Other non-big-tech options (later, if wanted)
-
-Additional roots plugged into the same verifier — no new machinery:
-
-- **IndieAuth** — your-own-domain identity, decentralized in spirit, but the user
-  must own/host a domain and it's an OAuth redirect (not a local signature
-  check), so it's a poorer fit for a zero-server static app.
-- **GitLab OIDC** — a real-account provider that isn't Google/Microsoft; same
-  committable-`client_id` shape as Google.
-- **did:key / SIWE** — maximally decentralized keypair identities, but did:key
-  has no browser signing UX (you'd rebuild key management → effectively Nostr
-  without the ecosystem) and SIWE drags in wallet/crypto-culture baggage.
+Additional roots plugged into the same verifier — no new machinery — should the
+need arise: **GitLab OIDC** (a real-account provider that isn't Google/Microsoft,
+same committable-`client_id` shape) or **IndieAuth** (your-own-domain identity,
+though it's an OAuth redirect rather than a local signature check).
 
 ## The capability token: Biscuit
 
