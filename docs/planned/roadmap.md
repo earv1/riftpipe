@@ -278,11 +278,28 @@ entirely — the wasm payload is the app's backend. What remains:
   `restricted_mesh_rejects_an_unauthorized_writer`) and a real-process shell e2e
   (`run-restricted-mesh.sh`) — an authorized device's write syncs; an
   unauthorized device's write is rejected while the founder's write still
-  reaches it (proving connection, not a failed link). *Remaining:* onboarding
-  UX (device-linking QR / request-approve) so grants aren't manual; the browser
-  into signed boards; the read/write split (view-only) + read-key rotation.
+  reaches it (proving connection, not a failed link).
   Sealing stops outsiders; this stops unauthorized *writers*. See `SECURITY.md`
   §"the insider gap".
+- **Read revocation + onboarding + passkey — lib backends shipped (tested,
+  wasm-clean).** Everything a UX needs is now a library primitive (the app just
+  renders + confirms):
+  - `core::keywrap` — per-client X25519 keys + epoch-key wrapping. Content
+    seals under a rotatable epoch key wrapped to each authorized client; revoke
+    = rotate + wrap to the remaining. `rotation_excludes_a_removed_client`
+    proves read-revocation. (The "key per client".)
+  - `core::onboard` — `JoinRequest` (signed; doubles for request-to-join and
+    device-linking; `encode`/`safety_code` for QR/out-of-band) + `approve()`
+    → a grant + a wrapped epoch key in one admin action. E2E test: approve →
+    the newcomer both writes (authorized) and reads (unwraps the epoch).
+  - `core::passkey` — WebAuthn assertion verifier (ES256 + EdDSA, pure-Rust,
+    no `webauthn-rs`/OpenSSL) + `challenge_of` for the device-id binding.
+  *Remaining is integration + interactive glue, not new crypto:* driving the
+  mesh seal from epoch keys (replacing the static board-secret cipher); relaying
+  `JoinRequest`/approve over the mesh; the browser into signed boards; and the
+  WebAuthn browser ceremony + kanban UI on top of these lib calls.
+- **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md) (not built).
+  Two planes: centralized *issuance* (an identity vouches for you, touched once)
 - **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md) (not built).
   Two planes: centralized *issuance* (an identity vouches for you, touched once)
   + decentralized *offline* verification (peers check a Biscuit capability
