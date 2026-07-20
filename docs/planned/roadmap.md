@@ -294,10 +294,19 @@ entirely — the wasm payload is the app's backend. What remains:
     the newcomer both writes (authorized) and reads (unwraps the epoch).
   - `core::passkey` — WebAuthn assertion verifier (ES256 + EdDSA, pure-Rust,
     no `webauthn-rs`/OpenSSL) + `challenge_of` for the device-id binding.
+  **Browser into signed boards — done (2026-07-20).** `web::gossip`'s
+  `GossipTreeSync` now carries the same `Auth` (identity + trust log +
+  require_signed) as the native `TreePeer`: signs pushes, verifies incoming
+  writes, replicates the trust log, catches neighbors up. Device identity +
+  restricted config persist in localStorage; `deviceId()`/`configureAuth()`
+  are wasm exports (on `window.riftpipe`). **Proven in real browsers**
+  (`restricted-browser.mjs`, 3 Playwright windows): a founder grants only the
+  member — the member's card syncs, an ungranted browser's card is rejected,
+  the founder's card reaches both (read open). Open mode unchanged.
   *Remaining is integration + interactive glue, not new crypto:* driving the
   mesh seal from epoch keys (replacing the static board-secret cipher); relaying
-  `JoinRequest`/approve over the mesh; the browser into signed boards; and the
-  WebAuthn browser ceremony + kanban UI on top of these lib calls.
+  `JoinRequest`/approve over the mesh (so grants aren't manual); and the WebAuthn
+  browser ceremony + kanban UI on top of these lib calls.
 - **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md) (not built).
   Two planes: centralized *issuance* (an identity vouches for you, touched once)
 - **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md) (not built).
