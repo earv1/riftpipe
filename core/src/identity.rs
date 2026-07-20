@@ -98,6 +98,44 @@ pub fn verify(id: &DeviceId, msg: &[u8], sig: &[u8]) -> bool {
     vk.verify_strict(msg, &Signature::from_bytes(&sig)).is_ok()
 }
 
+/// A write authenticated by its author — the wire wrapper that turns the trust
+/// log's authority into enforcement. The `payload` is opaque (e.g. a postcard
+/// `MeshMsg::Sync`); `author` + `sig` let a receiver prove who wrote it and drop
+/// writes from keys the board hasn't authorized. Authorship is unforgeable:
+/// claiming someone else's `author` fails [`verify`] (the sig won't match their
+/// key), and claiming your own fails the trust-log check.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SignedWrite {
+    pub author: DeviceId,
+    pub sig: Vec<u8>,
+    pub payload: Vec<u8>,
+}
+
+impl DeviceKey {
+    /// Sign `payload` for authenticated broadcast.
+    pub fn sign_write(&self, payload: Vec<u8>) -> SignedWrite {
+        let sig = self.sign(&payload).to_vec();
+        SignedWrite { author: self.id(), sig, payload }
+    }
+}
+
+impl SignedWrite {
+    /// The payload iff the signature is valid AND `log` authorizes the author —
+    /// the check for **member mode** (writes require a trust-log signature).
+    /// `None` (dropped) otherwise.
+    pub fn verified<'a>(&'a self, log: &TrustLog) -> Option<&'a [u8]> {
+        (log.is_authorized(&self.author) && verify(&self.author, &self.payload, &self.sig))
+            .then_some(self.payload.as_slice())
+    }
+
+    /// Just check authorship (valid signature), ignoring authorization — for
+    /// **Anyone-with-link Editor** mode, where writes are gated by epoch-key
+    /// possession (sealing) rather than membership. Returns the proven author.
+    pub fn author_verified(&self) -> Option<DeviceId> {
+        verify(&self.author, &self.payload, &self.sig).then_some(self.author)
+    }
+}
+
 /// A device's authority on a board.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -478,5 +516,45 @@ mod tests {
         assert_eq!(key.id(), restored.id());
         let sig = restored.sign(b"x");
         assert!(verify(&key.id(), b"x", &sig));
+    }
+
+    #[test]
+    fn signed_write_is_accepted_only_from_an_authorized_author() {
+        let founder = DeviceKey::generate();
+        let member = DeviceKey::generate();
+        let outsider = DeviceKey::generate();
+        let mut log = TrustLog::new();
+        log.apply(founder.genesis());
+        log.apply(founder.grant(member.id(), Role::Member, nonce(1)));
+
+        // Authorized member: accepted, payload returned intact.
+        let w = member.sign_write(b"move card A".to_vec());
+        assert_eq!(w.verified(&log), Some(&b"move card A"[..]));
+
+        // Unauthorized key (not in the log): rejected even though its own
+        // signature is valid.
+        let w = outsider.sign_write(b"sneaky write".to_vec());
+        assert!(w.author_verified().is_some(), "its signature is genuine");
+        assert!(w.verified(&log).is_none(), "but it isn't authorized");
+    }
+
+    #[test]
+    fn tampered_or_spoofed_writes_are_rejected() {
+        let founder = DeviceKey::generate();
+        let attacker = DeviceKey::generate();
+        let mut log = TrustLog::new();
+        log.apply(founder.genesis());
+
+        // Tampered payload: signature no longer matches.
+        let mut w = founder.sign_write(b"legit".to_vec());
+        w.payload = b"tampered".to_vec();
+        assert!(w.verified(&log).is_none());
+        assert!(w.author_verified().is_none());
+
+        // Spoofed author: the attacker signs but claims to be the founder.
+        let mut w = attacker.sign_write(b"forge as founder".to_vec());
+        w.author = founder.id();
+        assert!(w.author_verified().is_none(), "sig doesn't match the claimed author's key");
+        assert!(w.verified(&log).is_none());
     }
 }
