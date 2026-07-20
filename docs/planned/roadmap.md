@@ -258,13 +258,22 @@ entirely — the wasm payload is the app's backend. What remains:
   shape). Verified: a wrong-secret ticket lands on a different topic and never
   syncs; a 12 KB file syncs sealed+chunked; the browser↔CLI `board-cli-mesh`
   e2e passes end-to-end sealed.
-- **Signing (insider authenticity) + read/write split** — the next step, NOT
-  yet built. Sealing stops outsiders, but one shared symmetric key means any
-  *holder* can still forge `Presence`/`Version`, freeze a file (`Lww`
-  `version=u64::MAX` — clamp received LWW to `now + ε` too), or replace a doc
-  via the origin-conflict rule. A per-message Ed25519 signature makes
-  authorship provable; a signing key distinct from the read/seal key enables
-  view-only links. See `SECURITY.md` §"the insider gap".
+- **Write signing + trust-log enforcement** — *mechanism shipped
+  (2026-07-20, `PROTOCOL_VERSION` 3).* `core::identity` (device keys + the
+  signed `TrustLog`) is now wired into the mesh: `MeshMsg::Trust` replicates
+  the authorized-device set and `MeshMsg::SignedSync` carries a per-message
+  Ed25519-signed write. In restricted mode the native `TreePeer` rejects
+  unsigned writes and signed writes from unauthorized devices; open mode (the
+  default) is unchanged, so the shipped kanban flow and browser↔CLI sync keep
+  working (both APPENDED variants; browsers skip them for now). Enforcement is
+  unit-tested at `authorize_and_apply` (authorized accepted, unauthorized/
+  unsigned rejected, open-mode unsigned still applies); the wire bump is
+  verified by the mesh integration test + the `board-cli-mesh` e2e (open mode
+  unbroken). *Remaining:* exposing restricted mode + onboarding (device-linking
+  / request-approve) to populate the trust log via the CLI/app; wiring the
+  browser into signed boards; the read/write split (view-only) and read-key
+  rotation. Sealing stops outsiders; this stops unauthorized *writers*. See
+  `SECURITY.md` §"the insider gap".
 - **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md) (not built).
   Two planes: centralized *issuance* (an identity vouches for you, touched once)
   + decentralized *offline* verification (peers check a Biscuit capability

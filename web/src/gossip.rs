@@ -301,6 +301,12 @@ impl GossipTreeSync {
                             }
                             // feed() never yields a Chunk (it refuses nesting).
                             MeshMsg::Chunk { .. } => {}
+                            // Device-linking auth (v3): the browser runs open
+                            // mode for now, so it ignores replicated trust
+                            // entries and signed writes (only restricted-mode
+                            // native boards emit these). Wiring the browser into
+                            // signed/restricted boards is the follow-on.
+                            MeshMsg::Trust(_) | MeshMsg::SignedSync(_) => {}
                         }
                     }
                     Event::NeighborUp(_) => {

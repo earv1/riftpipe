@@ -25,7 +25,8 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, MissedTickBehavior};
 
-use riftpipe_core::sync::{SyncMsg, Syncer};
+use riftpipe_core::identity::{DeviceKey, TrustEntry, TrustLog};
+use riftpipe_core::sync::{MeshMsg, SyncMsg, Syncer};
 
 use crate::net::{anyerr, Result, Sink, Source};
 
@@ -71,6 +72,19 @@ pub struct TreePeer {
     /// `Syncer`), so the stderr breadcrumb fires once per park — and again if a
     /// path recovers and later parks anew.
     parked_reported: HashSet<String>,
+    // --- device-linking auth (protocol v3) ---
+    /// This device's signing identity. `None` = open mode (writes unsigned).
+    identity: Option<DeviceKey>,
+    /// The board's authorized device set, built from replicated trust entries.
+    trust: TrustLog,
+    /// Trust entries we hold, kept to catch a new neighbor up (gossip is
+    /// ephemeral, so a late joiner must be re-sent the log).
+    trust_entries: Vec<TrustEntry>,
+    /// Entry ids already stored (blake3 of the postcard), so replays don't grow
+    /// `trust_entries`.
+    trust_seen: HashSet<[u8; 32]>,
+    /// When true (restricted mode), unsigned or unauthorized writes are rejected.
+    require_signed: bool,
 }
 
 impl TreePeer {
@@ -79,7 +93,92 @@ impl TreePeer {
             syncer: Syncer::new(format!("n{:08x}", rand::random::<u32>())),
             seen: HashMap::new(),
             parked_reported: HashSet::new(),
+            identity: None,
+            trust: TrustLog::new(),
+            trust_entries: Vec::new(),
+            trust_seen: HashSet::new(),
+            require_signed: false,
         }
+    }
+
+    /// Enable device-linking auth: sign our writes with `key`, and — when
+    /// `require_signed` — reject writes that aren't signed by an authorized
+    /// device. Open mode (the default) leaves both off.
+    pub(crate) fn set_identity(&mut self, key: DeviceKey, require_signed: bool) {
+        self.identity = Some(key);
+        self.require_signed = require_signed;
+    }
+
+    /// This device's id, if an identity is set.
+    pub(crate) fn device_id(&self) -> Option<[u8; 32]> {
+        self.identity.as_ref().map(|k| k.id())
+    }
+
+    /// Ingest a trust-log entry (idempotent) and remember it for neighbor
+    /// catch-up. Returns whether the log now holds it.
+    pub(crate) fn add_trust(&mut self, entry: TrustEntry) -> bool {
+        let id = *blake3::hash(&postcard::to_allocvec(&entry).unwrap_or_default()).as_bytes();
+        if self.trust_seen.insert(id) {
+            self.trust_entries.push(entry.clone());
+        }
+        self.trust.apply(entry)
+    }
+
+    /// The trust entries to catch a new neighbor up (so a late joiner learns the
+    /// authorized set).
+    pub(crate) fn trust_catchup(&self) -> Vec<MeshMsg> {
+        self.trust_entries.iter().cloned().map(MeshMsg::Trust).collect()
+    }
+
+    /// Wrap an outgoing write for the mesh: a `SignedSync` if we have an
+    /// identity, else a plain `Sync` (open mode).
+    pub(crate) fn sign_mesh(&self, msg: SyncMsg) -> MeshMsg {
+        match &self.identity {
+            Some(key) => {
+                let payload = postcard::to_allocvec(&msg).unwrap_or_default();
+                MeshMsg::SignedSync(key.sign_write(payload))
+            }
+            None => MeshMsg::Sync(msg),
+        }
+    }
+
+    /// Auth-aware receive for a data-carrying mesh message (`Sync` /
+    /// `SignedSync` / `Trust`): enforce signing when required, verify a signed
+    /// write against the trust log, apply + persist, and return replies already
+    /// wrapped for the wire. `Presence`/`Version`/`Chunk` are handled by the
+    /// driver, not here.
+    pub(crate) fn authorize_and_apply(&mut self, msg: MeshMsg, dir: &Path) -> Vec<MeshMsg> {
+        let inner = match msg {
+            MeshMsg::Trust(entry) => {
+                self.add_trust(entry);
+                return Vec::new(); // gossip already floods it to current members
+            }
+            MeshMsg::Sync(s) => {
+                if self.require_signed {
+                    return Vec::new(); // unsigned write rejected in restricted mode
+                }
+                s
+            }
+            MeshMsg::SignedSync(sw) => {
+                let ok = if self.require_signed {
+                    // Restricted: signature valid AND author authorized.
+                    sw.verified(&self.trust).is_some()
+                } else {
+                    // Open: accept any authentically-signed write.
+                    sw.author_verified().is_some()
+                };
+                if !ok {
+                    return Vec::new();
+                }
+                match postcard::from_bytes::<SyncMsg>(&sw.payload) {
+                    Ok(m) => m,
+                    Err(_) => return Vec::new(),
+                }
+            }
+            _ => return Vec::new(), // Presence/Version/Chunk not routed here
+        };
+        let replies = self.apply_and_persist(inner, dir);
+        replies.into_iter().map(|r| self.sign_mesh(r)).collect()
     }
 
     /// The push decision for one local file, shared by every driver (link +
@@ -359,6 +458,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::canonicalize(&d).unwrap()
+    }
+
+    /// Device-linking auth enforcement: in a restricted-mode peer, a write from
+    /// an AUTHORIZED device is applied to disk; writes that are unauthorized or
+    /// unsigned are rejected. Exercises `authorize_and_apply` directly (no
+    /// network), which is what the mesh driver calls per incoming message.
+    #[test]
+    fn signed_writes_enforce_authorization() {
+        use riftpipe_core::identity::{DeviceKey, Role};
+
+        let founder_key = DeviceKey::from_seed(&[1u8; 32]);
+        let member_key = DeviceKey::from_seed(&[2u8; 32]);
+        let outsider_key = DeviceKey::from_seed(&[3u8; 32]);
+
+        // Founder hosts a restricted board: genesis (self = Admin) + a grant for
+        // the member. (In the product these arrive via device-linking / a
+        // request-approve; here we hand them to the peer directly.)
+        let d = dir("auth");
+        let mut founder = TreePeer::new();
+        founder.set_identity(DeviceKey::from_seed(&[1u8; 32]), true);
+        founder.add_trust(founder_key.genesis());
+        founder.add_trust(founder_key.grant(member_key.id(), Role::Member, [7u8; 16]));
+
+        // Helper: a signed write of an LWW file from `key`.
+        let signed = |key: &DeviceKey, path: &str, bytes: &[u8]| {
+            let msg = SyncMsg::Lww { path: path.into(), version: 1000, bytes: bytes.to_vec() };
+            MeshMsg::SignedSync(key.sign_write(postcard::to_allocvec(&msg).unwrap()))
+        };
+
+        // Authorized member → applied to disk.
+        founder.authorize_and_apply(signed(&member_key, "state.bin", b"ok"), &d);
+        assert_eq!(std::fs::read(d.join("state.bin")).unwrap(), b"ok", "authorized write persisted");
+
+        // Unauthorized device (validly signed, but not in the trust log) → rejected.
+        founder.authorize_and_apply(signed(&outsider_key, "evil.bin", b"x"), &d);
+        assert!(!d.join("evil.bin").exists(), "unauthorized signed write rejected");
+
+        // Unsigned write in restricted mode → rejected.
+        let plain = MeshMsg::Sync(SyncMsg::Lww { path: "unsigned.bin".into(), version: 1000, bytes: b"y".to_vec() });
+        founder.authorize_and_apply(plain, &d);
+        assert!(!d.join("unsigned.bin").exists(), "unsigned write rejected in restricted mode");
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Open mode (the default — no identity, `require_signed` off) is unchanged:
+    /// plain unsigned writes still apply, so the shipped kanban flow keeps working.
+    #[test]
+    fn open_mode_still_accepts_unsigned_writes() {
+        let d = dir("open");
+        let mut peer = TreePeer::new(); // no identity
+        let plain = MeshMsg::Sync(SyncMsg::Lww { path: "open.bin".into(), version: 1000, bytes: b"z".to_vec() });
+        peer.authorize_and_apply(plain, &d);
+        assert_eq!(std::fs::read(d.join("open.bin")).unwrap(), b"z", "open mode applies unsigned writes");
+        std::fs::remove_dir_all(&d).ok();
     }
 
     /// Drive two crossed TreePeers over a mock link: feed `feed` (paths

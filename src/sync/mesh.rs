@@ -239,7 +239,9 @@ pub async fn run(
                 }
                 for p in batch {
                     if let Some(msg) = peer.local_change(&p, dir) {
-                        broadcast(&sender, &cipher, &MeshMsg::Sync(msg)).await;
+                        // Signed when this peer has an identity, else a plain Sync.
+                        let mm = peer.sign_mesh(msg);
+                        broadcast(&sender, &cipher, &mm).await;
                     }
                 }
             }
@@ -249,7 +251,8 @@ pub async fn run(
                 scan_files(dir, &mut files);
                 for p in files {
                     if let Some(msg) = peer.local_change(&p, dir) {
-                        broadcast(&sender, &cipher, &MeshMsg::Sync(msg)).await;
+                        let mm = peer.sign_mesh(msg);
+                        broadcast(&sender, &cipher, &mm).await;
                     }
                 }
             }
@@ -276,12 +279,6 @@ pub async fn run(
                         let Some(plain) = cipher.open(&m.content) else { continue };
                         let Some(gm) = assembler.feed(&plain) else { continue };
                         match gm {
-                            MeshMsg::Sync(msg) => {
-                                // `apply_and_persist` prints SYNCED:{path} on persist.
-                                for reply in peer.apply_and_persist(msg, dir) {
-                                    broadcast(&sender, &cipher, &MeshMsg::Sync(reply)).await;
-                                }
-                            }
                             MeshMsg::Presence { id, neighbors } => {
                                 if id != my_id_bytes {
                                     if let Some(p) = versions.on_presence(id, now_ms()) {
@@ -299,6 +296,15 @@ pub async fn run(
                             }
                             // feed() never yields a Chunk (it refuses nesting).
                             MeshMsg::Chunk { .. } => {}
+                            // Sync / SignedSync / Trust — auth-aware apply
+                            // (`authorize_and_apply` enforces signing, verifies,
+                            // persists, prints SYNCED:{path}). Replies come back
+                            // already wrapped for the wire.
+                            other => {
+                                for reply in peer.authorize_and_apply(other, dir) {
+                                    broadcast(&sender, &cipher, &reply).await;
+                                }
+                            }
                         }
                     }
                     Event::NeighborUp(id) => {
@@ -312,10 +318,15 @@ pub async fn run(
                             &MeshMsg::Version { id: my_id_bytes, proto: PROTOCOL_VERSION },
                         )
                         .await;
-                        // Catch the new neighbor up with our whole tree —
-                        // direct neighbors only; the swarm doesn't need it.
+                        // Catch the new neighbor up: first the trust log (so it
+                        // learns the authorized set — gossip is ephemeral), then
+                        // our whole tree. Direct neighbors only.
+                        for m in peer.trust_catchup() {
+                            broadcast_neighbors(&sender, &cipher, &m).await;
+                        }
                         for msg in peer.full_state() {
-                            broadcast_neighbors(&sender, &cipher, &MeshMsg::Sync(msg)).await;
+                            let mm = peer.sign_mesh(msg);
+                            broadcast_neighbors(&sender, &cipher, &mm).await;
                         }
                         let list: Vec<[u8; 32]> =
                             receiver.neighbors().map(|n| *n.as_bytes()).collect();

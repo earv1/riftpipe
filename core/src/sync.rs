@@ -38,7 +38,10 @@ pub fn is_text_path(path: &str) -> bool {
 /// a v2 board's topic differs from v1's, so v1/v2 peers land on different
 /// topics and simply don't meet (changing the rendezvous is inherent to
 /// blinding it), rather than meeting and mismatching.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3: device-linking auth wire types — `MeshMsg::Trust` (replicated trust log)
+/// and `MeshMsg::SignedSync` (signed writes). Both APPENDED, so an open-mode
+/// board stays wire-compatible; enforcement is opt-in per board.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Per-chunk payload budget for [`encode_mesh_frames`]. iroh-gossip's message
 /// limit defaults to 4096 bytes and is enforced on SEND AND RECEIVE — so
@@ -122,6 +125,16 @@ pub enum MeshMsg {
     /// pre-versioning (v0) peer. Fed to [`VersionMonitor`]; drivers surface
     /// what it flags.
     Version { id: [u8; 32], proto: u32 },
+    /// A signed trust-log entry (device-linking auth) — broadcast so every peer
+    /// converges on the authorized device set. Fed to
+    /// [`identity::TrustLog`](crate::identity::TrustLog). APPENDED: peers that
+    /// predate auth skip it cleanly.
+    Trust(crate::identity::TrustEntry),
+    /// A **signed** tree write: the payload is a postcard-encoded [`SyncMsg`]
+    /// signed by its author (device-linking auth). A driver enforcing signing
+    /// verifies it against the trust log before applying; an open-mode peer that
+    /// predates auth skips the unknown variant. APPENDED.
+    SignedSync(crate::identity::SignedWrite),
 }
 
 /// FNV-1a 64-bit — a tiny, dependency-free content hash for chunk ids. Not
@@ -669,11 +682,15 @@ mod wire_compat {
     /// lets deployed browser tabs coexist with chunking peers, no reload.
     #[test]
     fn mesh_msg_indexes_pinned_and_legacy_peers_skip_chunks() {
+        use crate::identity::{DeviceKey, SignedWrite};
+        let k = DeviceKey::from_seed(&[5u8; 32]);
         let cases: Vec<(MeshMsg, u8)> = vec![
             (MeshMsg::Sync(SyncMsg::Resync { path: "p".into() }), 0),
             (MeshMsg::Presence { id: [0; 32], neighbors: vec![] }, 1),
             (MeshMsg::Chunk { id: 1, index: 0, total: 2, bytes: vec![9] }, 2),
             (MeshMsg::Version { id: [0; 32], proto: 1 }, 3),
+            (MeshMsg::Trust(k.genesis()), 4),
+            (MeshMsg::SignedSync(SignedWrite { author: [0; 32], sig: vec![], payload: vec![] }), 5),
         ];
         for (msg, index) in cases {
             let bytes = postcard::to_allocvec(&msg).unwrap();
@@ -690,7 +707,9 @@ mod wire_compat {
         }
         let chunk = MeshMsg::Chunk { id: 7, index: 0, total: 1, bytes: vec![1, 2] };
         let version = MeshMsg::Version { id: [1; 32], proto: 1 };
-        for msg in [chunk, version] {
+        let trust = MeshMsg::Trust(k.genesis());
+        let signed = MeshMsg::SignedSync(SignedWrite { author: [1; 32], sig: vec![1], payload: vec![2] });
+        for msg in [chunk, version, trust, signed] {
             let bytes = postcard::to_allocvec(&msg).unwrap();
             assert!(
                 postcard::from_bytes::<LegacyMeshMsg>(&bytes).is_err(),
