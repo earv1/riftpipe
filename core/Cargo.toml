@@ -26,6 +26,10 @@ ed25519-dalek = { version = "2", default-features = false }
 # Read revocation: per-client X25519 encryption keys for epoch-key wrapping.
 # Pure-Rust, wasm-clean; secrets are built from a getrandom/KDF seed (no rng feature).
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+# Passkey (WebAuthn) assertion verification: ES256 (P-256/ECDSA) + SHA-256 over
+# authenticatorData ‖ SHA-256(clientDataJSON). Pure-Rust, wasm-clean (no ring/openssl).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "alloc"] }
+sha2 = { version = "0.10", default-features = false }
 
 # On wasm32, diamond-types' transitive `getrandom` (0.2) needs a browser entropy
 # source — enable its `js` backend. Native targets are unaffected.
