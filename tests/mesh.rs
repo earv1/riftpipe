@@ -98,3 +98,142 @@ async fn native_peers_converge_over_gossip_mesh() {
     std::fs::remove_dir_all(&da).ok();
     std::fs::remove_dir_all(&db).ok();
 }
+
+/// Wait for a mesh host to acquire a dialable (relay) address.
+async fn dialable_addr(conn: &MeshConn) -> iroh::EndpointAddr {
+    let _ = tokio::time::timeout(Duration::from_secs(10), conn.endpoint().online()).await;
+    let mut addr = conn.endpoint().addr();
+    for _ in 0..100 {
+        if !addr.addrs.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        addr = conn.endpoint().addr();
+    }
+    assert!(!addr.addrs.is_empty(), "host never got a dialable address");
+    addr
+}
+
+/// Feed one file path to a peer's watcher channel so it's pushed on connect.
+fn push_file(dir: &std::path::Path, rel: &str, bytes: &[u8]) -> (
+    tokio::sync::mpsc::UnboundedSender<PathBuf>,
+    tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
+) {
+    std::fs::write(dir.join(rel), bytes).unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    tx.send(dir.join(rel)).unwrap();
+    (tx, rx)
+}
+
+/// Device-linking auth END-TO-END over the real gossip mesh: a founder hosts a
+/// **restricted** board and grants an authorized device — that device's signed
+/// write is accepted and lands on the founder's disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restricted_mesh_accepts_an_authorized_writer() {
+    use riftpipe_core::identity::{DeviceKey, Role};
+
+    let df = dir("ra-founder");
+    let db = dir("ra-member");
+    let secret = riftpipe_core::crypto::generate_secret();
+
+    let host = MeshConn::join(secret, None).await.expect("host join");
+    let host_addr = dialable_addr(&host).await;
+
+    // The member's device id (same seed reconstructs the same key on both ends).
+    let member_id = DeviceKey::from_seed(&[42u8; 32]).id();
+
+    // Member writes a file that — because it's authorized — must reach the founder.
+    let (_tx_b, mut rx_b) = push_file(&db, "member.bin", b"authorized write");
+    // The founder has no local file to push — an idle watcher channel.
+    let (_tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+
+    let df_task = df.clone();
+    let a_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        let founder = DeviceKey::from_seed(&[41u8; 32]);
+        peer.set_identity(DeviceKey::from_seed(&[41u8; 32]), true); // restricted
+        peer.add_trust(founder.genesis()); // founder = Admin
+        peer.add_trust(founder.grant(member_id, Role::Member, [1u8; 16])); // grant the member
+        let _ = riftpipe::sync::mesh::run(host, &df_task, &mut peer, &mut rx_a, false).await;
+    });
+    let (db_task, addr) = (db.clone(), host_addr.clone());
+    let b_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        peer.set_identity(DeviceKey::from_seed(&[42u8; 32]), true); // the granted member
+        let _ = riftpipe::sync::mesh::join_and_run(secret, addr, &db_task, &mut peer, &mut rx_b, false).await;
+    });
+
+    let want = df.join("member.bin");
+    tokio::time::timeout(BUDGET, async {
+        while !want.is_file() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("an authorized member's signed write should reach the founder");
+    assert_eq!(std::fs::read(&want).unwrap(), b"authorized write");
+
+    a_task.abort();
+    b_task.abort();
+    std::fs::remove_dir_all(&df).ok();
+    std::fs::remove_dir_all(&db).ok();
+}
+
+/// The security proof, END-TO-END over the real mesh: an UNAUTHORIZED device's
+/// signed write is rejected by a restricted founder — while the founder's own
+/// write still reaches that device (proving they're genuinely connected and it
+/// is the write-authorization, not a failed connection, doing the rejecting).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restricted_mesh_rejects_an_unauthorized_writer() {
+    use riftpipe_core::identity::DeviceKey;
+
+    let df = dir("rr-founder");
+    let dc = dir("rr-outsider");
+    let secret = riftpipe_core::crypto::generate_secret();
+
+    let host = MeshConn::join(secret, None).await.expect("host join");
+    let host_addr = dialable_addr(&host).await;
+
+    // Founder writes a file that MUST reach the outsider (read is open — they
+    // have the link — so this proves the two are actually connected).
+    let (_tx_a, mut rx_a) = push_file(&df, "from_founder.bin", b"reaches everyone");
+    // Outsider writes a file that MUST be rejected (it's not an authorized writer).
+    let (_tx_c, mut rx_c) = push_file(&dc, "from_outsider.bin", b"should be dropped");
+
+    let df_task = df.clone();
+    let a_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        let founder = DeviceKey::from_seed(&[51u8; 32]);
+        peer.set_identity(DeviceKey::from_seed(&[51u8; 32]), true); // restricted
+        peer.add_trust(founder.genesis()); // founder = Admin; the outsider is NOT granted
+        let _ = riftpipe::sync::mesh::run(host, &df_task, &mut peer, &mut rx_a, false).await;
+    });
+    let (dc_task, addr) = (dc.clone(), host_addr.clone());
+    let c_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        peer.set_identity(DeviceKey::from_seed(&[52u8; 32]), true); // signs, but ungranted
+        let _ = riftpipe::sync::mesh::join_and_run(secret, addr, &dc_task, &mut peer, &mut rx_c, false).await;
+    });
+
+    // The founder's write reaches the connected outsider.
+    let on_outsider = dc.join("from_founder.bin");
+    tokio::time::timeout(BUDGET, async {
+        while !on_outsider.is_file() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("founder's write should reach the connected outsider (read is open)");
+
+    // Give the outsider's rejected write ample time; it must NEVER reach the founder.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        !df.join("from_outsider.bin").exists(),
+        "an unauthorized device's signed write must be rejected by the restricted founder",
+    );
+
+    a_task.abort();
+    c_task.abort();
+    std::fs::remove_dir_all(&df).ok();
+    std::fs::remove_dir_all(&dc).ok();
+}

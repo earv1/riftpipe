@@ -269,11 +269,20 @@ entirely — the wasm payload is the app's backend. What remains:
   unit-tested at `authorize_and_apply` (authorized accepted, unauthorized/
   unsigned rejected, open-mode unsigned still applies); the wire bump is
   verified by the mesh integration test + the `board-cli-mesh` e2e (open mode
-  unbroken). *Remaining:* exposing restricted mode + onboarding (device-linking
-  / request-approve) to populate the trust log via the CLI/app; wiring the
-  browser into signed boards; the read/write split (view-only) and read-key
-  rotation. Sealing stops outsiders; this stops unauthorized *writers*. See
-  `SECURITY.md` §"the insider gap".
+  unbroken). **Usable from the CLI:** `connect --accept <dir> --restricted
+  [--grant <device-id>]…` hosts a restricted board (founder = genesis Admin,
+  grants authorize writers); joiners run `connect <ticket> <dir> --restricted`;
+  `device-id <dir>` prints a device's id to `--grant`. Identity persists in
+  `<dir>/.device` (a dot-file, never synced). **E2E-proven over the real mesh:**
+  two integration tests (`restricted_mesh_accepts_an_authorized_writer`,
+  `restricted_mesh_rejects_an_unauthorized_writer`) and a real-process shell e2e
+  (`run-restricted-mesh.sh`) — an authorized device's write syncs; an
+  unauthorized device's write is rejected while the founder's write still
+  reaches it (proving connection, not a failed link). *Remaining:* onboarding
+  UX (device-linking QR / request-approve) so grants aren't manual; the browser
+  into signed boards; the read/write split (view-only) + read-key rotation.
+  Sealing stops outsiders; this stops unauthorized *writers*. See `SECURITY.md`
+  §"the insider gap".
 - **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md) (not built).
   Two planes: centralized *issuance* (an identity vouches for you, touched once)
   + decentralized *offline* verification (peers check a Biscuit capability

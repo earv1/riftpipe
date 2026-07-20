@@ -104,19 +104,19 @@ impl TreePeer {
     /// Enable device-linking auth: sign our writes with `key`, and — when
     /// `require_signed` — reject writes that aren't signed by an authorized
     /// device. Open mode (the default) leaves both off.
-    pub(crate) fn set_identity(&mut self, key: DeviceKey, require_signed: bool) {
+    pub fn set_identity(&mut self, key: DeviceKey, require_signed: bool) {
         self.identity = Some(key);
         self.require_signed = require_signed;
     }
 
     /// This device's id, if an identity is set.
-    pub(crate) fn device_id(&self) -> Option<[u8; 32]> {
+    pub fn device_id(&self) -> Option<[u8; 32]> {
         self.identity.as_ref().map(|k| k.id())
     }
 
     /// Ingest a trust-log entry (idempotent) and remember it for neighbor
     /// catch-up. Returns whether the log now holds it.
-    pub(crate) fn add_trust(&mut self, entry: TrustEntry) -> bool {
+    pub fn add_trust(&mut self, entry: TrustEntry) -> bool {
         let id = *blake3::hash(&postcard::to_allocvec(&entry).unwrap_or_default()).as_bytes();
         if self.trust_seen.insert(id) {
             self.trust_entries.push(entry.clone());
