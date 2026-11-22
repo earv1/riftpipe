@@ -81,7 +81,7 @@ use crate::net::negotiate::negotiate_session_halves;
 use crate::net::transport::{accept_link, connect_link};
 use crate::net::{Counters, Result, Sink, Source};
 use crate::sync::pipe::{Role, SessionOutcome};
-use crate::sync::workspace::{Hash, Tombstone, Workspace, DELETION_IDS_CAP, SEEN_CAP};
+use crate::sync::workspace::{Hash, Resource, Tombstone, Workspace, DELETION_IDS_CAP, SEEN_CAP};
 
 /// Re-advertise cadence — and the liveness beat: every heartbeat starts with a
 /// `Version` frame, so even an empty workspace proves it's alive.
@@ -138,15 +138,7 @@ fn collect_local(ws: &mut Workspace) -> Vec<Vec<u8>> {
             deleted.push(path);
             continue;
         }
-        let bytes = res.backing.load();
-        if res.strategy.observe(&bytes) {
-            res.note_state();
-            changed = true;
-            if let Some(d) = res.strategy.push_delta() {
-                out.push(delta(&path, d));
-            }
-            out.push(advert(&path, res.strategy.state_vector(), true));
-        }
+        changed |= observe_local(res, &path, &mut out);
     }
     for path in deleted {
         if let Some(t) = ws.record_local_delete(&path) {
@@ -157,6 +149,22 @@ fn collect_local(ws: &mut Workspace) -> Vec<Vec<u8>> {
         ws.mark_dirty();
     }
     out
+}
+
+/// Observe one resource's current bytes; on a real change note the state and
+/// queue its delta (if push-capable) and a reply-expecting advert. True if it
+/// changed.
+fn observe_local(res: &mut Resource, path: &str, out: &mut Vec<Vec<u8>>) -> bool {
+    let bytes = res.backing.load();
+    if !res.strategy.observe(&bytes) {
+        return false;
+    }
+    res.note_state();
+    if let Some(d) = res.strategy.push_delta() {
+        out.push(delta(path, d));
+    }
+    out.push(advert(path, res.strategy.state_vector(), true));
+    true
 }
 
 /// Version frame + a reply-expecting advert for every resource (connect +
@@ -183,8 +191,22 @@ fn apply_inbound(ws: &mut Workspace, msg: SyncMsg) -> Vec<Vec<u8>> {
     match msg {
         SyncMsg::StratDelta { path, bytes } => {
             if ws.is_tombstoned(&path) {
-                delta_for_tombstone(ws, &path, &bytes, &mut out);
-                return out;
+                // The user may have re-created the file on disk since the last
+                // scan (the biased select puts inbound frames first, widening
+                // that window). Pick it up before acting, so resurrecting with
+                // the peer's content can't truncate or overwrite it: if it is
+                // live now, observe it (queuing its announcement, as a scan
+                // would) and handle the delta as for any live resource.
+                let _ = ws.refresh_disk();
+                if ws.is_tombstoned(&path) {
+                    delta_for_tombstone(ws, &path, &bytes, &mut out);
+                    return out;
+                }
+                if let Some(res) = ws.get_mut(&path) {
+                    if observe_local(res, &path, &mut out) {
+                        ws.mark_dirty();
+                    }
+                }
             }
             if bytes == EMPTY_CONTENT {
                 return out; // only matters to a tombstoned path
@@ -1318,6 +1340,40 @@ mod tests {
             postcard::from_bytes::<SyncMsg>(r),
             Ok(SyncMsg::StratDelete { .. } | SyncMsg::StratDelta { .. })
         )));
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    /// B holds a tombstone and the user re-creates the file on B's disk, but
+    /// B hasn't scanned yet when A's EMPTY_CONTENT arrives (A re-created it
+    /// empty). B must pick up its own re-creation first and NOT resurrect
+    /// empty over it; its content then syncs to A.
+    #[test]
+    fn unscanned_local_recreation_is_not_truncated_by_empty_content() {
+        let ra = dir("ut-a");
+        let rb = dir("ut-b");
+        std::fs::write(ra.join("r.bin"), b"original").unwrap();
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        std::fs::remove_file(ra.join("r.bin")).unwrap();
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+        assert!(b.is_tombstoned("r.bin"));
+
+        std::fs::write(ra.join("r.bin"), b"").unwrap();
+        let _ = collect_local(&mut a); // empty re-creation: nothing to send yet
+        std::fs::write(rb.join("r.bin"), b"B re-created this").unwrap(); // not scanned
+        // A's heartbeat → B re-asserts its delete → A keeps (superseded) and
+        // answers EMPTY_CONTENT → B must not truncate its own re-creation.
+        let ha = advertise_all(&mut a);
+        pump(&mut a, &mut b, vec![], ha);
+
+        assert_eq!(std::fs::read(rb.join("r.bin")).unwrap(), b"B re-created this");
+        assert_eq!(std::fs::read(ra.join("r.bin")).unwrap(), b"B re-created this");
+        assert!(!a.is_tombstoned("r.bin") && !b.is_tombstoned("r.bin"));
 
         std::fs::remove_dir_all(&ra).ok();
         std::fs::remove_dir_all(&rb).ok();
