@@ -406,7 +406,7 @@ impl Auth {
             MeshMsg::Sync(msg)
         };
         if mode.seals_content() {
-            self.epochs.seal(&signed)
+            self.epochs.seal(&signed, &self.trust)
         } else {
             Some(signed)
         }
@@ -516,8 +516,9 @@ impl Auth {
     }
 
     /// Act on what accepting announce(s) changed: persist, apply content parked
-    /// for a newly-held key, broadcast our full state on our first key (it carries
-    /// edits made while keyless), then run Admin maintenance.
+    /// for a newly-held key, broadcast our full state on any newly-held key (it
+    /// carries edits held back while keyless or while our latest epoch still
+    /// wrapped a revoked device), then run Admin maintenance.
     fn followups(&mut self, ing: Ingested) -> Accepted {
         if ing.changed {
             persist_epochs(&self.topic, self.epochs.announces());
@@ -530,7 +531,9 @@ impl Auth {
         let mut acc = Accepted {
             apply: ing.released.into_iter().filter_map(|m| self.content_of(m)).collect(),
             send: Vec::new(),
-            send_full_state: ing.gained_first_key,
+            // A newly-held epoch releases writes held back: edits made while
+            // keyless, or between a revoke and its rotation (`EpochBook::seal`).
+            send_full_state: ing.held.is_some(),
         };
         acc.merge(self.maintain());
         acc
@@ -1551,7 +1554,11 @@ mod tests {
         assert_eq!(b.accept(dup(&s)).apply.len(), 1, "a member opens sealed content");
 
         let r = a.make_revoke(c_id).expect("owner removes c");
-        deliver(&r, &mut b);
+        assert!(matches!(r.send[0], MeshMsg::Trust(_)) && r.send.len() == 2, "revoke, then the new epoch");
+        b.accept(dup(&r.send[0]));
+        assert!(b.sign(lww("gap", b"g")).is_none(), "b saw the revoke, not the rotation: its write is held");
+        let rotated = b.accept(dup(&r.send[1]));
+        assert!(rotated.send_full_state, "the new epoch releases b's held writes (full state)");
         deliver(&r, &mut c);
         assert!(!c.can_read(), "the removed device lost read");
         assert!(b.can_read(), "the remaining member still reads");

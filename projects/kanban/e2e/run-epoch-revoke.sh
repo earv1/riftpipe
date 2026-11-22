@@ -69,9 +69,13 @@ done
 if [ "$rotated" = 1 ]; then echo "OK: revoke triggered a rotation to epoch 2"
 else echo "FAIL: founder never rotated after the revoke"; fail=1; fi
 
-# The member seals under the highest epoch it HOLDS: wait until it has
-# ingested epoch 2, or its write could go out under epoch 1 (which the victim
-# still holds) and leak — a test race, not a protocol bug.
+# Wait until the member holds epoch 2 before it writes. Between the revoke
+# and the rotation reaching it, a member that has seen the revoke HOLDS its
+# writes (EpochBook::seal refuses an epoch that still wraps a revoked device)
+# and re-sends under epoch 2; but a member that hasn't seen the revoke yet
+# still seals under epoch 1, which the victim can read — the documented
+# propagation window. Waiting makes the "victim reads nothing new" check
+# deterministic.
 held=0
 for _ in $(seq 1 40); do
   grep -q "holding epoch 2" "$WORK/member.log" && { held=1; break; }

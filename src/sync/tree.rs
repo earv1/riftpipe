@@ -106,6 +106,8 @@ pub struct TreePeer {
     warned_restricted: bool,
     /// A local edit was held back because we hold no epoch key yet (warned once).
     warned_keyless: bool,
+    /// Epochs already reported as "still wraps a revoked device — writes held".
+    stale_epoch_reported: HashSet<u64>,
 }
 
 impl TreePeer {
@@ -124,6 +126,7 @@ impl TreePeer {
             no_key_reported: HashSet::new(),
             warned_restricted: false,
             warned_keyless: false,
+            stale_epoch_reported: HashSet::new(),
         }
     }
 
@@ -207,22 +210,30 @@ impl TreePeer {
             None => MeshMsg::Sync(msg),
         };
         if self.mode.seals_content() {
-            self.epochs.as_ref()?.seal(&signed)
+            self.epochs.as_ref()?.seal(&signed, &self.trust)
         } else {
             Some(signed)
         }
     }
 
     /// [`sign_mesh`](Self::sign_mesh) for a LOCAL edit: when it can't go out (restricted,
-    /// no epoch key yet), say so once — the edit stays in the syncer and goes out
-    /// with our full state once an admin wraps us in.
+    /// and no epoch key yet, or our latest epoch still wraps a revoked device), say
+    /// so once — the edit stays in the syncer and goes out with our full state when
+    /// a (new) epoch key arrives.
     pub(crate) fn sign_local(&mut self, msg: SyncMsg) -> Option<MeshMsg> {
         let out = self.sign_mesh(msg);
-        if out.is_none() && !self.warned_keyless {
-            self.warned_keyless = true;
-            eprintln!(
-                "[epoch] no read key yet — local edits are held until an admin wraps this device in (is the board --restricted?)"
-            );
+        if out.is_some() || !self.mode.seals_content() {
+            return out;
+        }
+        if self.epoch_held().is_none() {
+            if !self.warned_keyless {
+                self.warned_keyless = true;
+                eprintln!(
+                    "[epoch] no read key yet — local edits are held until an admin wraps this device in (is the board --restricted?)"
+                );
+            }
+        } else if self.stale_epoch_reported.insert(self.epoch_held().unwrap_or(0)) {
+            eprintln!("[epoch] a device was removed — local edits are held until the new epoch key arrives");
         }
         out
     }
@@ -321,7 +332,8 @@ impl TreePeer {
 
     /// Act on what accepting announce(s) changed: report an epoch we're not wrapped
     /// into, apply content that was parked for a newly-held key, broadcast our full
-    /// state on our first key (it carries edits made while keyless), then run Admin
+    /// state on any newly-held key (it carries edits held back while keyless or
+    /// while our latest epoch still wrapped a revoked device), then run Admin
     /// maintenance.
     fn epoch_followups(&mut self, ing: Ingested, dir: &Path) -> Vec<MeshMsg> {
         let mut out = Vec::new();
@@ -337,6 +349,10 @@ impl TreePeer {
         if ing.gained_first_key {
             let n = self.epoch_held().unwrap_or(0);
             eprintln!("[epoch] read key acquired (epoch {n})");
+        }
+        // A newly-held epoch releases writes held back: edits made while keyless,
+        // or between a revoke and its rotation (`EpochBook::seal`).
+        if ing.held.is_some() {
             out.extend(self.sealed_full_state());
         }
         out.extend(self.maintenance());
@@ -806,6 +822,37 @@ mod tests {
         assert_eq!(revokee.epoch_held(), Some(1));
         assert_eq!(revokee.epoch_known(), Some(2));
 
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A member that has applied a revoke but not yet the rotation holds its writes
+    /// (sealing under the old epoch would reach the removed device), then sends
+    /// them sealed under the new epoch the moment it arrives.
+    #[test]
+    fn member_holds_writes_between_revoke_and_rotation() {
+        let (mut founder, df, mut member, dm, _revokee, dc) = restricted_board("gap");
+        // The swarm relays every announce: the member learns the revokee's wrap.
+        for m in founder.auth_catchup() {
+            member.authorize_and_apply(m, &dm);
+        }
+        std::fs::write(dm.join("gap.bin"), b"held").unwrap();
+        let edit = member.local_change(&dm.join("gap.bin"), &dm).expect("a local edit");
+        let out = founder.revoke_device(DeviceKey::from_seed(&[3u8; 32]).id(), &df);
+        let (trust, epochs): (Vec<MeshMsg>, Vec<MeshMsg>) = out.into_iter().partition(|m| matches!(m, MeshMsg::Trust(_)));
+        for m in trust {
+            member.authorize_and_apply(m, &dm);
+        }
+        assert!(member.sign_local(edit).is_none(), "epoch 1 still wraps the revoked device");
+        let mut released = Vec::new();
+        for m in epochs {
+            released.extend(member.authorize_and_apply(m, &dm));
+        }
+        assert!(
+            released.iter().any(|m| matches!(m, MeshMsg::Sealed(s) if s.seq == 2)),
+            "the held state goes out sealed under epoch 2"
+        );
         for d in [&df, &dm, &dc] {
             std::fs::remove_dir_all(d).ok();
         }

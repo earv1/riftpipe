@@ -148,8 +148,10 @@ requires an explicit wrap.
   own writes are rejected everywhere immediately (once the revoke
   propagates); it can't open content sealed under the new epoch, but during
   the propagation window still reads content sealed by a remaining member
-  who hasn't received the new epoch yet (inherent to eventual consistency). It
-  keeps only what it already saw.
+  who hasn't seen the revoke yet (inherent to eventual consistency). A member
+  that has seen the revoke but not the new epoch holds its writes instead of
+  sealing under an epoch that still wraps the revoked device, and sends them
+  once the new epoch arrives. It keeps only what it already saw.
 
 ## Deliberately deferred
 
