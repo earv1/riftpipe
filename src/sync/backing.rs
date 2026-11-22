@@ -20,6 +20,18 @@ pub trait Backing: Send {
     fn name(&self) -> &str;
     fn load(&self) -> Vec<u8>;
     fn store(&mut self, bytes: &[u8]);
+    /// True for backings that mirror a file on disk (only those can be deleted
+    /// out from under us, and only those are persisted in the folder index).
+    fn on_disk(&self) -> bool {
+        false
+    }
+    /// Whether the resource currently exists in its store. File: is the file
+    /// on disk (missing = a local delete). Memory: always true.
+    fn exists(&self) -> bool {
+        true
+    }
+    /// Delete the resource's bytes from its store (applying a peer's delete).
+    fn remove(&mut self);
 }
 
 /// File-backed: the resource is a file on disk (today's mirror behavior).
@@ -50,6 +62,15 @@ impl Backing for FileBacking {
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(&self.path, bytes);
+    }
+    fn on_disk(&self) -> bool {
+        true
+    }
+    fn exists(&self) -> bool {
+        self.path.is_file()
+    }
+    fn remove(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -82,6 +103,9 @@ impl Backing for MemoryBacking {
     }
     fn store(&mut self, bytes: &[u8]) {
         *self.buf.lock().unwrap() = bytes.to_vec();
+    }
+    fn remove(&mut self) {
+        self.buf.lock().unwrap().clear();
     }
 }
 
@@ -117,6 +141,11 @@ impl MemoryRegistry {
             .map(|(n, h)| (n.clone(), h.lock().unwrap().clone()))
             .collect()
     }
+
+    /// Stop reporting `name` (its resource was deleted).
+    pub fn remove(&self, name: &str) {
+        self.inner.lock().unwrap().retain(|(n, _)| n != name);
+    }
 }
 
 #[cfg(test)]
@@ -149,5 +178,35 @@ mod tests {
                 ("c.bin".to_string(), b"cccc".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn file_backing_exists_and_remove() {
+        let dir = std::env::temp_dir().join(format!("riftpipe-backing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.bin");
+        std::fs::write(&path, b"hi").unwrap();
+
+        let mut b = FileBacking::new("f.bin", path.clone());
+        assert!(b.on_disk());
+        assert!(b.exists());
+        b.remove();
+        assert!(!b.exists());
+        assert!(!path.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn memory_backing_remove_and_registry_remove() {
+        let reg = MemoryRegistry::new();
+        let mut a = reg.backing("a");
+        a.store(b"x");
+        a.remove();
+        assert!(a.load().is_empty());
+        reg.remove("a");
+        assert!(reg.snapshot().is_empty());
+        assert!(!MemoryBacking::new("m").on_disk());
     }
 }
