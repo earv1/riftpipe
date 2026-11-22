@@ -227,6 +227,12 @@ pub async fn run(
     let mut version_tick = interval(Duration::from_secs(5));
     version_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // Live admin commands (`riftpipe revoke|grant <dir> <id>`), polled from the
+    // control dotfile once a second.
+    let mut control = crate::sync::control::Control::open(dir);
+    let mut control_tick = interval(Duration::from_secs(1));
+    control_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             // Local edits → broadcast (the watcher feeds paths into `rx`).
@@ -268,6 +274,18 @@ pub async fn run(
             _ = version_tick.tick() => {
                 for p in versions.tick(now_ms()) {
                     report_mismatch(&p);
+                }
+            }
+            // Live admin commands from `riftpipe revoke|grant <dir> <id>`.
+            _ = control_tick.tick() => {
+                for cmd in control.poll() {
+                    let out = match cmd {
+                        crate::sync::control::Command::Revoke(id) => peer.revoke_device(id, dir),
+                        crate::sync::control::Command::Grant(id) => peer.grant_device(id, dir),
+                    };
+                    for m in out {
+                        broadcast(&sender, &cipher, &m).await;
+                    }
                 }
             }
             // Mesh events: remote edits → disk, membership → catch-up + presence.

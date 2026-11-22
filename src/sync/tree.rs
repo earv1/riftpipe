@@ -356,7 +356,6 @@ impl TreePeer {
     /// Admin action on a live board: sign a `Revoke` for `id`, apply it, and run
     /// the follow-ups (on a restricted board: rotate to a new epoch the revoked
     /// device isn't wrapped into). Returns everything to broadcast.
-    #[allow(dead_code)] // driven by the live control file (next step: `riftpipe revoke|grant`)
     pub(crate) fn revoke_device(&mut self, id: [u8; 32], dir: &Path) -> Vec<MeshMsg> {
         let entry = {
             let Some(key) = self.identity.as_ref() else {
@@ -383,7 +382,6 @@ impl TreePeer {
     /// Admin action on a live board: grant `id` as a Member and run the follow-ups
     /// (on a restricted board: wrap it into the current epoch once its request is
     /// known). Returns everything to broadcast.
-    #[allow(dead_code)] // driven by the live control file (next step: `riftpipe revoke|grant`)
     pub(crate) fn grant_device(&mut self, id: [u8; 32], dir: &Path) -> Vec<MeshMsg> {
         let entry = {
             let Some(key) = self.identity.as_ref() else {

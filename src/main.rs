@@ -129,6 +129,21 @@ async fn main() {
                 None => eprintln!("usage: riftpipe device-id <dir>"),
             }
         }
+        // Live admin commands on a running `connect … --restricted` peer: queue a
+        // revoke/grant by appending to <dir>/.riftpipe-control, which the running
+        // mesh loop polls once a second (`riftpipe::sync::control`).
+        "revoke" | "grant" => {
+            let verb = args[1].clone();
+            match (args.get(2), args.get(3)) {
+                (Some(dir), Some(id)) if hex_to_32(id).is_some() => {
+                    match riftpipe::sync::control::append(std::path::Path::new(dir), &verb, id) {
+                        Ok(()) => println!("queued `{verb} {id}` for the running restricted peer on {dir}"),
+                        Err(e) => eprintln!("[riftpipe] {verb} failed: {e}"),
+                    }
+                }
+                _ => eprintln!("usage: riftpipe {verb} <dir> <device-id>   # applied by the running `connect … --restricted` admin peer on <dir>"),
+            }
+        }
         "share" => {
             let opts = parse(&args);
             match opts.pos.first().cloned() {
@@ -230,9 +245,11 @@ async fn main() {
             eprintln!("  riftpipe connect --accept <dir> [--restricted [--grant <device-id>]...]");
             eprintln!("                                      # host a gossip-mesh swarm for <dir>: prints a mesh ticket a browser OR CLI");
             eprintln!("                                      # peer joins with `connect <ticket> <dir>` — one protocol, N peers, no signaling.");
-            eprintln!("                                      # --restricted: only signed writes from authorized devices are accepted (read");
-            eprintln!("                                      # stays open); --grant <id> authorizes a device (get one via `device-id <dir>`)");
+            eprintln!("                                      # --restricted: only devices the founder grants can READ or write — content is sealed under a rotating epoch key");
+            eprintln!("                                      # --grant <id> authorizes a device at startup (get one via `device-id <dir>`)");
             eprintln!("  riftpipe device-id <dir>            # print (creating if absent) this device's id for <dir> — share it to be --grant'ed");
+            eprintln!("  riftpipe revoke <dir> <device-id>    # remove a device from a running restricted board (rotates the read key)");
+            eprintln!("  riftpipe grant <dir> <device-id>     # authorize a device on a running restricted board");
             eprintln!("  riftpipe serve <dir> [--port 8080]  # static-host a folder + SSE change events at /events");
             eprintln!("                                      # (share/join a folder + serve = live-updating static site)");
             eprintln!("  riftpipe signal [--port 9000]       # WebRTC signaling relay for browser peers");
@@ -432,7 +449,7 @@ fn apply_auth(peer: &mut riftpipe::sync::tree::TreePeer, dir: &std::path::Path, 
     peer.set_identity(key, true);
     eprintln!("[auth] restricted mode — this device id: {id_hex}");
     if !founder {
-        eprintln!("[auth] ask the founder to `--grant {id_hex}` so your writes are accepted");
+        eprintln!("[auth] ask the founder to grant {id_hex} (`--grant` at startup or `riftpipe grant <dir> {id_hex}`) — once granted, its peer wraps the read key to you");
     }
 }
 
