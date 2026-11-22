@@ -18,9 +18,17 @@ use crate::sync::strategy::{Kind, SyncStrategy};
 
 /// Recent fingerprints a resource / tombstone remembers (oldest first).
 pub const SEEN_CAP: usize = 8;
-/// Deletion ids a tombstone stands for, and ids a re-created resource
-/// remembers having superseded (also the cap applied to a peer's `ids`).
+/// Deletion ids a tombstone stands for (also the cap applied to a peer's
+/// `ids` on receipt — this list is on the wire).
 pub const DELETION_IDS_CAP: usize = 8;
+/// Deletion ids a re-created resource remembers having superseded — its whole
+/// delete/re-create chain, not just the last step (local-only, never on the
+/// wire). A peer still holding a tombstone from any step of the chain must
+/// find its id here, or it would delete the restored file. 64 covers a peer
+/// that stays offline through 64 delete/re-create cycles of ONE path; the
+/// cost is ≤512 B per such path in memory and in the index, and paths that
+/// were never deleted carry nothing.
+pub const SUPERSEDED_CAP: usize = 64;
 pub type Hash = [u8; 32];
 
 /// Make `h` the most-recent entry (moving it if present), keeping ≤ SEEN_CAP.
@@ -36,12 +44,29 @@ pub fn push_seen(seen: &mut Vec<Hash>, h: Hash) {
 /// Make deletion id `id` the most-recent entry (moving it if present),
 /// keeping ≤ DELETION_IDS_CAP (oldest dropped).
 pub fn push_deletion_id(ids: &mut Vec<u64>, id: u64) {
-    ids.retain(|x| *x != id);
-    ids.push(id);
-    if ids.len() > DELETION_IDS_CAP {
-        let excess = ids.len() - DELETION_IDS_CAP;
-        ids.drain(..excess);
+    push_capped(ids, id, DELETION_IDS_CAP);
+}
+
+/// Make `id` the most-recent entry of `list` (moving it if present), keeping
+/// ≤ `cap` entries (oldest dropped).
+fn push_capped(list: &mut Vec<u64>, id: u64, cap: usize) {
+    list.retain(|x| *x != id);
+    list.push(id);
+    if list.len() > cap {
+        let excess = list.len() - cap;
+        list.drain(..excess);
     }
+}
+
+/// What a re-creation of a tombstoned path supersedes: the ids the deleted
+/// resource had itself superseded (`prior`, the earlier chain) plus the
+/// tombstone's own `ids`, oldest first, capped at SUPERSEDED_CAP.
+fn superseded_by_recreating(t: Tombstone) -> Vec<u64> {
+    let mut out = Vec::new();
+    for id in t.prior.into_iter().chain(t.ids) {
+        push_capped(&mut out, id, SUPERSEDED_CAP);
+    }
+    out
 }
 
 /// The id of deleting `rel` from a resource in state (`seen`, `superseded`).
@@ -75,6 +100,11 @@ pub struct Tombstone {
     /// all of them.
     pub ids: Vec<u64>,
     pub seen: Vec<Hash>,
+    /// The ids the deleted resource had itself superseded (earlier steps of
+    /// its delete/re-create chain). Local-only (persisted, never sent): a
+    /// re-creation supersedes `prior` ∪ `ids`, so a peer's stale tombstone
+    /// from ANY earlier step is still recognized.
+    pub prior: Vec<u64>,
     /// Loop guard: one re-assert per heartbeat (in-memory only).
     #[serde(skip)]
     pub reasserted: bool,
@@ -83,7 +113,7 @@ pub struct Tombstone {
 /// Folder index file (inside the root; dot-prefixed so the scan never
 /// syncs it): last-known live files + tombstones, so deletes survive restarts.
 pub const INDEX_FILE: &str = ".riftpipe-folder-index";
-const INDEX_VERSION: u32 = 2; // v2: Tombstone.ids (was a single id)
+const INDEX_VERSION: u32 = 3; // v2: Tombstone.ids (was a single id); v3: Tombstone.prior
 
 #[derive(Serialize, Deserialize, Default)]
 struct LiveEntry {
@@ -263,6 +293,7 @@ impl Workspace {
         let t = Tombstone {
             ids: vec![deletion_id(rel, &res.seen, &res.superseded)],
             seen: res.seen,
+            prior: res.superseded,
             reasserted: false,
         };
         self.tombstones.insert(rel.to_string(), t.clone());
@@ -276,17 +307,18 @@ impl Workspace {
     /// the error is returned (the peer re-asserts on our next advert, so it is
     /// retried).
     pub fn apply_remote_delete(&mut self, rel: &str, ids: &[u64], seen: &[Hash]) -> std::io::Result<()> {
-        let mut merged = Vec::new();
+        let (mut merged, mut prior) = (Vec::new(), Vec::new());
         if let Some(res) = self.resources.get_mut(rel) {
             res.backing.remove()?;
             let res = self.resources.remove(rel).expect("present");
             self.registry.remove(rel);
             merged = res.seen;
+            prior = res.superseded;
         }
         for h in seen {
             push_seen(&mut merged, *h);
         }
-        let mut t = Tombstone { ids: Vec::new(), seen: merged, reasserted: false };
+        let mut t = Tombstone { ids: Vec::new(), seen: merged, prior, reasserted: false };
         for id in ids {
             push_deletion_id(&mut t.ids, *id);
         }
@@ -318,12 +350,13 @@ impl Workspace {
     }
 
     /// Bring a tombstoned path back with `strategy` (already holding the
-    /// peer's merged state) and `bytes` as its content. The tombstone's ids
-    /// become `superseded`: the deletion was overruled, and a later delete of
-    /// this content must mint a fresh [`deletion_id`] (else it would collide
-    /// with the overruled one and be rejected by the peer that restored it).
+    /// peer's merged state) and `bytes` as its content. The tombstone's chain
+    /// (`prior` ∪ `ids`) becomes `superseded`: the deletion was overruled, and
+    /// a later delete of this content must mint a fresh [`deletion_id`] (else
+    /// it would collide with the overruled one and be rejected by the peer
+    /// that restored it).
     pub fn resurrect(&mut self, rel: &str, strategy: Box<dyn SyncStrategy>, bytes: &[u8]) {
-        let superseded = self.tombstones.remove(rel).map(|t| t.ids).unwrap_or_default();
+        let superseded = self.tombstones.remove(rel).map(superseded_by_recreating).unwrap_or_default();
         let kind = self.manifest.kind_for(rel);
         let backing = self.make_backing(rel);
         let mut res = Resource {
@@ -371,8 +404,9 @@ impl Workspace {
         let strategy = kind.build(rel);
         let backing = self.make_backing(rel);
         // A creation of a tombstoned path is a local re-creation: it
-        // overrides every deletion the tombstone stands for.
-        let superseded = self.tombstones.remove(rel).map(|t| t.ids).unwrap_or_default();
+        // overrides every deletion the tombstone stands for, and the earlier
+        // chain the deleted resource had already overridden.
+        let superseded = self.tombstones.remove(rel).map(superseded_by_recreating).unwrap_or_default();
         self.resources.insert(
             rel.to_string(),
             Resource {
@@ -405,15 +439,16 @@ impl Workspace {
                 // Live last run, gone now: deleted while we were offline. Same
                 // deterministic id the live delete would have minted.
                 let ids = vec![deletion_id(&rel, &e.seen, &e.superseded)];
-                self.tombstones.insert(rel, Tombstone { ids, seen: e.seen, reasserted: false });
+                let t = Tombstone { ids, seen: e.seen, prior: e.superseded, reasserted: false };
+                self.tombstones.insert(rel, t);
                 self.dirty = true;
             } // else: on disk but no resource (e.g. manifest now maps it to a stub) — leave it alone
         }
         for (rel, t) in idx.tombstones {
             if let Some(res) = self.resources.get_mut(&rel) {
-                // Re-created while offline: overrides all the tombstone's ids.
-                for id in t.ids {
-                    push_deletion_id(&mut res.superseded, id);
+                // Re-created while offline: overrides the tombstone's whole chain.
+                for id in superseded_by_recreating(t) {
+                    push_capped(&mut res.superseded, id, SUPERSEDED_CAP);
                 }
                 self.dirty = true;
             } else {
@@ -783,6 +818,30 @@ mod tests {
         assert!(!ws.is_tombstoned("d.bin"));
         assert_eq!(ws.get_mut("d.bin").unwrap().superseded, t.ids);
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A tombstone remembers what the deleted resource had superseded
+    /// (`prior`), persists it, and a re-creation supersedes `prior` ∪ `ids`.
+    #[test]
+    fn tombstone_prior_persists_and_feeds_recreation() {
+        let root = unique_dir("tombstone-prior");
+        std::fs::write(root.join("p.bin"), b"x").unwrap();
+        let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        let res = ws.get_mut("p.bin").unwrap();
+        res.superseded = vec![5];
+        res.note_state();
+        std::fs::remove_file(root.join("p.bin")).unwrap();
+        let t = ws.record_local_delete("p.bin").unwrap();
+        assert_eq!(t.prior, vec![5]);
+        ws.save_index_if_dirty();
+        drop(ws);
+
+        let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        assert_eq!(ws.tombstone("p.bin").unwrap().prior, vec![5]);
+        std::fs::write(root.join("p.bin"), b"x").unwrap();
+        ws.refresh_disk().unwrap();
+        assert_eq!(ws.get_mut("p.bin").unwrap().superseded, vec![5, t.ids[0]]);
         std::fs::remove_dir_all(&root).ok();
     }
 

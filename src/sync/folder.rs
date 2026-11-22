@@ -1106,6 +1106,76 @@ mod tests {
         std::fs::remove_dir_all(&rb).ok();
     }
 
+    /// B deletes; A applies; the link drops. A then restores, deletes again and
+    /// restores again (two chain steps). When B reconnects it answers A's
+    /// advert with its FIRST-step tombstone — whose id A's latest re-creation
+    /// must still supersede (via the chain carried in `Tombstone::prior`), or A
+    /// would delete its restored file.
+    #[test]
+    fn restore_after_two_cycles_survives_a_first_cycle_tombstone() {
+        let ra = dir("tc-a");
+        let rb = dir("tc-b");
+        std::fs::write(ra.join("f.bin"), b"cycle content").unwrap();
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        std::fs::remove_file(rb.join("f.bin")).unwrap();
+        let fb = collect_local(&mut b);
+        pump(&mut a, &mut b, fb, vec![]);
+        assert!(a.is_tombstoned("f.bin"));
+
+        // Link down: A's frames go nowhere.
+        std::fs::write(ra.join("f.bin"), b"cycle content").unwrap();
+        let _ = collect_local(&mut a);
+        std::fs::remove_file(ra.join("f.bin")).unwrap();
+        let _ = collect_local(&mut a);
+        std::fs::write(ra.join("f.bin"), b"cycle content").unwrap();
+        let _ = collect_local(&mut a);
+
+        let (ha, hb) = (advertise_all(&mut a), advertise_all(&mut b));
+        pump(&mut a, &mut b, hb, ha);
+        assert_eq!(std::fs::read(ra.join("f.bin")).unwrap(), b"cycle content");
+        assert_eq!(std::fs::read(rb.join("f.bin")).unwrap(), b"cycle content");
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    /// While the link is down A runs two delete/restore cycles and B deletes
+    /// independently, minting the same id as A's FIRST delete (same content,
+    /// same empty history). A's final restore must supersede that first-step
+    /// id too, so B's re-assert on reconnect doesn't delete it.
+    #[test]
+    fn independent_delete_survives_a_restore_two_cycles_later() {
+        let ra = dir("ir-a");
+        let rb = dir("ir-b");
+        std::fs::write(ra.join("g.bin"), b"shared").unwrap();
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        // Link down from here until the reconnect.
+        std::fs::remove_file(ra.join("g.bin")).unwrap();
+        let _ = collect_local(&mut a);
+        std::fs::write(ra.join("g.bin"), b"shared").unwrap();
+        let _ = collect_local(&mut a);
+        std::fs::remove_file(ra.join("g.bin")).unwrap();
+        let _ = collect_local(&mut a);
+        std::fs::write(ra.join("g.bin"), b"shared").unwrap();
+        let _ = collect_local(&mut a);
+        std::fs::remove_file(rb.join("g.bin")).unwrap();
+        let _ = collect_local(&mut b);
+
+        let (ha, hb) = (advertise_all(&mut a), advertise_all(&mut b));
+        pump(&mut a, &mut b, hb, ha);
+        assert_eq!(std::fs::read(ra.join("g.bin")).unwrap(), b"shared");
+        assert_eq!(std::fs::read(rb.join("g.bin")).unwrap(), b"shared");
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
     /// A peer's delete for a path we already deleted is merged, not ignored:
     /// its id joins our tombstone, so our later re-creation overrides it and
     /// the peer's re-assert of that id is rejected. A huge id list is capped.
