@@ -7,7 +7,8 @@
 //   2. Window B joins A's share link. While unlocked, B can add a card and it
 //      syncs to A (open edit).
 //   3. A clicks "Claim board" → A becomes the author. B, un-authorized, drops
-//      to "view only"; a card B writes now must NOT appear on A.
+//      to "no access"; a card B writes now must NOT appear on A, and a card A
+//      writes now must NOT reach B.
 //   4. B clicks "Ask for edit access" → the request appears in A's inbox. A
 //      clicks "Approve". B returns to "you can edit"; a card B writes now DOES
 //      appear on A.
@@ -64,7 +65,7 @@ try {
   if (!(await waitCard(a, "open-edit"))) fail("unlocked: B's card should sync to A");
   console.log("✓ unlocked: B's edit synced to A");
 
-  // 3. A claims → becomes author; B drops to view-only.
+  // 3. A claims → becomes author; B drops to no access.
   await a.locator(".lock-btn").click();
   await wait(2500);
   const aState = await authState(a);
@@ -74,8 +75,13 @@ try {
   const bState = await authState(b);
   if (!bState.locked) fail("B should observe the board is now claimed");
   if (bState.authorized) fail("B should be un-authorized right after A claims");
-  await b.waitForSelector(".auth-status.viewer", { timeout: 5000 });
-  console.log("✓ B dropped to view-only after claim");
+  await b.waitForSelector(".auth-status.no-access", { timeout: 5000 });
+  console.log("✓ B dropped to no access after claim");
+
+  await addCard(a, "owner-only");
+  await wait(3000);
+  if (await hasCard(b, "owner-only")) fail("claimed: un-approved B must NOT read the owner's new card");
+  console.log("✓ claimed: B cannot read the owner's new card");
 
   // B's write must be rejected by A now.
   await addCard(b, "blocked-write");
@@ -101,11 +107,14 @@ try {
   await b.waitForSelector(".auth-status.editor", { timeout: 5000 });
   console.log("✓ B authorized after approval");
 
+  if (!(await waitCard(b, "owner-only", 10000))) fail("approved: B should now read the owner's card (wrapped into the epoch)");
+  console.log("✓ approved: B reads content sealed before its approval");
+
   await addCard(b, "granted-write");
   if (!(await waitCard(a, "granted-write"))) fail("granted: B's card should now sync to A");
   console.log("✓ granted: B's write synced to A");
 
-  console.log("\nPASS — claim=authorship + ask/approve flow works end to end over the mesh");
+  console.log("\nPASS — claim=authorship + ask/approve flow works end to end over the mesh, with reads gated until approval");
 } finally {
   await browser.close();
 }
