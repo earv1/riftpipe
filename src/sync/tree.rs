@@ -282,13 +282,15 @@ impl TreePeer {
     pub(crate) fn authorize_and_apply(&mut self, msg: MeshMsg, dir: &Path) -> Vec<MeshMsg> {
         match msg {
             MeshMsg::Trust(e) => {
+                let was_held = self.writes_held();
                 self.add_trust(e);
-                self.after_trust_change(dir)
+                self.after_trust_change(dir, was_held)
             }
             MeshMsg::Epoch(a) => {
+                let was_held = self.writes_held();
                 let Some(book) = self.epochs.as_mut() else { return Vec::new() };
                 let ing = book.ingest(a, &self.trust);
-                self.epoch_followups(ing, dir)
+                self.epoch_followups(ing, dir, was_held)
             }
             MeshMsg::Request(req) => {
                 if let Some(b) = self.epochs.as_mut() {
@@ -325,10 +327,18 @@ impl TreePeer {
 
     /// The trust log changed: announces deferred for an unknown signer may now
     /// apply, and an Admin may need to rotate (a revoke) or wrap (a grant).
-    fn after_trust_change(&mut self, dir: &Path) -> Vec<MeshMsg> {
+    /// `was_held`: writes were held ([`writes_held`](Self::writes_held)) before the change.
+    fn after_trust_change(&mut self, dir: &Path, was_held: bool) -> Vec<MeshMsg> {
         let Some(book) = self.epochs.as_mut() else { return Vec::new() };
         let ing = book.retry_pending(&self.trust);
-        self.epoch_followups(ing, dir)
+        self.epoch_followups(ing, dir, was_held)
+    }
+
+    /// Are our writes held back right now (restricted, and `EpochBook::can_seal`
+    /// says no: no key, the epoch we hold isn't the latest, or it still wraps a
+    /// revoked device)?
+    fn writes_held(&self) -> bool {
+        self.mode.seals_content() && !self.epochs.as_ref().is_some_and(|b| b.can_seal(&self.trust))
     }
 
     /// Act on what accepting announce(s) changed: report an epoch we're not wrapped
@@ -336,7 +346,7 @@ impl TreePeer {
     /// state on any newly-held key (it carries edits held back while keyless or
     /// while our latest epoch still wrapped a revoked device), then run Admin
     /// maintenance.
-    fn epoch_followups(&mut self, ing: Ingested, dir: &Path) -> Vec<MeshMsg> {
+    fn epoch_followups(&mut self, ing: Ingested, dir: &Path, was_held: bool) -> Vec<MeshMsg> {
         let mut out = Vec::new();
         if let Some(seq) = ing.unheld {
             eprintln!("[epoch] no key for epoch {seq} — this device is not wrapped in (revoked, or not yet approved)");
@@ -351,9 +361,10 @@ impl TreePeer {
             let n = self.epoch_held().unwrap_or(0);
             eprintln!("[epoch] read key acquired (epoch {n})");
         }
-        // A newly-held epoch releases writes held back: edits made while keyless,
-        // or between a revoke and its rotation (`EpochBook::seal`).
-        if ing.held.is_some() {
+        // Writes held back go out once the hold lifts: a newly-held epoch (edits
+        // made while keyless, or between a revoke and its rotation), or a trust
+        // change without a new key (e.g. the revoked device was re-granted).
+        if ing.held.is_some() || (was_held && !self.writes_held()) {
             out.extend(self.sealed_full_state());
         }
         out.extend(self.maintenance());
@@ -409,10 +420,11 @@ impl TreePeer {
             }
             key.revoke(id, rand::random::<[u8; 16]>())
         };
+        let was_held = self.writes_held();
         self.add_trust(entry.clone());
         eprintln!("[auth] revoked device {}", hex32(&id));
         let mut out = vec![MeshMsg::Trust(entry)];
-        out.extend(self.after_trust_change(dir));
+        out.extend(self.after_trust_change(dir, was_held));
         out
     }
 
@@ -435,10 +447,11 @@ impl TreePeer {
             }
             key.grant(id, Role::Member, rand::random::<[u8; 16]>())
         };
+        let was_held = self.writes_held();
         self.add_trust(entry.clone());
         eprintln!("[auth] granted device {} (Member)", hex32(&id));
         let mut out = vec![MeshMsg::Trust(entry)];
-        out.extend(self.after_trust_change(dir));
+        out.extend(self.after_trust_change(dir, was_held));
         out
     }
 
@@ -853,6 +866,32 @@ mod tests {
         assert!(
             released.iter().any(|m| matches!(m, MeshMsg::Sealed(s) if s.seq == 2)),
             "the held state goes out sealed under epoch 2"
+        );
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A hold that lifts without a new key (the revoked device is re-granted
+    /// before the rotation reaches us) still sends the held writes.
+    #[test]
+    fn regrant_lifts_the_hold_and_resends() {
+        let (mut founder, df, mut member, dm, _revokee, dc) = restricted_board("regrant");
+        for m in founder.auth_catchup() {
+            member.authorize_and_apply(m, &dm);
+        }
+        std::fs::write(dm.join("held.bin"), b"held").unwrap();
+        let edit = member.local_change(&dm.join("held.bin"), &dm).expect("a local edit");
+        let c_id = DeviceKey::from_seed(&[3u8; 32]).id();
+        let revoke = founder.revoke_device(c_id, &df).into_iter().find(|m| matches!(m, MeshMsg::Trust(_))).unwrap();
+        member.authorize_and_apply(revoke, &dm);
+        assert!(member.sign_local(edit).is_none(), "held: epoch 1 wraps the revoked device");
+
+        let regrant = founder.grant_device(c_id, &df).into_iter().find(|m| matches!(m, MeshMsg::Trust(_))).unwrap();
+        let out = member.authorize_and_apply(regrant, &dm);
+        assert!(
+            out.iter().any(|m| matches!(m, MeshMsg::Sealed(s) if s.seq == 1)),
+            "the hold lifted (no new key): held state goes out sealed"
         );
         for d in [&df, &dm, &dc] {
             std::fs::remove_dir_all(d).ok();
