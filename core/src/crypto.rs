@@ -20,10 +20,14 @@
 //! authorship — sealing stops outsiders, not insiders) and a **read/write
 //! split**. This layer closes the outsider threats; signing closes the rest.
 //!
+//! [`MeshCipher::from_epoch`] is the inner content cipher for restricted boards
+//! (see `core::epoch`): a second AEAD seal, under the current epoch key, inside
+//! the outer board-secret seal above.
+//!
 //! Shared by native (`sync::mesh`) and browser (`web::gossip`) so both derive
 //! the identical topic + key from a link and interoperate.
 
-use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
 
 /// Length of a board secret, in bytes.
@@ -36,6 +40,7 @@ const NONCE_LEN: usize = 24;
 /// blake3 domain-separation contexts. Changing either string changes the
 /// derived value, so they double as a crypto-scheme version tag.
 const TOPIC_CONTEXT: &str = "riftpipe board topic v1";
+const EPOCH_CONTENT_CONTEXT: &str = "riftpipe epoch content v1";
 const AEAD_CONTEXT: &str = "riftpipe mesh aead v1";
 
 /// A fresh random board secret. The caller persists it (a host, so the topic is
@@ -67,17 +72,31 @@ impl MeshCipher {
         MeshCipher { cipher }
     }
 
+    /// Content cipher for one epoch key (restricted boards): a domain-separated KDF of
+    /// the epoch key, so the same 32 bytes used as a board secret and as an epoch key
+    /// never yield the same AEAD key.
+    pub fn from_epoch(epoch_key: &[u8; 32]) -> Self {
+        let key = blake3::derive_key(EPOCH_CONTENT_CONTEXT, epoch_key);
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+        MeshCipher { cipher }
+    }
+
     /// Seal `plaintext` into a self-contained frame `nonce(24) ‖ ciphertext‖tag`
     /// with a fresh random nonce. The nonce travels in the clear (it must — the
     /// receiver needs it); confidentiality rests on the key, integrity on the tag.
     pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
+        self.seal_aad(plaintext, &[])
+    }
+
+    /// `seal` with associated data bound into the tag (not encrypted, not transmitted).
+    pub fn seal_aad(&self, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
         let mut nonce = [0u8; NONCE_LEN];
         getrandom::getrandom(&mut nonce).expect("OS RNG unavailable");
         // AEAD encryption fails only on absurd (multi-GiB) inputs; a mesh frame
         // is at most a few KiB, so this cannot fail in practice.
         let ct = self
             .cipher
-            .encrypt(XNonce::from_slice(&nonce), plaintext)
+            .encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext, aad })
             .expect("AEAD seal");
         let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
         out.extend_from_slice(&nonce);
@@ -90,11 +109,16 @@ impl MeshCipher {
     /// frames (an outsider's traffic, or corruption), exactly like an
     /// undecodable message.
     pub fn open(&self, framed: &[u8]) -> Option<Vec<u8>> {
+        self.open_aad(framed, &[])
+    }
+
+    /// Inverse of `seal_aad`; `None` if the aad, key, or bytes don't match.
+    pub fn open_aad(&self, framed: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
         if framed.len() < NONCE_LEN {
             return None;
         }
         let (nonce, ct) = framed.split_at(NONCE_LEN);
-        self.cipher.decrypt(XNonce::from_slice(nonce), ct).ok()
+        self.cipher.decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad }).ok()
     }
 }
 
@@ -157,5 +181,30 @@ mod tests {
         assert!(cipher.open(&sealed).is_none(), "the auth tag must catch tampering");
         assert!(cipher.open(&sealed[..NONCE_LEN]).is_none(), "truncation is rejected");
         assert!(cipher.open(b"short").is_none(), "under-length frame is rejected");
+    }
+
+    #[test]
+    fn seal_is_seal_aad_with_empty_aad() {
+        let cipher = MeshCipher::from_secret(&[5u8; SECRET_LEN]);
+        let x = b"cross-path equivalence";
+        assert_eq!(cipher.open_aad(&cipher.seal(x), b"").as_deref(), Some(&x[..]));
+        assert_eq!(cipher.open(&cipher.seal_aad(x, b"")).as_deref(), Some(&x[..]));
+    }
+
+    #[test]
+    fn aad_mismatch_is_rejected() {
+        let cipher = MeshCipher::from_secret(&[6u8; SECRET_LEN]);
+        let sealed = cipher.seal_aad(b"content", b"a");
+        assert!(cipher.open_aad(&sealed, b"b").is_none(), "aad is bound into the tag");
+    }
+
+    #[test]
+    fn epoch_cipher_is_domain_separated_from_board_cipher() {
+        let k = [4u8; 32];
+        let sealed = MeshCipher::from_epoch(&k).seal(b"x");
+        assert!(
+            MeshCipher::from_secret(&k).open(&sealed).is_none(),
+            "epoch content key and board secret key must differ even for the same bytes"
+        );
     }
 }
