@@ -221,9 +221,10 @@ fn apply_inbound(ws: &mut Workspace, msg: SyncMsg) -> Vec<Vec<u8>> {
 }
 
 /// A delta for a path we deleted means the peer holds content we lack. If it
-/// materializes standalone, edit wins → resurrect. If not (an incremental
-/// delta), re-assert the delete — once per heartbeat — so the peer either
-/// agrees or answers with a self-contained delta.
+/// applies standalone to a fresh strategy (it materializes, or at least moves
+/// the state vector), edit wins → resurrect. If not (an incremental delta),
+/// re-assert the delete — once per heartbeat — so the peer either agrees or
+/// answers with a self-contained delta.
 fn delta_for_tombstone(ws: &mut Workspace, path: &str, bytes: &[u8], out: &mut Vec<Vec<u8>>) {
     let Some(mut fresh) = ws.fresh_strategy(path) else { return };
     if bytes == EMPTY_CONTENT {
@@ -232,8 +233,17 @@ fn delta_for_tombstone(ws: &mut Workspace, path: &str, bytes: &[u8], out: &mut V
         ws.resurrect(path, fresh, b"");
         return;
     }
+    let empty_sv = fresh.state_vector();
     if let Some(nb) = fresh.merge(bytes) {
         ws.resurrect(path, fresh, &nb);
+        return;
+    }
+    if fresh.state_vector() != empty_sv {
+        // The delta applied standalone but materializes EMPTY content (text
+        // typed then cleared, every lww record deleted): it was self-contained,
+        // so resurrect empty — with that history — rather than mistake it for
+        // an incremental delta and re-assert the delete every heartbeat.
+        ws.resurrect(path, fresh, b"");
         return;
     }
     if let Some(t) = ws.tombstone_mut(path) {
@@ -1258,6 +1268,56 @@ mod tests {
         let fa = collect_local(&mut a);
         pump(&mut a, &mut b, vec![], fa);
         assert!(!rb.join("e.bin").exists());
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    /// Like `recreated_empty_file_converges`, but the re-creation has HISTORY:
+    /// text typed then cleared, an lww record added then deleted. The
+    /// self-contained delta is non-empty yet materializes empty on the
+    /// deleter, which must still resurrect (empty) — not re-assert its delete
+    /// on every heartbeat.
+    #[test]
+    fn recreated_then_emptied_file_converges() {
+        let ra = dir("eh-a");
+        let rb = dir("eh-b");
+        std::fs::write(ra.join("e.md"), "had text\n").unwrap();
+        std::fs::write(ra.join("meta.toml"), "a = 1\n").unwrap();
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        for f in ["e.md", "meta.toml"] {
+            std::fs::remove_file(ra.join(f)).unwrap();
+        }
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+        assert!(b.is_tombstoned("e.md") && b.is_tombstoned("meta.toml"));
+
+        // Link down: A re-creates both with content, then empties them.
+        std::fs::write(ra.join("e.md"), "x").unwrap();
+        std::fs::write(ra.join("meta.toml"), "z = 9\n").unwrap();
+        let _ = collect_local(&mut a);
+        for f in ["e.md", "meta.toml"] {
+            std::fs::write(ra.join(f), b"").unwrap();
+        }
+        let _ = collect_local(&mut a);
+
+        let (ha, hb) = (advertise_all(&mut a), advertise_all(&mut b));
+        pump(&mut a, &mut b, hb, ha);
+        for f in ["e.md", "meta.toml"] {
+            assert_eq!(std::fs::read(rb.join(f)).unwrap(), b"", "{f} on B");
+            assert_eq!(std::fs::read(ra.join(f)).unwrap(), b"", "{f} on A");
+            assert!(!a.is_tombstoned(f) && !b.is_tombstoned(f), "{f} tombstoned");
+        }
+
+        // No heartbeat churn: A's adverts draw no delete or delta from B.
+        let replies: Vec<Vec<u8>> = advertise_all(&mut a).iter().flat_map(|f| deliver(&mut b, f)).collect();
+        assert!(replies.iter().all(|r| !matches!(
+            postcard::from_bytes::<SyncMsg>(r),
+            Ok(SyncMsg::StratDelete { .. } | SyncMsg::StratDelta { .. })
+        )));
 
         std::fs::remove_dir_all(&ra).ok();
         std::fs::remove_dir_all(&rb).ok();
