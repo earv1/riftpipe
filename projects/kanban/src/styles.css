@@ -116,7 +116,27 @@ body {
 .auth-bar .auth-status { font-weight: 600; }
 .auth-bar .auth-status.owner { color: #0b6b3a; }
 .auth-bar .auth-status.editor { color: #0b57d0; }
-.auth-bar .auth-status.viewer { color: #8a4d00; }
+.auth-bar .auth-status.no-access { color: #8a4d00; }
+.auth-bar .auth-status.pending-key { color: #8a9099; }
+.auth-bar .member {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.15rem 0.3rem 0.15rem 0.5rem;
+  border: 1px solid #e6e8eb;
+  border-radius: 6px;
+  background: #fff;
+}
+.auth-bar .revoke-btn {
+  padding: 0.3rem 0.7rem;
+  border: 1px solid #b3261e;
+  border-radius: 6px;
+  background: #fff;
+  color: #b3261e;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.auth-bar .revoke-btn:hover { background: #fbeceb; }
 .auth-bar .device-id {
   margin-left: auto;
   padding: 0.3rem 0.6rem;

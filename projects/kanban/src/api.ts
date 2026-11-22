@@ -16,6 +16,8 @@ import {
   deviceId,
   lockBoard,
   grantDevice,
+  revokeDevice,
+  boardMembers,
   requestAccess,
   pendingRequests,
   authState,
@@ -39,7 +41,9 @@ export { logEvent, readEvents, onEvent, type RiftEvent } from "./events.ts";
 //   riftpipe.requestAccess()     → ask the author for write access
 //   riftpipe.pendingRequests()   → author-only: who's asking [{device,name,safety}]
 //   riftpipe.grantDevice(id)     → author-only: approve a device to write
-//   riftpipe.authState()         → { locked, device, authorized, isAuthor, author, requested }
+//   riftpipe.revokeDevice(id)    → admin-only: remove a device (rotates the read key)
+//   riftpipe.boardMembers()      → authorized devices [{device,role,founder,me}]
+//   riftpipe.authState()         → { locked, device, authorized, isAuthor, author, requested, canRead, epoch }
 export type AuthState = {
   locked: boolean;
   device: string;
@@ -47,14 +51,19 @@ export type AuthState = {
   isAuthor: boolean;
   author: string;
   requested: boolean;
+  canRead: boolean;
+  epoch: number;
 };
 export type PendingRequest = { device: string; name: string; safety: string };
+export type Member = { device: string; role: "admin" | "member"; founder: boolean; me: boolean };
 export const auth = {
   deviceId: (): string => deviceId(),
   lockBoard: (): boolean => lockBoard(),
   requestAccess: (): boolean => requestAccess(),
   pending: (): PendingRequest[] => JSON.parse(pendingRequests()),
   grantDevice: (id: string): boolean => grantDevice(id),
+  revokeDevice: (id: string): boolean => revokeDevice(id),
+  members: (): Member[] => JSON.parse(boardMembers()),
   state: (): AuthState => JSON.parse(authState()),
 };
 (globalThis as any).riftpipe = {
@@ -65,6 +74,8 @@ export const auth = {
   requestAccess: () => requestAccess(),
   pendingRequests: () => JSON.parse(pendingRequests()),
   grantDevice: (id: string) => grantDevice(id),
+  revokeDevice: (id: string) => revokeDevice(id),
+  boardMembers: () => JSON.parse(boardMembers()),
   authState: () => JSON.parse(authState()),
   readEvents: () => readEvents(),
 };
@@ -167,6 +178,10 @@ export async function newBoard(): Promise<void> {
   // Drop the board secret too: a new board must mint a fresh secret, so it gets
   // a new topic (H(secret)) and a brand-new, unrelated share link.
   localStorage.removeItem("riftpipe:board_secret");
+  // Drop the claim and the epoch keys too: they belong to the old board's topic.
+  localStorage.removeItem("riftpipe:trust");
+  localStorage.removeItem("riftpipe:trust:v2");
+  localStorage.removeItem("riftpipe:epochs");
   location.hash = "";
   location.reload();
 }
