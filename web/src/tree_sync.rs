@@ -33,20 +33,24 @@ pub async fn connect_and_sync(
     on_change: js_sys::Function,
 ) -> Result<(), JsValue> {
     let link = crate::connect_via_signaling(&ws_url, &room).await?;
-    SYNC.with(|c| *c.borrow_mut() = Some(TreeSync::new(link, opfs_on_merged(on_change))));
-    wasm_bindgen_futures::spawn_local(crate::opfs::prime_all());
+    // No topic on this transport: the tree is this page's board (its link or
+    // its own hosted board), the same one pre-connect reads used.
+    let board = enter_board(page_board_topic()).await;
+    SYNC.with(|c| *c.borrow_mut() = Some(TreeSync::new(link, opfs_on_merged(on_change, board))));
+    wasm_bindgen_futures::spawn_local(crate::opfs::prime_all(board));
     Ok(())
 }
 
-/// A merge handler that lands the file in OPFS, fires a per-path
+/// A merge handler that lands the file in board `board`'s OPFS tree (the board
+/// the link syncs — even if the page has switched since), fires a per-path
 /// `riftpipe:file-changed` event (the file API's `watch`), and nudges the UI to
 /// refetch via the legacy `on_change` callback.
-fn opfs_on_merged(on_change: js_sys::Function) -> Rc<dyn Fn(String, Vec<u8>)> {
+fn opfs_on_merged(on_change: js_sys::Function, board: [u8; 32]) -> Rc<dyn Fn(String, Vec<u8>)> {
     let on_change = Rc::new(on_change);
     Rc::new(move |path: String, bytes: Vec<u8>| {
         let cb = on_change.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = crate::opfs::write_path(&path, &bytes).await;
+            let _ = crate::opfs::write_path_in(&board, &path, &bytes).await;
             // Record the merge for history/debugging — but NOT for the event
             // files themselves, or logging a merged log would recurse forever.
             if !path.starts_with("events/") {
@@ -84,7 +88,6 @@ thread_local! {
 pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result<JsValue, JsValue> {
     use crate::gossip::{GossipTreeSync, Mesh};
     use crate::iroh_link::{parse_ticket, ticket_of};
-    let on_merged = opfs_on_merged(on_change);
     let sk = load_or_create_secret_key();
     let my_id = sk.public();
 
@@ -102,33 +105,85 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
         None => true,
     };
 
-    let (mesh, my_ticket, topic) = if is_host {
-        // Our own link is authoritative for the secret if present (survives a
-        // localStorage wipe that kept the URL); else persist-or-mint one.
-        let secret = match &parsed {
-            Some((s, _)) => *s,
-            None => load_or_create_board_secret(),
-        };
+    // Our own link is authoritative for the secret if present (survives a
+    // localStorage wipe that kept the URL); else persist-or-mint one. A joiner's
+    // link carries the secret and the host to dial.
+    let secret = match &parsed {
+        Some((s, _)) => *s,
+        None => load_or_create_board_secret(),
+    };
+    if is_host {
         persist_board_secret(&secret);
+    }
+    // Scope the file tree to this board BEFORE joining (a failed join still
+    // works solo on the right tree).
+    let topic = enter_board(riftpipe_core::crypto::topic_from_secret(&secret)).await;
+    let on_merged = opfs_on_merged(on_change, topic);
+
+    let (mesh, my_ticket) = if is_host {
         let mesh = Mesh::join(sk, secret, None).await.map_err(|e| JsValue::from_str(&e))?;
         let addr = mesh.wait_for_addr().await;
-        (mesh, Some(ticket_of(&secret, &addr)), riftpipe_core::crypto::topic_from_secret(&secret))
+        (mesh, Some(ticket_of(&secret, &addr)))
     } else {
-        // Joiner: the link carries everything — the secret and the host to dial.
-        let (secret, addr) = parsed.unwrap();
+        let addr = parsed.unwrap().1;
         let mesh = Mesh::join(sk, secret, Some(addr)).await.map_err(|e| JsValue::from_str(&e))?;
-        (mesh, None, riftpipe_core::crypto::topic_from_secret(&secret))
+        (mesh, None)
     };
 
     // Device-linking auth: always carry this device's identity + the trust log
     // and epoch announces persisted for this board (its topic). The board is
     // "open" until someone locks it (adds a genesis); `lockBoard()` does that
     // live. See `web::gossip::Auth`.
-    let auth = crate::gossip::Auth::load(load_or_create_device(), topic);
+    let mut auth = crate::gossip::Auth::load(load_or_create_device(), topic);
+    if crate::opfs::board_claimed(&topic).await {
+        auth.set_claimed_hint();
+    }
     crate::gossip::set_active(GossipTreeSync::new(mesh, on_merged, auth));
-    wasm_bindgen_futures::spawn_local(crate::opfs::prime_all());
+    wasm_bindgen_futures::spawn_local(crate::opfs::prime_all(topic));
 
     Ok(my_ticket.map(|t| JsValue::from_str(&t)).unwrap_or(JsValue::NULL))
+}
+
+/// The board this page is for: its link's (`location.hash`) secret, else this
+/// browser's own hosted board (minting one, as connecting would) — the same
+/// choice [`iroh_connect`] makes, so the file API reads the right tree even
+/// before the page connects.
+pub(crate) fn page_board_topic() -> [u8; 32] {
+    let hash = web_sys::window().and_then(|w| w.location().hash().ok()).unwrap_or_default();
+    let ticket = hash.trim_start_matches('#');
+    let secret = match crate::iroh_link::parse_ticket(ticket) {
+        Ok((s, _)) if !ticket.is_empty() => s,
+        _ => load_or_create_board_secret(),
+    };
+    riftpipe_core::crypto::topic_from_secret(&secret)
+}
+
+/// Scope the file tree to board `topic`, upgrade a pre-scoping OPFS root once,
+/// and nudge the UI to re-read (the page may have read another board's tree).
+async fn enter_board(topic: [u8; 32]) -> [u8; 32] {
+    crate::opfs::set_active_board(topic);
+    if let Some(owner) = legacy_root_owner(&topic) {
+        crate::opfs::adopt_legacy_root(&owner).await;
+    }
+    dispatch_file_changed("");
+    topic
+}
+
+/// Which board a pre-scoping OPFS root (one tree shared by every board this
+/// browser opened) belongs to: this browser's own hosted board if it has one;
+/// else — only if no board was ever claimed here (no legacy trust log, so all
+/// of it was open-board content) — the board being opened. Otherwise `None`:
+/// leave it at the root, unsynced, rather than risk moving claimed content
+/// into another board.
+fn legacy_root_owner(opening: &[u8; 32]) -> Option<[u8; 32]> {
+    if let Some(secret) = persisted_board_secret() {
+        return Some(riftpipe_core::crypto::topic_from_secret(&secret));
+    }
+    let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten())?;
+    match storage.get_item(crate::gossip::LEGACY_TRUST_STORE_KEY) {
+        Ok(None) => Some(*opening),
+        _ => None,
+    }
 }
 
 /// This device's persisted signing identity (localStorage `riftpipe:device`),

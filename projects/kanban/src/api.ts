@@ -163,16 +163,21 @@ export async function connectPeer(): Promise<boolean> {
 }
 
 /**
- * Start a fresh board: wipe the local OPFS tree, drop the persisted iroh
- * identity (a new key ⇒ a new EndpointId ⇒ a new topic + share ticket), clear
+ * Start a fresh board: drop the persisted iroh identity (a new key ⇒ a new
+ * EndpointId ⇒ a new share ticket) and the board secret (⇒ a new topic), clear
  * the URL hash, and reload — the tab comes back as the host of an empty board
- * and writes its fresh ticket into the URL.
+ * and writes its fresh ticket into the URL. Each board's files live in their
+ * own OPFS directory (keyed by topic), so the new board starts empty and the
+ * old board's files stay with the old board (reopen its link to get them back)
+ * — they are never wiped, and never carried into the new board.
  */
 export async function newBoard(): Promise<void> {
+  // Wipe only a pre-scoping tree still at the OPFS root (it belonged to the
+  // old board — it must not be adopted by the new one). `.boards/` stays.
   const root = await navigator.storage.getDirectory();
   // deno-lint-ignore no-explicit-any — async iteration isn't in TS's lib yet
   for await (const name of (root as any).keys()) {
-    await root.removeEntry(name, { recursive: true }).catch(() => {});
+    if (!name.startsWith(".")) await root.removeEntry(name, { recursive: true }).catch(() => {});
   }
   localStorage.removeItem("riftpipe:iroh_sk");
   // Drop the board secret too: a new board must mint a fresh secret, so it gets

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# "Merge both boards" over iroh: two browsers that each already have their own card
-# connect and end up seeing BOTH — no signaling server, no host you run.
+# Board isolation over iroh: a browser's claimed board's files never reach
+# another board it opens (each board's files live in their own OPFS directory).
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$ROOT"
@@ -18,8 +18,8 @@ PREVIEW=$!
 trap 'kill $PREVIEW 2>/dev/null' EXIT
 for _ in $(seq 1 50); do curl -fsS "http://127.0.0.1:$PORT/" >/dev/null 2>&1 && break; sleep 0.2; done
 
-echo "== two browsers, each with a pre-existing board, merge over iroh =="
-( cd projects/kanban/e2e && PORT=$PORT node iroh-merge.mjs )
+echo "== a claimed board's files stay out of another board =="
+( cd projects/kanban/e2e && PORT=$PORT node board-isolation.mjs )
 RESULT=$?
 echo "== exit: $RESULT =="
 exit $RESULT

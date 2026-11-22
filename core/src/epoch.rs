@@ -291,9 +291,16 @@ impl EpochBook {
         out
     }
 
-    /// Seal content under the highest epoch we hold. `None` if we hold none.
-    pub fn seal(&self, inner: &MeshMsg) -> Option<MeshMsg> {
+    /// Seal content under the highest epoch we hold. `None` (hold the write) if we
+    /// hold none, or if that epoch still wraps a device `trust` has revoked — we
+    /// saw the revoke but not yet the rotation, and sealing now would let the
+    /// removed device read it. The caller re-sends once the new epoch arrives
+    /// ([`Ingested::held`]).
+    pub fn seal(&self, inner: &MeshMsg, trust: &TrustLog) -> Option<MeshMsg> {
         let (&(seq, id), key) = self.keys.iter().next_back()?;
+        if self.wrapped.get(&(seq, id)).is_some_and(|w| w.iter().any(|d| trust.is_revoked(d))) {
+            return None;
+        }
         let pt = postcard::to_allocvec(inner).ok()?;
         let body = MeshCipher::from_epoch(key).seal_aad(&pt, &sealed_aad(seq, &id));
         Some(MeshMsg::Sealed(SealedMsg { seq, id, body }))
@@ -532,7 +539,7 @@ mod tests {
         assert_eq!(ing.held, Some(1), "now holds epoch 1");
         assert!(mb.holds_latest());
 
-        let s = sealed(fb.seal(&content("p")).expect("founder holds a key"));
+        let s = sealed(fb.seal(&content("p"), &trust).expect("founder holds a key"));
         assert!(is_resync(&mb.open(s), "p"));
     }
 
@@ -602,7 +609,7 @@ mod tests {
         assert_eq!(cb.latest_held_seq(), Some(1));
         assert_eq!(cb.latest_known_seq(), Some(2));
 
-        let s = sealed(fb.seal(&content("new")).unwrap());
+        let s = sealed(fb.seal(&content("new"), &trust).unwrap());
         assert_eq!(s.seq, 2);
         assert!(is_resync(&bb.open(s.clone()), "new"));
         assert_eq!(cb.open(s).err(), Some(OpenError::NoKey { seq: 2 }));
@@ -628,9 +635,22 @@ mod tests {
     }
 
     #[test]
+    fn member_holds_writes_between_a_revoke_and_its_rotation() {
+        let (f, _b, c, mut trust, mut fb, mut bb, _cb) = three_wrapped();
+        assert!(bb.seal(&content("before"), &trust).is_some());
+        trust.apply(f.revoke(c.id(), [3; 16]));
+        assert!(bb.seal(&content("gap"), &trust).is_none(), "epoch 1 still wraps revoked C: hold");
+        let out = fb.maintain(&f, &trust);
+        let ing = feed(&mut bb, &out.announces, &trust);
+        assert_eq!(ing.held, Some(2), "the new epoch arrived: the caller re-sends");
+        let s = sealed(bb.seal(&content("after"), &trust).expect("epoch 2 excludes C"));
+        assert_eq!(s.seq, 2);
+    }
+
+    #[test]
     fn old_epoch_content_still_opens_after_rotation() {
         let (f, _b, c, mut trust, mut fb, bb, _cb) = three_wrapped();
-        let from_b = sealed(bb.seal(&content("old")).unwrap());
+        let from_b = sealed(bb.seal(&content("old"), &trust).unwrap());
         assert_eq!(from_b.seq, 1);
         trust.apply(f.revoke(c.id(), [3; 16]));
         assert!(fb.maintain(&f, &trust).rotated.is_some());
@@ -643,7 +663,7 @@ mod tests {
         let (f, _b, c, mut trust, mut fb, mut bb, _cb) = three_wrapped();
         trust.apply(f.revoke(c.id(), [3; 16]));
         let out = fb.maintain(&f, &trust);
-        let early = sealed(fb.seal(&content("early")).unwrap());
+        let early = sealed(fb.seal(&content("early"), &trust).unwrap());
 
         assert_eq!(bb.open(early).err(), Some(OpenError::NoKey { seq: 2 }));
         let ing = feed(&mut bb, &out.announces, &trust);
@@ -662,12 +682,12 @@ mod tests {
         assert_eq!(slots.len(), 2);
         let (old, new) = (slots[0], slots[1]);
 
-        let mut flipped = sealed(fb.seal(&content("x")).unwrap());
+        let mut flipped = sealed(fb.seal(&content("x"), &trust).unwrap());
         let last = flipped.body.len() - 1;
         flipped.body[last] ^= 0x01;
         assert_eq!(fb.open(flipped).err(), Some(OpenError::Invalid));
 
-        let mut moved = sealed(fb.seal(&content("x")).unwrap());
+        let mut moved = sealed(fb.seal(&content("x"), &trust).unwrap());
         assert_eq!((moved.seq, moved.id), new);
         (moved.seq, moved.id) = old;
         assert_eq!(fb.open(moved).err(), Some(OpenError::Invalid), "header swapped onto another held epoch");
@@ -677,7 +697,7 @@ mod tests {
         let body = MeshCipher::from_epoch(&fb.keys[&new]).seal_aad(&pt, &sealed_aad(new.0 + 7, &new.1));
         assert_eq!(fb.open(SealedMsg { seq: new.0, id: new.1, body }).err(), Some(OpenError::Invalid));
 
-        let not_content = fb.seal(&MeshMsg::Trust(f.genesis())).unwrap();
+        let not_content = fb.seal(&MeshMsg::Trust(f.genesis()), &trust).unwrap();
         assert_eq!(fb.open(sealed(not_content)).err(), Some(OpenError::Invalid), "only content is sealed");
     }
 

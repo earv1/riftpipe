@@ -185,7 +185,7 @@ const TRUST_STORE_PREFIX: &str = "riftpipe:trust:v2:";
 /// localStorage: the pre-v2, board-unscoped `hex(postcard(Vec<TrustEntry>))`.
 /// Migrated once, and only into this browser's own hosted board (see
 /// [`load_trust_entries`]).
-const LEGACY_TRUST_STORE_KEY: &str = "riftpipe:trust";
+pub(crate) const LEGACY_TRUST_STORE_KEY: &str = "riftpipe:trust";
 /// localStorage key prefix: `riftpipe:epochs:<hex topic>` = `hex(postcard(Vec<EpochAnnounce>))`
 /// — verified announces only (wraps are ciphertext to their recipients); raw
 /// epoch keys are never stored, they're re-opened with the device seed on load.
@@ -238,6 +238,13 @@ pub struct Auth {
     /// Our own outstanding access request (viewer side), re-announced to new
     /// neighbors so a late-arriving owner still sees it. Cleared once granted.
     my_request: Option<JoinRequest>,
+    /// This board is known to be claimed (an OPFS marker next to its files)
+    /// even if the trust log hasn't arrived — e.g. localStorage was cleared but
+    /// OPFS kept. Treated as claimed: nothing goes out in plaintext and the
+    /// Claim button can't race the real founder.
+    claimed_hint: bool,
+    /// The OPFS claimed-marker is (being) written for this board.
+    claim_marked: bool,
 }
 
 impl Auth {
@@ -255,8 +262,10 @@ impl Auth {
             epochs,
             requests: Vec::new(),
             my_request: None,
+            claimed_hint: false,
+            claim_marked: false,
         };
-        for e in load_trust_entries(&topic) {
+        for e in load_trust_entries(&topic, &a.identity.id()) {
             a.add_trust(e);
         }
         for an in load_epochs(&topic) {
@@ -270,8 +279,7 @@ impl Auth {
     /// Ingest a trust entry (idempotent), remember it for neighbor catch-up, and
     /// persist. The wire/load is the source; we persist our own converged view.
     pub fn add_trust(&mut self, e: TrustEntry) {
-        let id = *blake3::hash(&postcard::to_allocvec(&e).unwrap_or_default()).as_bytes();
-        let fresh = self.seen.insert(id);
+        let fresh = self.seen.insert(trust_entry_id(&e));
         if fresh {
             self.entries.push(e.clone());
         }
@@ -288,9 +296,25 @@ impl Auth {
         }
     }
 
-    /// A board is locked once it has an author (genesis).
+    /// A board is locked once it has an author (genesis) — or once we know it
+    /// was claimed even before its trust log arrives ([`Self::set_claimed_hint`]).
     fn locked(&self) -> bool {
-        self.trust.founder().is_some()
+        self.trust.founder().is_some() || self.claimed_hint
+    }
+
+    /// The board's OPFS marker says it is claimed: treat it as claimed until the
+    /// trust log arrives (restricted, holding no key: nothing goes out unsealed).
+    pub fn set_claimed_hint(&mut self) {
+        self.claimed_hint = true;
+        self.claim_marked = true;
+    }
+
+    /// `true` once, when the board first has a founder and the OPFS claimed
+    /// marker hasn't been written yet — the driver writes it.
+    fn take_claim_to_mark(&mut self) -> bool {
+        let due = self.trust.founder().is_some() && !self.claim_marked;
+        self.claim_marked |= due;
+        due
     }
 
     /// How this board gates reads and writes — the **only** place the browser
@@ -382,7 +406,7 @@ impl Auth {
             MeshMsg::Sync(msg)
         };
         if mode.seals_content() {
-            self.epochs.seal(&signed)
+            self.epochs.seal(&signed, &self.trust)
         } else {
             Some(signed)
         }
@@ -492,8 +516,9 @@ impl Auth {
     }
 
     /// Act on what accepting announce(s) changed: persist, apply content parked
-    /// for a newly-held key, broadcast our full state on our first key (it carries
-    /// edits made while keyless), then run Admin maintenance.
+    /// for a newly-held key, broadcast our full state on any newly-held key (it
+    /// carries edits held back while keyless or while our latest epoch still
+    /// wrapped a revoked device), then run Admin maintenance.
     fn followups(&mut self, ing: Ingested) -> Accepted {
         if ing.changed {
             persist_epochs(&self.topic, self.epochs.announces());
@@ -506,7 +531,9 @@ impl Auth {
         let mut acc = Accepted {
             apply: ing.released.into_iter().filter_map(|m| self.content_of(m)).collect(),
             send: Vec::new(),
-            send_full_state: ing.gained_first_key,
+            // A newly-held epoch releases writes held back: edits made while
+            // keyless, or between a revoke and its rotation (`EpochBook::seal`).
+            send_full_state: ing.held.is_some(),
         };
         acc.merge(self.maintain());
         acc
@@ -559,6 +586,40 @@ impl Auth {
     }
 }
 
+impl Auth {
+    /// Another tab of this browser persisted board state (a `storage` event for
+    /// `key` = `value`): feed it in as if it arrived over gossip, so a tab opened
+    /// before a claim / grant / revoke / rotation in a sibling tab picks it up
+    /// (and stops writing plaintext) without waiting for the swarm.
+    fn sync_from_storage(&mut self, key: &str, value: &str) -> Accepted {
+        let mut acc = Accepted::default();
+        if key == trust_store_key(&self.topic) {
+            let was_authorized = self.authorized();
+            for e in decode_hex_postcard::<Vec<TrustEntry>>(value).unwrap_or_default() {
+                if !self.seen.contains(&trust_entry_id(&e)) {
+                    self.add_trust(e);
+                }
+            }
+            // The sibling stored its epochs right after its trust change: take
+            // them before maintenance, or this tab (same device — so also the
+            // founder) would mint a duplicate epoch of its own.
+            let mut ing = self.epochs.retry_pending(&self.trust);
+            for a in load_epochs(&self.topic) {
+                ing.absorb(self.epochs.ingest(a, &self.trust));
+            }
+            acc = self.followups(ing);
+            if !was_authorized {
+                acc.send.extend(self.read_request());
+            }
+        } else if key == epoch_store_key(&self.topic) {
+            for a in decode_hex_postcard::<Vec<EpochAnnounce>>(value).unwrap_or_default() {
+                acc.merge(self.accept(MeshMsg::Epoch(a)));
+            }
+        }
+        acc
+    }
+}
+
 fn local_storage() -> Option<web_sys::Storage> {
     web_sys::window().and_then(|w| w.local_storage().ok().flatten())
 }
@@ -574,7 +635,11 @@ fn store_hex_postcard<T: serde::Serialize>(key: &str, value: &T) {
 
 /// Read a `hex(postcard(T))` value from `key`; `None` if absent or undecodable.
 fn load_hex_postcard<T: serde::de::DeserializeOwned>(key: &str) -> Option<T> {
-    let hex = local_storage()?.get_item(key).ok()??;
+    decode_hex_postcard(&local_storage()?.get_item(key).ok()??)
+}
+
+/// Decode a stored `hex(postcard(T))` value.
+fn decode_hex_postcard<T: serde::de::DeserializeOwned>(hex: &str) -> Option<T> {
     let bytes: Vec<u8> = (0..hex.len() / 2)
         .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
         .collect();
@@ -589,37 +654,68 @@ fn epoch_store_key(topic: &[u8; 32]) -> String {
     format!("{EPOCH_STORE_PREFIX}{}", hex32(topic))
 }
 
-/// Persist the converged trust log for `topic` so a claimed board — and its
-/// author + grants — survives a reload.
-fn persist_trust_entries(topic: &[u8; 32], entries: &[TrustEntry]) {
-    store_hex_postcard(&trust_store_key(topic), &entries);
+/// Content address of a trust entry (dedups the persisted union).
+fn trust_entry_id(e: &TrustEntry) -> [u8; 32] {
+    *blake3::hash(&postcard::to_allocvec(e).unwrap_or_default()).as_bytes()
 }
 
-/// The trust log persisted for `topic`. Else, if `topic` is this browser's own
-/// hosted board (`H(persisted board secret)`), a one-time migration of the
-/// legacy board-unscoped log (the legacy key is removed) — it was written by
-/// the board this browser hosts, so it must not land on any other board. Else empty.
-fn load_trust_entries(topic: &[u8; 32]) -> Vec<TrustEntry> {
+/// `stored` plus every item of `ours` not already in it (by `id`) — the
+/// persisted sets are content-addressed, so a union never loses anything.
+fn union_by<T: Clone>(mut stored: Vec<T>, ours: &[T], id: impl Fn(&T) -> [u8; 32]) -> Vec<T> {
+    let have: std::collections::HashSet<[u8; 32]> = stored.iter().map(&id).collect();
+    stored.extend(ours.iter().filter(|e| !have.contains(&id(e))).cloned());
+    stored
+}
+
+/// Persist the trust log for `topic` so a claimed board — and its author +
+/// grants — survives a reload. Read-union-write: another tab may have stored
+/// entries we haven't seen (a revoke), and overwriting would roll them back.
+fn persist_trust_entries(topic: &[u8; 32], entries: &[TrustEntry]) {
+    let key = trust_store_key(topic);
+    let stored = load_hex_postcard::<Vec<TrustEntry>>(&key).unwrap_or_default();
+    store_hex_postcard(&key, &union_by(stored, entries, trust_entry_id));
+}
+
+/// The trust log persisted for `topic`. Else a one-time look at the legacy
+/// board-unscoped log, on this browser's own hosted board only
+/// (`H(persisted board secret)`): it was written by whichever board was open
+/// last (hosted OR joined), so it is migrated only if its founder is `me` (a
+/// board this device claimed); any other founder's log could lock the host out
+/// of its own board, so it's dropped and gossip restores the real one. Either
+/// way the legacy key is removed. Else empty.
+fn load_trust_entries(topic: &[u8; 32], me: &[u8; 32]) -> Vec<TrustEntry> {
     if let Some(entries) = load_hex_postcard::<Vec<TrustEntry>>(&trust_store_key(topic)) {
         return entries;
     }
     let own_board = crate::tree_sync::persisted_board_secret()
         .is_some_and(|s| &riftpipe_core::crypto::topic_from_secret(&s) == topic);
-    if own_board {
-        if let Some(entries) = load_hex_postcard::<Vec<TrustEntry>>(LEGACY_TRUST_STORE_KEY) {
-            persist_trust_entries(topic, &entries);
-            if let Some(store) = local_storage() {
-                let _ = store.remove_item(LEGACY_TRUST_STORE_KEY);
-            }
-            return entries;
-        }
+    if !own_board {
+        return Vec::new();
     }
-    Vec::new()
+    let Some(entries) = load_hex_postcard::<Vec<TrustEntry>>(LEGACY_TRUST_STORE_KEY) else {
+        return Vec::new();
+    };
+    if let Some(store) = local_storage() {
+        let _ = store.remove_item(LEGACY_TRUST_STORE_KEY);
+    }
+    let mut legacy = TrustLog::new();
+    for e in &entries {
+        legacy.apply(e.clone());
+    }
+    if legacy.founder() != Some(*me) {
+        return Vec::new();
+    }
+    persist_trust_entries(topic, &entries);
+    entries
 }
 
 /// Persist the accepted epoch announces for `topic` (never raw keys).
+/// Read-union-write, like [`persist_trust_entries`] (announces are unique by
+/// signature).
 fn persist_epochs(topic: &[u8; 32], announces: &[EpochAnnounce]) {
-    store_hex_postcard(&epoch_store_key(topic), &announces);
+    let key = epoch_store_key(topic);
+    let stored = load_hex_postcard::<Vec<EpochAnnounce>>(&key).unwrap_or_default();
+    store_hex_postcard(&key, &union_by(stored, announces, |a| *blake3::hash(&a.sig).as_bytes()));
 }
 
 /// The epoch announces persisted for `topic`.
@@ -640,7 +736,91 @@ pub struct GossipTreeSync {
     /// Device-linking auth (shared with the recv task): signs pushes and gates
     /// incoming writes.
     auth: std::rc::Rc<std::cell::RefCell<Auth>>,
+    /// Feeds sibling tabs' persisted trust/epoch changes into `auth`.
+    _storage: Option<StorageListener>,
     _keep: MeshKeepAlive,
+}
+
+/// A `storage` event listener on `window`, removed when dropped (the closure
+/// must not outlive its registration).
+struct StorageListener {
+    closure: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::StorageEvent)>,
+}
+
+impl StorageListener {
+    fn add(f: impl FnMut(web_sys::StorageEvent) + 'static) -> Option<StorageListener> {
+        use wasm_bindgen::JsCast;
+        let closure = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::StorageEvent)>::new(f);
+        web_sys::window()?
+            .add_event_listener_with_callback("storage", closure.as_ref().unchecked_ref())
+            .ok()?;
+        Some(StorageListener { closure })
+    }
+}
+
+impl Drop for StorageListener {
+    fn drop(&mut self) {
+        use wasm_bindgen::JsCast;
+        if let Some(w) = web_sys::window() {
+            let _ = w.remove_event_listener_with_callback("storage", self.closure.as_ref().unchecked_ref());
+        }
+    }
+}
+
+/// Act on auth output produced outside the receive loop: apply its content
+/// (firing `on_merged`), then broadcast its messages, the replies, and (if
+/// asked) our full state — all signed/sealed, in order, from one task.
+fn apply_and_broadcast(
+    acc: Accepted,
+    sy: &std::cell::RefCell<riftpipe_core::sync::Syncer>,
+    au: &std::cell::RefCell<Auth>,
+    on_merged: &dyn Fn(String, Vec<u8>),
+    sender: &GossipSender,
+    cipher: &std::rc::Rc<riftpipe_core::crypto::MeshCipher>,
+) {
+    let mut msgs = acc.send;
+    for msg in acc.apply {
+        let (persist, replies) = sy.borrow_mut().apply(msg);
+        if let Some((path, bytes)) = persist {
+            on_merged(path, bytes);
+        }
+        let a = au.borrow();
+        msgs.extend(replies.into_iter().filter_map(|r| a.sign(r)));
+    }
+    if acc.send_full_state {
+        let full = sy.borrow().full_state();
+        let a = au.borrow();
+        msgs.extend(full.into_iter().filter_map(|m| a.sign(m)));
+    }
+    broadcast_msgs(sender, cipher, msgs);
+}
+
+/// Encode and seal every frame of every message, sent in order from ONE task
+/// (so e.g. a trust entry precedes the epoch announce it authorizes).
+fn broadcast_msgs(sender: &GossipSender, cipher: &std::rc::Rc<riftpipe_core::crypto::MeshCipher>, msgs: Vec<MeshMsg>) {
+    if msgs.is_empty() {
+        return;
+    }
+    let frames: Vec<Vec<u8>> = msgs.iter().flat_map(riftpipe_core::sync::encode_mesh_frames).collect();
+    let sender = sender.clone();
+    let cipher = cipher.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        for b in frames {
+            let sealed = cipher.seal(&b);
+            let n = sealed.len();
+            if let Err(e) = sender.broadcast(sealed.into()).await {
+                web_sys::console::warn_1(&format!("[mesh] broadcast of {n} bytes failed: {e}").into());
+            }
+        }
+    });
+}
+
+/// Write the board's OPFS claimed-marker once it first has a founder, so the
+/// claim survives a lost localStorage (see [`Auth::set_claimed_hint`]).
+fn mark_claimed_if_due(auth: &std::rc::Rc<std::cell::RefCell<Auth>>, topic: [u8; 32]) {
+    if auth.borrow_mut().take_claim_to_mark() {
+        wasm_bindgen_futures::spawn_local(async move { crate::opfs::mark_board_claimed(&topic).await });
+    }
 }
 
 /// Surface a flagged peer: console.warn + a `riftpipe:protocol-mismatch`
@@ -680,7 +860,10 @@ impl GossipTreeSync {
         let neighbors = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
         let routing = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
         let versions = Rc::new(RefCell::new(riftpipe_core::sync::VersionMonitor::new()));
+        let topic = auth.topic;
+        let on_merged_storage = on_merged.clone();
         let auth = Rc::new(RefCell::new(auth));
+        mark_claimed_if_due(&auth, topic);
 
         let (sy, nb, rt, vs, snd, cph, au) = (
             syncer.clone(),
@@ -760,6 +943,7 @@ impl GossipTreeSync {
                             // is held across an `.await`.
                             other => {
                                 let acc = au.borrow_mut().accept(other);
+                                mark_claimed_if_due(&au, topic);
                                 for m in &acc.send {
                                     send(&snd, &cph, m, false).await;
                                 }
@@ -859,7 +1043,22 @@ impl GossipTreeSync {
             }
         });
 
-        GossipTreeSync { syncer, sender, cipher, neighbors, routing, versions, auth, _keep: keep }
+        // Sibling tabs on this board persist claims/grants/revokes/epochs to
+        // localStorage; their `storage` events feed them in here. Weak refs:
+        // the listener must not keep a torn-down sync alive.
+        let storage = {
+            let (wsy, wau) = (Rc::downgrade(&syncer), Rc::downgrade(&auth));
+            let (snd, cph, on_merged) = (sender.clone(), cipher.clone(), on_merged_storage);
+            StorageListener::add(move |ev: web_sys::StorageEvent| {
+                let (Some(key), Some(value)) = (ev.key(), ev.new_value()) else { return };
+                let (Some(sy), Some(au)) = (wsy.upgrade(), wau.upgrade()) else { return };
+                let acc = au.borrow_mut().sync_from_storage(&key, &value);
+                mark_claimed_if_due(&au, topic);
+                apply_and_broadcast(acc, &sy, &au, &*on_merged, &snd, &cph);
+            })
+        };
+
+        GossipTreeSync { syncer, sender, cipher, neighbors, routing, versions, auth, _storage: storage, _keep: keep }
     }
 
     pub fn push_text(&self, path: &str, content: &str) {
@@ -889,6 +1088,8 @@ impl GossipTreeSync {
         let acc = self.auth.borrow_mut().lock_as_author();
         match acc {
             Some(acc) => {
+                let topic = self.auth.borrow().topic;
+                mark_claimed_if_due(&self.auth, topic);
                 self.dispatch(acc);
                 true
             }
@@ -1011,23 +1212,8 @@ impl GossipTreeSync {
         self.broadcast_all(vec![gm]);
     }
 
-    /// Encode and seal every frame of every message, sent in order from ONE task
-    /// (so e.g. a trust entry precedes the epoch announce it authorizes).
     fn broadcast_all(&self, msgs: Vec<MeshMsg>) {
-        let frames: Vec<Vec<u8>> = msgs.iter().flat_map(riftpipe_core::sync::encode_mesh_frames).collect();
-        let sender = self.sender.clone();
-        let cipher = self.cipher.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            for b in frames {
-                let sealed = cipher.seal(&b);
-                let n = sealed.len();
-                if let Err(e) = sender.broadcast(sealed.into()).await {
-                    web_sys::console::warn_1(
-                        &format!("[mesh] broadcast of {n} bytes failed: {e}").into(),
-                    );
-                }
-            }
-        });
+        broadcast_msgs(&self.sender, &self.cipher, msgs);
     }
 
     /// Direct neighbors in the swarm (this peer's connected peers), as hex ids.
@@ -1224,23 +1410,107 @@ mod tests {
         assert!(a2.locked() && a2.is_author(), "board A is still claimed after board B persisted");
         assert!(a2.can_read() && a2.epochs.latest_held_seq() == Some(1), "A re-opens its epoch key");
 
-        // Legacy log: left alone on a foreign board, migrated into our own.
+        // Legacy log: left alone on a foreign board; on our own hosted board,
+        // dropped if someone else founded it (it could lock us out of our own
+        // board), migrated only if we did.
         let store = local_storage().expect("localStorage");
-        let legacy = vec![DeviceKey::from_seed(&[33; 32]).genesis()];
-        store_hex_postcard(LEGACY_TRUST_STORE_KEY, &legacy);
+        let other_founder = vec![DeviceKey::from_seed(&[33; 32]).genesis()];
+        store_hex_postcard(LEGACY_TRUST_STORE_KEY, &other_founder);
         let foreign = Auth::load(DeviceKey::from_seed(&[34; 32]), riftpipe_core::crypto::generate_secret());
         assert!(!foreign.locked(), "legacy log must not migrate into a board we don't host");
         assert!(store.get_item(LEGACY_TRUST_STORE_KEY).unwrap().is_some(), "legacy log kept");
 
-        let own_secret = riftpipe_core::crypto::generate_secret();
         let prior_secret = store.get_item("riftpipe:board_secret").unwrap();
+        let own_secret = riftpipe_core::crypto::generate_secret();
         crate::tree_sync::persist_board_secret(&own_secret);
         let own = Auth::load(DeviceKey::from_seed(&[34; 32]), riftpipe_core::crypto::topic_from_secret(&own_secret));
-        assert!(own.locked(), "legacy log migrates into our own hosted board");
+        assert!(!own.locked(), "another founder's legacy log must not lock the host out of its own board");
+        assert!(store.get_item(LEGACY_TRUST_STORE_KEY).unwrap().is_none(), "the foreign legacy log is dropped");
+
+        let mine = vec![DeviceKey::from_seed(&[35; 32]).genesis()];
+        store_hex_postcard(LEGACY_TRUST_STORE_KEY, &mine);
+        let own_secret = riftpipe_core::crypto::generate_secret();
+        crate::tree_sync::persist_board_secret(&own_secret);
+        let own = Auth::load(DeviceKey::from_seed(&[35; 32]), riftpipe_core::crypto::topic_from_secret(&own_secret));
+        assert!(own.locked() && own.is_author(), "our own legacy claim migrates into our hosted board");
         assert!(store.get_item(LEGACY_TRUST_STORE_KEY).unwrap().is_none(), "legacy key removed after migration");
         match prior_secret {
             Some(s) => store.set_item("riftpipe:board_secret", &s).unwrap(),
             None => store.remove_item("riftpipe:board_secret").unwrap(),
+        }
+    }
+
+    /// Offline: a board known claimed only from its OPFS marker (localStorage —
+    /// and so the trust log — lost) sends nothing in plaintext, accepts no
+    /// unsealed writes, and can't be re-claimed, until the real log arrives.
+    #[wasm_bindgen_test]
+    fn claimed_hint_holds_writes_until_the_trust_log_arrives() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        let mut fresh = Auth::load(DeviceKey::from_seed(&[41; 32]), topic);
+        fresh.set_claimed_hint();
+        assert!(fresh.locked() && !fresh.can_read(), "treated as claimed, no key yet");
+        let lww = SyncMsg::Lww { path: "x".into(), version: 1, bytes: b"1".to_vec() };
+        assert!(fresh.sign(lww).is_none(), "nothing goes out unsealed");
+        let plain = MeshMsg::Sync(SyncMsg::Lww { path: "y".into(), version: 1, bytes: b"2".to_vec() });
+        assert!(fresh.accept(plain).apply.is_empty(), "unsealed writes are dropped");
+        assert!(fresh.lock_as_author().is_none(), "a known-claimed board can't be re-claimed");
+
+        let mut owner = Auth::load(DeviceKey::from_seed(&[42; 32]), riftpipe_core::crypto::generate_secret());
+        let acc = owner.lock_as_author().unwrap();
+        assert!(owner.take_claim_to_mark(), "a fresh claim is marked once");
+        assert!(!owner.take_claim_to_mark());
+        deliver(&acc, &mut fresh);
+        assert_eq!(fresh.trust.founder(), Some(owner.my_id()), "the real log takes over");
+        assert!(!fresh.take_claim_to_mark(), "already marked (the hint came from the marker)");
+    }
+
+    /// A tab opened before a sibling tab claimed the board picks the claim (and
+    /// the epoch) up from the sibling's `storage` events and stops sending
+    /// plaintext at once.
+    #[wasm_bindgen_test]
+    fn sibling_tab_claim_arrives_via_storage() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        let mut early = Auth::load(DeviceKey::from_seed(&[61; 32]), topic);
+        let lww = |p: &str| SyncMsg::Lww { path: p.into(), version: 1, bytes: b"1".to_vec() };
+        assert!(matches!(early.sign(lww("a")), Some(MeshMsg::Sync(_))), "open board: plain Sync");
+
+        let mut claimer = Auth::load(DeviceKey::from_seed(&[61; 32]), topic);
+        claimer.lock_as_author().unwrap();
+        let store = local_storage().unwrap();
+        let (tk, ek) = (trust_store_key(&topic), epoch_store_key(&topic));
+
+        let acc = early.sync_from_storage(&tk, &store.get_item(&tk).unwrap().unwrap());
+        assert!(early.locked() && early.is_author(), "the sibling's claim arrived");
+        assert!(acc.send.is_empty(), "no duplicate epoch minted: the sibling's was taken first");
+        assert_eq!(early.epochs.announces().len(), claimer.epochs.announces().len());
+        assert!(matches!(early.sign(lww("b")), Some(MeshMsg::Sealed(_))), "sealed from now on");
+        let again = early.sync_from_storage(&ek, &store.get_item(&ek).unwrap().unwrap());
+        assert!(again.send.is_empty() && again.apply.is_empty(), "the epochs event is idempotent");
+        assert!(early.sync_from_storage("riftpipe:unrelated", "00").send.is_empty());
+    }
+
+    /// Two tabs on one board persist through a read-union-write: neither tab's
+    /// write rolls back an entry or announce only the other has seen.
+    #[wasm_bindgen_test]
+    fn two_tabs_persist_the_union() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        let mut tab1 = Auth::load(DeviceKey::from_seed(&[51; 32]), topic);
+        tab1.lock_as_author().unwrap();
+        let mut tab2 = Auth::load(DeviceKey::from_seed(&[51; 32]), topic);
+        assert!(tab2.is_author(), "tab 2 loaded the claim");
+        let (x, y) = ([52; 32], [53; 32]);
+        tab1.make_grant(x).unwrap();
+        tab2.make_grant(y).unwrap(); // tab 2 never saw the grant of x
+        tab1.make_revoke(x).unwrap();
+        tab2.make_grant([54; 32]).unwrap(); // must not roll the revoke back
+
+        let reloaded = Auth::load(DeviceKey::from_seed(&[51; 32]), topic);
+        assert!(reloaded.trust.is_revoked(&x), "tab 1's revoke survived tab 2's later write");
+        assert!(reloaded.trust.is_authorized(&y) && reloaded.trust.is_authorized(&[54; 32]));
+
+        let stored = load_epochs(&topic);
+        for a in tab1.epochs.announces().iter().chain(tab2.epochs.announces()) {
+            assert!(stored.iter().any(|s| s.sig == a.sig), "every tab's announce is persisted");
         }
     }
 
@@ -1284,7 +1554,11 @@ mod tests {
         assert_eq!(b.accept(dup(&s)).apply.len(), 1, "a member opens sealed content");
 
         let r = a.make_revoke(c_id).expect("owner removes c");
-        deliver(&r, &mut b);
+        assert!(matches!(r.send[0], MeshMsg::Trust(_)) && r.send.len() == 2, "revoke, then the new epoch");
+        b.accept(dup(&r.send[0]));
+        assert!(b.sign(lww("gap", b"g")).is_none(), "b saw the revoke, not the rotation: its write is held");
+        let rotated = b.accept(dup(&r.send[1]));
+        assert!(rotated.send_full_state, "the new epoch releases b's held writes (full state)");
         deliver(&r, &mut c);
         assert!(!c.can_read(), "the removed device lost read");
         assert!(b.can_read(), "the remaining member still reads");

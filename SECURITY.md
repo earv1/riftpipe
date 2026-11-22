@@ -142,9 +142,12 @@ rotates.
   to open (native logs `[epoch] no key for epoch N — this device is not
   wrapped in`; the browser reports `canRead: false`), and its own writes are
   rejected everywhere. It keeps whatever it already decrypted. During the
-  propagation window, a remaining member that hasn't yet received the new
-  epoch still seals under the old one, which the revoked device can still
-  read — inherent to eventual consistency, not a bug.
+  propagation window, a remaining member that hasn't yet seen the revoke
+  still seals under the old epoch, which the revoked device can still read —
+  inherent to eventual consistency, not a bug. A member that has seen the
+  revoke but not yet the new epoch holds its writes (it never seals under an
+  epoch that still wraps a revoked device) and sends them once the new epoch
+  arrives.
 
 ## Still open
 
