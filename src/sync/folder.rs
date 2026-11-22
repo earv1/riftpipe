@@ -913,6 +913,37 @@ mod tests {
         std::fs::remove_dir_all(&rb).ok();
     }
 
+    /// B edits its files on disk, but its scan hasn't run yet when A's delete
+    /// arrives: `remote_delete` must re-read the disk first, see the edit,
+    /// and keep it (edit wins) rather than judge by B's stale strategy state.
+    #[test]
+    fn unscanned_edit_beats_an_arriving_delete() {
+        let ra = dir("us-a");
+        let rb = dir("us-b");
+        std::fs::write(ra.join("u.bin"), b"v1").unwrap();
+        std::fs::write(ra.join("u.md"), "one\n").unwrap();
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        std::fs::write(rb.join("u.bin"), b"B's unscanned edit").unwrap();
+        std::fs::write(rb.join("u.md"), "one\ntwo from B\n").unwrap();
+        // No collect_local(&mut b): the delete lands before B's scan.
+        std::fs::remove_file(ra.join("u.bin")).unwrap();
+        std::fs::remove_file(ra.join("u.md")).unwrap();
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+
+        for root in [&ra, &rb] {
+            assert_eq!(std::fs::read(root.join("u.bin")).unwrap(), b"B's unscanned edit");
+            assert_eq!(std::fs::read(root.join("u.md")).unwrap(), b"one\ntwo from B\n");
+        }
+        assert!(!a.is_tombstoned("u.bin") && !a.is_tombstoned("u.md"));
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
     /// Pins the documented lww-record limit (module doc, "Known limit"): a
     /// local comment the algorithm never syncs is not a concurrent edit, so a
     /// peer's delete still applies — the same bytes any remote merge's

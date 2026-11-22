@@ -493,6 +493,14 @@ mod tests {
 
     /// Closing the data channel must surface as EOF (`Ok(None)`) on both ends,
     /// not leave `recv` hanging on a queue whose senders the channel keeps alive.
+    ///
+    /// This covers the `on_close` half of the latch only. The other half — the
+    /// peer connection reaching `Failed` after ICE consent stops (a vanished
+    /// peer) — isn't loopback-testable: both peers live in this process on
+    /// host candidates, and there's no hook to silently black-hole one side's
+    /// UDP, so `Failed` can't be provoked deterministically. Folder mode's
+    /// recv-idle timeout (`sync::folder::RECV_IDLE_TIMEOUT`, paused-time tests)
+    /// is the transport-agnostic backstop for that case.
     #[tokio::test]
     async fn closing_the_channel_ends_recv_on_both_ends() {
         let (mut sa, mut sb) = mock_pair();
