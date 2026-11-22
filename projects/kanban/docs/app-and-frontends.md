@@ -1,14 +1,17 @@
 # Planned: the kanban app & frontends
 
-**Status:** the serve layer is **gone — superseded by the wasm payload.** The
-JSON API (`/api/board`, `/api/cards/:id[/detail]`, POST `/api/cards`, PATCH
-`/api/cards/:id`, POST `/api/cards/:id/comments`) is handled **in-page** by
-`kanbanHandle` (the Rust handler compiled to wasm, over OPFS); the UI ships as
-a static bundle. Two server implementations existed along the way (the Deno
-reference `server/main.ts`, then a Rust `kanban-server` crate) — both removed
-once the browser path made them redundant. Per the generic-core principle
-(`agent.md`), the riftpipe **binary has no kanban verbs**; the app composes
-with generic ones.
+**Status:** the serve layer is **gone — the page is the backend.** There is no
+JSON/HTTP API any more: the board domain is plain TypeScript in `src/board.ts`
+(`getBoard`, `getCardDetail`, `addCard`, `patchCard`, `addComment`) reading and
+writing the board files through riftpipe-web's generic wasm file API
+(`src/fs.ts` over `readFile`/`writeFile`/`listDir`, OPFS-backed); the UI ships
+as a static bundle. (A Rust in-page handler, `kanbanHandle`, briefly served the
+`/api/…` routes below before the "filify" change ported it to TypeScript; the
+route list is kept as the original plan.) Two server implementations existed
+along the way (the Deno reference `server/main.ts`, then a Rust
+`kanban-server` crate) — both removed once the browser path made them
+redundant. Per the generic-core principle (`agent.md`), the riftpipe **binary
+has no kanban verbs**; the app composes with generic ones.
 
 ## Commands
 

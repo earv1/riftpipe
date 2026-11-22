@@ -97,17 +97,26 @@ sense to do it, not strict priority.
 The restructure made the native binary fully generic (verbs: `share · join ·
 connect · serve · signal`; the tree-sync driver is `sync::tree`, generic
 static+SSE hosting is `app::host`), and the kanban servers were then removed
-entirely — the wasm payload is the app's backend. What remains:
+entirely — the app's backend runs in the page (since "filify": TypeScript
+over riftpipe's wasm file API). What remains:
 
-8. ~~Get kanban out of the riftpipe crates entirely~~ — *done.* The board file
-   format and the OPFS kanban handler now live in the `kanban-wasm` crate
-   (`projects/kanban/wasm/`, modules `format` + `handler`); `riftpipe-web` is
-   app-generic (links, gossip, `opfs` helpers, `tree_sync` — `BoardSync` is now
-   `TreeSync`, browser ALPN `riftpipe/tree/0`) and `riftpipe-core` is CRDT +
-   sync protocol + wal only. The app builds ONE bundle from `kanban-wasm`
-   (which links `riftpipe-web`, so both crates' wasm exports surface);
-   `api.ts`/e2e/`pages.yml` point at `projects/kanban/wasm/pkg`, and
-   `web/test-headless.sh` runs both crates' headless suites.
+8. ~~Get kanban out of the riftpipe crates entirely~~ — *done, then taken
+   further ("filify the API").* `riftpipe-web` is app-generic (links, gossip,
+   `opfs` helpers, `tree_sync` — `BoardSync` is now `TreeSync`, browser ALPN
+   `riftpipe/tree/0`) and `riftpipe-core` is CRDT + sync protocol + wal only.
+   The browser bundle is now a generic **file library**: `web/src/file.rs`
+   exports `readFile`/`writeFile`/`listDir` over the synced OPFS tree
+   (`writeFile` persists *and* pushes, channel picked by `is_text_path`), and
+   a remote merge fires a per-path `riftpipe:file-changed` CustomEvent (the
+   API's `watch`). The kanban board domain — parsing/serializing `board.md`,
+   `meta.toml`, `card.md`, comments, card positions — is plain TypeScript
+   (`projects/kanban/src/board.ts` over the `fs.ts` file wrapper); the old
+   kanban-specific Rust (`format.rs` + `handler.rs`, the in-browser JSON
+   "server") is **deleted**. `kanban-wasm` (`projects/kanban/wasm/`) is a thin
+   passthrough that links `riftpipe-web` so its exports surface from the ONE
+   app bundle; `api.ts`/e2e/`pages.yml` point at `projects/kanban/wasm/pkg`.
+   On-disk layout is unchanged, so a board stays portable between the browser
+   and a `riftpipe connect` working copy.
 9. ~~One wire protocol~~ — *done.* Folder mode adopted the core protocol:
    `core::sync::SyncMsg` gained two APPENDED variants — `StratAdvert { path,
    sv, reply }` (unifying `SYNCREQ`/`SYNCREP`) and `StratDelta { path, bytes }`
@@ -225,7 +234,7 @@ entirely — the wasm payload is the app's backend. What remains:
   the kanban/library parity review).* The rule (`.md` → text CRDT, else LWW)
   now lives in `core::sync::is_text_path`, used by the native driver, the
   browser's `prime_all`, and a new unified `tree_sync::push(path, bytes)` —
-  the app-facing entry; `push_text`/`push_lww` went crate-private. Fixes a
+  the app-facing entry (now behind the `writeFile` file API); `push_text`/`push_lww` went crate-private. Fixes a
   real divergence: kanban pushed `events/<site>.jsonl` as text-CRDT while
   the CLI and `prime_all` classified it LWW — one path, two merge semantics,
   so a CLI relay could regress event lines. Now every peer classifies
@@ -298,20 +307,33 @@ entirely — the wasm payload is the app's backend. What remains:
   `GossipTreeSync` now carries the same `Auth` (identity + trust log +
   require_signed) as the native `TreePeer`: signs pushes, verifies incoming
   writes, replicates the trust log, catches neighbors up. Device identity +
-  restricted config persist in localStorage; `deviceId()`/`configureAuth()`
-  are wasm exports (on `window.riftpipe`). **Proven in real browsers**
-  (`restricted-browser.mjs`, 3 Playwright windows): a founder grants only the
-  member — the member's card syncs, an ungranted browser's card is rejected,
-  the founder's card reaches both (read open). Open mode unchanged.
+  the converged trust log persist in localStorage.
+  **Claim + request-to-join — done (2026-07-20).** A board is open until its
+  first opener **claims** it (`lockBoard()` → becomes the immutable author,
+  trust-log genesis broadcast live); everyone else is view-only. A viewer
+  **asks for access** (`requestAccess()` broadcasts a signed `JoinRequest` as
+  the APPENDED `MeshMsg::Request` variant, re-announced to new neighbors so a
+  late-joining owner still sees it); the author's inbox (`pendingRequests()`:
+  name · device · safety code) approves with one click (`grantDevice()`), and
+  the landed grant prunes the request. `deviceId()`/`authState()` round out
+  the wasm surface (on `window.riftpipe`); the kanban auth bar renders the
+  states (Claim board / Claimed · you can edit / view only + Ask for edit
+  access). **Proven in real browsers** over the sealed mesh
+  (`e2e/lock-grant.mjs`: unlocked sync → claim → view-only rejection → ask →
+  inbox → approve → edit access; `shot-auth.mjs` screenshots it). Native
+  peers skip `MeshMsg::Request` (their catch-all) — the CLI still grants via
+  `--grant <device-id>`.
   *Remaining is integration + interactive glue, not new crypto:* driving the
-  mesh seal from epoch keys (replacing the static board-secret cipher); relaying
-  `JoinRequest`/approve over the mesh (so grants aren't manual); and the WebAuthn
-  browser ceremony + kanban UI on top of these lib calls.
-- **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md) (not built).
-  Two planes: centralized *issuance* (an identity vouches for you, touched once)
-- **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md) (not built).
-  Two planes: centralized *issuance* (an identity vouches for you, touched once)
-  + decentralized *offline* verification (peers check a Biscuit capability
+  mesh seal from epoch keys (replacing the static board-secret cipher); having
+  approve also deliver a wrapped epoch key (today a grant is write access only —
+  reads stay open to anyone with the link); request/approve on the native CLI;
+  and the WebAuthn browser ceremony on top of these lib calls.
+- **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md). Built so
+  far (above): device keys + signed trust log, write signing, onboarding, the
+  claim/request-to-join flow, and the `core::passkey` verifier; *not* built:
+  Biscuit capabilities and the browser passkey ceremony. Two planes:
+  centralized *issuance* (an identity vouches for you, touched once) +
+  decentralized *offline* verification (peers check a Biscuit capability
   against a root public key; data stays P2P). **Cemented identity: passkeys /
   WebAuthn** — no company, no hosting, no committed secret, verified in-core with
   pure-Rust `p256`/`ed25519-dalek`; **Google (OIDC + PKCE)** optional for
@@ -320,14 +342,21 @@ entirely — the wasm payload is the app's backend. What remains:
 
 ## Iteration 2 (added 2026-07-04)
 
-17. **Events log in the wasm handler** — *done.* The per-peer change log
-    (`events/<site>.jsonl` + `.site` id) lost its writer when the servers were
-    removed; restored inside `kanban-wasm`'s handler: mints/persists the site id
-    (`.site`, 8 lowercase hex), appends one JSON line per mutation in the old
-    server's exact shape (`ts`/`site`/`kind` + fields), pushes the log to peers
-    as text-CRDT, and serves `GET /api/history` (merged, ts-sorted). Dot-`.site`
-    stays local — the web `prime_all` now skips dot-entries like the native
-    tree driver's `hidden()` rule. Unblocks the history view.
+17. **Event log** — *done, now a generic library primitive.* The per-peer
+    change log lost its writer when the servers were removed; it briefly lived
+    in `kanban-wasm`'s handler, was dropped with it in the "filify" change, and
+    is back app-agnostic in `web/src/events.rs`: each device appends to its own
+    `events/<device-id>.jsonl` in the synced tree (one writer per file ⇒ zero
+    merge conflicts; rides LWW per `is_text_path`), keyed by the same device
+    identity that signs writes. Wasm exports `logEvent(kind, dataJson)` /
+    `readEvents()` (every `events/*.jsonl`, merged + ts-sorted), and each
+    append fires a `riftpipe:event` CustomEvent for live tailing. The library
+    records what only it sees — `mesh.merge` (guarded against `events/*` to
+    avoid a merge-about-merge loop) and `auth.claim`/`auth.request`/
+    `auth.grant`; the kanban app logs its semantic events from `board.ts`
+    (`card.create`/`move`/`check`/`edit`, `comment.add`) via `events.ts`.
+    Verified over the real mesh (`e2e/events.mjs`). Nothing renders it yet —
+    it's the substrate for a history view (and sync/auth debugging today).
 18. **Per-resource backing in the manifest** — `riftpipe.toml` rules gain an
     optional `backing = "memory" | "file"` per glob (today `--memory` is
     all-or-nothing); `--memory` stays as the global default override.

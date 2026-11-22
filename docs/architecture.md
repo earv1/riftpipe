@@ -17,14 +17,16 @@ riftpipe/
     crdt/               re-export shim over riftpipe_core::text
     sync/               every sync driver: --pipe, mirror, folder, tree
       strategy.rs       the SyncStrategy trait + Kind (folder mode's Strategy seam)
-      algo/             text_crdt, rsync (real); wal, image (stubs); sqlite (unwired)
+      algo/             text_crdt, rsync, wal, lww_record (real); image (stub)
     monitor/            metrics + in-memory `process` sidecar
     app/                generic runnables: host (static + SSE), signal relay
   web/                  riftpipe-web — app-generic wasm crate (workspace-excluded,
-                        own lockfile): links, gossip mesh, OPFS, tree sync
-  projects/kanban/      the showcase app: SolidJS UI + kanban-wasm crate (wasm/ —
-                        board format + OPFS handler, links riftpipe-web into the
-                        one in-page bundle; no server) + e2e harness + seed board
+                        own lockfile): links, gossip mesh, OPFS, tree sync,
+                        auth, the file API (file.rs) + synced event log (events.rs)
+  projects/kanban/      the showcase app: SolidJS UI + board domain in TypeScript
+                        (src/board.ts over the src/fs.ts file wrapper) + kanban-wasm
+                        (wasm/ — a thin passthrough linking riftpipe-web into the
+                        one in-page bundle; no kanban Rust, no server) + e2e + seed board
   nvim/                 Neovim bridge (session-local lua)
   tests/                native integration tests (mock, real iroh, full stack)
   deploy/               fly.io signaling server (legacy/fallback transport)
@@ -40,14 +42,14 @@ The two platform crates only add transport + storage; the UIs only render.
 ```mermaid
 flowchart LR
     ED["editors & scripts<br/>(stdio JSON)"] --> CLI
-    UI["SolidJS board UI<br/>(static bundle — no server)"] --> APP
-    APP["kanban-wasm (wasm)<br/>projects/kanban/wasm/ — board format,<br/>OPFS JSON handler (the app's backend)"] --> WEB
+    UI["SolidJS board UI + board.ts<br/>(static bundle — no server;<br/>board domain in TypeScript)"] --> APP
+    APP["kanban-wasm (wasm)<br/>projects/kanban/wasm/ — thin passthrough,<br/>links riftpipe-web into one bundle"] --> WEB
     CLI["riftpipe (native)<br/>src/ — generic verbs, iroh/WebRTC,<br/>folder & tree sync, host/signal"]
-    WEB["riftpipe-web (wasm)<br/>web/ — OPFS, iroh relay,<br/>gossip mesh, per-file tree sync"]
+    WEB["riftpipe-web (wasm)<br/>web/ — file API, OPFS, iroh relay,<br/>gossip mesh, per-file tree sync, event log"]
     CLI <-. "iroh QUIC · WebRTC" .-> WEB
     CLI --> CORE
     WEB --> CORE
-    CORE["riftpipe-core (pure)<br/>eg-walker CRDT · sync protocol ·<br/>WAL frames"]
+    CORE["riftpipe-core (pure)<br/>eg-walker CRDT · sync protocol ·<br/>WAL frames · crypto/identity/keywrap"]
 ```
 
 ## Native layers (src/)
@@ -76,9 +78,9 @@ Why the seams hold:
   concrete transport type.
 - **`sync` is the single home for drivers.** `pipe`/`folder` speak the native
   wire formats; `tree` speaks `riftpipe_core::sync` (the browser protocol) so
-  native and browser peers interoperate on any file tree. Two wire protocols
-  still exist (folder framing vs `SyncMsg`) — that's the remaining
-  consolidation candidate, now side-by-side in one module.
+  native and browser peers interoperate on any file tree. Folder mode now
+  rides the same `SyncMsg` envelope too (strategy-channel variants), so there
+  is one wire protocol with two dialects.
 - **`app` is generic.** `host` serves a static dir + SSE change events (the
   `serve` verb, also consumable as a library); `signal` relays SDP blobs.
   `connect` dials a link and hands the halves to `sync::tree::run`. No app
@@ -165,24 +167,27 @@ sequenceDiagram
 ```
 
 **2. Browser kanban (serverless)** — browser ↔ browser over the gossip mesh:
-the UI calls `kanbanHandle` (from the app's `kanban-wasm` crate) which
-reads/writes OPFS via `riftpipe_web::opfs`; every mutation is pushed through
-`core::sync::Syncer`
+the UI calls the board domain in `projects/kanban/src/board.ts` (TypeScript),
+which reads/writes plain files through `fs.ts` — a thin wrapper over
+riftpipe-web's generic file API (`readFile`/`writeFile`/`listDir`, over OPFS).
+Every `writeFile` is pushed through `core::sync::Syncer`
 (`card.md` → text-CRDT event, `meta.toml` → LWW) and broadcast on the
-iroh-gossip topic; receiving peers merge and land files back into OPFS. New
-neighbors are caught up with `full_state()` on `NeighborUp`. A native peer joins
-the same board with the generic `riftpipe connect <id> <dir>`, whose
-`sync::tree` driver speaks the identical protocol against a real directory —
-the binary never knows it's a kanban board.
+iroh-gossip topic; receiving peers merge, land files back into OPFS, and fire a
+per-path `riftpipe:file-changed` event that `fs.ts`'s `watch` turns into a
+re-read. New neighbors are caught up with `full_state()` on `NeighborUp`. A
+native peer joins the same board with the generic `riftpipe connect`, whose
+`sync::tree`/`sync::mesh` drivers speak the identical protocol against a real
+directory — neither the binary nor the wasm library knows it's a kanban board.
 
 ## One bridge pattern, two dialects (vim vs wasm)
 
 The native editor path and the browser path are the **same four layers**: a
 dumb frontend, a thin glue file, the riftpipe engine owning everything hard,
 and files as truth. The only real difference is the wire dialect the glue
-speaks — JSON lines on stdio for the terminal world, a fetch-shaped JSON API
-for the web — because each is what that world's developers already know. The
-frontend never sees a CRDT, a version vector, or a socket in either column.
+speaks — JSON lines on stdio for the terminal world, a small file API
+(read/write/list a path, watch for changes) for the web — because each is what
+that world's developers already know. The frontend never sees a CRDT, a
+version vector, or a socket in either column.
 
 ```mermaid
 flowchart TB
@@ -199,11 +204,11 @@ flowchart TB
     subgraph BROWSER["browser — the wasm path"]
         direction TB
         WU["SolidJS UI — dumb frontend<br/>(renders state, nothing else)"]
-        WA["api.ts — thin glue<br/>(a fetch shim over the wasm handler)"]
+        WA["board.ts + fs.ts — thin glue<br/>(board domain ↔ plain files)"]
         WW["riftpipe-web wasm — the engine, in-page<br/>same Syncer · CRDT · gossip · persistence"]
         WF[("OPFS files")]
         WU --- WA
-        WA -->|"JSON API<br/>(GET/POST /api/… — resource-shaped)"| WW
+        WA -->|"file API<br/>(readFile · writeFile · listDir · file-changed)"| WW
         WW --- WF
     end
     NP <-->|"one wire protocol — iroh QUIC · WebRTC · gossip"| WW
@@ -217,17 +222,18 @@ Layer-by-layer, the correspondence is exact:
 | concept              | vim path                          | wasm path                          |
 |----------------------|-----------------------------------|------------------------------------|
 | dumb frontend        | nvim buffer                       | SolidJS store/UI                   |
-| thin glue            | `nvim/riftpipe.lua`               | `projects/kanban/src/api.ts`       |
-| glue's dialect       | JSON lines on stdio (document ops)| fetch-style JSON API (resources)   |
+| thin glue            | `nvim/riftpipe.lua`               | `projects/kanban/src/{board,fs}.ts`|
+| glue's dialect       | JSON lines on stdio (document ops)| file API (read/write/list + watch) |
 | the engine           | `riftpipe --pipe` process         | `riftpipe-web` wasm in the page    |
 | where files live     | the real filesystem               | OPFS (the browser's private fs)    |
 | merge/versions/wire  | `riftpipe-core`                   | `riftpipe-core` (same crate)       |
 
-The dialects sit at different altitudes on purpose: an editor's natural unit
-is *document edits*, so the pipe carries ops against one text; a web UI's
-natural unit is *resources*, so the API carries cards and comments and the
-engine decomposes them into per-file CRDT/LWW sync underneath. Same
-architecture, each world addressed in its own idiom.
+The dialects sit at slightly different altitudes: an editor's natural unit is
+*document edits*, so the pipe carries ops against one text; the web glue works
+in *whole files*, so the app's TypeScript maps cards and comments onto paths
+(`board.md`, `tickets/<id>/{card.md,meta.toml}`, `comments/*.md`) and the
+engine decomposes each write into per-file CRDT/LWW sync underneath — the same
+layout a native `riftpipe connect` working copy shows as real files.
 
 ## Known seams & wrinkles
 
@@ -245,7 +251,8 @@ Fixed in the July 2026 restructure + review series:
   `sync::tree` behind `riftpipe connect`; static hosting is generic
   `app::host`; verbs are all generic. The kanban servers themselves (Deno
   reference, then a brief `kanban-server` crate) were subsequently **removed
-  entirely** — the wasm payload is the backend.
+  entirely** — the app's backend runs in the page (TypeScript over the wasm
+  file API, since the "filify" change deleted `kanban-wasm`'s Rust handler).
 - ~~Board-sync correctness debt~~ — dotfile leak (`.site`) fixed both
   directions; guard-across-await + triple Arc/Mutex replaced by one select!
   loop with caller-owned `TreePeer`; unbounded echo map → blake3 `seen`;
@@ -264,8 +271,18 @@ strategy-channel variants (`StratAdvert`/`StratDelta`), wire-compatible with
 deployed peers (old peers skip unknown variants; guarded by `wire_compat`
 tests in `core::sync`).
 
+Since the protocol + security series (`docs/planned/roadmap.md` §Security):
+the browser bundle is a generic **file library** (`web/src/file.rs`:
+`readFile`/`writeFile`/`listDir`, per-path `riftpipe:file-changed` events)
+plus a synced per-device **event log** (`web/src/events.rs`: `logEvent`/
+`readEvents`, `events/<device-id>.jsonl`, `riftpipe:event`); `kanban-wasm`
+carries no Rust of its own. Mesh frames are AEAD-sealed under the ticket
+secret, and writes on a claimed board are signed and checked against the
+replicated trust log (claim / request-to-join / approve via `MeshMsg::Trust`
+and `MeshMsg::Request`) — see `docs/security/`.
+
 Still open (tracked in `docs/planned/roadmap.md` §Architecture / hygiene):
 
 - **Two deploy stories** — Pages ships the iroh app; `deploy/` + workflow vars
   still treat the signaling server as first-class. (The kanban servers
-  themselves are gone — the wasm payload is the backend.)
+  themselves are gone — the app's backend runs in the page.)
