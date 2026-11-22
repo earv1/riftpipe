@@ -681,4 +681,242 @@ mod tests {
         std::fs::remove_dir_all(&ra).ok();
         std::fs::remove_dir_all(&rb).ok();
     }
+
+    #[test]
+    fn delete_propagates_and_stays_deleted() {
+        let ra = dir("del-a");
+        let rb = dir("del-b");
+        std::fs::write(ra.join("x.bin"), b"binary-ish payload").unwrap();
+        std::fs::write(ra.join("y.md"), "# doc\n").unwrap();
+
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        std::fs::remove_file(ra.join("x.bin")).unwrap();
+        std::fs::remove_file(ra.join("y.md")).unwrap();
+        let fa = collect_local(&mut a);
+        assert_eq!(fa.len(), 2);
+        for f in &fa {
+            assert!(matches!(
+                postcard::from_bytes::<SyncMsg>(f).unwrap(),
+                SyncMsg::StratDelete { .. }
+            ));
+        }
+
+        pump(&mut a, &mut b, vec![], fa);
+
+        assert!(!rb.join("x.bin").exists());
+        assert!(!rb.join("y.md").exists());
+        assert_eq!(b.tombstone_paths(), vec!["x.bin".to_string(), "y.md".to_string()]);
+        assert!(!ra.join("x.bin").exists());
+        assert!(!ra.join("y.md").exists());
+
+        let (ha, hb) = (advertise_all(&mut a), advertise_all(&mut b));
+        pump(&mut a, &mut b, hb, ha);
+        assert!(!ra.join("x.bin").exists());
+        assert!(!ra.join("y.md").exists());
+        assert!(!rb.join("x.bin").exists());
+        assert!(!rb.join("y.md").exists());
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    #[test]
+    fn delete_reaches_a_peer_that_was_offline() {
+        let ra = dir("off-a");
+        let rb = dir("off-b");
+        std::fs::write(ra.join("z.bin"), b"gone when we reconnect").unwrap();
+
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        std::fs::remove_file(ra.join("z.bin")).unwrap();
+        let _dropped = collect_local(&mut a); // the link was down: discarded
+
+        let (ha, hb) = (advertise_all(&mut a), advertise_all(&mut b));
+        pump(&mut a, &mut b, hb, ha);
+
+        assert!(!rb.join("z.bin").exists());
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    #[test]
+    fn concurrent_rsync_edit_beats_delete() {
+        let ra = dir("cr-a");
+        let rb = dir("cr-b");
+        std::fs::write(ra.join("f.bin"), b"v1").unwrap();
+
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        std::fs::remove_file(ra.join("f.bin")).unwrap();
+        std::fs::write(rb.join("f.bin"), b"edited by B").unwrap();
+
+        let (fa, fb) = (collect_local(&mut a), collect_local(&mut b));
+        pump(&mut a, &mut b, fb, fa);
+
+        assert_eq!(std::fs::read(ra.join("f.bin")).unwrap(), b"edited by B");
+        assert_eq!(std::fs::read(rb.join("f.bin")).unwrap(), b"edited by B");
+        assert!(!a.is_tombstoned("f.bin"));
+        assert!(!b.is_tombstoned("f.bin"));
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    #[test]
+    fn concurrent_text_edit_beats_delete() {
+        let ra = dir("ct-a");
+        let rb = dir("ct-b");
+        std::fs::write(ra.join("g.md"), "line one\n").unwrap();
+
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        std::fs::remove_file(ra.join("g.md")).unwrap();
+        std::fs::write(rb.join("g.md"), "line one\nline two from B\n").unwrap();
+
+        let (fa, fb) = (collect_local(&mut a), collect_local(&mut b));
+        pump(&mut a, &mut b, fb, fa);
+
+        assert_eq!(
+            std::fs::read(ra.join("g.md")).unwrap(),
+            b"line one\nline two from B\n"
+        );
+        assert_eq!(
+            std::fs::read(rb.join("g.md")).unwrap(),
+            b"line one\nline two from B\n"
+        );
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    #[test]
+    fn recreated_file_rejects_the_old_tombstone() {
+        let ra = dir("rc-a");
+        let rb = dir("rc-b");
+        std::fs::write(ra.join("h.bin"), b"same bytes").unwrap();
+
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        std::fs::remove_file(ra.join("h.bin")).unwrap();
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+        assert!(b.is_tombstoned("h.bin"));
+
+        std::fs::write(ra.join("h.bin"), b"same bytes").unwrap();
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+
+        assert_eq!(std::fs::read(ra.join("h.bin")).unwrap(), b"same bytes");
+        assert_eq!(std::fs::read(rb.join("h.bin")).unwrap(), b"same bytes");
+        assert!(!b.is_tombstoned("h.bin"));
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    #[test]
+    fn lww_record_delete_survives_canonical_rewrite() {
+        let ra = dir("lw-a");
+        let rb = dir("lw-b");
+        std::fs::write(ra.join("meta.toml"), "b = 2\n# note\na=1\n").unwrap();
+
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        assert_eq!(std::fs::read(rb.join("meta.toml")).unwrap(), b"a = 1\nb = 2\n");
+
+        std::fs::remove_file(ra.join("meta.toml")).unwrap();
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+
+        assert!(!rb.join("meta.toml").exists());
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    #[test]
+    fn restart_remembers_an_offline_delete() {
+        let ra = dir("rs-a");
+        let rb = dir("rs-b");
+        std::fs::write(ra.join("k.bin"), b"will be deleted offline").unwrap();
+
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        a.save_index_if_dirty();
+        drop(a);
+
+        std::fs::remove_file(ra.join("k.bin")).unwrap();
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        assert!(a.is_tombstoned("k.bin"));
+
+        let (ha, hb) = (advertise_all(&mut a), advertise_all(&mut b));
+        pump(&mut a, &mut b, hb, ha);
+        assert!(!rb.join("k.bin").exists());
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    #[tokio::test]
+    async fn live_sessions_propagate_a_delete() {
+        use crate::sync::workspace::INDEX_FILE;
+
+        let ra = dir("live-a");
+        let rb = dir("live-b");
+        std::fs::write(ra.join("a.bin"), b"a live file to delete").unwrap();
+
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+
+        let (link_a, link_b) = crate::net::mock_pair();
+        let (mut sa, mut ra_src) = link_a.into_halves();
+        let (mut sb, mut rb_src) = link_b.into_halves();
+        let (_ta, mut wa) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (_tb, mut wb) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        let sess_a = session(&mut a, &mut wa, &mut sa, &mut ra_src);
+        let sess_b = session(&mut b, &mut wb, &mut sb, &mut rb_src);
+
+        let script = async {
+            while !rb.join("a.bin").is_file() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            std::fs::remove_file(ra.join("a.bin")).unwrap();
+            while rb.join("a.bin").exists() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(!ra.join("a.bin").exists());
+            assert!(!rb.join("a.bin").exists());
+        };
+
+        tokio::select! {
+            r = sess_a => panic!("A ended early: {r:?}"),
+            r = sess_b => panic!("B ended early: {r:?}"),
+            r = tokio::time::timeout(Duration::from_secs(20), script) => {
+                r.expect("delete did not propagate");
+            }
+        }
+
+        assert!(ra.join(INDEX_FILE).is_file());
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
 }
