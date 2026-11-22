@@ -363,13 +363,14 @@ impl Workspace {
         }
     }
 
-    /// Persist the index if anything changed (atomic: tmp + rename). Errors are
-    /// logged, never fatal. Only file-backed, materialized resources are "live".
+    /// Persist the index if anything changed (atomic + durable: per-process tmp
+    /// file, fsync, rename). Errors are logged, never fatal, and leave the
+    /// index dirty so the next call retries. Only file-backed, materialized
+    /// resources are "live".
     pub fn save_index_if_dirty(&mut self) {
         if !self.dirty {
             return;
         }
-        self.dirty = false;
         let live = self
             .resources
             .iter()
@@ -379,10 +380,21 @@ impl Workspace {
         let tombstones = self.tombstones.iter().map(|(p, t)| (p.clone(), t.clone())).collect();
         let idx = IndexFile { version: INDEX_VERSION, live, tombstones };
         let Ok(bytes) = postcard::to_allocvec(&idx) else { return };
-        let tmp = self.root.join(format!("{INDEX_FILE}.tmp"));
-        if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, self.root.join(INDEX_FILE)))
-        {
-            eprintln!("[riftpipe] could not save {INDEX_FILE}: {e}");
+        // Per-pid tmp name: two processes sharing a root never clobber each
+        // other's half-written tmp file.
+        let tmp = self.root.join(format!("{INDEX_FILE}.{}.tmp", std::process::id()));
+        let write = || -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, &bytes)?;
+            f.sync_all()?; // durable before it becomes the index
+            std::fs::rename(&tmp, self.root.join(INDEX_FILE))
+        };
+        match write() {
+            Ok(()) => self.dirty = false,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!("[riftpipe] could not save {INDEX_FILE} (will retry): {e}");
+            }
         }
     }
 
@@ -734,6 +746,33 @@ mod tests {
         let added = ws.refresh_disk().unwrap();
         assert!(!added.iter().any(|p| p.starts_with('.')));
         assert!(!ws.paths().contains(&INDEX_FILE.to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A failed save must not clear the dirty flag (the tombstone would then
+    /// never be persisted) nor leave its tmp file behind; the next save retries.
+    #[test]
+    fn failed_index_save_stays_dirty_and_retries() {
+        let root = unique_dir("index-retry");
+        std::fs::write(root.join("f.bin"), b"x").unwrap();
+        let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        ws.get_mut("f.bin").unwrap().note_state();
+        std::fs::remove_file(root.join("f.bin")).unwrap();
+        let t = ws.record_local_delete("f.bin").unwrap();
+        // A non-empty directory where the index goes makes the rename fail.
+        std::fs::create_dir_all(root.join(INDEX_FILE).join("blocker")).unwrap();
+        ws.save_index_if_dirty();
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp file left behind");
+        std::fs::remove_dir_all(root.join(INDEX_FILE)).unwrap();
+        ws.save_index_if_dirty(); // still dirty → retried
+        drop(ws);
+        let ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        assert_eq!(ws.tombstone("f.bin").map(|x| x.id), Some(t.id));
         std::fs::remove_dir_all(&root).ok();
     }
 }
