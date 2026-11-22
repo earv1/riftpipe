@@ -269,17 +269,19 @@ const BOARD_SECRET_KEY: &str = "riftpipe:board_secret";
 /// link — stable across reloads, exactly as [`load_or_create_secret_key`] keeps
 /// the endpoint identity stable.
 pub(crate) fn load_or_create_board_secret() -> [u8; 32] {
-    let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
-    if let Some(store) = &storage {
-        if let Ok(Some(hex)) = store.get_item(BOARD_SECRET_KEY) {
-            if let Some(bytes) = hex32(&hex) {
-                return bytes;
-            }
-        }
+    if let Some(secret) = persisted_board_secret() {
+        return secret;
     }
     let secret = riftpipe_core::crypto::generate_secret();
     persist_board_secret(&secret);
     secret
+}
+
+/// The board secret this browser hosts (persisted), if any — never mints one.
+pub(crate) fn persisted_board_secret() -> Option<[u8; 32]> {
+    let store = web_sys::window().and_then(|w| w.local_storage().ok().flatten())?;
+    let hex = store.get_item(BOARD_SECRET_KEY).ok()??;
+    hex32(&hex)
 }
 
 /// Persist `secret` as the board secret (so a reloaded host keeps the same

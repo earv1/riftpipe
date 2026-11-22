@@ -129,8 +129,10 @@ requires an explicit wrap.
   unrecoverable (true everywhere).
 - **Persistence** — raw epoch keys are **never** written anywhere; only
   verified announces are persisted (wraps are ciphertext to their recipients)
-  and re-opened with the device seed. The browser keeps them in
-  `localStorage["riftpipe:epochs"]`, topic-bound; native peers keep nothing
+  and re-opened with the device seed. The browser keeps them, and the trust
+  log, per board: `localStorage["riftpipe:epochs:<topic>"]` and
+  `["riftpipe:trust:v2:<topic>"]`, so opening another board never overwrites
+  (and so never unlocks) a claimed one; native peers keep nothing
   on disk and relearn every epoch from the swarm each session, the same as
   the native trust log.
 

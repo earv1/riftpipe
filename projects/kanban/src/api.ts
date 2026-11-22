@@ -178,10 +178,13 @@ export async function newBoard(): Promise<void> {
   // Drop the board secret too: a new board must mint a fresh secret, so it gets
   // a new topic (H(secret)) and a brand-new, unrelated share link.
   localStorage.removeItem("riftpipe:board_secret");
-  // Drop the claim and the epoch keys too: they belong to the old board's topic.
+  // Drop the legacy (board-unscoped) trust log: it belonged to the old board.
+  // The per-board claim + epoch announces (`riftpipe:trust:v2:<topic>`,
+  // `riftpipe:epochs:<topic>`) are kept ON PURPOSE: the new board has a new
+  // topic so they can't collide, and they keep the old board claimed (sealed,
+  // owner-only) if this device reopens it with nobody else online. Cost: one
+  // small localStorage entry per board ever claimed/joined.
   localStorage.removeItem("riftpipe:trust");
-  localStorage.removeItem("riftpipe:trust:v2");
-  localStorage.removeItem("riftpipe:epochs");
   location.hash = "";
   location.reload();
 }

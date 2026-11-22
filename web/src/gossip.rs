@@ -178,16 +178,18 @@ use riftpipe_core::identity::{DeviceKey, Role, TrustEntry, TrustLog};
 use riftpipe_core::onboard::JoinRequest;
 use riftpipe_core::sync::SyncMsg;
 
-/// localStorage: `hex(postcard((topic, Vec<TrustEntry>)))` — the trust log is
-/// scoped to its board, so a stale genesis from another board can't lock you out.
-const TRUST_STORE_KEY: &str = "riftpipe:trust:v2";
-/// localStorage: the pre-v2, board-unscoped `hex(postcard(Vec<TrustEntry>))`,
-/// migrated once into [`TRUST_STORE_KEY`].
+/// localStorage key prefix: `riftpipe:trust:v2:<hex topic>` = `hex(postcard(Vec<TrustEntry>))`.
+/// One entry per board, so opening another board never overwrites (or unlocks)
+/// this one, and a stale genesis from another board can't lock you out.
+const TRUST_STORE_PREFIX: &str = "riftpipe:trust:v2:";
+/// localStorage: the pre-v2, board-unscoped `hex(postcard(Vec<TrustEntry>))`.
+/// Migrated once, and only into this browser's own hosted board (see
+/// [`load_trust_entries`]).
 const LEGACY_TRUST_STORE_KEY: &str = "riftpipe:trust";
-/// localStorage: `hex(postcard((topic, Vec<EpochAnnounce>)))` — verified announces
-/// only (wraps are ciphertext to their recipients); raw epoch keys are never
-/// stored, they're re-opened with the device seed on load.
-const EPOCH_STORE_KEY: &str = "riftpipe:epochs";
+/// localStorage key prefix: `riftpipe:epochs:<hex topic>` = `hex(postcard(Vec<EpochAnnounce>))`
+/// — verified announces only (wraps are ciphertext to their recipients); raw
+/// epoch keys are never stored, they're re-opened with the device seed on load.
+const EPOCH_STORE_PREFIX: &str = "riftpipe:epochs:";
 
 /// What handling a message (or an auth action) produced, for the driver to act
 /// on: content to apply to the syncer, messages to broadcast to the swarm, and
@@ -579,40 +581,50 @@ fn load_hex_postcard<T: serde::de::DeserializeOwned>(key: &str) -> Option<T> {
     postcard::from_bytes(&bytes).ok()
 }
 
+fn trust_store_key(topic: &[u8; 32]) -> String {
+    format!("{TRUST_STORE_PREFIX}{}", hex32(topic))
+}
+
+fn epoch_store_key(topic: &[u8; 32]) -> String {
+    format!("{EPOCH_STORE_PREFIX}{}", hex32(topic))
+}
+
 /// Persist the converged trust log for `topic` so a claimed board — and its
 /// author + grants — survives a reload.
 fn persist_trust_entries(topic: &[u8; 32], entries: &[TrustEntry]) {
-    store_hex_postcard(TRUST_STORE_KEY, &(topic, entries));
+    store_hex_postcard(&trust_store_key(topic), &entries);
 }
 
-/// The trust log persisted for `topic`; else a one-time migration of the legacy
-/// board-unscoped log (the key is removed); else empty.
+/// The trust log persisted for `topic`. Else, if `topic` is this browser's own
+/// hosted board (`H(persisted board secret)`), a one-time migration of the
+/// legacy board-unscoped log (the legacy key is removed) — it was written by
+/// the board this browser hosts, so it must not land on any other board. Else empty.
 fn load_trust_entries(topic: &[u8; 32]) -> Vec<TrustEntry> {
-    if let Some((stored, entries)) = load_hex_postcard::<([u8; 32], Vec<TrustEntry>)>(TRUST_STORE_KEY) {
-        if &stored == topic {
+    if let Some(entries) = load_hex_postcard::<Vec<TrustEntry>>(&trust_store_key(topic)) {
+        return entries;
+    }
+    let own_board = crate::tree_sync::persisted_board_secret()
+        .is_some_and(|s| &riftpipe_core::crypto::topic_from_secret(&s) == topic);
+    if own_board {
+        if let Some(entries) = load_hex_postcard::<Vec<TrustEntry>>(LEGACY_TRUST_STORE_KEY) {
+            persist_trust_entries(topic, &entries);
+            if let Some(store) = local_storage() {
+                let _ = store.remove_item(LEGACY_TRUST_STORE_KEY);
+            }
             return entries;
         }
-    }
-    if let Some(entries) = load_hex_postcard::<Vec<TrustEntry>>(LEGACY_TRUST_STORE_KEY) {
-        if let Some(store) = local_storage() {
-            let _ = store.remove_item(LEGACY_TRUST_STORE_KEY);
-        }
-        return entries;
     }
     Vec::new()
 }
 
 /// Persist the accepted epoch announces for `topic` (never raw keys).
 fn persist_epochs(topic: &[u8; 32], announces: &[EpochAnnounce]) {
-    store_hex_postcard(EPOCH_STORE_KEY, &(topic, announces));
+    store_hex_postcard(&epoch_store_key(topic), &announces);
 }
 
-/// The epoch announces persisted for `topic` (empty on a topic mismatch).
+/// The epoch announces persisted for `topic`.
 fn load_epochs(topic: &[u8; 32]) -> Vec<EpochAnnounce> {
-    match load_hex_postcard::<([u8; 32], Vec<EpochAnnounce>)>(EPOCH_STORE_KEY) {
-        Some((stored, announces)) if &stored == topic => announces,
-        _ => Vec::new(),
-    }
+    load_hex_postcard(&epoch_store_key(topic)).unwrap_or_default()
 }
 
 /// File-tree sync over the gossip mesh. Local pushes broadcast to everyone; received
@@ -1191,6 +1203,44 @@ mod tests {
     fn deliver(acc: &Accepted, to: &mut Auth) {
         for m in &acc.send {
             to.accept(dup(m));
+        }
+    }
+
+    /// Offline: the claim is persisted per board — claiming (persisting) another
+    /// board doesn't overwrite it, so a reloaded owner's board stays locked
+    /// (sealed) even with nobody else online. The legacy board-unscoped log only
+    /// migrates into this browser's own hosted board.
+    #[wasm_bindgen_test]
+    fn claim_persists_per_board() {
+        let topic_a = riftpipe_core::crypto::generate_secret();
+        let topic_b = riftpipe_core::crypto::generate_secret();
+        let mut a = Auth::load(DeviceKey::from_seed(&[31; 32]), topic_a);
+        a.lock_as_author().expect("A claims board A");
+        let mut b = Auth::load(DeviceKey::from_seed(&[32; 32]), topic_b);
+        assert!(!b.locked(), "board A's claim doesn't leak onto board B");
+        b.lock_as_author().expect("B claims board B");
+
+        let a2 = Auth::load(DeviceKey::from_seed(&[31; 32]), topic_a);
+        assert!(a2.locked() && a2.is_author(), "board A is still claimed after board B persisted");
+        assert!(a2.can_read() && a2.epochs.latest_held_seq() == Some(1), "A re-opens its epoch key");
+
+        // Legacy log: left alone on a foreign board, migrated into our own.
+        let store = local_storage().expect("localStorage");
+        let legacy = vec![DeviceKey::from_seed(&[33; 32]).genesis()];
+        store_hex_postcard(LEGACY_TRUST_STORE_KEY, &legacy);
+        let foreign = Auth::load(DeviceKey::from_seed(&[34; 32]), riftpipe_core::crypto::generate_secret());
+        assert!(!foreign.locked(), "legacy log must not migrate into a board we don't host");
+        assert!(store.get_item(LEGACY_TRUST_STORE_KEY).unwrap().is_some(), "legacy log kept");
+
+        let own_secret = riftpipe_core::crypto::generate_secret();
+        let prior_secret = store.get_item("riftpipe:board_secret").unwrap();
+        crate::tree_sync::persist_board_secret(&own_secret);
+        let own = Auth::load(DeviceKey::from_seed(&[34; 32]), riftpipe_core::crypto::topic_from_secret(&own_secret));
+        assert!(own.locked(), "legacy log migrates into our own hosted board");
+        assert!(store.get_item(LEGACY_TRUST_STORE_KEY).unwrap().is_none(), "legacy key removed after migration");
+        match prior_secret {
+            Some(s) => store.set_item("riftpipe:board_secret", &s).unwrap(),
+            None => store.remove_item("riftpipe:board_secret").unwrap(),
         }
     }
 
