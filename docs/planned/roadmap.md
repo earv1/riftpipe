@@ -206,9 +206,11 @@ over riftpipe's wasm file API). What remains:
   `StratAdvert` for a tombstoned path re-asserts the delete (how an
   offline-at-delete-time peer learns on reconnect); a non-self-contained
   delta re-asserts too, at most once per heartbeat (loop guard). Re-creating
-  a tombstoned path locally drops the tombstone and remembers its ids as
-  `superseded`, so an old copy of those deletions held by a peer is rejected
-  even for a byte-identical re-creation. Deletion ids are deterministic
+  a tombstoned path locally drops the tombstone and remembers its whole
+  delete/re-create chain as `superseded` (ids + local-only `prior`), so an
+  old copy of any of those deletions held by a peer is rejected even for a
+  byte-identical re-creation (cost: a lagging peer's deliberate delete can be
+  reverted once per chain step — fails toward keeping data). Deletion ids are deterministic
   (blake3 of path + last fingerprint + superseded ids) and independent
   deletes of one path merge their ids, so concurrent deletes followed by an
   identical restore can't lose the restored file. Tombstones + last-known live files

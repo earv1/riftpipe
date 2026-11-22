@@ -629,10 +629,14 @@ something else reads it.
   `StratAdvert` for a tombstoned path re-asserts the delete (how a peer that
   was offline at delete time learns of it on reconnect); an incremental delta
   that can't stand alone also re-asserts, at most once per heartbeat. Locally
-  re-creating a tombstoned path drops the tombstone and remembers ALL its
-  deletion ids as `superseded`, so a stale copy of any of those deletions
-  held by a peer is rejected (the receiver keeps the file if any incoming id
-  is superseded) even for a byte-identical re-creation. Deletion ids are
+  re-creating a tombstoned path drops the tombstone and remembers its whole
+  delete/re-create chain as `superseded` (the tombstone's `ids` plus its
+  local-only `prior` — the ids the deleted resource had itself superseded —
+  capped at 64), so a stale copy of any deletion from any earlier step held
+  by a peer is rejected (the receiver keeps the file if any incoming id is
+  superseded) even for a byte-identical re-creation; an empty re-created
+  file answers with a zero-length `StratDelta` (no strategy emits one), on
+  which the deleter resurrects the file empty, so the two converge. Deletion ids are
   **deterministic** — blake3(path, last fingerprint, superseded ids) — so two
   peers that delete the same content independently (even if the deletes
   never meet, or one is re-detected at startup after a crash) mint the same
@@ -646,6 +650,10 @@ something else reads it.
   any remote merge's canonical rewrite) are dropped by a remote delete too,
   and a comment-only file counts as empty; a raw-bytes check was rejected
   because it would make every hand-formatted file undeletable from a peer.
+  Known limit (fails toward keeping data): `superseded` chains are local, so
+  a peer whose state equals an old tombstone's mints that tombstone's id; a
+  deliberate delete by it is rejected as stale and reverted once per chain
+  step it lags (it resurrects, adopts the step, and its next delete applies).
   Out of scope: `sync::tree`/`sync::mesh` (the
   browser/kanban `Syncer`) have no delete notion yet — a separate plan.
 - **Liveness** — a 15s recv-idle timeout (`folder::RECV_IDLE_TIMEOUT`) treats
