@@ -291,16 +291,25 @@ impl EpochBook {
         out
     }
 
-    /// Seal content under the highest epoch we hold. `None` (hold the write) if we
-    /// hold none, or if that epoch still wraps a device `trust` has revoked — we
-    /// saw the revoke but not yet the rotation, and sealing now would let the
-    /// removed device read it. The caller re-sends once the new epoch arrives
-    /// ([`Ingested::held`]).
+    /// Can we seal new content right now? Only under the LATEST known epoch, and
+    /// only if it wraps no device `trust` has revoked. Otherwise writes are held:
+    /// a newer epoch exists that we aren't wrapped into yet (e.g. a rotation whose
+    /// wrap for us is still coming), or we saw a revoke but not yet its rotation —
+    /// sealing under the epoch we hold could let a removed device read it.
+    pub fn can_seal(&self, trust: &TrustLog) -> bool {
+        let Some(slot) = self.latest_held() else { return false };
+        self.latest_known() == Some(slot)
+            && !self.wrapped.get(&slot).is_some_and(|w| w.iter().any(|d| trust.is_revoked(d)))
+    }
+
+    /// Seal content under the latest epoch. `None` (hold the write) unless
+    /// [`can_seal`](Self::can_seal). The caller re-sends its state once the hold
+    /// lifts — a newly-held epoch ([`Ingested::held`]) or a trust change.
     pub fn seal(&self, inner: &MeshMsg, trust: &TrustLog) -> Option<MeshMsg> {
-        let (&(seq, id), key) = self.keys.iter().next_back()?;
-        if self.wrapped.get(&(seq, id)).is_some_and(|w| w.iter().any(|d| trust.is_revoked(d))) {
+        if !self.can_seal(trust) {
             return None;
         }
+        let (&(seq, id), key) = self.keys.iter().next_back()?;
         let pt = postcard::to_allocvec(inner).ok()?;
         let body = MeshCipher::from_epoch(key).seal_aad(&pt, &sealed_aad(seq, &id));
         Some(MeshMsg::Sealed(SealedMsg { seq, id, body }))
@@ -645,6 +654,24 @@ mod tests {
         assert_eq!(ing.held, Some(2), "the new epoch arrived: the caller re-sends");
         let s = sealed(bb.seal(&content("after"), &trust).expect("epoch 2 excludes C"));
         assert_eq!(s.seq, 2);
+    }
+
+    #[test]
+    fn holds_writes_while_a_newer_epoch_is_known_but_not_held() {
+        let (f, b, _c, trust, _fb, mut bb, _cb) = three_wrapped();
+        let k2 = generate_epoch();
+        // Epoch 2 announced without B's wrap (it comes in a later add-wrap).
+        let bare = EpochAnnounce::create(&f, 2, epoch_id(&k2), vec![]);
+        let ing = feed(&mut bb, &[bare], &trust);
+        assert_eq!(ing.unheld, Some(2));
+        assert!(!bb.can_seal(&trust));
+        assert!(bb.seal(&content("gap"), &trust).is_none(), "never seal under epoch 1 while epoch 2 exists");
+
+        let b_enc = ClientEncKey::from_seed(&b.seed()).public();
+        let wrap = EpochWrap { device: b.id(), wrapped: wrap_epoch(&k2, &[b_enc]).remove(0) };
+        let ing = feed(&mut bb, &[EpochAnnounce::create(&f, 2, epoch_id(&k2), vec![wrap])], &trust);
+        assert_eq!(ing.held, Some(2), "the wrap arrived: the caller re-sends its state");
+        assert_eq!(sealed(bb.seal(&content("after"), &trust).unwrap()).seq, 2);
     }
 
     #[test]

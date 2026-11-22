@@ -106,7 +106,7 @@ pub struct TreePeer {
     warned_restricted: bool,
     /// A local edit was held back because we hold no epoch key yet (warned once).
     warned_keyless: bool,
-    /// Epochs already reported as "still wraps a revoked device — writes held".
+    /// Epochs already reported as "not the current sealable epoch — writes held".
     stale_epoch_reported: HashSet<u64>,
 }
 
@@ -217,7 +217,8 @@ impl TreePeer {
     }
 
     /// [`sign_mesh`](Self::sign_mesh) for a LOCAL edit: when it can't go out (restricted,
-    /// and no epoch key yet, or our latest epoch still wraps a revoked device), say
+    /// and no epoch key yet, or the epoch we hold isn't the latest one / still wraps
+    /// a revoked device — see `EpochBook::can_seal`), say
     /// so once — the edit stays in the syncer and goes out with our full state when
     /// a (new) epoch key arrives.
     pub(crate) fn sign_local(&mut self, msg: SyncMsg) -> Option<MeshMsg> {
@@ -233,7 +234,7 @@ impl TreePeer {
                 );
             }
         } else if self.stale_epoch_reported.insert(self.epoch_held().unwrap_or(0)) {
-            eprintln!("[epoch] a device was removed — local edits are held until the new epoch key arrives");
+            eprintln!("[epoch] local edits are held until this device holds the current epoch key (a device was removed, or our wrap for a new epoch is still coming)");
         }
         out
     }
