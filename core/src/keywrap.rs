@@ -17,9 +17,10 @@
 //! devices/people per board). TreeKEM-style O(log n) rekey is deliberately out
 //! of scope until boards are large.
 //!
-//! This module is the crypto primitive. Where recipients' public keys come from
-//! (published alongside the trust log) and how the epoch key drives the mesh
-//! seal are the integration steps that build on it.
+//! This module is the crypto primitive. `core::epoch` (`EpochBook`) builds the
+//! mesh integration on it: where wrap targets come from (signed join requests),
+//! Admin-signed epoch announcements, sealing content under the current epoch,
+//! and rotate-on-revoke.
 
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
