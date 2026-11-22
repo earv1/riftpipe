@@ -31,7 +31,10 @@ pub trait Backing: Send {
         true
     }
     /// Delete the resource's bytes from its store (applying a peer's delete).
-    fn remove(&mut self);
+    /// Already gone counts as success; any other failure is returned so the
+    /// caller keeps the resource instead of recording a delete that didn't
+    /// happen.
+    fn remove(&mut self) -> std::io::Result<()>;
 }
 
 /// File-backed: the resource is a file on disk (today's mirror behavior).
@@ -69,8 +72,11 @@ impl Backing for FileBacking {
     fn exists(&self) -> bool {
         self.path.is_file()
     }
-    fn remove(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+    fn remove(&mut self) -> std::io::Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -104,8 +110,9 @@ impl Backing for MemoryBacking {
     fn store(&mut self, bytes: &[u8]) {
         *self.buf.lock().unwrap() = bytes.to_vec();
     }
-    fn remove(&mut self) {
+    fn remove(&mut self) -> std::io::Result<()> {
         self.buf.lock().unwrap().clear();
+        Ok(())
     }
 }
 
@@ -191,7 +198,7 @@ mod tests {
         let mut b = FileBacking::new("f.bin", path.clone());
         assert!(b.on_disk());
         assert!(b.exists());
-        b.remove();
+        b.remove().unwrap();
         assert!(!b.exists());
         assert!(!path.exists());
 
@@ -203,7 +210,7 @@ mod tests {
         let reg = MemoryRegistry::new();
         let mut a = reg.backing("a");
         a.store(b"x");
-        a.remove();
+        a.remove().unwrap();
         assert!(a.load().is_empty());
         reg.remove("a");
         assert!(reg.snapshot().is_empty());

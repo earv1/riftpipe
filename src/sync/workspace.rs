@@ -242,11 +242,15 @@ impl Workspace {
     }
 
     /// Apply a peer's delete: remove the bytes, drop the resource, adopt the
-    /// peer's `id`; `seen` = ours, then theirs pushed on top (capped).
-    pub fn apply_remote_delete(&mut self, rel: &str, id: u64, seen: &[Hash]) {
+    /// peer's `id`; `seen` = ours, then theirs pushed on top (capped). If the
+    /// bytes can't be removed, the resource is kept, nothing is recorded and
+    /// the error is returned (the peer re-asserts on our next advert, so it is
+    /// retried).
+    pub fn apply_remote_delete(&mut self, rel: &str, id: u64, seen: &[Hash]) -> std::io::Result<()> {
         let mut merged = Vec::new();
-        if let Some(mut res) = self.resources.remove(rel) {
-            res.backing.remove();
+        if let Some(res) = self.resources.get_mut(rel) {
+            res.backing.remove()?;
+            let res = self.resources.remove(rel).expect("present");
             self.registry.remove(rel);
             merged = res.seen;
         }
@@ -258,6 +262,7 @@ impl Workspace {
             Tombstone { id, seen: merged, reasserted: false },
         );
         self.dirty = true;
+        Ok(())
     }
 
     /// Bring a tombstoned path back with `strategy` (already holding the
@@ -634,7 +639,7 @@ mod tests {
         ws.get_mut("b.bin").unwrap().note_state();
         let original_fp = ws.get_mut("b.bin").unwrap().seen.clone();
 
-        ws.apply_remote_delete("b.bin", 42, &[[9u8; 32]]);
+        ws.apply_remote_delete("b.bin", 42, &[[9u8; 32]]).unwrap();
         assert!(!root.join("b.bin").exists());
         let t = ws.tombstone("b.bin").unwrap();
         assert_eq!(t.id, 42);
@@ -746,6 +751,30 @@ mod tests {
         let added = ws.refresh_disk().unwrap();
         assert!(!added.iter().any(|p| p.starts_with('.')));
         assert!(!ws.paths().contains(&INDEX_FILE.to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// If the file can't be removed (here: its directory is read-only), a
+    /// peer's delete must leave the resource live and record no tombstone —
+    /// otherwise the next scan would see the still-present file as a
+    /// re-creation and resurrect it everywhere.
+    #[cfg(unix)]
+    #[test]
+    fn failed_remote_delete_keeps_the_resource() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = unique_dir("remote-delete-fails");
+        let ro = root.join("ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::write(ro.join("g.bin"), b"keep me").unwrap();
+        let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        ws.get_mut("ro/g.bin").unwrap().note_state();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = ws.apply_remote_delete("ro/g.bin", 7, &[]);
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(r.is_err());
+        assert!(ro.join("g.bin").is_file());
+        assert!(ws.paths().contains(&"ro/g.bin".to_string()));
+        assert!(!ws.is_tombstoned("ro/g.bin"));
         std::fs::remove_dir_all(&root).ok();
     }
 

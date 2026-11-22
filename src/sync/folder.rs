@@ -231,8 +231,8 @@ fn remote_delete(ws: &mut Workspace, path: &str, id: u64, seen: &[Hash], out: &m
             out.push(delta(path, d));
         }
         ws.mark_dirty();
-    } else {
-        ws.apply_remote_delete(path, id, seen);
+    } else if let Err(e) = ws.apply_remote_delete(path, id, seen) {
+        eprintln!("[folder] could not delete {path} (peer's delete; kept, will retry): {e}");
     }
 }
 
