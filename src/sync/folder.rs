@@ -38,8 +38,10 @@
 //! incremental delta that can't stand alone instead re-asserts the delete (at
 //! most once per heartbeat). An advert for a tombstoned path is answered with
 //! the `StratDelete` (how a peer that was offline learns of it). A file
-//! re-created locally drops its tombstone and remembers all its deletion `ids`
-//! as `superseded`, so an old copy of any of them is rejected. A delete for a
+//! re-created locally drops its tombstone and remembers its whole chain as
+//! `superseded` — the tombstone's `ids` plus `prior`, the ids the deleted
+//! resource had itself superseded — so an old copy of any deletion from any
+//! earlier delete/re-create step is rejected. A delete for a
 //! path already deleted here merges its ids into the tombstone; ids are
 //! deterministic (same content + history → same id), so independent deletes
 //! that never met still match. Tombstones and last-known files persist in
@@ -53,6 +55,14 @@
 //! remote delete drops them too — a comment-only file counts as empty. A
 //! stricter raw-bytes check would make every hand-formatted file undeletable
 //! from another peer (it would resurrect on the deleter forever).
+//!
+//! Known limit (deliberate, fails toward keeping data): `superseded` is
+//! local-only, so a peer's chain can lag ours. A peer whose state equals an
+//! old tombstone's (same content, same superseded set) mints that tombstone's
+//! id when it deletes; if we re-created after that tombstone, we reject the
+//! delete as stale and answer with the content, the peer resurrects (adopting
+//! our chain step), and its next delete mints a fresh id and applies. So a
+//! deliberate delete can be reverted once per chain step the peer lags.
 
 use std::sync::Arc;
 use std::time::Duration;
