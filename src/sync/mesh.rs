@@ -252,7 +252,7 @@ pub async fn run(
                     if let Some(msg) = peer.local_change(&p, dir) {
                         // Signed when this peer has an identity, else a plain Sync;
                         // sealed on a restricted board (`None` until we hold a key).
-                        if let Some(mm) = peer.sign_mesh(msg) {
+                        if let Some(mm) = peer.sign_local(msg) {
                             broadcast(&sender, &cipher, &mm).await;
                         }
                     }
@@ -264,7 +264,7 @@ pub async fn run(
                 scan_files(dir, &mut files);
                 for p in files {
                     if let Some(msg) = peer.local_change(&p, dir) {
-                        if let Some(mm) = peer.sign_mesh(msg) {
+                        if let Some(mm) = peer.sign_local(msg) {
                             broadcast(&sender, &cipher, &mm).await;
                         }
                     }

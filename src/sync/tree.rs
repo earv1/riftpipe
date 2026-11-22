@@ -104,6 +104,8 @@ pub struct TreePeer {
     no_key_reported: HashSet<u64>,
     /// An open peer received sealed content once already (warned to rejoin restricted).
     warned_restricted: bool,
+    /// A local edit was held back because we hold no epoch key yet (warned once).
+    warned_keyless: bool,
 }
 
 impl TreePeer {
@@ -121,6 +123,7 @@ impl TreePeer {
             my_request: None,
             no_key_reported: HashSet::new(),
             warned_restricted: false,
+            warned_keyless: false,
         }
     }
 
@@ -208,6 +211,20 @@ impl TreePeer {
         } else {
             Some(signed)
         }
+    }
+
+    /// [`sign_mesh`](Self::sign_mesh) for a LOCAL edit: when it can't go out (restricted,
+    /// no epoch key yet), say so once — the edit stays in the syncer and goes out
+    /// with our full state once an admin wraps us in.
+    pub(crate) fn sign_local(&mut self, msg: SyncMsg) -> Option<MeshMsg> {
+        let out = self.sign_mesh(msg);
+        if out.is_none() && !self.warned_keyless {
+            self.warned_keyless = true;
+            eprintln!(
+                "[epoch] no read key yet — local edits are held until an admin wraps this device in (is the board --restricted?)"
+            );
+        }
+        out
     }
 
     /// Accept one content message (`Sync` / `SignedSync`, already opened if it
@@ -796,6 +813,14 @@ mod tests {
 
     /// An open peer (no identity) can't read a restricted board's sealed content:
     /// it is dropped, nothing persists.
+    #[test]
+    fn keyless_restricted_peer_holds_local_edits_and_warns_once() {
+        let mut keyless = restricted_peer(9);
+        assert!(keyless.sign_local(lww("a.bin", b"1")).is_none(), "no key: nothing goes out");
+        assert!(keyless.warned_keyless, "the held edit is reported");
+        assert!(keyless.sign_local(lww("b.bin", b"2")).is_none());
+    }
+
     #[test]
     fn open_peer_ignores_sealed_content() {
         use riftpipe_core::epoch::SealedMsg;
