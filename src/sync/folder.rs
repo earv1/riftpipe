@@ -45,6 +45,14 @@
 //! that never met still match. Tombstones and last-known files persist in
 //! `<root>/.riftpipe-folder-index`, so deletes made while offline are
 //! detected at startup.
+//!
+//! Known limit (deliberate): the edit-wins check compares *strategy*
+//! fingerprints, i.e. only what the algorithm syncs. For `lww-record` that is
+//! the records; comments, layout and lines without `=` are never synced (any
+//! remote merge already rewrites the file canonically and drops them), so a
+//! remote delete drops them too — a comment-only file counts as empty. A
+//! stricter raw-bytes check would make every hand-formatted file undeletable
+//! from another peer (it would resurrect on the deleter forever).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -900,6 +908,38 @@ mod tests {
         pump(&mut a, &mut b, vec![], fa);
 
         assert!(!rb.join("meta.toml").exists());
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    /// Pins the documented lww-record limit (module doc, "Known limit"): a
+    /// local comment the algorithm never syncs is not a concurrent edit, so a
+    /// peer's delete still applies — the same bytes any remote merge's
+    /// canonical rewrite would drop. A real record edit still wins.
+    #[test]
+    fn lww_record_remote_delete_ignores_unsynced_comments_but_not_records() {
+        let ra = dir("lc-a");
+        let rb = dir("lc-b");
+        std::fs::write(ra.join("meta.toml"), "a = 1\n").unwrap();
+        std::fs::create_dir_all(ra.join("x")).unwrap();
+        std::fs::write(ra.join("x/meta.toml"), "a = 1\n").unwrap();
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        // B: a comment on one file, a new record on the other — unscanned.
+        std::fs::write(rb.join("meta.toml"), "a = 1\n# B's note\n").unwrap();
+        std::fs::write(rb.join("x/meta.toml"), "a = 1\nb = 2\n").unwrap();
+        std::fs::remove_file(ra.join("meta.toml")).unwrap();
+        std::fs::remove_file(ra.join("x/meta.toml")).unwrap();
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+
+        assert!(!rb.join("meta.toml").exists(), "comment-only change is not an edit");
+        assert!(!ra.join("meta.toml").exists());
+        assert_eq!(std::fs::read(rb.join("x/meta.toml")).unwrap(), b"a = 1\nb = 2\n");
+        assert_eq!(std::fs::read(ra.join("x/meta.toml")).unwrap(), b"a = 1\nb = 2\n");
 
         std::fs::remove_dir_all(&ra).ok();
         std::fs::remove_dir_all(&rb).ok();

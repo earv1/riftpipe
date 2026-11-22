@@ -640,7 +640,13 @@ something else reads it.
   tombstone (ids + fingerprints) rather than ignored. Tombstones and
   last-known live files persist in `<root>/.riftpipe-folder-index` (postcard,
   atomic write), so a delete made while a peer was offline, or offline itself,
-  is still detected at startup. Out of scope: `sync::tree`/`sync::mesh` (the
+  is still detected at startup. Known limit: edit-wins compares strategy
+  fingerprints, so bytes an algorithm never syncs don't count as an edit —
+  for `lww-record`, comments/layout/lines without `=` (already dropped by
+  any remote merge's canonical rewrite) are dropped by a remote delete too,
+  and a comment-only file counts as empty; a raw-bytes check was rejected
+  because it would make every hand-formatted file undeletable from a peer.
+  Out of scope: `sync::tree`/`sync::mesh` (the
   browser/kanban `Syncer`) have no delete notion yet — a separate plan.
 - **Liveness** — a 15s recv-idle timeout (`folder::RECV_IDLE_TIMEOUT`) treats
   a peer that sends nothing for that long as dead and reconnects, even if the
