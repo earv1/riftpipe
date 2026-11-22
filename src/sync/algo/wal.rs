@@ -145,6 +145,10 @@ impl SyncStrategy for WalDbSyncer {
         self.last_known = bytes.clone();
         Some(bytes)
     }
+
+    fn fingerprint(&self) -> [u8; 32] {
+        *blake3::hash(&encode_log(&self.replica.linearize())).as_bytes()
+    }
 }
 
 #[cfg(test)]
@@ -264,5 +268,18 @@ mod tests {
         assert!(a.observe(&la), "the intact frame is ingested");
         let wm = a.replica.watermarks();
         assert_eq!(wm.get("a"), Some(&0));
+    }
+
+    /// A's fingerprint matches B's after B merges A's push — same materialized log.
+    #[test]
+    fn fingerprint_matches_after_merge() {
+        let mut a = WalDbSyncer::new("a");
+        let mut b = WalDbSyncer::new("b");
+        let (mut wa, mut la) = (Replica::new(), Vec::new());
+        append_local(&mut wa, &mut la, "a", b"one");
+        a.observe(&la);
+        let push = a.push_delta().expect("new frame to push");
+        b.merge(&push).expect("push lands on B");
+        assert_eq!(a.fingerprint(), b.fingerprint());
     }
 }

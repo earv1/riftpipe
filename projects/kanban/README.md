@@ -1,13 +1,16 @@
 # riftpipe kanban
 
-A super-simple, file-backed kanban board. **SolidJS + Vite** frontend over a
-tiny JSON file-API — and **there is no server**: `src/api.ts` calls
-`kanbanHandle` from [`wasm/pkg`](wasm/), the app's own `kanban-wasm` crate
-(board format + OPFS handler) compiled to WebAssembly, running in the page. It
-links the generic `riftpipe-web` crate, so one bundle also exports the sync
-entries (`connectAndSync`, `irohConnect`, …). The board lives in the browser's
-private filesystem (OPFS); peers sync directly over iroh / the gossip mesh.
-The app is a static bundle plus a wasm payload.
+A super-simple, file-backed kanban board. **SolidJS + Vite** frontend — and
+**there is no server**: the board domain is plain TypeScript (`src/board.ts`:
+parse/serialize `board.md`, `meta.toml`, `card.md`, comments, card positions)
+on top of riftpipe's generic **file API** (`src/fs.ts` wraps the wasm exports
+`readFile`/`writeFile`/`listDir` + a `watch` fed by `riftpipe:file-changed`).
+The wasm comes from [`wasm/pkg`](wasm/) — `kanban-wasm`, a thin passthrough that
+links the generic `riftpipe-web` crate (no kanban Rust), so one bundle exports
+the file API, the sync entries (`irohConnect`, …), the auth surface, and the
+event log. The board lives in the browser's private filesystem (OPFS); peers
+sync directly over iroh / the gossip mesh. The app is a static bundle plus a
+wasm payload.
 
 Native machines participate through riftpipe's **generic verbs** (the binary
 has no kanban code):
@@ -34,19 +37,19 @@ board/
       meta.toml                  # column, position, done   (structural fields)
       comments/<ts>-<author>.md  # one file per comment (planned)
       attachments/*              # arbitrary files (planned)
-  events/<site>.jsonl            # append-only change log, one file per peer
-  .site                          # this machine's site id (not synced)
+  events/<device-id>.jsonl       # append-only event log, one file per device
 ```
 
 ### Change-event log (history)
 
-Every mutation appends a line to `events/<site>.jsonl`. The trick: each replica
-writes its **own** file (named by a per-machine site id in `.site`, a dotfile
-riftpipe skips), so two peers never touch the same file — the log merges across
-machines with **zero conflicts**. Board files stay the source of truth; this is
-a purely additive trail to build history/undo on later. *(The retired servers
-originally wrote this log; the wasm handler now writes it on every mutation and
-serves the merged trail at `GET /api/history`.)*
+Every mutation appends a line to `events/<device-id>.jsonl`. The trick: each
+device writes its **own** file (named by its signing device id), so two peers
+never touch the same file — the log merges across machines with **zero
+conflicts**. Board files stay the source of truth; this is a purely additive
+trail to build history/undo on later. The log is a generic riftpipe-web
+primitive (`logEvent`/`readEvents`, live `riftpipe:event`): the library records
+remote merges and auth transitions, and `board.ts` logs `card.create`/`move`/
+`check`/`edit` and `comment.add` via `src/events.ts`. Nothing renders it yet.
 
 Why split prose (`card.md`) from structure (`meta.toml`): they sync differently
 under riftpipe — prose merges (text CRDT), scalars are last-writer-wins (rsync).

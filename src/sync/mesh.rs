@@ -7,7 +7,9 @@
 //!
 //! Mirrors `web/src/gossip.rs`'s `GossipTreeSync` behavior exactly:
 //! - received `Sync` → merge via the shared `Syncer`, persist, broadcast replies
-//! - `NeighborUp` → broadcast our whole tree (`full_state`) + a `Presence`
+//!   (on a restricted board content travels as epoch-`Sealed`; see `TreePeer`)
+//! - `NeighborUp` → trust log + epoch announces, our whole tree (`full_state`),
+//!   and a `Presence`
 //! - `NeighborDown` → drop the neighbor + re-broadcast `Presence`
 //! - local file change → `.md` as text CRDT, else LWW with a ms timestamp
 //!
@@ -16,7 +18,7 @@
 //! sync tasks. The push-decision and persist logic are the shared `TreePeer`
 //! methods, so link-sync and mesh-sync can't drift.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -31,19 +33,22 @@ use iroh_gossip::proto::TopicId;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, MissedTickBehavior};
 
-use riftpipe_core::sync::MeshMsg;
+use riftpipe_core::crypto::{topic_from_secret, MeshCipher};
+use riftpipe_core::sync::{
+    encode_mesh_frames, MeshAssembler, MeshMsg, PeerVersion, VersionMonitor, PROTOCOL_VERSION,
+};
 
 use crate::net::{anyerr, Result};
 use crate::sync::tree::{scan_files, TreePeer};
 
-/// The topic for a tree hosted by `host` — deterministic, so all peers
-/// (browser and native) agree. Identical to `web/src/gossip.rs::topic_of`.
-pub fn topic_of(host: EndpointId) -> TopicId {
-    TopicId::from_bytes(*host.as_bytes())
+/// The gossip topic for a board secret — `H(secret)`, so it's underivable
+/// without the share link. Identical to `web/src/gossip.rs::topic_of`.
+pub fn topic_of(secret: &[u8; 32]) -> TopicId {
+    TopicId::from_bytes(topic_from_secret(secret))
 }
 
 /// A joined gossip mesh for one shared tree: our endpoint (fresh identity),
-/// the spawned router, and the split topic handles.
+/// the spawned router, the split topic handles, and the frame cipher.
 pub struct MeshConn {
     endpoint: Endpoint,
     _router: Router,
@@ -51,14 +56,22 @@ pub struct MeshConn {
     sender: GossipSender,
     receiver: GossipReceiver,
     my_id: EndpointId,
+    /// The peer we bootstrapped off (`None` when we host the swarm) — kept so
+    /// a TOTAL neighbor loss can re-join it: hyparview heals only from its
+    /// passive view and never re-dials the original bootstrap on its own.
+    bootstrap: Option<EndpointId>,
+    /// Seals/opens every gossip frame with the key derived from the board
+    /// secret — the relay and non-holders see only ciphertext.
+    cipher: MeshCipher,
 }
 
 impl MeshConn {
-    /// Bind a fresh endpoint and subscribe to `host`'s topic. `bootstrap` is
-    /// the host's address (decoded from the browser's share-link ticket) for a
-    /// joiner, or `None` when WE start the swarm (the browser-host role — used
-    /// by the loopback test; the CLI is always a joiner in phase 1).
-    pub async fn join(host: Option<EndpointId>, bootstrap: Option<EndpointAddr>) -> Result<MeshConn> {
+    /// Bind a fresh endpoint and subscribe to the board's topic (`H(secret)`).
+    /// `bootstrap` is the host's address (from the share-link ticket) for a
+    /// joiner, or `None` when WE start the swarm (the host role). The `secret`
+    /// both names the topic and keys the frame cipher, so only link-holders
+    /// find and can read the board.
+    pub async fn join(secret: [u8; 32], bootstrap: Option<EndpointAddr>) -> Result<MeshConn> {
         // Seed the bootstrap address so we can dial it without waiting on discovery.
         let lookup = MemoryLookup::new();
         let mut boot = Vec::new();
@@ -72,16 +85,30 @@ impl MeshConn {
             .await
             .map_err(anyerr)?;
         let my_id = endpoint.id();
+        // The library's 4 KiB frame limit stays at its default: big messages are
+        // chunked (`core::sync::encode_mesh_frames`) so no peer — however old —
+        // ever receives an over-limit frame.
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
             .spawn();
+        let bootstrap = boot.first().copied();
         let topic = gossip
-            .subscribe(topic_of(host.unwrap_or(my_id)), boot)
+            .subscribe(topic_of(&secret), boot)
             .await
             .map_err(anyerr)?;
         let (sender, receiver) = topic.split();
-        Ok(MeshConn { endpoint, _router: router, _gossip: gossip, sender, receiver, my_id })
+        let cipher = MeshCipher::from_secret(&secret);
+        Ok(MeshConn {
+            endpoint,
+            _router: router,
+            _gossip: gossip,
+            sender,
+            receiver,
+            my_id,
+            bootstrap,
+            cipher,
+        })
     }
 
     /// The underlying endpoint (for `online()` / address sharing in tests).
@@ -95,6 +122,7 @@ impl MeshConn {
 /// [`super::tree::run`]: one `select!` loop over watcher events (`rx`), gossip
 /// events, and — when `poll` is set because the watcher failed — a slow rescan.
 pub async fn join_and_run(
+    secret: [u8; 32],
     host_addr: EndpointAddr,
     dir: &Path,
     peer: &mut TreePeer,
@@ -102,8 +130,8 @@ pub async fn join_and_run(
     poll: bool,
 ) -> Result<()> {
     let host_id = host_addr.id;
-    let conn = MeshConn::join(Some(host_id), Some(host_addr)).await?;
-    eprintln!("[mesh] joined topic of host {} as {}", host_id, conn.my_id);
+    let conn = MeshConn::join(secret, Some(host_addr)).await?;
+    eprintln!("[mesh] joined board (host {}) as {} — sealed", host_id, conn.my_id);
     run(conn, dir, peer, rx, poll).await
 }
 
@@ -118,24 +146,92 @@ pub async fn run(
     // Keep the endpoint/router/gossip alive for the whole loop: a host must keep
     // its Router listening on GOSSIP_ALPN to accept joiners (a bare `..` would
     // drop them here). Underscore-named bindings live to end of scope.
-    let MeshConn { endpoint: _endpoint, _router, _gossip, sender, mut receiver, my_id } = conn;
+    let MeshConn {
+        endpoint: _endpoint,
+        _router,
+        _gossip,
+        sender,
+        mut receiver,
+        my_id,
+        bootstrap,
+        cipher,
+    } = conn;
     let my_id_bytes = *my_id.as_bytes();
-    let mut neighbors: BTreeSet<[u8; 32]> = BTreeSet::new();
     // The gossiped routing map `id -> [neighbors]` (kept for parity with the
-    // browser's debug map; phase 2 will surface it).
+    // browser's debug map; phase 2 will surface it). Our own entry is sourced
+    // from `receiver.neighbors()` — the library's authoritative set.
     let mut routing: BTreeMap<[u8; 32], Vec<[u8; 32]>> = BTreeMap::new();
 
     let mut rescan = interval(Duration::from_secs(2));
     rescan.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut rx_open = true;
 
-    // Broadcast one message; mesh sends are best-effort (a lagging swarm must
-    // not kill the session — convergence is repaired by the next catch-up).
-    async fn broadcast(sender: &GossipSender, gm: &MeshMsg) {
-        if let Ok(b) = postcard::to_allocvec(gm) {
-            let _ = sender.broadcast(b.into()).await;
+    // Files that predate the session must be in the syncer BEFORE any
+    // NeighborUp, or the full_state() catch-up broadcasts an empty tree
+    // (the browser host primes OPFS the same way).
+    peer.seed(dir);
+    // A restricted founder mints epoch 1 here. The announces stay in the book
+    // and reach peers through the `NeighborUp` catch-up.
+    let _ = peer.startup();
+
+    // A failed send must not kill the session (convergence is repaired by the
+    // next catch-up), but it must be VISIBLE — a silently dropped broadcast
+    // reads as "synced" when it isn't. Big messages go out as chunk frames,
+    // and every frame is AEAD-sealed so only link-holders can read/inject.
+    async fn broadcast(sender: &GossipSender, cipher: &MeshCipher, gm: &MeshMsg) {
+        for b in encode_mesh_frames(gm) {
+            let sealed = cipher.seal(&b);
+            let n = sealed.len();
+            if let Err(e) = sender.broadcast(sealed.into()).await {
+                eprintln!("[mesh] broadcast of {n} bytes failed: {e}");
+            }
         }
     }
+
+    /// Direct-neighbor-only send for the `NeighborUp` catch-up: the newcomer is
+    /// (or is about to be) a direct neighbor, so flooding the whole swarm with
+    /// our full tree on every join is pure waste — the epidemic layer spreads
+    /// anything the rest actually lacks via the normal reply path.
+    async fn broadcast_neighbors(sender: &GossipSender, cipher: &MeshCipher, gm: &MeshMsg) {
+        for b in encode_mesh_frames(gm) {
+            let sealed = cipher.seal(&b);
+            let n = sealed.len();
+            if let Err(e) = sender.broadcast_neighbors(sealed.into()).await {
+                eprintln!("[mesh] neighbor broadcast of {n} bytes failed: {e}");
+            }
+        }
+    }
+
+    // Reassembles incoming chunk frames into whole messages.
+    let mut assembler = MeshAssembler::new();
+    // Flags peers whose announced protocol version differs (or who never
+    // announce — pre-versioning peers). One stable stderr line per peer, so
+    // scripts (and the npm wrapper) can parse it.
+    let mut versions = VersionMonitor::new();
+    fn report_mismatch(p: &PeerVersion) {
+        let hex: String = p.id.iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!(
+            "[mesh] protocol-mismatch peer={hex} theirs={} ours={PROTOCOL_VERSION} — \
+             sync with that peer may be incomplete",
+            p.proto,
+        );
+    }
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+    // A quiet mesh may only ever see ONE presence from a pre-versioning peer —
+    // this tick fires the grace-expiry path.
+    let mut version_tick = interval(Duration::from_secs(5));
+    version_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // Live admin commands (`riftpipe revoke|grant <dir> <id>`), polled from the
+    // control dotfile once a second.
+    let mut control = crate::sync::control::Control::open(dir);
+    let mut control_tick = interval(Duration::from_secs(1));
+    control_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -154,7 +250,11 @@ pub async fn run(
                 }
                 for p in batch {
                     if let Some(msg) = peer.local_change(&p, dir) {
-                        broadcast(&sender, &MeshMsg::Sync(msg)).await;
+                        // Signed when this peer has an identity, else a plain Sync;
+                        // sealed on a restricted board (`None` until we hold a key).
+                        if let Some(mm) = peer.sign_local(msg) {
+                            broadcast(&sender, &cipher, &mm).await;
+                        }
                     }
                 }
             }
@@ -164,7 +264,27 @@ pub async fn run(
                 scan_files(dir, &mut files);
                 for p in files {
                     if let Some(msg) = peer.local_change(&p, dir) {
-                        broadcast(&sender, &MeshMsg::Sync(msg)).await;
+                        if let Some(mm) = peer.sign_local(msg) {
+                            broadcast(&sender, &cipher, &mm).await;
+                        }
+                    }
+                }
+            }
+            // Grace expiry for announcement-less (pre-versioning) peers.
+            _ = version_tick.tick() => {
+                for p in versions.tick(now_ms()) {
+                    report_mismatch(&p);
+                }
+            }
+            // Live admin commands from `riftpipe revoke|grant <dir> <id>`.
+            _ = control_tick.tick() => {
+                for cmd in control.poll() {
+                    let out = match cmd {
+                        crate::sync::control::Command::Revoke(id) => peer.revoke_device(id, dir),
+                        crate::sync::control::Command::Grant(id) => peer.grant_device(id, dir),
+                    };
+                    for m in out {
+                        broadcast(&sender, &cipher, &m).await;
                     }
                 }
             }
@@ -179,36 +299,99 @@ pub async fn run(
                 };
                 match ev {
                     Event::Received(m) => {
-                        let Ok(gm) = postcard::from_bytes::<MeshMsg>(&m.content) else { continue };
+                        // Open the sealed frame (an outsider's or a corrupt frame
+                        // won't decrypt — drop it). Then plain frames pass through
+                        // and chunk frames buffer until whole.
+                        let Some(plain) = cipher.open(&m.content) else { continue };
+                        let Some(gm) = assembler.feed(&plain) else { continue };
                         match gm {
-                            MeshMsg::Sync(msg) => {
-                                // `apply_and_persist` prints SYNCED:{path} on persist.
-                                for reply in peer.apply_and_persist(msg, dir) {
-                                    broadcast(&sender, &MeshMsg::Sync(reply)).await;
+                            MeshMsg::Presence { id, neighbors } => {
+                                if id != my_id_bytes {
+                                    if let Some(p) = versions.on_presence(id, now_ms()) {
+                                        report_mismatch(&p);
+                                    }
+                                }
+                                routing.insert(id, neighbors);
+                            }
+                            MeshMsg::Version { id, proto } => {
+                                if id != my_id_bytes {
+                                    if let Some(p) = versions.on_version(id, proto) {
+                                        report_mismatch(&p);
+                                    }
                                 }
                             }
-                            MeshMsg::Presence { id, neighbors } => {
-                                routing.insert(id, neighbors);
+                            // feed() never yields a Chunk (it refuses nesting).
+                            MeshMsg::Chunk { .. } => {}
+                            // Sync / SignedSync / Trust / Request / Epoch / Sealed —
+                            // auth-aware apply (`authorize_and_apply` opens sealed
+                            // content, enforces signing, verifies, persists, prints
+                            // SYNCED:{path}, and runs epoch housekeeping). Replies
+                            // come back already wrapped for the wire.
+                            other => {
+                                for reply in peer.authorize_and_apply(other, dir) {
+                                    broadcast(&sender, &cipher, &reply).await;
+                                }
                             }
                         }
                     }
                     Event::NeighborUp(id) => {
                         eprintln!("[mesh] neighbor up: {id}");
-                        neighbors.insert(*id.as_bytes());
-                        // Catch the new neighbor up with our whole tree.
-                        for msg in peer.full_state() {
-                            broadcast(&sender, &MeshMsg::Sync(msg)).await;
+                        // Announce our protocol version BEFORE the Presence —
+                        // that ordering is what lets peers deduce "Presence
+                        // but no Version = pre-versioning peer".
+                        broadcast(
+                            &sender,
+                            &cipher,
+                            &MeshMsg::Version { id: my_id_bytes, proto: PROTOCOL_VERSION },
+                        )
+                        .await;
+                        // Catch the new neighbor up: first the trust log and the
+                        // epoch announces (so it learns the authorized set and
+                        // any wrapped keys — gossip is ephemeral), then our whole
+                        // tree. Direct neighbors only.
+                        for m in peer.auth_catchup() {
+                            broadcast_neighbors(&sender, &cipher, &m).await;
                         }
-                        let list: Vec<[u8; 32]> = neighbors.iter().copied().collect();
+                        // A restricted peer without the current key asks the
+                        // WHOLE swarm: the Admin who can wrap it may not be a
+                        // direct neighbor.
+                        if let Some(r) = peer.read_request() {
+                            broadcast(&sender, &cipher, &r).await;
+                        }
+                        for msg in peer.full_state() {
+                            if let Some(mm) = peer.sign_mesh(msg) {
+                                broadcast_neighbors(&sender, &cipher, &mm).await;
+                            }
+                        }
+                        let list: Vec<[u8; 32]> =
+                            receiver.neighbors().map(|n| *n.as_bytes()).collect();
                         routing.insert(my_id_bytes, list.clone());
-                        broadcast(&sender, &MeshMsg::Presence { id: my_id_bytes, neighbors: list }).await;
+                        broadcast(&sender, &cipher, &MeshMsg::Presence { id: my_id_bytes, neighbors: list }).await;
                     }
                     Event::NeighborDown(id) => {
                         eprintln!("[mesh] neighbor down: {id}");
-                        neighbors.remove(id.as_bytes());
-                        let list: Vec<[u8; 32]> = neighbors.iter().copied().collect();
+                        let list: Vec<[u8; 32]> =
+                            receiver.neighbors().map(|n| *n.as_bytes()).collect();
+                        // Total neighbor loss: hyparview refills only from its
+                        // passive view — it never re-dials the original
+                        // bootstrap. We still hold its address (MemoryLookup),
+                        // so ask the swarm to re-join it.
+                        if list.is_empty() {
+                            if let Some(b) = bootstrap {
+                                eprintln!("[mesh] all neighbors lost — re-joining bootstrap {b}");
+                                if let Err(e) = sender.join_peers(vec![b]).await {
+                                    eprintln!("[mesh] re-join failed: {e}");
+                                }
+                            }
+                        }
                         routing.insert(my_id_bytes, list.clone());
-                        broadcast(&sender, &MeshMsg::Presence { id: my_id_bytes, neighbors: list }).await;
+                        broadcast(
+                            &sender,
+                            &cipher,
+                            &MeshMsg::Version { id: my_id_bytes, proto: PROTOCOL_VERSION },
+                        )
+                        .await;
+                        broadcast(&sender, &cipher, &MeshMsg::Presence { id: my_id_bytes, neighbors: list }).await;
                     }
                     Event::Lagged => {}
                 }

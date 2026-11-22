@@ -301,6 +301,10 @@ impl SyncStrategy for RsyncSyncer {
         self.version = patch.version;
         Some(rebuilt)
     }
+
+    fn fingerprint(&self) -> [u8; 32] {
+        content_hash(&self.current)
+    }
 }
 
 #[cfg(test)]
@@ -457,5 +461,12 @@ mod tests {
         fn merge_peek(&self) -> Vec<u8> {
             self.current.clone()
         }
+    }
+
+    #[test]
+    fn fingerprint_is_the_content_hash() {
+        let mut a = RsyncSyncer::new("a");
+        a.observe(b"abc");
+        assert_eq!(a.fingerprint(), content_hash(b"abc"));
     }
 }

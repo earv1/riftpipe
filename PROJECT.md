@@ -16,8 +16,11 @@ riftpipe.io/.sh available. "Open a rift, pipe through it.")
 
 ## Repo / branch state
 - GitHub: **https://github.com/earv1/riftpipe** (public).
-- Current work: branch **`serverless-browser-kanban`** — browser kanban over the
-  gossip mesh, plus the July 2026 restructure/review series (see `What's done`).
+- Current work: branch **`epoch-seal`** (off `protocol-versioning`, off
+  `origin/main`, which already has the `serverless-browser-kanban` work) —
+  protocol versioning, mesh sealing, signed writes + trust log, the browser
+  claim/request-to-join flow, the generic file API, the synced event log, and
+  now epoch-sealed content + read revocation (see `What's done`).
 - **Guardrail:** a hook blocks committing/pushing to `main` (and any command
   containing the word "main") — the user pushes branches and merges PRs. Claude
   does not commit on `main`; current work is left in the working tree.
@@ -35,8 +38,9 @@ CLI (all generic — no app verbs, see `agent.md`):
 `riftpipe connect <connection-id> <dir> [--signal ws://…]` (tree sync with a
 core-protocol peer, e.g. a browser board) ·
 `riftpipe serve <dir> [--port]` (generic static host + SSE change events) ·
-`riftpipe signal [--port]`. The kanban app has **no server** — its API runs
-in-page as wasm; `riftpipe serve` hosts the static bundle.
+`riftpipe signal [--port]`. The kanban app has **no server** — its board
+domain is TypeScript in the page over riftpipe's wasm file API;
+`riftpipe serve` hosts the static bundle.
 
 nvim bridge (session-local, no install):
 ```sh
@@ -46,10 +50,12 @@ RIFTPIPE_BIN=./target/debug/riftpipe RIFTPIPE_ARGS="share /path/file --pipe" \
 
 ## Module map
 Crates: `core/` (riftpipe-core: pure, wasm-safe — text CRDT, tree sync
-protocol, wal frames), `src/` (native binary), `web/` (riftpipe-web:
-app-generic wasm/browser — WebRTC/iroh links, gossip mesh, `opfs`, `tree_sync`;
-workspace-excluded), `projects/kanban/wasm/` (kanban-wasm: the app's board
-format + OPFS handler; links riftpipe-web into the one app bundle). See
+protocol, wal frames, crypto/identity/keywrap/onboard/passkey), `src/`
+(native binary), `web/` (riftpipe-web: app-generic wasm/browser — WebRTC/iroh
+links, gossip mesh, `opfs`, `tree_sync`, the `file` API, the `events` log;
+workspace-excluded), `projects/kanban/wasm/` (kanban-wasm: a thin passthrough
+that links riftpipe-web into the one app bundle — no kanban Rust; the board
+domain is TypeScript in `projects/kanban/src/board.ts`). See
 `docs/architecture.md` for the diagram.
 
 src/:
@@ -63,16 +69,15 @@ src/:
   (file-mirror loop), folder (multiplexed reconnecting folder session), tree
   (the riftpipe_core::sync file-tree driver — wire-compatible with browser peers)
   - `strategy` — the `SyncStrategy` adapter trait + `Kind` (the Strategy seam, DESIGN §17)
-  - `algo/`  — concrete algorithms: text_crdt (real), rsync (real), wal/image
-    (adapter stubs; wal's core primitive is `riftpipe_core::wal`), sqlite
-    (real + tested, not yet wired into `Kind`)
+  - `algo/`  — concrete algorithms: text_crdt, rsync, wal (real; wal's core
+    primitive is `riftpipe_core::wal`), lww_record (per-key LWW), image (stub)
   - `backing` — where bytes live: FileBacking vs MemoryBacking + MemoryRegistry (§17.5)
   - `manifest`/`workspace` — riftpipe.toml glob→Kind rules; a folder of resources
 - `monitor/` — metrics (one-line status to a file for tmux; connection-kind detection), process (the in-memory `process` sidecar: size+hash for all RAM resources, §17.6)
 - `app/`   — generic runnables: host (static dir hosting + SSE change events —
   `riftpipe serve`, also consumable as a library) and signal (WebSocket
-  signaling relay). No app servers anywhere: the kanban app's API is the wasm
-  payload in the page.
+  signaling relay). No app servers anywhere: the kanban app's backend is its
+  TypeScript domain over the wasm file API, in the page.
 
 ## What's done
 - **Folder sync — CLI-wired (DESIGN §17, local on `main`):** `share <dir>` /
@@ -107,6 +112,27 @@ src/:
   `kanban-server` crate) — the wasm payload is the backend;
   `docs/architecture.md` with validated mermaid diagrams; `agent.md` with the
   durable working rules.
+- **Protocol + security series** (branch `protocol-versioning`, July 2026):
+  protocol version announcements (`PROTOCOL_VERSION`, mismatch surfaced on
+  stderr / `riftpipe:protocol-mismatch`); mesh sealing (secret-derived topic +
+  AEAD frames); signed writes + trust-log enforcement (`--restricted`,
+  `--grant`, `device-id`); `core::keywrap`/`onboard`/`passkey` lib backends;
+  the browser on signed boards with a **claim / request-to-join / approve** UI
+  (`MeshMsg::Request`). Then **"filify the API"**: the wasm bundle is a
+  generic file library (`readFile`/`writeFile`/`listDir`,
+  `riftpipe:file-changed`), the kanban domain moved to TypeScript
+  (`board.ts`/`fs.ts`) and `kanban-wasm`'s `format`/`handler` Rust was
+  deleted; plus a generic synced **event log** (`logEvent`/`readEvents`,
+  `events/<device-id>.jsonl`, `riftpipe:event`). Details:
+  `docs/planned/roadmap.md` §Security and items 8/17.
+- **Epoch-key mesh seal** (branch `epoch-seal`, July 2026): restricted/claimed
+  boards now seal content under a rotating epoch key (`core::epoch`,
+  `PROTOCOL_VERSION` 4) — read revocation by rotation, not just write-revoke.
+  `riftpipe revoke|grant <dir> <device-id>` drives it live on a running CLI
+  peer; the kanban owner gets a members list with "Remove". E2E:
+  `run-epoch-revoke.sh` (native), `run-browser-auth.sh` /
+  `e2e/epoch-revoke.mjs` (browser). Details: `docs/planned/roadmap.md`
+  §Security.
 
 ## Planned (design docs)
 - **P2P kanban — files as the database** — see [`docs/planned/`](docs/planned/).
@@ -117,7 +143,8 @@ src/:
   **stable**; column (incl. `archived`) is a **field** in `meta.toml` (path = sync
   identity, so cards don't move between folders). The app composes with generic
   riftpipe verbs (`riftpipe connect`, `riftpipe serve`) — there is no server,
-  the wasm payload handles the API in-page; vim plugin + any markdown editor
+  the page's TypeScript (`board.ts`) reads/writes the files via the wasm file
+  API; vim plugin + any markdown editor
   are interchangeable views. **No new sync engine, no native deps** — mostly wiring
   + UI. SQLite/cr-sqlite was considered and set aside (see
   `docs/planned/db-sync.md`).
@@ -133,14 +160,22 @@ Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
    (today `--memory` is all-or-nothing).
 4. **Phase 2 nvim bridge** — granular `on_bytes` edits (DESIGN §15/§16).
 5. Robustness: rsync v1 caveat (Copy references advertiser's blocks — stale-basis
-   reconstruction is rejected by hash + retried; consider basis-pinning); folder
-   deletes aren't synced yet (only creates/edits).
+   reconstruction is rejected by hash + retried; consider basis-pinning).
+   Folder deletes now sync (tombstones, edit-wins, `.riftpipe-folder-index`) —
+   see `docs/planned/roadmap.md` §Smaller ("Folder deletes sync");
+   browser/kanban (`sync::tree`/`sync::mesh`) deletes are the remaining
+   follow-up there ("tree/mesh (browser) deletes").
 6. **Architecture/hygiene backlog** — see `docs/planned/roadmap.md` §"Architecture
-   / hygiene": ~~get kanban out of `riftpipe-core`/`web/`~~ (*done:* the
-   `kanban-wasm` crate under `projects/kanban/wasm/` owns format + handler;
-   the riftpipe crates are app-generic), one wire protocol (folder vs tree),
-   `connect` over iroh + negotiation, track `web/Cargo.lock`, retire the
-   signaling deploy path, de-flake the real-relay test.
+   / hygiene": all items done (kanban out of the riftpipe crates — and, since
+   "filify", no kanban Rust at all; one wire protocol; `connect` over iroh +
+   negotiation; `web/Cargo.lock` tracked; signaling demoted; real-relay test
+   de-flaked).
+7. ~~**Auth follow-through**~~ (roadmap §Security) — *done:* the mesh seal now
+   runs on epoch keys, read revocation by rotation, and
+   `riftpipe revoke|grant <dir> <id>` on the native CLI (see `What's done`).
+   Remaining: the WebAuthn browser ceremony.
+8. **History view** — render `readEvents()` (the event log is produced but
+   nothing displays it yet).
 Older/parallel: file-mirror reconnection;
 verify connect-anywhere on real networks (§14.1); domain + landing.
 

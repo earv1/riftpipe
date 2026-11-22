@@ -14,20 +14,24 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
@@ -35,6 +39,13 @@ use crate::net::{anyerr, Counters, Link, Result};
 
 /// Label for the single data channel a session uses.
 const CHANNEL_LABEL: &str = "riftpipe";
+
+/// ICE liveness timeouts (webrtc-rs defaults: 5 s disconnected / 25 s failed /
+/// 2 s keepalive). Tighter, so a vanished peer drives the connection to
+/// `Failed` — and the link to EOF — within seconds instead of half a minute.
+const ICE_DISCONNECTED: Duration = Duration::from_secs(3);
+const ICE_FAILED: Duration = Duration::from_secs(7);
+const ICE_KEEPALIVE: Duration = Duration::from_secs(1);
 
 /// Signaling exchanged over the iroh link to broker the WebRTC channel.
 #[derive(Serialize, Deserialize)]
@@ -53,6 +64,7 @@ pub struct WebrtcLink {
     _pc: Arc<RTCPeerConnection>,
     dc: Arc<RTCDataChannel>,
     inbound: mpsc::Receiver<Vec<u8>>,
+    closed: watch::Receiver<bool>,
 }
 
 #[async_trait]
@@ -63,9 +75,9 @@ impl Link for WebrtcLink {
     }
 
     async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
-        // `None` once the channel closes and the queue drains — a clean EOF, same
-        // contract as the iroh link.
-        Ok(self.inbound.recv().await)
+        // `None` once the channel closes (or the connection fails) and the queue
+        // drains — a clean EOF, same contract as the iroh link.
+        Ok(recv_or_closed(&mut self.inbound, &mut self.closed).await)
     }
 
     async fn done(&mut self) -> Result<()> {
@@ -88,6 +100,7 @@ impl WebrtcLink {
             WebrtcSource {
                 _pc: self._pc,
                 inbound: self.inbound,
+                closed: self.closed,
                 counters,
             },
         )
@@ -105,6 +118,7 @@ pub struct WebrtcSink {
 pub struct WebrtcSource {
     _pc: Arc<RTCPeerConnection>,
     inbound: mpsc::Receiver<Vec<u8>>,
+    closed: watch::Receiver<bool>,
     counters: Arc<Counters>,
 }
 
@@ -126,7 +140,7 @@ impl crate::net::Sink for WebrtcSink {
 #[async_trait::async_trait]
 impl crate::net::Source for WebrtcSource {
     async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
-        let msg = self.inbound.recv().await;
+        let msg = recv_or_closed(&mut self.inbound, &mut self.closed).await;
         if let Some(b) = &msg {
             self.counters.recv.fetch_add(b.len() as u64, Ordering::Relaxed);
         }
@@ -169,8 +183,11 @@ fn ice_servers() -> Vec<RTCIceServer> {
 /// This exercises the worst-case (symmetric/CGNAT) path on a single machine.
 async fn new_peer_connection() -> Result<Arc<RTCPeerConnection>> {
     use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
+    let mut se = SettingEngine::default();
+    se.set_ice_timeouts(Some(ICE_DISCONNECTED), Some(ICE_FAILED), Some(ICE_KEEPALIVE));
     let api = APIBuilder::new()
         .with_media_engine(MediaEngine::default())
+        .with_setting_engine(se)
         .build();
     let config = RTCConfiguration {
         ice_servers: ice_servers(),
@@ -185,15 +202,49 @@ async fn new_peer_connection() -> Result<Arc<RTCPeerConnection>> {
     Ok(Arc::new(pc))
 }
 
+/// "This link is dead" latch: set by the data channel's `on_close` (wired in
+/// `wire_channel`) and by the peer connection reaching Failed/Closed. Needed
+/// because the inbound queue's senders live in the channel's `on_message`
+/// closure, which the channel keeps alive — so the queue alone never closes.
+fn closed_latch(pc: &Arc<RTCPeerConnection>) -> (Arc<watch::Sender<bool>>, watch::Receiver<bool>) {
+    let (tx, rx) = watch::channel(false);
+    let tx = Arc::new(tx);
+    let tx_pc = tx.clone();
+    pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+        if matches!(s, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
+            tx_pc.send_replace(true);
+        }
+        Box::pin(async {})
+    }));
+    (tx, rx)
+}
+
+/// Next inbound message; `None` once the link is dead and the queue is drained.
+async fn recv_or_closed(
+    inbound: &mut mpsc::Receiver<Vec<u8>>,
+    closed: &mut watch::Receiver<bool>,
+) -> Option<Vec<u8>> {
+    tokio::select! {
+        biased;
+        m = inbound.recv() => m,
+        _ = closed.wait_for(|c| *c) => inbound.try_recv().ok(),
+    }
+}
+
 /// Wire a data channel's callbacks: `on_message` → inbound queue, `on_open` →
-/// deliver the (now usable) channel through `ready`. Both senders are `mpsc`
-/// (clonable), so this works whether called directly (offerer) or inside the
-/// `on_data_channel` `FnMut` (answerer).
+/// deliver the (now usable) channel through `ready`, `on_close` → set the
+/// `closed` latch. The senders are clonable, so this works whether called
+/// directly (offerer) or inside the `on_data_channel` `FnMut` (answerer).
 fn wire_channel(
     dc: &Arc<RTCDataChannel>,
     inbound: mpsc::Sender<Vec<u8>>,
     ready: mpsc::Sender<Arc<RTCDataChannel>>,
+    closed: Arc<watch::Sender<bool>>,
 ) {
+    dc.on_close(Box::new(move || {
+        closed.send_replace(true);
+        Box::pin(async {})
+    }));
     let dc_for_open = dc.clone();
     dc.on_open(Box::new(move || {
         let ready = ready.clone();
@@ -215,6 +266,7 @@ fn wire_channel(
 /// peer offers. Returns once the data channel is open.
 pub async fn upgrade_to_webrtc(link: &mut dyn Link, we_offer: bool) -> Result<WebrtcLink> {
     let pc = new_peer_connection().await?;
+    let (closed_tx, closed_rx) = closed_latch(&pc);
     let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(256);
     let (ready_tx, mut ready_rx) = mpsc::channel::<Arc<RTCDataChannel>>(1);
 
@@ -223,7 +275,7 @@ pub async fn upgrade_to_webrtc(link: &mut dyn Link, we_offer: bool) -> Result<We
             .create_data_channel(CHANNEL_LABEL, None)
             .await
             .map_err(anyerr)?;
-        wire_channel(&dc, in_tx, ready_tx);
+        wire_channel(&dc, in_tx, ready_tx, closed_tx.clone());
 
         let offer = pc.create_offer(None).await.map_err(anyerr)?;
         pc.set_local_description(offer).await.map_err(anyerr)?;
@@ -245,11 +297,13 @@ pub async fn upgrade_to_webrtc(link: &mut dyn Link, we_offer: bool) -> Result<We
         // The channel arrives via `on_data_channel`; wire it as it appears.
         let in_tx2 = in_tx.clone();
         let ready_tx2 = ready_tx.clone();
+        let closed2 = closed_tx.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let inbound = in_tx2.clone();
             let ready = ready_tx2.clone();
+            let closed = closed2.clone();
             Box::pin(async move {
-                wire_channel(&dc, inbound, ready);
+                wire_channel(&dc, inbound, ready, closed);
             })
         }));
 
@@ -278,6 +332,7 @@ pub async fn upgrade_to_webrtc(link: &mut dyn Link, we_offer: bool) -> Result<We
         _pc: pc,
         dc,
         inbound: in_rx,
+        closed: closed_rx,
     })
 }
 
@@ -346,12 +401,13 @@ pub async fn connect_via_signaling(ws_url: &str, room: &str) -> Result<WebrtcLin
     };
 
     let pc = new_peer_connection().await?;
+    let (closed_tx, closed_rx) = closed_latch(&pc);
     let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(256);
     let (ready_tx, mut ready_rx) = mpsc::channel::<Arc<RTCDataChannel>>(1);
 
     if we_offer {
         let dc = pc.create_data_channel(CHANNEL_LABEL, None).await.map_err(anyerr)?;
-        wire_channel(&dc, in_tx, ready_tx);
+        wire_channel(&dc, in_tx, ready_tx, closed_tx.clone());
         let offer = pc.create_offer(None).await.map_err(anyerr)?;
         pc.set_local_description(offer).await.map_err(anyerr)?;
         wait_for_ice(&pc).await;
@@ -364,11 +420,13 @@ pub async fn connect_via_signaling(ws_url: &str, room: &str) -> Result<WebrtcLin
     } else {
         let in_tx2 = in_tx.clone();
         let ready_tx2 = ready_tx.clone();
+        let closed2 = closed_tx.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let inbound = in_tx2.clone();
             let ready = ready_tx2.clone();
+            let closed = closed2.clone();
             Box::pin(async move {
-                wire_channel(&dc, inbound, ready);
+                wire_channel(&dc, inbound, ready, closed);
             })
         }));
         let offer = recv_sdp_ws(&mut read).await?;
@@ -383,7 +441,7 @@ pub async fn connect_via_signaling(ws_url: &str, room: &str) -> Result<WebrtcLin
     }
 
     let dc = ready_rx.recv().await.ok_or_else(|| anyerr("webrtc: data channel never opened"))?;
-    Ok(WebrtcLink { _pc: pc, dc, inbound: in_rx })
+    Ok(WebrtcLink { _pc: pc, dc, inbound: in_rx, closed: closed_rx })
 }
 
 async fn recv_sdp_ws<S>(read: &mut S) -> Result<String>
@@ -431,5 +489,36 @@ mod tests {
         // And the other direction.
         lb.send(b"reply".to_vec()).await.unwrap();
         assert_eq!(la.recv().await.unwrap().unwrap(), b"reply");
+    }
+
+    /// Closing the data channel must surface as EOF (`Ok(None)`) on both ends,
+    /// not leave `recv` hanging on a queue whose senders the channel keeps alive.
+    ///
+    /// This covers the `on_close` half of the latch only. The other half — the
+    /// peer connection reaching `Failed` after ICE consent stops (a vanished
+    /// peer) — isn't loopback-testable: both peers live in this process on
+    /// host candidates, and there's no hook to silently black-hole one side's
+    /// UDP, so `Failed` can't be provoked deterministically. Folder mode's
+    /// recv-idle timeout (`sync::folder::RECV_IDLE_TIMEOUT`, paused-time tests)
+    /// is the transport-agnostic backstop for that case.
+    #[tokio::test]
+    async fn closing_the_channel_ends_recv_on_both_ends() {
+        let (mut sa, mut sb) = mock_pair();
+        let (ra, rb) = tokio::join!(
+            upgrade_to_webrtc(&mut sa, true),
+            upgrade_to_webrtc(&mut sb, false),
+        );
+        let mut la = ra.expect("offerer established");
+        let mut lb = rb.expect("answerer established");
+
+        la.done().await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(10), la.recv()).await,
+            Ok(Ok(None))
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(10), lb.recv()).await,
+            Ok(Ok(None))
+        ));
     }
 }

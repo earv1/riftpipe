@@ -25,8 +25,16 @@ VER=$("$CHROME" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
 BUILD=$(echo "$VER" | cut -d. -f1-3)
 echo "Chrome $VER (build $BUILD)"
 
-# 2. Matching chromedriver, cached under .chromedriver/.
+# 2. Matching chromedriver, cached under .chromedriver/. A cached driver whose
+#    major version no longer matches Chrome (Chrome auto-updated) is replaced.
 DRIVER="$PWD/.chromedriver/chromedriver-$PLATFORM/chromedriver"
+if [ -x "$DRIVER" ]; then
+  CACHED_MAJOR=$("$DRIVER" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | cut -d. -f1)
+  if [ "$CACHED_MAJOR" != "$(echo "$VER" | cut -d. -f1)" ]; then
+    echo "cached chromedriver is v${CACHED_MAJOR:-?}, Chrome is v$(echo "$VER" | cut -d. -f1) — re-downloading"
+    rm -rf .chromedriver
+  fi
+fi
 if [ ! -x "$DRIVER" ]; then
   echo "fetching chromedriver for build $BUILD..."
   URL=$(curl -fsSL 'https://googlechromelabs.github.io/chrome-for-testing/latest-patch-versions-per-build-with-downloads.json' \

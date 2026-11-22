@@ -22,6 +22,8 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1", features = ["alloc"] }
+# Dedup id for replicated trust entries (wasm-clean; already transitive via core).
+blake3 = { version = "1", default-features = false }
 gloo-timers = { version = "0.3", features = ["futures"] }
 
 [dependencies.web-sys]
@@ -41,18 +43,25 @@ features = [
     "RtcIceGatheringState",
     "MessageEvent",
     "Event",
+    # console.warn for dropped/oversized mesh broadcasts
+    "console",
+    # the riftpipe:protocol-mismatch event any app can listen for
+    "CustomEvent",
+    "CustomEventInit",
     # WebSocket signaling (connection id in the URL → a room on the signal server).
     "WebSocket",
     "Location",
     # OPFS (Origin Private File System) — local, serverless persistence.
     "Window",
     "Storage",
+    "StorageEvent",
     "Navigator",
     "StorageManager",
     "FileSystemDirectoryHandle",
     "FileSystemFileHandle",
     "FileSystemGetFileOptions",
     "FileSystemGetDirectoryOptions",
+    "FileSystemRemoveOptions",
     "FileSystemWritableFileStream",
     "WritableStream",
     "File",

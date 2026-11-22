@@ -36,6 +36,10 @@ webrtc = "0.17.1"
 #   similar        — Myers diff for snapshot -> ops (DESIGN.md §3)
 #   ratatui + crossterm — TTY repaint mode (DESIGN.md §4)
 
+[dev-dependencies]
+# `test-util` = paused virtual time for deterministic timeout tests.
+tokio = { version = "1.52.3", features = ["test-util"] }
+
 [[bin]]
 name = "riftpipe"
 path = "src/main.rs"

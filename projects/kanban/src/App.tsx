@@ -1,6 +1,6 @@
 import { createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, connectPeer, newBoard, onLocalChange, onSiblingChange, storageSupported, type Card } from "./api.ts";
+import { getBoard, addCard, patchCard, connectPeer, newBoard, watch, storageSupported, auth, type AuthState, type PendingRequest, type Member, type Card } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 
 export function App() {
@@ -16,6 +16,28 @@ export function App() {
   // OPFS failed at runtime (e.g. WebKit without working storage) — the board
   // is view-only and nothing persists; say so instead of spinning forever.
   const [storageBroken, setStorageBroken] = createSignal(false);
+  // Auth/login state (from the lib): whether the board is locked (has an
+  // author), and whether this device is the author / authorized to write.
+  const [authState, setAuthState] = createSignal<AuthState>(
+    { locked: false, device: "", authorized: false, isAuthor: false, author: "", requested: false, canRead: true, epoch: 0 },
+  );
+  // The author's inbox: who has asked for write access (device id + safety code).
+  const [pending, setPending] = createSignal<PendingRequest[]>([]);
+  // Every authorized device (restricted boards): lets the owner remove one.
+  const [members, setMembers] = createSignal<Member[]>([]);
+  const refreshAuth = () => {
+    setAuthState(auth.state());
+    setPending(auth.pending());
+    setMembers(auth.members());
+  };
+  const lock = () => { auth.lockBoard(); refreshAuth(); };
+  const askForAccess = () => { auth.requestAccess(); refreshAuth(); };
+  const approve = (device: string) => { auth.grantDevice(device); refreshAuth(); };
+  const revoke = (device: string) => { auth.revokeDevice(device); refreshAuth(); };
+
+  // A mesh peer announced a different riftpipe protocol version (or predates
+  // versioning). Detection lives in the library; we only render its event.
+  const [versionMismatch, setVersionMismatch] = createSignal<{ theirs: number; ours: number } | null>(null);
   // Drag-and-drop: which card is being dragged, and which column is hovered.
   const [draggedId, setDraggedId] = createSignal<string | null>(null);
   const [dragOverCol, setDragOverCol] = createSignal<string | null>(null);
@@ -44,19 +66,20 @@ export function App() {
   };
 
   onMount(() => {
-    // A local mutation (our own add/move/edit) refreshes the board too — no SSE.
-    onLocalChange(() => void refresh());
-    // Another tab in this browser profile edited the shared OPFS board.
-    onSiblingChange(() => void refresh());
+    // One subscription for every change to the synced tree — our own edits, a
+    // peer's merged edit, or another tab in this profile. All funnel through the
+    // file API's `watch`; each re-reads the board. The event log lives under
+    // events/ and doesn't affect the board view, so skip those. No SSE, no server.
+    watch((path) => { if (!path.startsWith("events/")) void refresh(); });
 
-    // Connect P2P when the URL carries a connection id / ticket; refresh on each
-    // peer edit merged into local OPFS. No id => single-player, no server.
+    // Connect P2P when the URL carries a connection id / ticket. No id =>
+    // single-player, no server. Merges arrive via `watch` above.
     let lastHash: string | null = null; // null => never connected (empty hash is valid)
     const connect = async () => {
       if (location.hash === lastHash) return; // e.g. the host writing its own ticket
       lastHash = location.hash;
       try {
-        await connectPeer(() => void refresh());
+        await connectPeer();
       } catch (_e) {
         // no peer / signaling unavailable — runs fine solo
       }
@@ -66,10 +89,25 @@ export function App() {
     (async () => {
       await refresh();
       await connect();
+      refreshAuth();
     })();
+
+    // Poll the lib's auth state — it changes as the board is locked or as
+    // grants/genesis arrive from peers over the mesh.
+    setInterval(refreshAuth, 2000);
 
     // Pasting a share link into this tab changes the hash — reconnect to it.
     window.addEventListener("hashchange", () => void connect());
+
+    // The library fires this when a peer speaks a different protocol version.
+    window.addEventListener("riftpipe:protocol-mismatch", (e) => {
+      try {
+        const d = JSON.parse((e as CustomEvent<string>).detail);
+        setVersionMismatch({ theirs: d.theirs, ours: d.ours });
+      } catch (_e) {
+        setVersionMismatch({ theirs: -1, ours: -1 });
+      }
+    });
   });
 
   const cardsIn = (col: string): Card[] =>
@@ -101,6 +139,16 @@ export function App() {
           won't be saved or synced.
         </div>
       </Show>
+      <Show when={versionMismatch()}>
+        {(m) => (
+          <div class="version-warning">
+            A connected peer runs a different riftpipe version
+            {m().theirs >= 0 ? ` (theirs v${m().theirs}, yours v${m().ours})` : ""} —
+            sync with it may be incomplete. Everyone should reload or update to
+            the same version.
+          </div>
+        )}
+      </Show>
       <header class="topbar">
         <h1>{board.title}</h1>
         <button
@@ -119,6 +167,68 @@ export function App() {
           New board
         </button>
       </header>
+      <div class="auth-bar">
+        <Show when={!authState().locked}>
+          <button
+            class="lock-btn"
+            title="Become this board's owner — only you (and people you approve) can read or edit"
+            onClick={lock}
+          >
+            🔓 Claim board (you become the owner)
+          </button>
+          <span class="auth-hint">anyone with the link can edit until you claim it</span>
+        </Show>
+        <Show when={authState().locked && authState().isAuthor}>
+          <span class="auth-status owner">🔒 You own this board</span>
+          <Show
+            when={pending().length > 0}
+            fallback={<span class="auth-hint">no access requests — people who ask will show up here</span>}
+          >
+            <span class="auth-hint">access requests:</span>
+            <For each={pending()}>
+              {(req) => (
+                <span class="req">
+                  <span class="req-id" title={`device ${req.device}\nsafety code ${req.safety}`}>
+                    {req.name || "someone"} · {req.device.slice(0, 8)}… · {req.safety}
+                  </span>
+                  <button class="approve-btn" onClick={() => approve(req.device)}>Approve</button>
+                </span>
+              )}
+            </For>
+          </Show>
+          <Show when={members().some((m) => !m.me)}>
+            <span class="auth-hint">members:</span>
+            <For each={members().filter((m) => !m.me)}>
+              {(m) => (
+                <span class="member">
+                  <span class="req-id" title={`device ${m.device}`}>{m.device.slice(0, 8)}… · {m.role}</span>
+                  <Show when={!m.founder}>
+                    <button class="revoke-btn" title="Remove this device — it can't read anything new" onClick={() => revoke(m.device)}>Remove</button>
+                  </Show>
+                </span>
+              )}
+            </For>
+          </Show>
+        </Show>
+        <Show when={authState().locked && authState().authorized && !authState().isAuthor && authState().canRead}>
+          <span class="auth-status editor">🔒 Claimed · you can edit</span>
+        </Show>
+        <Show when={authState().locked && authState().authorized && !authState().isAuthor && !authState().canRead}>
+          <span class="auth-status pending-key">🔒 Claimed · approved — waiting for the board key</span>
+        </Show>
+        <Show when={authState().locked && !authState().authorized}>
+          <span class="auth-status no-access">🔒 Claimed · no access</span>
+          <Show
+            when={!authState().requested}
+            fallback={<span class="auth-hint">✓ access requested — waiting for the owner to approve</span>}
+          >
+            <button class="ask-btn" onClick={askForAccess}>Ask to join</button>
+          </Show>
+        </Show>
+        <span class="device-id" title="this browser's device id">
+          id: {authState().device.slice(0, 10)}…
+        </span>
+      </div>
       <main class="columns">
         <For each={board.columns}>
           {(col) => (

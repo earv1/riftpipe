@@ -1,0 +1,109 @@
+// The consolidated riftpipe security model — architecture + user flows.
+// Element kinds are declared project-wide in security.likec4.
+// Rendered by `npm run diagrams`; embedded in docs/security/*.md.
+//
+// Two capabilities run through everything:
+//   READ  = holding the current content (epoch) key — from the link (open
+//           modes) or wrapped to your key (restricted mode).
+//   WRITE = accepted changes — gated by epoch-key possession (open-editor,
+//           today's model) OR by a trust-log signature (member mode).
+
+model {
+  participant = actor 'Member' {
+    description 'A board participant (a person, across their devices). Holds a per-client signing + encryption key.'
+  }
+  joiner = actor 'Newcomer' {
+    description 'Has the link (or wants in) but is not yet an authorized member.'
+  }
+  boardadmin = actor 'Admin' {
+    description 'A member whose trust-log role is Admin: may grant, revoke, approve, rotate, and set general access.'
+  }
+  n0relay = system 'n0 relay / discovery' {
+    description 'Routes QUIC and gossip; sees connection metadata and only sealed ciphertext.'
+  }
+
+  board = system 'Board' {
+    invite = artifact 'Share link' {
+      description 'URL fragment = secret (+ host address). Blinds the topic (H(secret)) and is the READ capability in open modes.'
+    }
+    accessmode = component 'General access setting' {
+      description 'Admin-signed: Restricted | Anyone-with-link Viewer | Anyone-with-link Editor. The Google-Docs-style dial.'
+    }
+    trustlog = component 'Trust log' {
+      description 'Append-only signed device/member set + roles (Admin/Member), rooted at a self-signed genesis. Governs WRITE authority + membership.'
+    }
+    clientkeys = component 'Per-client keys' {
+      description 'Each client: an Ed25519 signing key (write authority / identity) + an X25519 encryption key (a wrap target).'
+    }
+    epochkeys = component 'Epoch keys' {
+      description 'The symmetric content key. Rotated on revoke; each epoch wrapped to every authorized client key. The READ capability.'
+    }
+    gossipmesh = component 'Sealed gossip mesh' {
+      description 'topic = H(secret); every frame AEAD-sealed under the current epoch key. P2P over iroh — no server in the data path.'
+    }
+  }
+
+  // --- Architecture (structural) relationships ---
+  participant -> board.clientkeys 'holds a per-client keypair'
+  boardadmin -> board.accessmode 'sets the access mode'
+  boardadmin -> board.trustlog 'grant / revoke / approve'
+  board.invite -> board.gossipmesh 'topic = H(secret): find + join the mesh'
+  board.invite -> board.epochkeys 'unlocks the read key (open modes / epoch 1)'
+  board.accessmode -> board.trustlog 'decides whether writes need a trust-log signature'
+  board.clientkeys -> board.trustlog 'signing key = the authorized-writer identity'
+  board.trustlog -> board.epochkeys 'authorized set = who each epoch is wrapped to'
+  board.clientkeys -> board.epochkeys 'encryption key = wrap target for read access'
+  board.epochkeys -> board.gossipmesh 'content sealed under the current epoch key'
+  board.gossipmesh -> n0relay 'transits as ciphertext'
+}
+
+views {
+  view security_architecture {
+    title 'Security architecture: two capabilities (read via the link/wrap, write via the trust log)'
+    include participant, joiner, boardadmin, n0relay, board, board.*
+    autoLayout TopBottom
+  }
+
+  dynamic view flow_create {
+    title 'Create a board'
+    boardadmin -> board.clientkeys 'device generates its keypair'
+    boardadmin -> board.trustlog 'self-sign genesis (founder = Admin)'
+    boardadmin -> board.epochkeys 'mint epoch 1 + board secret'
+    boardadmin -> board.accessmode 'choose general access (default: Restricted)'
+    boardadmin -> board.invite 'get the share link'
+  }
+
+  dynamic view flow_open_link {
+    title 'Anyone-with-link opens the board (open modes)'
+    joiner -> board.invite 'opens the share link'
+    board.invite -> board.gossipmesh 'derive topic, join the sealed mesh'
+    board.invite -> board.epochkeys 'derive the read key → decrypt content'
+    joiner -> board.gossipmesh 'reads (Viewer); writes too if Editor'
+  }
+
+  dynamic view flow_request_access {
+    title 'Request to join (Restricted mode — Google-Docs style)'
+    joiner -> board.invite 'opens link → onto the mesh, no access yet'
+    joiner -> board.trustlog 'broadcast a signed join request (+ name/note)'
+    boardadmin -> board.trustlog 'approve: sign a Grant (role)'
+    boardadmin -> board.epochkeys 'wrap the current epoch key to the newcomer'
+    board.epochkeys -> joiner 'newcomer unwraps → can now read (+ write per role)'
+  }
+
+  dynamic view flow_link_device {
+    title 'Link your own device (co-present, high assurance)'
+    participant -> board.clientkeys 'new device generates its keypair'
+    participant -> boardadmin 'show pubkey out-of-band (QR / short code)'
+    boardadmin -> board.trustlog 'confirm + sign a Grant for the new device'
+    boardadmin -> board.epochkeys 'wrap the current epoch key to the new device'
+    board.epochkeys -> participant 'new device unwraps → fully joined'
+  }
+
+  dynamic view flow_revoke {
+    title 'Revoke a member (write + read)'
+    boardadmin -> board.trustlog 'sign a Revoke — future writes rejected everywhere'
+    boardadmin -> board.epochkeys 'rotate: mint a new epoch key'
+    boardadmin -> board.clientkeys 'wrap the new epoch to the REMAINING clients only'
+    board.epochkeys -> board.gossipmesh 'new content sealed under the new epoch — revoked party is blind'
+  }
+}

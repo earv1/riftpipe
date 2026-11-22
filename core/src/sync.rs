@@ -18,11 +18,61 @@ use serde::{Deserialize, Serialize};
 
 use crate::text::EgWalkerText;
 
+/// THE text-vs-LWW classification: `.md` files merge as text CRDTs, everything
+/// else as whole-file LWW. Single-sourced here because every peer must agree —
+/// the same path riding both channels (one peer pushing text deltas, another
+/// LWW) gives two conflicting merge semantics for one file. Native drivers,
+/// the browser's priming, and the browser's live-push entry all call this;
+/// apps never pick a channel themselves.
+pub fn is_text_path(path: &str) -> bool {
+    path.ends_with(".md")
+}
+
+/// The riftpipe wire-protocol version, announced to peers so a mismatch can
+/// be SURFACED (a warning in the app / on stderr) instead of silently
+/// degrading. Bump on any protocol change worth telling users about.
+/// v0 is implicit — peers that predate versioning never announce (detected
+/// via [`VersionMonitor::on_presence`]). v1: the strategy channel
+/// (`StratAdvert`/`StratDelta`), mesh chunking, and version announcements.
+/// v2: mesh security (`crypto`) — topic = `H(secret)` and AEAD-sealed frames;
+/// a v2 board's topic differs from v1's, so v1/v2 peers land on different
+/// topics and simply don't meet (changing the rendezvous is inherent to
+/// blinding it), rather than meeting and mismatching.
+/// v3: device-linking auth wire types — `MeshMsg::Trust` (replicated trust log)
+/// and `MeshMsg::SignedSync` (signed writes). Both APPENDED, so an open-mode
+/// board stays wire-compatible; enforcement is opt-in per board.
+/// v4: two APPENDED additions, one bump. (a) Epoch-sealed content for
+/// restricted boards — `MeshMsg::Epoch` (admin-signed wrapped epoch keys) and
+/// `MeshMsg::Sealed` (content under the current epoch key); open boards are
+/// wire-identical. (b) Folder-mode deletes — `SyncMsg::StratDelete` (a v3
+/// folder peer skips it and keeps deleted files). The bump surfaces both.
+pub const PROTOCOL_VERSION: u32 = 4;
+
+/// Per-chunk payload budget for [`encode_mesh_frames`]. iroh-gossip's message
+/// limit defaults to 4096 bytes and is enforced on SEND AND RECEIVE — so
+/// rather than raising it (which would make every already-deployed peer error
+/// on receiving a bigger frame, forcing reloads), we keep EVERY frame under
+/// the default and split big messages into [`MeshMsg::Chunk`]s. A peer that
+/// predates chunking skips the unknown variant cleanly — it just misses big
+/// files, exactly as it always did. 3800 leaves room for the chunk envelope
+/// (postcard varints + id) and the gossip header inside 4096.
+pub const MESH_CHUNK_PAYLOAD: usize = 3800;
+/// Reassembly cap: reject a `total` beyond this (~15 MiB) so a bogus header
+/// can't balloon memory.
+const MESH_MAX_CHUNKS: u32 = 4096;
+/// Concurrent in-flight reassemblies per peer; oldest is evicted beyond this.
+const MESH_ASSEMBLY_SLOTS: usize = 32;
+
 /// A compact per-document state vector: `(agent, seq)` tips (usually one or two).
 type Vv = Vec<(String, usize)>;
 /// A document's origin (root op id) — the reliable "same document?" identity.
 type Origin = Option<(String, usize)>;
 
+/// WIRE COMPAT: postcard encodes by variant index, so variant order and field
+/// shapes are load-bearing — deployed peers already speak this layout. New
+/// variants may only be APPENDED (an old peer fails to decode an unknown index
+/// and skips the message — every driver already does); existing variants must
+/// never change shape or position. Guarded by `wire_compat` tests below.
 #[derive(Serialize, Deserialize)]
 pub enum SyncMsg {
     /// Connect handshake: "here are the version vectors of the text docs I have,
@@ -39,6 +89,35 @@ pub enum SyncMsg {
     Resync { path: String },
     /// A whole-file last-writer-wins update; newest version wins.
     Lww { path: String, version: u64, bytes: Vec<u8> },
+    /// The generic **strategy channel** (folder mode's multi-algorithm sync —
+    /// rsync, wal-db, lww-record, …): an advertisement of what the sender holds
+    /// for `path`, as the resource's algorithm encodes it (`sv` is opaque —
+    /// a version vector, block checksums, a WAL watermark). `reply: true` asks
+    /// the peer to advertise back (sent on connect, local change, heartbeat);
+    /// `reply: false` is that answer, so the exchange can't ping-pong forever.
+    /// [`Syncer`] ignores these — the workspace/strategy layer drives them.
+    StratAdvert { path: String, sv: Vec<u8>, reply: bool },
+    /// A strategy-channel delta for `path`, opaque to the wire: whatever the
+    /// resource's algorithm `merge`s (rsync token stream, WAL frames, …).
+    StratDelta { path: String, bytes: Vec<u8> },
+    /// "I speak protocol `proto`" — sent alongside the connect handshake so
+    /// the driver can warn when the peer's version differs. [`Syncer`]
+    /// ignores it; drivers intercept.
+    Version { proto: u32 },
+    /// Folder-mode **tombstone** on the strategy channel: "I deleted `path`".
+    /// `ids` name the deletion(s) this tombstone stands for (oldest first;
+    /// carried unchanged by every peer that adopts the tombstone, merged when
+    /// two peers delete independently), so a peer that has since RE-CREATED
+    /// the file can recognize — and reject — an old deletion: it keeps the file
+    /// if ANY id is one it overrode. Receivers ignore ids beyond a small cap.
+    /// `seen` is the
+    /// deleter's recent content fingerprints (blake3-32 of what each replica
+    /// materializes, oldest first): a peer applies the delete only if its own
+    /// current fingerprint is one the deleter had already seen; otherwise it
+    /// holds a concurrent edit, which wins (it answers with a self-contained
+    /// `StratDelta` and the deleter resurrects the file). [`Syncer`] ignores it.
+    /// APPENDED (wire index 7): peers that predate it skip it cleanly.
+    StratDelete { path: String, ids: Vec<u64>, seen: Vec<[u8; 32]> },
 }
 
 /// What travels over a gossip-mesh topic: tree [`SyncMsg`]s plus periodic
@@ -54,6 +133,247 @@ pub enum MeshMsg {
     Sync(SyncMsg),
     /// "I am `id`, directly connected to `neighbors`." Aggregated into the map.
     Presence { id: [u8; 32], neighbors: Vec<[u8; 32]> },
+    /// One piece of a message too big for a single gossip frame (the library
+    /// caps frames at 4 KiB): `bytes` is `chunk_index`'th slice of an encoded
+    /// `MeshMsg` split by [`encode_mesh_frames`]; [`MeshAssembler`] reassembles.
+    /// `id` is a content hash, so a re-broadcast reuses the same reassembly
+    /// slot. APPENDED variant: peers that predate it skip it cleanly.
+    Chunk { id: u64, index: u32, total: u32, bytes: Vec<u8> },
+    /// "Peer `id` speaks protocol `proto`" — broadcast right BEFORE every
+    /// `Presence`, so a `Presence` from a peer that never announced marks a
+    /// pre-versioning (v0) peer. Fed to [`VersionMonitor`]; drivers surface
+    /// what it flags.
+    Version { id: [u8; 32], proto: u32 },
+    /// A signed trust-log entry (device-linking auth) — broadcast so every peer
+    /// converges on the authorized device set. Fed to
+    /// [`identity::TrustLog`](crate::identity::TrustLog). APPENDED: peers that
+    /// predate auth skip it cleanly.
+    Trust(crate::identity::TrustEntry),
+    /// A **signed** tree write: the payload is a postcard-encoded [`SyncMsg`]
+    /// signed by its author (device-linking auth). A driver enforcing signing
+    /// verifies it against the trust log before applying; an open-mode peer that
+    /// predates auth skips the unknown variant. APPENDED.
+    SignedSync(crate::identity::SignedWrite),
+    /// A signed **request to join** a locked board, broadcast by a would-be
+    /// writer (the Google-Docs "request access" flow). An admin peer collects it
+    /// and — on approval — replies with a `Trust` grant. Self-authenticating via
+    /// its signature; peers that predate it skip the unknown variant. APPENDED.
+    Request(crate::onboard::JoinRequest),
+    /// An Admin-signed epoch announcement carrying wrapped epoch keys (restricted
+    /// boards). APPENDED (v4): older peers skip it.
+    Epoch(crate::epoch::EpochAnnounce),
+    /// Content (`Sync`/`SignedSync`) sealed under an epoch key — only devices
+    /// wrapped into that epoch can open it. APPENDED (v4).
+    Sealed(crate::epoch::SealedMsg),
+}
+
+/// FNV-1a 64-bit — a tiny, dependency-free content hash for chunk ids. Not
+/// cryptographic; a collision only merges two identical-id reassemblies, and
+/// the resulting decode failure is dropped like any corrupt frame.
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
+/// Encode `msg` as ready-to-broadcast gossip frames: one plain frame when it
+/// fits the per-frame budget, else a series of [`MeshMsg::Chunk`]s. Every
+/// returned frame stays under iroh-gossip's 4 KiB default, so no peer — however
+/// old — ever receives an over-limit frame.
+pub fn encode_mesh_frames(msg: &MeshMsg) -> Vec<Vec<u8>> {
+    let Ok(encoded) = postcard::to_allocvec(msg) else { return Vec::new() };
+    if encoded.len() <= MESH_CHUNK_PAYLOAD {
+        return vec![encoded];
+    }
+    let id = fnv64(&encoded);
+    let total = encoded.len().div_ceil(MESH_CHUNK_PAYLOAD) as u32;
+    encoded
+        .chunks(MESH_CHUNK_PAYLOAD)
+        .enumerate()
+        .filter_map(|(index, part)| {
+            postcard::to_allocvec(&MeshMsg::Chunk {
+                id,
+                index: index as u32,
+                total,
+                bytes: part.to_vec(),
+            })
+            .ok()
+        })
+        .collect()
+}
+
+/// One in-flight chunked message being reassembled.
+struct Assembly {
+    total: u32,
+    parts: Vec<Option<Vec<u8>>>,
+    received: u32,
+}
+
+/// Turns incoming gossip frames back into [`MeshMsg`]s: plain messages pass
+/// straight through; [`MeshMsg::Chunk`]s are buffered per content id and the
+/// whole message is returned when the last piece lands. Bounded: at most
+/// [`MESH_ASSEMBLY_SLOTS`] concurrent reassemblies (oldest evicted — gossip is
+/// best-effort, the catch-up paths repair a dropped message) and a `total` cap
+/// so a bogus header can't balloon memory.
+#[derive(Default)]
+pub struct MeshAssembler {
+    slots: HashMap<u64, Assembly>,
+    /// Insertion order for eviction (ids, oldest first).
+    order: Vec<u64>,
+}
+
+impl MeshAssembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one received frame; returns a complete message if this frame
+    /// finished one (or WAS one). Undecodable frames return `None`.
+    pub fn feed(&mut self, frame: &[u8]) -> Option<MeshMsg> {
+        let msg = postcard::from_bytes::<MeshMsg>(frame).ok()?;
+        let MeshMsg::Chunk { id, index, total, bytes } = msg else {
+            return Some(msg);
+        };
+        if total == 0 || total > MESH_MAX_CHUNKS || index >= total {
+            return None;
+        }
+        if !self.slots.contains_key(&id) {
+            if self.order.len() >= MESH_ASSEMBLY_SLOTS {
+                let evict = self.order.remove(0);
+                self.slots.remove(&evict);
+            }
+            self.order.push(id);
+            self.slots
+                .insert(id, Assembly { total, parts: vec![None; total as usize], received: 0 });
+        }
+        let slot = self.slots.get_mut(&id)?;
+        if slot.total != total {
+            return None; // id collision with a different shape — drop
+        }
+        if slot.parts[index as usize].is_none() {
+            slot.parts[index as usize] = Some(bytes);
+            slot.received += 1;
+        }
+        if slot.received < slot.total {
+            return None;
+        }
+        let assembly = self.slots.remove(&id)?;
+        self.order.retain(|x| *x != id);
+        let whole: Vec<u8> = assembly.parts.into_iter().flatten().flatten().collect();
+        match postcard::from_bytes::<MeshMsg>(&whole).ok()? {
+            // A chunked chunk is nonsense — refuse the recursion.
+            MeshMsg::Chunk { .. } => None,
+            inner => Some(inner),
+        }
+    }
+}
+
+/// One peer's announced protocol version (0 = never announced, i.e. a peer
+/// that predates versioning).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerVersion {
+    pub id: [u8; 32],
+    pub proto: u32,
+}
+
+/// How long a peer may go announcement-less after its first `Presence` before
+/// it is deemed pre-versioning (v0). Long enough that a reordered
+/// Version/Presence pair can't false-flag; short enough to surface promptly.
+pub const VERSION_GRACE_MS: u64 = 10_000;
+
+/// Tracks peers' announced protocol versions and flags mismatches — shared by
+/// the native and browser mesh drivers so the detection logic can't drift.
+/// Pure state, no I/O or clock: callers pass a millisecond `now` and surface
+/// what this returns (stderr line, browser event). Detection:
+///   * a [`MeshMsg::Version`] announcing `proto != PROTOCOL_VERSION` flags
+///     immediately;
+///   * version-aware peers announce right BEFORE every `Presence`, so a peer
+///     whose `Presence` arrives with no announcement on record is suspect —
+///     flagged v0 on a SECOND bare presence (one gap tolerates gossip
+///     reordering), or when [`VERSION_GRACE_MS`] passes without an
+///     announcement (a quiet two-peer mesh may only ever see one presence) —
+///     the driver calls [`tick`](Self::tick) periodically for that.
+/// Each peer is flagged at most once.
+#[derive(Default)]
+pub struct VersionMonitor {
+    /// Announced versions, per peer.
+    versions: HashMap<[u8; 32], u32>,
+    /// Peers seen via `Presence` only: (first-seen ms, presence count).
+    presence_only: HashMap<[u8; 32], (u64, u8)>,
+    /// Peers already reported — flag once.
+    flagged: HashSet<[u8; 32]>,
+}
+
+impl VersionMonitor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an announcement. Returns the peer the FIRST time it proves
+    /// mismatched, for the driver to surface.
+    pub fn on_version(&mut self, id: [u8; 32], proto: u32) -> Option<PeerVersion> {
+        self.presence_only.remove(&id);
+        self.versions.insert(id, proto);
+        (proto != PROTOCOL_VERSION && self.flagged.insert(id)).then_some(PeerVersion { id, proto })
+    }
+
+    /// Record a `Presence` from `id` at `now` (ms). Returns the peer the first
+    /// time it is deemed pre-versioning (v0).
+    pub fn on_presence(&mut self, id: [u8; 32], now: u64) -> Option<PeerVersion> {
+        if self.versions.contains_key(&id) {
+            return None;
+        }
+        let (first, strikes) = self.presence_only.entry(id).or_insert((now, 0));
+        *strikes = strikes.saturating_add(1);
+        let overdue = now.saturating_sub(*first) >= VERSION_GRACE_MS;
+        ((*strikes >= 2 || overdue) && self.flagged.insert(id))
+            .then_some(PeerVersion { id, proto: 0 })
+    }
+
+    /// Flag every announcement-less peer whose grace expired by `now` (ms).
+    /// Drivers call this on a periodic tick so a quiet mesh still surfaces a
+    /// pre-versioning peer.
+    pub fn tick(&mut self, now: u64) -> Vec<PeerVersion> {
+        let overdue: Vec<[u8; 32]> = self
+            .presence_only
+            .iter()
+            .filter(|(id, (first, _))| {
+                now.saturating_sub(*first) >= VERSION_GRACE_MS && !self.flagged.contains(*id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        overdue
+            .into_iter()
+            .filter(|id| self.flagged.insert(*id))
+            .map(|id| PeerVersion { id, proto: 0 })
+            .collect()
+    }
+
+    /// Every peer with a known-or-deduced version (announced, or flagged v0).
+    /// Sorted by id for stable output.
+    pub fn peers(&self) -> Vec<PeerVersion> {
+        let mut v: Vec<PeerVersion> = self
+            .versions
+            .iter()
+            .map(|(id, proto)| PeerVersion { id: *id, proto: *proto })
+            .chain(
+                self.flagged
+                    .iter()
+                    .filter(|id| !self.versions.contains_key(*id))
+                    .map(|id| PeerVersion { id: *id, proto: 0 }),
+            )
+            .collect();
+        v.sort_by_key(|p| p.id);
+        v
+    }
+
+    /// The subset of [`peers`](Self::peers) whose version differs from ours.
+    pub fn mismatched(&self) -> Vec<PeerVersion> {
+        self.peers().into_iter().filter(|p| p.proto != PROTOCOL_VERSION).collect()
+    }
 }
 
 /// While awaiting a resync, re-ask only after this many further failed merges:
@@ -317,7 +637,371 @@ impl Syncer {
                     (None, Vec::new())
                 }
             }
+            // The strategy channel belongs to the workspace/strategy layer
+            // (folder mode), and version announcements to the driver; a
+            // text/LWW syncer has nothing to do with either.
+            SyncMsg::StratAdvert { .. }
+            | SyncMsg::StratDelta { .. }
+            | SyncMsg::StratDelete { .. }
+            | SyncMsg::Version { .. } => {
+                (None, Vec::new())
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_compat {
+    use super::*;
+
+    /// Postcard encodes an enum as a varint of its variant index, so the FIRST
+    /// byte of every encoded `SyncMsg` is its wire index (all eight fit in one
+    /// varint byte). Deployed peers already speak indexes 0–3 — this pins the
+    /// full table so a reorder/insertion fails loudly, not on live browsers.
+    #[test]
+    fn variant_indexes_are_pinned() {
+        let cases: Vec<(SyncMsg, u8)> = vec![
+            (SyncMsg::Hello { versions: vec![], lww_versions: vec![] }, 0),
+            (SyncMsg::TextDelta { path: "p".into(), ops: vec![], vv: vec![], origin: None }, 1),
+            (SyncMsg::Resync { path: "p".into() }, 2),
+            (SyncMsg::Lww { path: "p".into(), version: 1, bytes: vec![] }, 3),
+            (SyncMsg::StratAdvert { path: "p".into(), sv: vec![], reply: true }, 4),
+            (SyncMsg::StratDelta { path: "p".into(), bytes: vec![] }, 5),
+            (SyncMsg::Version { proto: 1 }, 6),
+            (SyncMsg::StratDelete { path: "p".into(), ids: vec![1], seen: vec![] }, 7),
+        ];
+        for (msg, index) in cases {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            assert_eq!(bytes[0], index, "variant index moved — deployed peers would misdecode");
+        }
+    }
+
+    /// An old peer (built before the strategy channel) decodes the appended
+    /// variants as an ERROR, not as garbage — and every driver skips messages
+    /// that fail to decode, so mixed-version meshes stay safe.
+    #[test]
+    fn legacy_decoder_rejects_appended_variants_cleanly() {
+        /// The wire enum exactly as deployed peers know it.
+        #[derive(serde::Deserialize)]
+        enum LegacySyncMsg {
+            #[allow(dead_code)]
+            Hello { versions: Vec<(String, Vv)>, lww_versions: Vec<(String, u64)> },
+            #[allow(dead_code)]
+            TextDelta { path: String, ops: Vec<u8>, vv: Vv, origin: Origin },
+            #[allow(dead_code)]
+            Resync { path: String },
+            #[allow(dead_code)]
+            Lww { path: String, version: u64, bytes: Vec<u8> },
+        }
+
+        let advert = SyncMsg::StratAdvert { path: "a.bin".into(), sv: vec![1, 2], reply: true };
+        let delta = SyncMsg::StratDelta { path: "a.bin".into(), bytes: vec![3] };
+        let del = SyncMsg::StratDelete { path: "a.bin".into(), ids: vec![9], seen: vec![[7u8; 32]] };
+        for msg in [advert, delta, del] {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            assert!(
+                postcard::from_bytes::<LegacySyncMsg>(&bytes).is_err(),
+                "legacy peers must reject (and thus skip) strategy-channel messages",
+            );
+        }
+        // And a legacy-shaped message still round-trips through the new enum.
+        let hello = postcard::to_allocvec(&SyncMsg::Hello { versions: vec![], lww_versions: vec![] }).unwrap();
+        assert!(matches!(
+            postcard::from_bytes::<SyncMsg>(&hello),
+            Ok(SyncMsg::Hello { .. })
+        ));
+    }
+
+    /// `StratDelete` round-trips its fields (path, ids, seen).
+    #[test]
+    fn strat_delete_round_trips() {
+        let msg = SyncMsg::StratDelete {
+            path: "d/x.bin".into(),
+            ids: vec![u64::MAX, 3],
+            seen: vec![[1; 32], [2; 32]],
+        };
+        let bytes = postcard::to_allocvec(&msg).unwrap();
+        match postcard::from_bytes::<SyncMsg>(&bytes).unwrap() {
+            SyncMsg::StratDelete { path, ids, seen } => {
+                assert_eq!(path, "d/x.bin");
+                assert_eq!(ids, vec![u64::MAX, 3]);
+                assert_eq!(seen, vec![[1; 32], [2; 32]]);
+            }
+            _ => panic!("expected StratDelete"),
+        }
+    }
+
+    /// Pin `MeshMsg`'s variant indexes too (Sync=0, Presence=1, Chunk=2) and
+    /// prove a pre-chunking peer skips `Chunk` frames cleanly — that's what
+    /// lets deployed browser tabs coexist with chunking peers, no reload.
+    #[test]
+    fn mesh_msg_indexes_pinned_and_legacy_peers_skip_chunks() {
+        use crate::identity::{DeviceKey, SignedWrite};
+        let k = DeviceKey::from_seed(&[5u8; 32]);
+        let cases: Vec<(MeshMsg, u8)> = vec![
+            (MeshMsg::Sync(SyncMsg::Resync { path: "p".into() }), 0),
+            (MeshMsg::Presence { id: [0; 32], neighbors: vec![] }, 1),
+            (MeshMsg::Chunk { id: 1, index: 0, total: 2, bytes: vec![9] }, 2),
+            (MeshMsg::Version { id: [0; 32], proto: 1 }, 3),
+            (MeshMsg::Trust(k.genesis()), 4),
+            (MeshMsg::SignedSync(SignedWrite { author: [0; 32], sig: vec![], payload: vec![] }), 5),
+            (MeshMsg::Request(crate::onboard::JoinRequest::create(&k, "x")), 6),
+            (MeshMsg::Epoch(crate::epoch::EpochAnnounce::create(&k, 1, [0; 8], vec![])), 7),
+            (MeshMsg::Sealed(crate::epoch::SealedMsg { seq: 1, id: [0; 8], body: vec![] }), 8),
+        ];
+        for (msg, index) in cases {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            assert_eq!(bytes[0], index, "MeshMsg variant index moved");
+        }
+
+        /// The mesh wire enum exactly as pre-chunking peers know it.
+        #[derive(serde::Deserialize)]
+        enum LegacyMeshMsg {
+            #[allow(dead_code)]
+            Sync(SyncMsg),
+            #[allow(dead_code)]
+            Presence { id: [u8; 32], neighbors: Vec<[u8; 32]> },
+        }
+        let chunk = MeshMsg::Chunk { id: 7, index: 0, total: 1, bytes: vec![1, 2] };
+        let version = MeshMsg::Version { id: [1; 32], proto: 1 };
+        let trust = MeshMsg::Trust(k.genesis());
+        let signed = MeshMsg::SignedSync(SignedWrite { author: [1; 32], sig: vec![1], payload: vec![2] });
+        for msg in [chunk, version, trust, signed] {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            assert!(
+                postcard::from_bytes::<LegacyMeshMsg>(&bytes).is_err(),
+                "legacy peers must reject (and thus skip) post-v0 frames",
+            );
+        }
+    }
+
+    /// A v3 peer (device-linking auth, no epoch support) rejects the APPENDED
+    /// `Epoch`/`Sealed` variants and skips them, rather than misdecoding.
+    #[test]
+    fn v3_peers_skip_epoch_and_sealed() {
+        use crate::identity::{DeviceKey, SignedWrite};
+        let k = DeviceKey::from_seed(&[6u8; 32]);
+
+        /// The mesh wire enum exactly as v3 peers know it.
+        #[derive(serde::Deserialize)]
+        enum LegacyV3MeshMsg {
+            #[allow(dead_code)]
+            Sync(SyncMsg),
+            #[allow(dead_code)]
+            Presence { id: [u8; 32], neighbors: Vec<[u8; 32]> },
+            #[allow(dead_code)]
+            Chunk { id: u64, index: u32, total: u32, bytes: Vec<u8> },
+            #[allow(dead_code)]
+            Version { id: [u8; 32], proto: u32 },
+            #[allow(dead_code)]
+            Trust(crate::identity::TrustEntry),
+            #[allow(dead_code)]
+            SignedSync(SignedWrite),
+            #[allow(dead_code)]
+            Request(crate::onboard::JoinRequest),
+        }
+
+        let epoch = MeshMsg::Epoch(crate::epoch::EpochAnnounce::create(&k, 1, [0; 8], vec![]));
+        let sealed = MeshMsg::Sealed(crate::epoch::SealedMsg { seq: 1, id: [0; 8], body: vec![1] });
+        for msg in [epoch, sealed] {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            assert!(
+                postcard::from_bytes::<LegacyV3MeshMsg>(&bytes).is_err(),
+                "v3 peers must reject (and thus skip) epoch-sealed frames",
+            );
+        }
+    }
+
+    /// The mismatch detector: an announced different version flags once;
+    /// presence-without-announcement flags v0 on the second strike OR after
+    /// the grace period; matching versions never flag; an announcement clears
+    /// suspicion.
+    #[test]
+    fn version_monitor_flags_mismatches_and_v0_peers() {
+        let mut m = VersionMonitor::new();
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+
+        // Matching version: never flagged.
+        assert!(m.on_version(a, PROTOCOL_VERSION).is_none());
+        assert!(m.on_presence(a, 0).is_none() && m.on_presence(a, 0).is_none());
+
+        // Different version: flagged exactly once.
+        assert_eq!(m.on_version(b, 99), Some(PeerVersion { id: b, proto: 99 }));
+        assert!(m.on_version(b, 99).is_none(), "flag once");
+
+        // Presence-only peer: first strike tolerated (reordering), second flags v0.
+        assert!(m.on_presence(c, 0).is_none());
+        assert_eq!(m.on_presence(c, 1), Some(PeerVersion { id: c, proto: 0 }));
+        assert!(m.on_presence(c, 2).is_none(), "flag once");
+
+        assert_eq!(
+            m.mismatched(),
+            vec![PeerVersion { id: b, proto: 99 }, PeerVersion { id: c, proto: 0 }],
+        );
+        assert_eq!(m.peers().len(), 3);
+
+        // A late announcement upgrades a suspect before the second strike.
+        let mut m2 = VersionMonitor::new();
+        assert!(m2.on_presence(a, 0).is_none());
+        assert!(m2.on_version(a, PROTOCOL_VERSION).is_none());
+        assert!(m2.on_presence(a, 1).is_none(), "announced peer never strikes");
+        assert!(m2.mismatched().is_empty());
+    }
+
+    /// A quiet two-peer mesh sees only ONE presence from an old host — the
+    /// grace tick must still flag it, and must not flag inside the grace.
+    #[test]
+    fn version_monitor_grace_tick_flags_quiet_v0_peer() {
+        let mut m = VersionMonitor::new();
+        let old = [7u8; 32];
+        assert!(m.on_presence(old, 1_000).is_none(), "single presence: not yet");
+        assert!(m.tick(1_000 + VERSION_GRACE_MS - 1).is_empty(), "inside grace");
+        assert_eq!(
+            m.tick(1_000 + VERSION_GRACE_MS),
+            vec![PeerVersion { id: old, proto: 0 }],
+            "grace expiry flags the quiet pre-versioning peer",
+        );
+        assert!(m.tick(1_000 + 2 * VERSION_GRACE_MS).is_empty(), "flag once");
+
+        // An announcement inside the grace prevents the flag entirely.
+        let mut m2 = VersionMonitor::new();
+        let new = [8u8; 32];
+        assert!(m2.on_presence(new, 1_000).is_none());
+        assert!(m2.on_version(new, PROTOCOL_VERSION).is_none());
+        assert!(m2.tick(1_000 + 2 * VERSION_GRACE_MS).is_empty(), "announced in time");
+    }
+
+    /// The text/LWW `Syncer` ignores the strategy channel: no persist, no reply.
+    #[test]
+    fn syncer_ignores_strategy_channel_messages() {
+        let mut s = Syncer::new("a");
+        s.local_text("note.md", "hi\n");
+        let (persist, replies) =
+            s.apply(SyncMsg::StratAdvert { path: "x.bin".into(), sv: vec![], reply: true });
+        assert!(persist.is_none() && replies.is_empty());
+        let (persist, replies) =
+            s.apply(SyncMsg::StratDelta { path: "x.bin".into(), bytes: vec![1] });
+        assert!(persist.is_none() && replies.is_empty());
+        let (persist, replies) =
+            s.apply(SyncMsg::StratDelete { path: "x.bin".into(), ids: vec![1], seen: vec![] });
+        assert!(persist.is_none() && replies.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod chunking {
+    use super::*;
+
+    fn big_sync_msg() -> MeshMsg {
+        // ~20 KiB of low-compressibility payload rides an Lww so the encoded
+        // frame decisively exceeds one chunk.
+        let mut bytes = Vec::with_capacity(20_000);
+        let mut x: u32 = 0x1234_5678;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            bytes.push((x >> 24) as u8);
+        }
+        MeshMsg::Sync(SyncMsg::Lww { path: "big.bin".into(), version: 9, bytes })
+    }
+
+    #[test]
+    fn small_messages_stay_plain_frames() {
+        let msg = MeshMsg::Sync(SyncMsg::Resync { path: "p".into() });
+        let frames = encode_mesh_frames(&msg);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], postcard::to_allocvec(&msg).unwrap(), "byte-identical to plain");
+        assert!(matches!(
+            MeshAssembler::new().feed(&frames[0]),
+            Some(MeshMsg::Sync(SyncMsg::Resync { .. }))
+        ));
+    }
+
+    #[test]
+    fn big_message_chunks_under_the_limit_and_reassembles() {
+        let msg = big_sync_msg();
+        let frames = encode_mesh_frames(&msg);
+        assert!(frames.len() > 1, "a 20 KiB message must chunk");
+        for f in &frames {
+            assert!(f.len() <= 4096, "every frame under iroh-gossip's default: {}", f.len());
+        }
+        let mut asm = MeshAssembler::new();
+        let mut out = None;
+        for f in &frames {
+            let got = asm.feed(f);
+            assert!(out.is_none() || got.is_none(), "completes exactly once");
+            out = out.or(got);
+        }
+        match out.expect("reassembled") {
+            MeshMsg::Sync(SyncMsg::Lww { path, version, bytes }) => {
+                assert_eq!((path.as_str(), version, bytes.len()), ("big.bin", 9, 20_000));
+            }
+            _ => panic!("wrong message out"),
+        }
+    }
+
+    #[test]
+    fn out_of_order_and_interleaved_senders_reassemble() {
+        let a = big_sync_msg();
+        let b = MeshMsg::Sync(SyncMsg::Lww {
+            path: "other.bin".into(),
+            version: 1,
+            bytes: vec![0xAB; 10_000],
+        });
+        let (mut fa, fb) = (encode_mesh_frames(&a), encode_mesh_frames(&b));
+        fa.reverse(); // out of order
+        let mut asm = MeshAssembler::new();
+        let mut done = 0;
+        // Interleave the two chunk streams.
+        let mut it_a = fa.iter();
+        let mut it_b = fb.iter();
+        loop {
+            let (na, nb) = (it_a.next(), it_b.next());
+            for f in [na, nb].into_iter().flatten() {
+                if asm.feed(f).is_some() {
+                    done += 1;
+                }
+            }
+            if na.is_none() && nb.is_none() {
+                break;
+            }
+        }
+        assert_eq!(done, 2, "both interleaved messages reassemble");
+    }
+
+    #[test]
+    fn duplicate_chunks_and_rebroadcasts_are_idempotent() {
+        let frames = encode_mesh_frames(&big_sync_msg());
+        let mut asm = MeshAssembler::new();
+        // Feed the first chunk twice, then the rest — still completes once.
+        assert!(asm.feed(&frames[0]).is_none());
+        assert!(asm.feed(&frames[0]).is_none());
+        let mut out = 0;
+        for f in &frames[1..] {
+            if asm.feed(f).is_some() {
+                out += 1;
+            }
+        }
+        assert_eq!(out, 1);
+        // A full re-broadcast (same content hash id) reassembles again fine.
+        let mut again = 0;
+        for f in &frames {
+            if asm.feed(f).is_some() {
+                again += 1;
+            }
+        }
+        assert_eq!(again, 1, "re-broadcast reuses the id and still completes");
+    }
+
+    #[test]
+    fn bogus_headers_and_junk_are_dropped() {
+        let mut asm = MeshAssembler::new();
+        assert!(asm.feed(b"\xff\xff\xff").is_none(), "junk frame");
+        let zero = MeshMsg::Chunk { id: 1, index: 0, total: 0, bytes: vec![] };
+        assert!(asm.feed(&postcard::to_allocvec(&zero).unwrap()).is_none(), "total=0");
+        let huge = MeshMsg::Chunk { id: 2, index: 0, total: u32::MAX, bytes: vec![1] };
+        assert!(asm.feed(&postcard::to_allocvec(&huge).unwrap()).is_none(), "total cap");
+        let oob = MeshMsg::Chunk { id: 3, index: 5, total: 2, bytes: vec![1] };
+        assert!(asm.feed(&postcard::to_allocvec(&oob).unwrap()).is_none(), "index >= total");
     }
 }
 

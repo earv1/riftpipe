@@ -21,6 +21,10 @@ use web_sys::{
     RtcSdpType, RtcSessionDescriptionInit,
 };
 
+/// The generic append-only event log exposed to JS (logEvent/readEvents).
+pub mod events;
+/// The generic file API exposed to JS (readFile/writeFile/listDir).
+pub mod file;
 pub mod gossip;
 pub mod iroh_link;
 /// OPFS file-tree helpers — local, serverless persistence.

@@ -77,11 +77,15 @@ sense to do it, not strict priority.
 
 ### Done
 
-- **Merge two independent boards** — peers prime their stored tree on connect
-  (`opfs::prime_all`) and the sync layer unions distinct files + resolves a
-  same-path file by origin (`core::sync`). Verified `run-iroh-merge.sh`: two
-  browsers each with their own card connect over iroh and both see both. Converges
-  for N peers (`three_independent_trees_converge`). *Remaining nits:* primed
+- **Peers of one board merge their stored trees** — peers prime their stored tree
+  on connect (`opfs::prime_all`) and the sync layer unions distinct files +
+  resolves a same-path file by origin (`core::sync`). Converges for N peers
+  (`three_independent_trees_converge`). **Browser trees are scoped per board**
+  (`.boards/<hex topic>/` in OPFS): opening another board's link no longer merges
+  this browser's other board into it — that primed a *claimed* board's files into
+  any board opened next, as plain Sync. Verified `run-board-isolation.sh` (was
+  `run-iroh-merge.sh`): a claimed board's card never reaches another board.
+  *Remaining nits:* primed
   `meta.toml` (LWW) uses wall-clock now() so a same-card meta conflict is racy
   (cards rarely collide); and pasting a share link into a **solo tab** reconnects
   best-effort via a `hashchange` listener. On reconnect we now tear down the prior
@@ -97,21 +101,41 @@ sense to do it, not strict priority.
 The restructure made the native binary fully generic (verbs: `share · join ·
 connect · serve · signal`; the tree-sync driver is `sync::tree`, generic
 static+SSE hosting is `app::host`), and the kanban servers were then removed
-entirely — the wasm payload is the app's backend. What remains:
+entirely — the app's backend runs in the page (since "filify": TypeScript
+over riftpipe's wasm file API). What remains:
 
-8. ~~Get kanban out of the riftpipe crates entirely~~ — *done.* The board file
-   format and the OPFS kanban handler now live in the `kanban-wasm` crate
-   (`projects/kanban/wasm/`, modules `format` + `handler`); `riftpipe-web` is
-   app-generic (links, gossip, `opfs` helpers, `tree_sync` — `BoardSync` is now
-   `TreeSync`, browser ALPN `riftpipe/tree/0`) and `riftpipe-core` is CRDT +
-   sync protocol + wal only. The app builds ONE bundle from `kanban-wasm`
-   (which links `riftpipe-web`, so both crates' wasm exports surface);
-   `api.ts`/e2e/`pages.yml` point at `projects/kanban/wasm/pkg`, and
-   `web/test-headless.sh` runs both crates' headless suites.
-9. **One wire protocol** — folder mode (`sync::folder` framing + `SyncStrategy`
-   seam) and tree/board sync (`core::sync` `SyncMsg`, browser-compatible) are
-   two protocols for overlapping jobs. Consolidating means folder mode adopting
-   the core protocol (or vice versa) without breaking browser peers.
+8. ~~Get kanban out of the riftpipe crates entirely~~ — *done, then taken
+   further ("filify the API").* `riftpipe-web` is app-generic (links, gossip,
+   `opfs` helpers, `tree_sync` — `BoardSync` is now `TreeSync`, browser ALPN
+   `riftpipe/tree/0`) and `riftpipe-core` is CRDT + sync protocol + wal only.
+   The browser bundle is now a generic **file library**: `web/src/file.rs`
+   exports `readFile`/`writeFile`/`listDir` over the synced OPFS tree
+   (`writeFile` persists *and* pushes, channel picked by `is_text_path`), and
+   a remote merge fires a per-path `riftpipe:file-changed` CustomEvent (the
+   API's `watch`). The kanban board domain — parsing/serializing `board.md`,
+   `meta.toml`, `card.md`, comments, card positions — is plain TypeScript
+   (`projects/kanban/src/board.ts` over the `fs.ts` file wrapper); the old
+   kanban-specific Rust (`format.rs` + `handler.rs`, the in-browser JSON
+   "server") is **deleted**. `kanban-wasm` (`projects/kanban/wasm/`) is a thin
+   passthrough that links `riftpipe-web` so its exports surface from the ONE
+   app bundle; `api.ts`/e2e/`pages.yml` point at `projects/kanban/wasm/pkg`.
+   On-disk layout is unchanged, so a board stays portable between the browser
+   and a `riftpipe connect` working copy.
+9. ~~One wire protocol~~ — *done.* Folder mode adopted the core protocol:
+   `core::sync::SyncMsg` gained two APPENDED variants — `StratAdvert { path,
+   sv, reply }` (unifying `SYNCREQ`/`SYNCREP`) and `StratDelta { path, bytes }`
+   — carrying the `SyncStrategy` seam's opaque payloads, and `sync::folder` now
+   speaks postcard-encoded `SyncMsg` like tree/mesh; the bespoke
+   `[path_len][path][tag]` framing is deleted. Wire-safe for deployed browsers:
+   variants were appended (old peers decode-fail and skip; every driver already
+   does), guarded by `core::sync::wire_compat` tests that pin all variant
+   indexes and prove a legacy 4-variant decoder rejects the new ones cleanly.
+   The text/LWW `Syncer` ignores strategy messages and folder sessions ignore
+   tree messages — one envelope, two dialects. Moving the strategy channel
+   into core is also the prerequisite for item 6's "browser peers speak WAL".
+   *Follow-up (not blocking):* folder-mode text resources still ride the
+   strategy channel rather than `TextDelta`; deep-merging them onto the tree
+   dialect would let a folder session and a browser peer share text docs.
 10. ~~`riftpipe connect` transport generalization~~ — *done, all three
     transports.* `connect <ticket>` dials native↔native over iroh (auth +
     negotiation + WebRTC upgrade); `connect --accept` mints the ticket and
@@ -133,29 +157,265 @@ entirely — the wasm payload is the app's backend. What remains:
 
 ## Smaller
 
-14. ~~"New board" UX~~ — *done:* a confirm-guarded topbar button wipes the
-    local OPFS board, drops the persisted iroh identity (new key ⇒ new topic
-    ⇒ fresh share ticket), clears the hash, and reloads as the host of an
-    empty board.
+14. ~~"New board" UX~~ — *done:* a confirm-guarded topbar button drops the
+    persisted iroh identity + board secret (new topic ⇒ fresh share ticket and
+    a fresh, empty per-board OPFS tree), clears the hash, and reloads as the
+    host of an empty board. The old board's files stay in its own tree.
 15. ~~Consolidate `opfs_root` helpers~~ — *done* (one `web/src/opfs.rs` module).
-16. **TypeScript-first glue (npm wrapper)** — frontend people shouldn't need
-    Rust to build on riftpipe. The seams are already language-agnostic (JSON
-    lines on stdio for `--pipe`, `SYNCED:` lines from `connect`, HTTP+SSE from
-    `host`, the wasm API in the browser); package them the esbuild/biome way:
-    an npm package that ships the prebuilt `riftpipe` binary and exposes a
-    typed TS API (spawn + typed protocol wrappers). `src/<entrypoint>.rs`
-    stays a ~350-line shell; all product glue can then live in TS.
+16. ~~TypeScript-first glue (npm wrapper)~~ — *done (local package; publishing
+    is release engineering for later).* `npm/`: zero-runtime-dependency
+    TypeScript package typing the language-agnostic seams — `PipeSession`
+    (the `--pipe` JSON-lines editor stream, `EditOp` typed as the wire's
+    serde shape), `TreeSession` (`connect`/`connect --accept`, `SYNCED:`
+    breadcrumbs as events, `ticket()` from the stderr banner), `Serve`
+    (spawn + readiness probe + typed SSE `/events` client). Binary resolution:
+    `$RIFTPIPE_BIN` → packaged `bin/` → enclosing cargo `target/{release,debug}`
+    → `$PATH` (the esbuild model — `npm/` mirrors its layout). e2e tests spawn
+    the real binary through the built `dist/` exports. Building the wrapper
+    ALSO surfaced and fixed a real `serve` bug: SSE frames were padded to
+    1200 bytes to defeat tiny_http's 1 KiB `BufWriter`, but the binding buffer
+    is `chunked_transfer`'s 8192-byte chunk (which only emits on overflow, not
+    exact fill) — events reached clients ~7 stale. Frames now pad to two
+    chunks so each event's data line is forced out by its own padding.
+
+- ~~Folder-mode dead-link detection is slow~~ (observed 2026-07-18 while
+  verifying the wire unification) — *done.* Both fix candidates landed:
+  `folder::session` now has a 15s recv-idle timeout
+  (`folder::RECV_IDLE_TIMEOUT`) that treats silence as a dead link even when
+  the transport never reports a close, and every heartbeat (5s) opens with a
+  `Version` frame so an idle-but-alive, empty workspace still proves it's
+  there. The WebRTC transport also now surfaces death directly: a data
+  channel's `on_close` and the peer connection reaching
+  Failed/Closed both latch recv to end in `None` (link EOF), and ICE
+  timeouts are tightened (disconnected 3s / failed 7s / keepalive 1s, down
+  from webrtc-rs's 5s/25s/2s defaults) so a vanished direct peer is detected
+  faster at the transport layer too.
+- **Folder deletes sync** — *done.* `riftpipe_core::sync::SyncMsg` gained an
+  APPENDED `StratDelete { path, ids, seen }` variant (wire index 7;
+  `PROTOCOL_VERSION` 3 → 4 — one bump shared with the epoch-key mesh seal —
+  since a pre-bump peer silently ignores deletes and keeps the files). A
+  file-backed resource that was materialized at least once and then goes missing from disk (watcher/poll scan, or a startup
+  index comparison after being offline) becomes a tombstone and sends
+  `StratDelete`. Delete-vs-concurrent-edit is judged by content via
+  `SyncStrategy::fingerprint()` (blake3 of what a replica materializes —
+  canonical bytes for `lww-record`, so formatting differences don't count as
+  a conflict): a receiver deletes only if its own current fingerprint is one
+  the deleter had already seen (`seen`, capped at 8, oldest first); otherwise
+  the concurrent edit wins (add-wins, matching Syncthing/Dropbox) and it
+  answers with a self-contained delta so the deleter resurrects the file. A
+  `StratAdvert` for a tombstoned path re-asserts the delete (how an
+  offline-at-delete-time peer learns on reconnect); a non-self-contained
+  delta re-asserts too, at most once per heartbeat (loop guard). Re-creating
+  a tombstoned path locally drops the tombstone and remembers its whole
+  delete/re-create chain as `superseded` (ids + local-only `prior`), so an
+  old copy of any of those deletions held by a peer is rejected even for a
+  byte-identical re-creation (cost: a lagging peer's deliberate delete can be
+  reverted once per chain step — fails toward keeping data). Deletion ids are deterministic
+  (blake3 of path + last fingerprint + superseded ids) and independent
+  deletes of one path merge their ids, so concurrent deletes followed by an
+  identical restore can't lose the restored file. Tombstones + last-known live files
+  persist in `<root>/.riftpipe-folder-index` (postcard, atomic write), so
+  deletes made or received while offline survive a restart. Out of scope,
+  tracked as the next bullet: `sync::tree`/`sync::mesh` (browser/kanban).
+- **tree/mesh (browser) deletes** — not built. The core `Syncer` (text CRDT +
+  whole-file LWW) that `sync::tree`/`sync::mesh` and the browser/kanban ride
+  has no delete notion; folder mode's tombstone design doesn't transfer
+  as-is because kanban already has its own "delete" (cards are archived via
+  a `meta.toml` field, never removed). Needs a `Syncer`-level tombstone (wire
+  + merge + browser OPFS removal) and a kanban decision on how archiving and
+  a real delete interact. Separate plan.
+
+- ~~Mesh messages over 4 KiB are silently lost~~ — *fixed, by chunking (no
+  reload needed).* Rather than raising iroh-gossip's 4 KiB frame limit (it's
+  enforced on receive too, so already-open tabs would error on bigger frames
+  until reloaded), every frame stays under the default: `core::sync` gained an
+  APPENDED `MeshMsg::Chunk` variant plus `encode_mesh_frames` /
+  `MeshAssembler` (content-hash ids so re-broadcasts are idempotent; bounded
+  slots + total cap so bogus headers can't balloon memory; nested chunks
+  refused), and both drivers broadcast via frames and receive via the
+  assembler. A pre-chunking peer skips the unknown variant cleanly — it just
+  keeps missing big files, exactly as it always did, and never errors
+  (`mesh_msg_indexes_pinned_and_legacy_peers_skip_chunks` pins this). No size
+  cap anymore either (~15 MiB reassembly guard). Broadcast failures are
+  logged (stderr / console.warn) instead of `let _ =`-swallowed. Verified: a
+  60 KB `big.md` (≈16 chunk frames) crosses a CLI mesh byte-identical; the
+  browser↔CLI `board-cli-mesh` e2e passes with chunking peers on both ends.
+- ~~Mesh drivers: adopt what iroh-gossip already provides~~ — *done.* Both
+  drivers source neighbors from `GossipReceiver::neighbors()` (the hand-kept
+  sets are gone; the web cell is a mirror for the `connectedPeers()` debug
+  accessor); the `NeighborUp` full_state catch-up uses `broadcast_neighbors()`
+  (direct neighbors only — the join no longer floods the whole swarm with the
+  tree); and on TOTAL neighbor loss a joiner `join_peers()`s its bootstrap
+  again (hyparview only refills from its passive view; the bootstrap address
+  is still in the MemoryLookup — this is the swarm half of live reconnection;
+  exercising it end-to-end needs a persistent-identity host restart, still
+  open below). `joined()`/`subscribe_and_join` deliberately NOT adopted: it
+  consumes the first `NeighborUp`, which our catch-up logic depends on — the
+  library's own docs point to exactly our track-the-stream pattern. Kept
+  app-level by design: late-joiner catch-up (gossip is ephemeral), the
+  Presence routing map (the library only knows local neighbors), author
+  identity (`delivered_from` is the relay, not the author).
+
+- **Protocol version announcements** — *done (2026-07-19).*
+  `core::sync::PROTOCOL_VERSION` (v1; v0 = implicit pre-versioning) rides two
+  appended variants: `SyncMsg::Version` (sent with the connect handshake on
+  the tree link + folder sessions) and `MeshMsg::Version` (broadcast right
+  BEFORE every `Presence`). The shared `core::sync::VersionMonitor` (no I/O,
+  no clock — callers pass ms) flags a peer once when: it announces a
+  different version; a second bare `Presence` arrives with no announcement;
+  or the 10 s grace expires (drivers tick it — a quiet 2-peer mesh sees only
+  one presence from an old host). Surfacing is library-level and
+  app-agnostic: native prints one stable stderr line per peer
+  (`protocol-mismatch peer=<hex> theirs=<n> ours=<n>`, parsed by the npm
+  wrapper's `onProtocolMismatch`); the browser fires a
+  `riftpipe:protocol-mismatch` CustomEvent on `window` + exposes
+  `riftpipe.protocolStatus()`. Kanban only renders the event (a banner).
+  Verified live: an old (pre-versioning) binary hosting a mesh is flagged
+  `theirs=0 ours=1` by a new joiner while files still sync; two new peers
+  stay quiet.
+- **Text-vs-LWW classification single-sourced** — *done (2026-07-19; found by
+  the kanban/library parity review).* The rule (`.md` → text CRDT, else LWW)
+  now lives in `core::sync::is_text_path`, used by the native driver, the
+  browser's `prime_all`, and a new unified `tree_sync::push(path, bytes)` —
+  the app-facing entry (now behind the `writeFile` file API); `push_text`/`push_lww` went crate-private. Fixes a
+  real divergence: kanban pushed `events/<site>.jsonl` as text-CRDT while
+  the CLI and `prime_all` classified it LWW — one path, two merge semantics,
+  so a CLI relay could regress event lines. Now every peer classifies
+  identically (events ride LWW: one writer per site file, so whole-file
+  newest-wins converges). Rest of the parity review was clean: priming,
+  tickets, identity, reconnect, merge all live in the library; the TS app
+  only renders.
+
+## Security / trust — see `SECURITY.md` + `docs/security/`
+
+> Consolidated model: [`docs/security/architecture.md`](../security/architecture.md)
+> + [`docs/security/user-flows.md`](../security/user-flows.md) (LikeC4-backed).
+> Read/write capability split, per-client keys + epoch-key wrapping (read
+> revocation), the general-access dial (Restricted / Anyone-with-link
+> Viewer/Editor), and the create / open-link / request-access / link-device /
+> revoke flows.
+
+
+- ~~Mesh sealing (first cut): secret-derived topic + AEAD frames~~ — *done
+  (2026-07-19, `PROTOCOL_VERSION` 2).* The share ticket now carries a 32-byte
+  random **secret** (`hex(postcard((secret, addr)))`, native + browser
+  identical). `core::crypto`: `topic = blake3::derive_key(…, secret)` (blinds
+  the rendezvous — a stranger with the host's public key, or a future DHT,
+  can't derive the topic) and every gossip frame is AEAD-sealed with a
+  domain-separated `KDF(secret)` (XChaCha20-Poly1305, random 192-bit nonce, no
+  cross-peer coordination). Both mesh drivers seal on send / open on receive,
+  after chunking so it composes with the 4 KiB framing. The web host persists
+  `riftpipe:board_secret` so the topic is stable across reloads; "New board"
+  clears it (new secret ⇒ new topic ⇒ new link — the rotation-as-revocation
+  shape). Verified: a wrong-secret ticket lands on a different topic and never
+  syncs; a 12 KB file syncs sealed+chunked; the browser↔CLI `board-cli-mesh`
+  e2e passes end-to-end sealed.
+- **Write signing + trust-log enforcement** — *mechanism shipped
+  (2026-07-20, `PROTOCOL_VERSION` 3).* `core::identity` (device keys + the
+  signed `TrustLog`) is now wired into the mesh: `MeshMsg::Trust` replicates
+  the authorized-device set and `MeshMsg::SignedSync` carries a per-message
+  Ed25519-signed write. In restricted mode the native `TreePeer` rejects
+  unsigned writes and signed writes from unauthorized devices; open mode (the
+  default) is unchanged, so the shipped kanban flow and browser↔CLI sync keep
+  working (both APPENDED variants; browsers skip them for now). Enforcement is
+  unit-tested at `authorize_and_apply` (authorized accepted, unauthorized/
+  unsigned rejected, open-mode unsigned still applies); the wire bump is
+  verified by the mesh integration test + the `board-cli-mesh` e2e (open mode
+  unbroken). **Usable from the CLI:** `connect --accept <dir> --restricted
+  [--grant <device-id>]…` hosts a restricted board (founder = genesis Admin,
+  grants authorize writers); joiners run `connect <ticket> <dir> --restricted`;
+  `device-id <dir>` prints a device's id to `--grant`. Identity persists in
+  `<dir>/.device` (a dot-file, never synced). **E2E-proven over the real mesh:**
+  two integration tests (`restricted_mesh_accepts_an_authorized_writer`,
+  `restricted_mesh_rejects_an_unauthorized_writer`) and a real-process shell e2e
+  (`run-restricted-mesh.sh`) — an authorized device's write syncs; an
+  unauthorized device's write is rejected while the founder's write still
+  reaches it (proving connection, not a failed link).
+  Sealing stops outsiders; this stops unauthorized *writers*. See `SECURITY.md`
+  §"the insider gap".
+- **Read revocation + onboarding + passkey — lib backends shipped (tested,
+  wasm-clean).** Everything a UX needs is now a library primitive (the app just
+  renders + confirms):
+  - `core::keywrap` — per-client X25519 keys + epoch-key wrapping. Content
+    seals under a rotatable epoch key wrapped to each authorized client; revoke
+    = rotate + wrap to the remaining. `rotation_excludes_a_removed_client`
+    proves read-revocation. (The "key per client".)
+  - `core::onboard` — `JoinRequest` (signed; doubles for request-to-join and
+    device-linking; `encode`/`safety_code` for QR/out-of-band) + `approve()`
+    → a grant + a wrapped epoch key in one admin action. E2E test: approve →
+    the newcomer both writes (authorized) and reads (unwraps the epoch).
+  - `core::passkey` — WebAuthn assertion verifier (ES256 + EdDSA, pure-Rust,
+    no `webauthn-rs`/OpenSSL) + `challenge_of` for the device-id binding.
+  **Browser into signed boards — done (2026-07-20).** `web::gossip`'s
+  `GossipTreeSync` now carries the same `Auth` (identity + trust log +
+  require_signed) as the native `TreePeer`: signs pushes, verifies incoming
+  writes, replicates the trust log, catches neighbors up. Device identity +
+  the converged trust log persist in localStorage.
+  **Claim + request-to-join — done (2026-07-20).** A board is open until its
+  first opener **claims** it (`lockBoard()` → becomes the immutable author,
+  trust-log genesis broadcast live); everyone else is view-only. A viewer
+  **asks for access** (`requestAccess()` broadcasts a signed `JoinRequest` as
+  the APPENDED `MeshMsg::Request` variant, re-announced to new neighbors so a
+  late-joining owner still sees it); the author's inbox (`pendingRequests()`:
+  name · device · safety code) approves with one click (`grantDevice()`), and
+  the landed grant prunes the request. `deviceId()`/`authState()` round out
+  the wasm surface (on `window.riftpipe`); the kanban auth bar renders the
+  states (Claim board / Claimed · you can edit / view only + Ask for edit
+  access). **Proven in real browsers** over the sealed mesh
+  (`e2e/lock-grant.mjs`: unlocked sync → claim → view-only rejection → ask →
+  inbox → approve → edit access; `shot-auth.mjs` screenshots it). Native
+  peers skip `MeshMsg::Request` (their catch-all) — the CLI still grants via
+  `--grant <device-id>`.
+  *Remaining is interactive glue, not new crypto:* the WebAuthn browser
+  ceremony on top of these lib calls. (Driving the mesh seal from epoch keys,
+  approve delivering a wrapped epoch key, and request/approve on the native
+  CLI are now shipped — see "Epoch-key mesh seal" below.)
+- **Epoch-key mesh seal — done (`PROTOCOL_VERSION` 4, shared with folder deletes).** `core::epoch::EpochBook`
+  wires the content key into the mesh for real: on a **Restricted** board,
+  `Sync`/`SignedSync` is sealed a second time under the current epoch key
+  (`MeshMsg::Sealed`), identified by an 8-byte key fingerprint so two admins
+  rotating at once still agree everywhere on "current." Wrapped keys travel in
+  an Admin-signed `MeshMsg::Epoch`: any online Admin rotates on revoke and
+  auto add-wraps a newly-granted device without one. Older epochs are kept
+  for the session (content sealed under them still opens; out-of-order
+  content is parked and replayed once its key arrives); a revoked device
+  stays a gossip member (sees control-plane metadata, never the keys).
+  **Behaviour change:** a claimed/`--restricted` board now means true
+  **no-access** for an ungranted device, not "view only" — see `SECURITY.md`
+  §"Restricted boards: epoch-sealed content". **Proven over the real mesh:**
+  native (`restricted_mesh_revoked_device_loses_read_after_rotation`,
+  `run-epoch-revoke.sh`) and browser (`epoch-revoke.mjs`,
+  `run-browser-auth.sh`); live via `riftpipe revoke|grant <dir> <id>` and the
+  kanban owner's members-list "Remove" button.
+- **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md). Built so
+  far (above): device keys + signed trust log, write signing, onboarding, the
+  claim/request-to-join flow, and the `core::passkey` verifier; *not* built:
+  Biscuit capabilities and the browser passkey ceremony. Two planes:
+  centralized *issuance* (an identity vouches for you, touched once) +
+  decentralized *offline* verification (peers check a Biscuit capability
+  against a root public key; data stays P2P). **Cemented identity: passkeys /
+  WebAuthn** — no company, no hosting, no committed secret, verified in-core with
+  pure-Rust `p256`/`ed25519-dalek`; **Google (OIDC + PKCE)** optional for
+  real-account gating. Build order: signing → Biscuit capabilities → passkey
+  front door → membership/roles → read-key rotation.
 
 ## Iteration 2 (added 2026-07-04)
 
-17. **Events log in the wasm handler** — *done.* The per-peer change log
-    (`events/<site>.jsonl` + `.site` id) lost its writer when the servers were
-    removed; restored inside `kanban-wasm`'s handler: mints/persists the site id
-    (`.site`, 8 lowercase hex), appends one JSON line per mutation in the old
-    server's exact shape (`ts`/`site`/`kind` + fields), pushes the log to peers
-    as text-CRDT, and serves `GET /api/history` (merged, ts-sorted). Dot-`.site`
-    stays local — the web `prime_all` now skips dot-entries like the native
-    tree driver's `hidden()` rule. Unblocks the history view.
+17. **Event log** — *done, now a generic library primitive.* The per-peer
+    change log lost its writer when the servers were removed; it briefly lived
+    in `kanban-wasm`'s handler, was dropped with it in the "filify" change, and
+    is back app-agnostic in `web/src/events.rs`: each device appends to its own
+    `events/<device-id>.jsonl` in the synced tree (one writer per file ⇒ zero
+    merge conflicts; rides LWW per `is_text_path`), keyed by the same device
+    identity that signs writes. Wasm exports `logEvent(kind, dataJson)` /
+    `readEvents()` (every `events/*.jsonl`, merged + ts-sorted), and each
+    append fires a `riftpipe:event` CustomEvent for live tailing. The library
+    records what only it sees — `mesh.merge` (guarded against `events/*` to
+    avoid a merge-about-merge loop) and `auth.claim`/`auth.request`/
+    `auth.grant`; the kanban app logs its semantic events from `board.ts`
+    (`card.create`/`move`/`check`/`edit`, `comment.add`) via `events.ts`.
+    Verified over the real mesh (`e2e/events.mjs`). Nothing renders it yet —
+    it's the substrate for a history view (and sync/auth debugging today).
 18. **Per-resource backing in the manifest** — `riftpipe.toml` rules gain an
     optional `backing = "memory" | "file"` per glob (today `--memory` is
     all-or-nothing); `--memory` stays as the global default override.

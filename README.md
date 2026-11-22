@@ -221,7 +221,7 @@ self-host a relay for production.
 Early/experimental (`v0.0.0`), developed against loopback and local networks.
 Working: text CRDT, rsync, folder sync, in-memory mode, reconnection, the nvim
 bridge, and the browser stack — the wasm CRDT, OPFS
-persistence, WebRTC + link-based signaling, the in-browser kanban handler, **and
+persistence, WebRTC + link-based signaling, the generic in-browser file API, **and
 per-file tree sync over the link** (two browsers converge card prose as a CRDT
 and structural moves as LWW). All verified headlessly in real Chrome, and the full
 **two-real-browser loop is verified end-to-end with Playwright** (a card created

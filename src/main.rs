@@ -26,6 +26,11 @@ struct Opts {
     manifest: Option<String>,
     process: Option<String>,
     signal: Option<String>,
+    /// Device-linking auth (mesh): sign our writes and reject unsigned/
+    /// unauthorized ones. Identity persists in `<dir>/.device`.
+    restricted: bool,
+    /// Founder only: hex device ids to authorize (as Members) at startup.
+    grant: Vec<String>,
 }
 
 /// Parse `args[2..]` into positionals + flags. `--metrics`/`--manifest`/
@@ -40,6 +45,8 @@ fn parse(args: &[String]) -> Opts {
         manifest: None,
         process: None,
         signal: None,
+        restricted: false,
+        grant: Vec::new(),
     };
     let mut i = 2;
     while i < args.len() {
@@ -47,6 +54,13 @@ fn parse(args: &[String]) -> Opts {
             "--pipe" => o.pipe = true,
             "--memory" => o.memory = true,
             "--accept" => o.accept = true,
+            "--restricted" => o.restricted = true,
+            "--grant" => {
+                if let Some(v) = args.get(i + 1).cloned() {
+                    o.grant.push(v);
+                }
+                i += 1;
+            }
             "--metrics" => {
                 o.metrics = args.get(i + 1).cloned();
                 i += 1;
@@ -102,6 +116,34 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str).unwrap_or("help") {
         "text" => demo_text(),
+        // Print (creating if absent) the device id for `<dir>/.device` — so a
+        // founder can `--grant` it. The seed stays local; only the public id prints.
+        "device-id" => {
+            match args.get(2) {
+                Some(dir) => {
+                    let _ = std::fs::create_dir_all(dir);
+                    let key = load_or_create_device(std::path::Path::new(dir));
+                    let id: String = key.id().iter().map(|b| format!("{b:02x}")).collect();
+                    println!("{id}");
+                }
+                None => eprintln!("usage: riftpipe device-id <dir>"),
+            }
+        }
+        // Live admin commands on a running `connect … --restricted` peer: queue a
+        // revoke/grant by appending to <dir>/.riftpipe-control, which the running
+        // mesh loop polls once a second (`riftpipe::sync::control`).
+        "revoke" | "grant" => {
+            let verb = args[1].clone();
+            match (args.get(2), args.get(3)) {
+                (Some(dir), Some(id)) if hex_to_32(id).is_some() => {
+                    match riftpipe::sync::control::append(std::path::Path::new(dir), &verb, id) {
+                        Ok(()) => println!("queued `{verb} {id}` for the running restricted peer on {dir}"),
+                        Err(e) => eprintln!("[riftpipe] {verb} failed: {e}"),
+                    }
+                }
+                _ => eprintln!("usage: riftpipe {verb} <dir> <device-id>   # applied by the running `connect … --restricted` admin peer on <dir>"),
+            }
+        }
         "share" => {
             let opts = parse(&args);
             match opts.pos.first().cloned() {
@@ -200,9 +242,14 @@ async fn main() {
             eprintln!("                                      # browser share link's hex ticket after '#') joins that folder's iroh-gossip");
             eprintln!("                                      # mesh natively — same protocol browsers speak, no signaling server. anything");
             eprintln!("                                      # else is a signaling connection-id — WebRTC via --signal (byte totals on exit)");
-            eprintln!("  riftpipe connect --accept <dir>");
+            eprintln!("  riftpipe connect --accept <dir> [--restricted [--grant <device-id>]...]");
             eprintln!("                                      # host a gossip-mesh swarm for <dir>: prints a mesh ticket a browser OR CLI");
-            eprintln!("                                      # peer joins with `connect <ticket> <dir>` — one protocol, N peers, no signaling");
+            eprintln!("                                      # peer joins with `connect <ticket> <dir>` — one protocol, N peers, no signaling.");
+            eprintln!("                                      # --restricted: only devices the founder grants can READ or write — content is sealed under a rotating epoch key");
+            eprintln!("                                      # --grant <id> authorizes a device at startup (get one via `device-id <dir>`)");
+            eprintln!("  riftpipe device-id <dir>            # print (creating if absent) this device's id for <dir> — share it to be --grant'ed");
+            eprintln!("  riftpipe revoke <dir> <device-id>    # remove a device from a running restricted board (rotates the read key)");
+            eprintln!("  riftpipe grant <dir> <device-id>     # authorize a device on a running restricted board");
             eprintln!("  riftpipe serve <dir> [--port 8080]  # static-host a folder + SSE change events at /events");
             eprintln!("                                      # (share/join a folder + serve = live-updating static site)");
             eprintln!("  riftpipe signal [--port 9000]       # WebRTC signaling relay for browser peers");
@@ -317,15 +364,17 @@ async fn join(ticket: &str, file: &str, opts: &Opts) -> riftpipe::net::Result<()
 async fn connect_dial(target: &str, dir: &str, opts: &Opts) -> riftpipe::net::Result<()> {
     // A share link carries the ticket in its URL fragment (after the LAST '#').
     let target = target.rsplit('#').next().unwrap_or(target);
-    if let Some(addr) = decode_mesh_ticket(target) {
-        // Browser mesh path: join the folder's gossip swarm as a native peer.
+    if let Some((secret, addr)) = decode_mesh_ticket(target) {
+        // Browser mesh path: join the board's sealed gossip swarm as a native
+        // peer. The secret from the ticket derives the topic + frame cipher.
         // (No --metrics here yet: the metrics side-car reports a single peer's
         // connection_kind, which doesn't fit a swarm — phase 2.)
         let dir = riftpipe::sync::tree::prepare_dir(std::path::Path::new(dir))?;
         let (watcher, mut rx) = riftpipe::sync::tree::watch(&dir);
         let mut peer = riftpipe::sync::tree::TreePeer::new();
-        eprintln!("[riftpipe] joining browser mesh of {} (iroh-gossip); syncing {}", addr.id, dir.display());
-        return riftpipe::sync::mesh::join_and_run(addr, &dir, &mut peer, &mut rx, watcher.is_none()).await;
+        apply_auth(&mut peer, &dir, opts, false); // joiner
+        eprintln!("[riftpipe] joining sealed board (host {}); syncing {}", addr.id, dir.display());
+        return riftpipe::sync::mesh::join_and_run(secret, addr, &dir, &mut peer, &mut rx, watcher.is_none()).await;
     }
     // Connection-id path (WebRTC via signaling). There's no iroh Endpoint here,
     // so the tmux metrics side-car (which needs one for `connection_kind`)
@@ -344,22 +393,83 @@ async fn connect_dial(target: &str, dir: &str, opts: &Opts) -> riftpipe::net::Re
     res
 }
 
-/// Encode our address as a mesh ticket: hex(postcard(EndpointAddr)) — the exact
-/// encoding of `web/src/iroh_link.rs::ticket_of` and the inverse of
-/// [`decode_mesh_ticket`], so a browser or CLI peer joins our swarm from the
-/// printed string (a bare address, no secret).
-fn encode_mesh_ticket(addr: &iroh::EndpointAddr) -> String {
-    postcard::to_allocvec(addr)
+/// Load this device's persisted signing identity from `<dir>/.device` (a hex
+/// seed), or mint + store one. `.device` is a dot-file, so it stays machine-local
+/// and never syncs (the `hidden()` rule). The seed is secret — guard the dir.
+fn load_or_create_device(dir: &std::path::Path) -> riftpipe_core::identity::DeviceKey {
+    use riftpipe_core::identity::DeviceKey;
+    let path = dir.join(".device");
+    if let Ok(hex) = std::fs::read_to_string(&path) {
+        if let Some(seed) = hex_to_32(hex.trim()) {
+            return DeviceKey::from_seed(&seed);
+        }
+    }
+    let key = DeviceKey::generate();
+    let hex: String = key.seed().iter().map(|b| format!("{b:02x}")).collect();
+    let _ = std::fs::write(&path, hex);
+    key
+}
+
+/// Parse 64 hex chars into a 32-byte array (a device id or a seed).
+fn hex_to_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Configure device-linking auth on a mesh `TreePeer` when `--restricted` is set:
+/// load/persist this device's identity, turn on signing + enforcement, and — for
+/// a founder — self-sign the genesis and grant any `--grant <hex>` device ids as
+/// Members. Prints this device's id (share it to be granted). No-op otherwise.
+fn apply_auth(peer: &mut riftpipe::sync::tree::TreePeer, dir: &std::path::Path, opts: &Opts, founder: bool) {
+    use riftpipe_core::identity::Role;
+    if !opts.restricted {
+        return;
+    }
+    let key = load_or_create_device(dir);
+    let id_hex: String = key.id().iter().map(|b| format!("{b:02x}")).collect();
+    if founder {
+        peer.add_trust(key.genesis());
+        for g in &opts.grant {
+            match hex_to_32(g) {
+                Some(gid) => {
+                    let nonce = rand::random::<[u8; 16]>();
+                    peer.add_trust(key.grant(gid, Role::Member, nonce));
+                    eprintln!("[auth] granted device {g} (Member)");
+                }
+                None => eprintln!("[auth] ignoring malformed --grant {g}"),
+            }
+        }
+    }
+    peer.set_identity(key, true);
+    eprintln!("[auth] restricted mode — this device id: {id_hex}");
+    if !founder {
+        eprintln!("[auth] ask the founder to grant {id_hex} (`--grant` at startup or `riftpipe grant <dir> {id_hex}`) — once granted, its peer wraps the read key to you");
+    }
+}
+
+/// Encode a mesh ticket: `hex(postcard((secret, addr)))` — the exact encoding of
+/// `web/src/iroh_link.rs::ticket_of` and the inverse of [`decode_mesh_ticket`],
+/// so a browser or CLI peer joins our board from the printed string. The 32-byte
+/// **secret** both names the topic (`H(secret)`) and keys the frame cipher, so
+/// possession of the ticket is what grants access (see `SECURITY.md`).
+fn encode_mesh_ticket(secret: &[u8; 32], addr: &iroh::EndpointAddr) -> String {
+    postcard::to_allocvec(&(secret, addr))
         .unwrap_or_default()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
 }
 
-/// Decode a browser mesh ticket: hex(postcard(EndpointAddr)) — the exact
-/// encoding of `web/src/iroh_link.rs::ticket_of` (a bare address, no secret).
-/// `None` if `s` isn't that (so the caller falls through to signaling).
-fn decode_mesh_ticket(s: &str) -> Option<iroh::EndpointAddr> {
+/// Decode a mesh ticket into `(secret, addr)` — the inverse of
+/// [`encode_mesh_ticket`], matching `web/src/iroh_link.rs`. `None` if `s` isn't
+/// a valid such ticket (so the caller falls through to signaling).
+fn decode_mesh_ticket(s: &str) -> Option<([u8; 32], iroh::EndpointAddr)> {
     if s.is_empty() || s.len() % 2 != 0 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
@@ -376,24 +486,26 @@ fn decode_mesh_ticket(s: &str) -> Option<iroh::EndpointAddr> {
 /// one mesh, no signaling, no native-only transport. Edits on any peer
 /// converge. `_opts` (e.g. `--metrics`) is unused: the metrics side-car reports
 /// a single link's `connection_kind`, which a swarm doesn't have.
-async fn connect_accept(dir: &str, _opts: &Opts) -> riftpipe::net::Result<()> {
+async fn connect_accept(dir: &str, opts: &Opts) -> riftpipe::net::Result<()> {
     use riftpipe::sync::{mesh, tree};
     use std::time::Duration;
 
     let dir = tree::prepare_dir(std::path::Path::new(dir))?;
     let (watcher, mut rx) = tree::watch(&dir);
     let mut peer = tree::TreePeer::new();
+    apply_auth(&mut peer, &dir, opts, true); // founder: genesis + any --grant ids
 
-    // Host role: bind a fresh endpoint and start the swarm on OUR own topic
-    // (`join(None, None)` keys the topic on our EndpointId — same as a browser
-    // host). Go online (best-effort relay home) so the ticket dials cross-network.
-    let conn = mesh::MeshConn::join(None, None).await?;
+    // Host role: mint a fresh board secret (names the topic `H(secret)` + keys
+    // the frame cipher), bind an endpoint, and start the sealed swarm. Go online
+    // (best-effort relay home) so the ticket dials cross-network.
+    let secret = riftpipe_core::crypto::generate_secret();
+    let conn = mesh::MeshConn::join(secret, None).await?;
     let _ = tokio::time::timeout(Duration::from_secs(5), conn.endpoint().online()).await;
     let addr = local_addr(conn.endpoint()).await;
-    let ticket = encode_mesh_ticket(&addr);
+    let ticket = encode_mesh_ticket(&secret, &addr);
     let _ = std::fs::write(format!("{}.ticket", dir.display()), &ticket); // sidecar for scripts
-    eprintln!("share this ticket — a browser or CLI joins the same mesh with `connect`:\n\n{ticket}\n");
-    eprintln!("hosting {} on the gossip mesh; waiting for peers...", dir.display());
+    eprintln!("share this ticket — a browser or CLI joins the same sealed board with `connect`:\n\n{ticket}\n");
+    eprintln!("hosting {} on the gossip mesh (sealed); waiting for peers...", dir.display());
 
     mesh::run(conn, &dir, &mut peer, &mut rx, watcher.is_none()).await
 }

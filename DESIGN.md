@@ -601,17 +601,66 @@ something else reads it.
 - **Workspace** (`sync::workspace`) — scans the tree (skips dotfiles, the
   manifest, `.ticket`s), binds each file to a `SyncStrategy` + a backing; unimplemented
   kinds are skipped (a stub never panics a live session).
-- **Multiplexed session** (`sync::folder`) — one link, many resources. Frame =
-  `[path_len u16][path][tag][payload]`; tags `DELTA` / `SYNCREQ` / `SYNCREP`.
-  Local changes are found by **polling** the backings (200ms); an unknown path in
-  an inbound frame **auto-creates** the resource (peer-driven discovery). Same
+- **Multiplexed session** (`sync::folder`) — one link, many resources. Speaks
+  the shared wire protocol (postcard-encoded `core::sync::SyncMsg`) via its
+  **strategy channel**: `StratDelta` (opaque patch → merge) and `StratAdvert`
+  (opaque state advertisement, with a reply-expected flag). Local changes are
+  found by **watching** the tree (slow poll as fallback); an unknown path in an
+  inbound message **auto-creates** the resource (peer-driven discovery). Same
   reconnect loop as `--pipe`.
-- **Request/reply advertising** — a local change sends `SYNCREQ`; the peer
-  answers `SYNCREP` with *its* signatures so a pull-only algorithm (rsync) can
-  then push its `DELTA`. `REP` is never replied to, so it can't ping-pong; the
-  heartbeat re-`REQ`s every 5s.
+- **Request/reply advertising** — a local change sends a reply-expecting
+  advert; the peer answers with *its* signatures (`reply: false`) so a
+  pull-only algorithm (rsync) can then push its delta. A reply is never replied
+  to, so it can't ping-pong; the heartbeat re-advertises every 5s.
 - **`--memory`** holds resources in RAM (seeded once from disk) instead of
   mirroring to disk; **`--process <path>`** writes the §17.6 size+hash file.
+- **Deletes** — a file-backed resource that was materialized at least once
+  (non-empty `seen` fingerprint history) and is now missing from disk is a
+  local delete: the watcher/poll scan turns it into a tombstone and sends
+  `SyncMsg::StratDelete { path, ids, seen }` (APPENDED wire variant, index 7;
+  `PROTOCOL_VERSION` 3 → 4, the same bump as the epoch-key mesh seal).
+  Delete-vs-concurrent-edit is judged by content, not clocks: `seen` holds the deleter's recent **fingerprints**
+  (`SyncStrategy::fingerprint()`, blake3 of what the replica materializes —
+  canonical bytes for `lww-record`, so a hand-formatted file and a peer's
+  canonical rewrite compare equal); a receiver applies the delete only if its
+  own current fingerprint is one the deleter had already seen, otherwise the
+  concurrent edit wins (edit-wins/add-wins, like Syncthing/Dropbox) and it
+  replies with a self-contained delta so the deleter resurrects the file. A
+  `StratAdvert` for a tombstoned path re-asserts the delete (how a peer that
+  was offline at delete time learns of it on reconnect); an incremental delta
+  that can't stand alone also re-asserts, at most once per heartbeat. Locally
+  re-creating a tombstoned path drops the tombstone and remembers its whole
+  delete/re-create chain as `superseded` (the tombstone's `ids` plus its
+  local-only `prior` — the ids the deleted resource had itself superseded —
+  capped at 64), so a stale copy of any deletion from any earlier step held
+  by a peer is rejected (the receiver keeps the file if any incoming id is
+  superseded) even for a byte-identical re-creation; an empty re-created
+  file answers with a zero-length `StratDelta` (no strategy emits one), on
+  which the deleter resurrects the file empty, so the two converge. Deletion ids are
+  **deterministic** — blake3(path, last fingerprint, superseded ids) — so two
+  peers that delete the same content independently (even if the deletes
+  never meet, or one is re-detected at startup after a crash) mint the same
+  id; a peer's delete for a path already deleted here is merged into the
+  tombstone (ids + fingerprints) rather than ignored. Tombstones and
+  last-known live files persist in `<root>/.riftpipe-folder-index` (postcard,
+  atomic write), so a delete made while a peer was offline, or offline itself,
+  is still detected at startup. Known limit: edit-wins compares strategy
+  fingerprints, so bytes an algorithm never syncs don't count as an edit —
+  for `lww-record`, comments/layout/lines without `=` (already dropped by
+  any remote merge's canonical rewrite) are dropped by a remote delete too,
+  and a comment-only file counts as empty; a raw-bytes check was rejected
+  because it would make every hand-formatted file undeletable from a peer.
+  Known limit (fails toward keeping data): `superseded` chains are local, so
+  a peer whose state equals an old tombstone's mints that tombstone's id; a
+  deliberate delete by it is rejected as stale and reverted once per chain
+  step it lags (it resurrects, adopts the step, and its next delete applies).
+  Out of scope: `sync::tree`/`sync::mesh` (the
+  browser/kanban `Syncer`) have no delete notion yet — a separate plan.
+- **Liveness** — a 15s recv-idle timeout (`folder::RECV_IDLE_TIMEOUT`) treats
+  a peer that sends nothing for that long as dead and reconnects, even if the
+  transport never reports a close; every heartbeat (5s) now starts with a
+  `Version` frame so an otherwise-silent, empty workspace still proves it's
+  alive.
 
 Verified end-to-end over loopback: a text file (text-crdt) and a binary blob
 (rsync) sync into a nested subdir A→B with discovery; a live edit on one side

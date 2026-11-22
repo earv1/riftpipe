@@ -32,17 +32,25 @@ A working vertical slice over a board *directory* (no SQLite, no new sync engine
 - **Board** with columns, add-card, drag-to-column, toggle done.
 - **Ticket detail drawer:** live (debounce-free) title + description editing with
   clobber-safety; comments (one file each under `comments/`, conflict-free).
-- **Per-peer append-only change-event log** design (`events/<site>.jsonl`, one
-  file per peer → merges with zero conflicts). *Currently writer-less — it
-  lived in the removed servers; moving into the wasm handler is TODO below.*
+- **Per-device append-only event log** (`events/<device-id>.jsonl`, one file
+  per device → merges with zero conflicts) — a generic riftpipe-web primitive
+  (`logEvent`/`readEvents`); `board.ts` logs card/comment events through
+  `src/events.ts`, the library adds `mesh.merge` + `auth.*`. Not rendered yet.
 - **Realtime:** in-page — mutations go straight to the Solid store; remote
-  merges arrive via the sync layer's `on_merged` and reconcile (only the
-  changed card re-renders).
+  merges fire `riftpipe:file-changed`, which `fs.ts`'s `watch` funnels (with
+  local writes and sibling tabs) into a reconcile (only the changed card
+  re-renders).
+- **Claim / request-to-join auth bar, with epoch-sealed read revocation:** the
+  first opener claims the board (becomes the owner; content is now sealed
+  under a rotating epoch key); others see "no access" until approved and can
+  "Ask to join"; the owner approves from an inbox and can **Remove** a member
+  from the auth bar's members list, which rotates the read key — the removed
+  device decrypts nothing new (`e2e/lock-grant.mjs`, `e2e/epoch-revoke.mjs`).
 - **Demos:** two/three-browser e2e flows over iroh + the gossip mesh
   (`e2e/run-iroh*.sh`).
 
 The board is just files: `board.md` + `tickets/<id>/{card.md, meta.toml,
-comments/*.md, attachments/*}` + `events/<site>.jsonl`. Prose (`card.md`,
+comments/*.md, attachments/*}` + `events/<device-id>.jsonl`. Prose (`card.md`,
 comments) syncs via **text-crdt**; structural scalars (`meta.toml`) and binaries
 (`attachments/`) via **rsync** (LWW). See [`data-model.md`](data-model.md).
 
@@ -97,7 +105,7 @@ Roughly priority order. Most of this is *wiring and UI*, not new sync code.
   their pushes through it over the BroadcastChannel.
 - **WebSocket-based presence** — "who's viewing/editing this card" (a separate
   channel; cursors/avatars are decorations, never part of the text/file model).
-- **History view** over `GET /api/history` — render the merged `events/*.jsonl`
+- **History view** over `readEvents()` — render the merged `events/*.jsonl`
   timeline (the log is already produced; this is the UI for it).
 - **Attachments UI** — drop/upload into `attachments/`; rsync carries the bytes.
 - **Per-field `meta.toml` merge** — a future `lww-record` Syncer doing *per-key*
@@ -106,15 +114,16 @@ Roughly priority order. Most of this is *wiring and UI*, not new sync code.
   today loses one (rare). Lives in the riftpipe core, not the app. See
   [`data-model.md`](data-model.md#future-nicety-an-lww-record-syncer).
 - **Servers removed — finish the follow-through.** `server/main.ts` (Deno),
-  `server-rs/` (Rust), and `run-demo.sh` are gone; the wasm payload is the
-  backend. Remaining: (a) the **change-event log** (`events/<site>.jsonl`) was
-  written by the servers — move it into the wasm handler so history survives
-  serverless; (b) Vite-via-Deno remains as *build tooling only* — swap to
-  plain npm/vite (or keep, it's contained) when convenient.
-- ~~**Own the kanban code riftpipe still carries**~~ *(done)* — the format parser
-  and kanban handler now live in this project's own wasm crate
-  (`projects/kanban/wasm`); `riftpipe-core`/`web` are app-blind. The wasm-crate
-  split (a generic riftpipe wasm crate + a kanban wasm crate here) is complete.
+  `server-rs/` (Rust), and `run-demo.sh` are gone; the page is the backend.
+  ~~(a) restore the change-event log~~ *(done — now a generic riftpipe-web
+  event log, see Status)*; (b) Vite-via-Deno remains as *build tooling only* —
+  swap to plain npm/vite (or keep, it's contained) when convenient.
+- ~~**Own the kanban code riftpipe still carries**~~ *(done, then taken
+  further)* — the format parser + handler briefly lived in this project's own
+  wasm crate; the "filify" change ported them to TypeScript (`src/board.ts`
+  over the generic file API in `src/fs.ts`) and deleted the Rust. `kanban-wasm`
+  is now a thin passthrough linking `riftpipe-web`; `riftpipe-core`/`web` are
+  app-blind.
 
 ### Out of scope (per the principle)
 

@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::{Buf, BytesMut};
 use iroh::endpoint::{presets, Connection, QuicTransportConfig, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use tokio::io::AsyncWriteExt;
@@ -72,14 +73,14 @@ pub async fn accept_link(endpoint: &Endpoint) -> Result<IrohLink> {
         .ok_or_else(|| anyerr("endpoint closed"))?;
     let conn = incoming.await.map_err(anyerr)?;
     let (send, recv) = conn.accept_bi().await.map_err(anyerr)?;
-    Ok(IrohLink { conn, send, recv })
+    Ok(IrohLink { conn, send, recv, frames: FrameBuf::default() })
 }
 
 /// Dial `addr` and open a bi-stream `Link`.
 pub async fn connect_link(endpoint: &Endpoint, addr: EndpointAddr) -> Result<IrohLink> {
     let conn = endpoint.connect(addr, ALPN).await.map_err(anyerr)?;
     let (send, recv) = conn.open_bi().await.map_err(anyerr)?;
-    Ok(IrohLink { conn, send, recv })
+    Ok(IrohLink { conn, send, recv, frames: FrameBuf::default() })
 }
 
 /// A `Link` over a QUIC bidirectional stream. Messages are framed as a u32
@@ -89,6 +90,51 @@ pub struct IrohLink {
     conn: Connection,
     send: SendStream,
     recv: RecvStream,
+    frames: FrameBuf,
+}
+
+/// Inbound bytes not yet returned as a whole frame. Lives in the link (not in
+/// a `recv` future's locals) so `recv` is **cancel-safe**: the session's
+/// `select!` drops an in-flight `recv` on every timer tick, and a frame read
+/// halfway must survive that, or the length-prefixed framing desyncs.
+#[derive(Default)]
+struct FrameBuf {
+    pending: BytesMut,
+}
+
+/// Max bytes pulled from the stream per read.
+const READ_CHUNK: usize = 64 * 1024;
+
+impl FrameBuf {
+    /// Split off the next complete `u32 LE length + body` frame, if buffered.
+    fn take_frame(&mut self) -> Option<Vec<u8>> {
+        let len: [u8; 4] = self.pending.get(..4)?.try_into().ok()?;
+        let n = u32::from_le_bytes(len) as usize;
+        if self.pending.len() < 4 + n {
+            return None;
+        }
+        self.pending.advance(4);
+        Some(self.pending.split_to(n).to_vec())
+    }
+
+    /// Next frame from `recv`. Cancel-safe: the only await is
+    /// `RecvStream::read_chunk` (documented cancel-safe), and its bytes are
+    /// appended to `pending` before anything else can be dropped. A clean end
+    /// of stream (or a read error) between frames is `Ok(None)`, as before;
+    /// inside a frame it is an error (truncated frame).
+    async fn next(&mut self, recv: &mut RecvStream) -> Result<Option<Vec<u8>>> {
+        loop {
+            if let Some(f) = self.take_frame() {
+                return Ok(Some(f));
+            }
+            match recv.read_chunk(READ_CHUNK).await {
+                Ok(Some(chunk)) => self.pending.extend_from_slice(&chunk),
+                Ok(None) | Err(_) if self.pending.is_empty() => return Ok(None),
+                Ok(None) => return Err(anyerr("iroh link: stream ended mid-frame")),
+                Err(e) => return Err(anyerr(e)),
+            }
+        }
+    }
 }
 
 impl IrohLink {
@@ -109,6 +155,7 @@ impl IrohLink {
             },
             IrohSource {
                 recv: self.recv,
+                frames: self.frames,
                 counters,
             },
         )
@@ -125,6 +172,7 @@ pub struct IrohSink {
 /// Receive half of a split iroh link.
 pub struct IrohSource {
     recv: RecvStream,
+    frames: FrameBuf,
     counters: Arc<Counters>,
 }
 
@@ -150,16 +198,13 @@ impl crate::net::Sink for IrohSink {
 #[async_trait]
 impl crate::net::Source for IrohSource {
     /// Await the next message — costs zero traffic/CPU while none arrives.
+    /// Cancel-safe (see [`FrameBuf`]).
     async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
-        let mut len = [0u8; 4];
-        if self.recv.read_exact(&mut len).await.is_err() {
-            return Ok(None);
+        let msg = self.frames.next(&mut self.recv).await?;
+        if let Some(b) = &msg {
+            self.counters.recv.fetch_add(b.len() as u64, Ordering::Relaxed);
         }
-        let n = u32::from_le_bytes(len) as usize;
-        let mut buf = vec![0u8; n];
-        self.recv.read_exact(&mut buf).await.map_err(anyerr)?;
-        self.counters.recv.fetch_add(n as u64, Ordering::Relaxed);
-        Ok(Some(buf))
+        Ok(msg)
     }
 }
 
@@ -174,15 +219,8 @@ impl Link for IrohLink {
     }
 
     async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
-        let mut len = [0u8; 4];
-        // A clean stream end shows up as an EOF on the length read.
-        if self.recv.read_exact(&mut len).await.is_err() {
-            return Ok(None);
-        }
-        let n = u32::from_le_bytes(len) as usize;
-        let mut buf = vec![0u8; n];
-        self.recv.read_exact(&mut buf).await.map_err(anyerr)?;
-        Ok(Some(buf))
+        // A clean stream end between frames is `None`. Cancel-safe.
+        self.frames.next(&mut self.recv).await
     }
 
     async fn done(&mut self) -> Result<()> {
@@ -199,5 +237,34 @@ impl Link for IrohLink {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frames reassemble across arbitrary chunk boundaries — including a split
+    /// inside the length prefix — and nothing is consumed until a frame is
+    /// whole (what makes a cancelled `recv` lossless).
+    #[test]
+    fn frame_buf_reassembles_across_chunk_boundaries() {
+        let mut wire = Vec::new();
+        for body in [&b"hello"[..], b"", b"a longer third frame"] {
+            wire.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            wire.extend_from_slice(body);
+        }
+        for step in 1..=wire.len() {
+            let mut fb = FrameBuf::default();
+            let mut got = Vec::new();
+            for chunk in wire.chunks(step) {
+                fb.pending.extend_from_slice(chunk);
+                while let Some(f) = fb.take_frame() {
+                    got.push(f);
+                }
+            }
+            assert_eq!(got, vec![b"hello".to_vec(), Vec::new(), b"a longer third frame".to_vec()], "step {step}");
+            assert!(fb.pending.is_empty());
+        }
     }
 }

@@ -21,8 +21,7 @@ code. (For why not SQLite/cr-sqlite, see
       attachments/
         <whatever>               # arbitrary attached files
   events/
-    <site>.jsonl                 # append-only change log, one file per peer
-  .site                          # this machine's site id (dotfile, NOT synced)
+    <device-id>.jsonl            # append-only event log, one file per device
 ```
 
 `<ticket-id>` is a client-generated stable id (e.g. `tk_8f3a`), so it never
@@ -103,22 +102,24 @@ lands when folder-delete sync does.
 
 ## Change-event log (history) — IMPLEMENTED in the app
 
-Every mutation also appends a line to `events/<site>.jsonl` (JSONL):
+Every mutation also appends a line to `events/<device-id>.jsonl` (JSONL):
 
 ```json
-{"ts":"2026-06-27T12:28:20.883Z","site":"d2c7cc76","kind":"card.create","id":"tk_…","column":"Todo","title":"…"}
-{"ts":"…","site":"d2c7cc76","kind":"card.move","id":"tk_…","from":"Todo","to":"Doing"}
-{"ts":"…","site":"d2c7cc76","kind":"card.check","id":"tk_…","done":true}
-{"ts":"…","site":"d2c7cc76","kind":"card.edit","id":"tk_…","field":"title","value":"…"}
+{"ts":"2026-06-27T12:28:20.883Z","device":"<64-hex>","kind":"card.create","id":"tk_…","column":"Todo","title":"…"}
+{"ts":"…","device":"<64-hex>","kind":"card.move","id":"tk_…","from":"Todo","to":"Doing"}
+{"ts":"…","device":"<64-hex>","kind":"card.check","id":"tk_…","done":true}
+{"ts":"…","device":"<64-hex>","kind":"card.edit","id":"tk_…","field":"title","value":"…"}
 ```
 
 The board files stay the **source of truth**; the log is a **purely additive
 audit trail** (history/undo later, not event-sourcing). It's conflict-free by the
-same principle as comments: **one file per peer**, named by a machine-local
-`site` id kept in the `.site` dotfile (which riftpipe's scan skips, so each
-replica gets a distinct events file). `events/*.jsonl` syncs via text-crdt
-(append-merge-friendly); "history" = every `events/*.jsonl` merged and sorted by
-`ts`. Served at `GET /api/history`.
+same principle as comments: **one file per device**, named by the device's
+signing id. The log itself is a generic riftpipe-web primitive
+(`logEvent`/`readEvents`, live `riftpipe:event`); `board.ts` logs the app's
+semantic events (above, plus `comment.add`) and the library adds `mesh.merge`
+and `auth.*` lines. `events/*.jsonl` syncs as LWW (one writer per file, so
+whole-file newest-wins converges); "history" = `readEvents()`, every
+`events/*.jsonl` merged and sorted by `ts`. No UI renders it yet.
 
 ## Future nicety: an `lww-record` Syncer
 

@@ -65,6 +65,86 @@ body {
   font-size: 0.85rem;
 }
 
+.version-warning {
+  padding: 0.5rem 1.25rem;
+  background: #fdecea;
+  color: #8a1f11;
+  border-bottom: 1px solid #f5c6c0;
+  font-size: 0.85rem;
+}
+
+.auth-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  padding: 0.5rem 1.25rem;
+  background: #f7f8fa;
+  border-bottom: 1px solid #e6e8eb;
+  font-size: 0.85rem;
+}
+.auth-bar .lock-btn,
+.auth-bar .ask-btn,
+.auth-bar .approve-btn {
+  padding: 0.3rem 0.7rem;
+  border: 1px solid #c3c8ce;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.auth-bar .approve-btn {
+  border-color: #0b6b3a;
+  color: #0b6b3a;
+}
+.auth-bar .approve-btn:hover { background: #eaf6ef; }
+.auth-bar .req {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.15rem 0.3rem 0.15rem 0.5rem;
+  border: 1px solid #e6e8eb;
+  border-radius: 6px;
+  background: #fff;
+}
+.auth-bar .req-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  color: #5a6069;
+}
+.auth-bar .auth-hint { color: #8a9099; }
+.auth-bar .auth-status { font-weight: 600; }
+.auth-bar .auth-status.owner { color: #0b6b3a; }
+.auth-bar .auth-status.editor { color: #0b57d0; }
+.auth-bar .auth-status.no-access { color: #8a4d00; }
+.auth-bar .auth-status.pending-key { color: #8a9099; }
+.auth-bar .member {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.15rem 0.3rem 0.15rem 0.5rem;
+  border: 1px solid #e6e8eb;
+  border-radius: 6px;
+  background: #fff;
+}
+.auth-bar .revoke-btn {
+  padding: 0.3rem 0.7rem;
+  border: 1px solid #b3261e;
+  border-radius: 6px;
+  background: #fff;
+  color: #b3261e;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.auth-bar .revoke-btn:hover { background: #fbeceb; }
+.auth-bar .device-id {
+  margin-left: auto;
+  padding: 0.3rem 0.6rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  color: #8a9099;
+}
+
 .columns {
   display: flex;
   flex-wrap: wrap;
