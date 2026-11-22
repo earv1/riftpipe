@@ -311,6 +311,9 @@ impl TreePeer {
         if let Some(seq) = ing.unheld {
             eprintln!("[epoch] no key for epoch {seq} — this device is not wrapped in (revoked, or not yet approved)");
         }
+        if let Some(seq) = ing.held {
+            eprintln!("[epoch] holding epoch {seq} — new content is sealed under it");
+        }
         for m in ing.released {
             out.extend(self.apply_content(m, dir));
         }

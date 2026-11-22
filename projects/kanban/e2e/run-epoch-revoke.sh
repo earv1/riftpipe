@@ -69,6 +69,17 @@ done
 if [ "$rotated" = 1 ]; then echo "OK: revoke triggered a rotation to epoch 2"
 else echo "FAIL: founder never rotated after the revoke"; fail=1; fi
 
+# The member seals under the highest epoch it HOLDS: wait until it has
+# ingested epoch 2, or its write could go out under epoch 1 (which the victim
+# still holds) and leak — a test race, not a protocol bug.
+held=0
+for _ in $(seq 1 40); do
+  grep -q "holding epoch 2" "$WORK/member.log" && { held=1; break; }
+  sleep 0.5
+done
+if [ "$held" = 1 ]; then echo "OK: member holds the epoch-2 key"
+else echo "FAIL: member never received the epoch-2 key"; fail=1; fi
+
 # Phase 2: post-rotation content from the founder and from the remaining
 # member must still converge between them; the revoked victim writes too (its
 # write must never land anywhere — it's unauthorized).

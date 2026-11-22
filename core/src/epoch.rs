@@ -116,6 +116,9 @@ pub struct Ingested {
     pub released: Vec<MeshMsg>,
     /// We went from holding NO epoch key to holding one: broadcast our full state.
     pub gained_first_key: bool,
+    /// Seq of the highest epoch whose key we newly hold (log it: from here on we
+    /// seal under it).
+    pub held: Option<u64>,
     /// Seq of a newly-learned epoch we are NOT wrapped into (log it).
     pub unheld: Option<u64>,
     /// The accepted-announce set changed (persist it).
@@ -125,6 +128,7 @@ impl Ingested {
     pub fn absorb(&mut self, o: Ingested) {
         self.released.extend(o.released);
         self.gained_first_key |= o.gained_first_key;
+        self.held = self.held.max(o.held);
         self.unheld = self.unheld.max(o.unheld);
         self.changed |= o.changed;
     }
@@ -257,6 +261,7 @@ impl EpochBook {
                     let first = self.keys.is_empty();
                     self.keys.insert(slot, k);
                     out.gained_first_key = first;
+                    out.held = Some(a.seq);
                     out.released = self.release(slot);
                 }
                 _ => {
@@ -514,6 +519,7 @@ mod tests {
         let ing = feed(&mut mb, fb.announces(), &trust);
         assert!(!ing.gained_first_key);
         assert_eq!(ing.unheld, Some(1), "learned epoch 1 but is not wrapped in");
+        assert_eq!(ing.held, None);
         assert!(!mb.holds_latest());
 
         assert!(fb.learn_request(&JoinRequest::create(&m, "m")));
@@ -523,6 +529,7 @@ mod tests {
 
         let ing = feed(&mut mb, &out.announces, &trust);
         assert!(ing.gained_first_key);
+        assert_eq!(ing.held, Some(1), "now holds epoch 1");
         assert!(mb.holds_latest());
 
         let s = sealed(fb.seal(&content("p")).expect("founder holds a key"));
@@ -643,6 +650,7 @@ mod tests {
         assert_eq!(ing.released.len(), 1);
         assert!(matches!(&ing.released[0], MeshMsg::Sync(SyncMsg::Resync { path }) if path == "early"));
         assert!(!ing.gained_first_key, "B already held epoch 1");
+        assert_eq!(ing.held, Some(2), "B newly holds epoch 2");
     }
 
     #[test]
