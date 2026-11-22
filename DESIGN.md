@@ -617,7 +617,7 @@ something else reads it.
 - **Deletes** — a file-backed resource that was materialized at least once
   (non-empty `seen` fingerprint history) and is now missing from disk is a
   local delete: the watcher/poll scan turns it into a tombstone and sends
-  `SyncMsg::StratDelete { path, id, seen }` (APPENDED wire variant, index 7;
+  `SyncMsg::StratDelete { path, ids, seen }` (APPENDED wire variant, index 7;
   `PROTOCOL_VERSION` 3 → 4). Delete-vs-concurrent-edit is judged by content,
   not clocks: `seen` holds the deleter's recent **fingerprints**
   (`SyncStrategy::fingerprint()`, blake3 of what the replica materializes —
@@ -629,9 +629,15 @@ something else reads it.
   `StratAdvert` for a tombstoned path re-asserts the delete (how a peer that
   was offline at delete time learns of it on reconnect); an incremental delta
   that can't stand alone also re-asserts, at most once per heartbeat. Locally
-  re-creating a tombstoned path drops the tombstone and remembers the old
-  deletion's id as `superseded`, so a stale copy of that deletion held by a
-  peer is rejected even for a byte-identical re-creation. Tombstones and
+  re-creating a tombstoned path drops the tombstone and remembers ALL its
+  deletion ids as `superseded`, so a stale copy of any of those deletions
+  held by a peer is rejected (the receiver keeps the file if any incoming id
+  is superseded) even for a byte-identical re-creation. Deletion ids are
+  **deterministic** — blake3(path, last fingerprint, superseded ids) — so two
+  peers that delete the same content independently (even if the deletes
+  never meet, or one is re-detected at startup after a crash) mint the same
+  id; a peer's delete for a path already deleted here is merged into the
+  tombstone (ids + fingerprints) rather than ignored. Tombstones and
   last-known live files persist in `<root>/.riftpipe-folder-index` (postcard,
   atomic write), so a delete made while a peer was offline, or offline itself,
   is still detected at startup. Out of scope: `sync::tree`/`sync::mesh` (the

@@ -18,8 +18,9 @@ use crate::sync::strategy::{Kind, SyncStrategy};
 
 /// Recent fingerprints a resource / tombstone remembers (oldest first).
 pub const SEEN_CAP: usize = 8;
-/// Deletion ids a re-created resource remembers having superseded.
-pub const SUPERSEDED_CAP: usize = 8;
+/// Deletion ids a tombstone stands for, and ids a re-created resource
+/// remembers having superseded (also the cap applied to a peer's `ids`).
+pub const DELETION_IDS_CAP: usize = 8;
 pub type Hash = [u8; 32];
 
 /// Make `h` the most-recent entry (moving it if present), keeping ≤ SEEN_CAP.
@@ -32,20 +33,47 @@ pub fn push_seen(seen: &mut Vec<Hash>, h: Hash) {
     }
 }
 
-/// Push a superseded deletion id, keeping ≤ SUPERSEDED_CAP (oldest dropped).
-fn push_superseded(superseded: &mut Vec<u64>, id: u64) {
-    superseded.retain(|x| *x != id);
-    superseded.push(id);
-    if superseded.len() > SUPERSEDED_CAP {
-        let excess = superseded.len() - SUPERSEDED_CAP;
-        superseded.drain(..excess);
+/// Make deletion id `id` the most-recent entry (moving it if present),
+/// keeping ≤ DELETION_IDS_CAP (oldest dropped).
+pub fn push_deletion_id(ids: &mut Vec<u64>, id: u64) {
+    ids.retain(|x| *x != id);
+    ids.push(id);
+    if ids.len() > DELETION_IDS_CAP {
+        let excess = ids.len() - DELETION_IDS_CAP;
+        ids.drain(..excess);
     }
+}
+
+/// The id of deleting `rel` from a resource in state (`seen`, `superseded`).
+/// **Deterministic**, not random: two peers that independently delete the
+/// same content with the same history mint the SAME id, so if one of them
+/// later restores the file, the other's deletion is recognized as superseded
+/// even when the two deletes never reached each other (link down, crash
+/// before the index was saved, a delete detected at startup). `superseded`
+/// is mixed in so deleting a re-created file mints a fresh id rather than
+/// the one the re-creation overrode.
+pub fn deletion_id(rel: &str, seen: &[Hash], superseded: &[u64]) -> u64 {
+    let mut h = blake3::Hasher::new();
+    h.update(b"riftpipe/folder-delete/v1\0");
+    h.update(rel.as_bytes());
+    h.update(&[0]);
+    h.update(seen.last().unwrap_or(&[0u8; 32]));
+    let mut sup = superseded.to_vec();
+    sup.sort_unstable();
+    sup.dedup();
+    for id in sup {
+        h.update(&id.to_le_bytes());
+    }
+    u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("8 bytes"))
 }
 
 /// A deleted path: what a peer needs to judge delete-vs-concurrent-edit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tombstone {
-    pub id: u64,
+    /// The deletion(s) this tombstone stands for (oldest first, capped): our
+    /// own, plus any a peer deleted independently — a re-creation overrides
+    /// all of them.
+    pub ids: Vec<u64>,
     pub seen: Vec<Hash>,
     /// Loop guard: one re-assert per heartbeat (in-memory only).
     #[serde(skip)]
@@ -55,7 +83,7 @@ pub struct Tombstone {
 /// Folder index file (inside the root; dot-prefixed so the scan never
 /// syncs it): last-known live files + tombstones, so deletes survive restarts.
 pub const INDEX_FILE: &str = ".riftpipe-folder-index";
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2; // v2: Tombstone.ids (was a single id)
 
 #[derive(Serialize, Deserialize, Default)]
 struct LiveEntry {
@@ -226,13 +254,14 @@ impl Workspace {
         k.is_implemented().then(|| k.build(rel))
     }
 
-    /// Local delete observed: drop the resource, mint a tombstone (random id,
-    /// the resource's `seen`), return a copy for the wire.
+    /// Local delete observed: drop the resource, mint a tombstone (the
+    /// deterministic [`deletion_id`], the resource's `seen`), return a copy for
+    /// the wire.
     pub fn record_local_delete(&mut self, rel: &str) -> Option<Tombstone> {
         let res = self.resources.remove(rel)?;
         self.registry.remove(rel);
         let t = Tombstone {
-            id: rand::random::<u64>(),
+            ids: vec![deletion_id(rel, &res.seen, &res.superseded)],
             seen: res.seen,
             reasserted: false,
         };
@@ -242,11 +271,11 @@ impl Workspace {
     }
 
     /// Apply a peer's delete: remove the bytes, drop the resource, adopt the
-    /// peer's `id`; `seen` = ours, then theirs pushed on top (capped). If the
+    /// peer's `ids`; `seen` = ours, then theirs pushed on top (capped). If the
     /// bytes can't be removed, the resource is kept, nothing is recorded and
     /// the error is returned (the peer re-asserts on our next advert, so it is
     /// retried).
-    pub fn apply_remote_delete(&mut self, rel: &str, id: u64, seen: &[Hash]) -> std::io::Result<()> {
+    pub fn apply_remote_delete(&mut self, rel: &str, ids: &[u64], seen: &[Hash]) -> std::io::Result<()> {
         let mut merged = Vec::new();
         if let Some(res) = self.resources.get_mut(rel) {
             res.backing.remove()?;
@@ -257,19 +286,44 @@ impl Workspace {
         for h in seen {
             push_seen(&mut merged, *h);
         }
-        self.tombstones.insert(
-            rel.to_string(),
-            Tombstone { id, seen: merged, reasserted: false },
-        );
+        let mut t = Tombstone { ids: Vec::new(), seen: merged, reasserted: false };
+        for id in ids {
+            push_deletion_id(&mut t.ids, *id);
+        }
+        self.tombstones.insert(rel.to_string(), t);
         self.dirty = true;
         Ok(())
     }
 
+    /// A peer's delete for a path we ALSO deleted (independently, or an echo):
+    /// fold its ids and fingerprints into our tombstone, so a later local
+    /// re-creation overrides the peer's deletion too — otherwise the peer
+    /// would re-assert its own id against the restored file and delete it.
+    pub fn merge_remote_delete(&mut self, rel: &str, ids: &[u64], seen: &[Hash]) {
+        let Some(t) = self.tombstones.get_mut(rel) else { return };
+        let before = (t.ids.clone(), t.seen.clone());
+        for id in ids {
+            if !t.ids.contains(id) {
+                push_deletion_id(&mut t.ids, *id);
+            }
+        }
+        for h in seen {
+            if !t.seen.contains(h) {
+                push_seen(&mut t.seen, *h);
+            }
+        }
+        if (t.ids.clone(), t.seen.clone()) != before {
+            self.dirty = true;
+        }
+    }
+
     /// Bring a tombstoned path back with `strategy` (already holding the
-    /// peer's merged state) and `bytes` as its content. Edit-wins resurrection
-    /// does NOT mark the deletion superseded.
+    /// peer's merged state) and `bytes` as its content. The tombstone's ids
+    /// become `superseded`: the deletion was overruled, and a later delete of
+    /// this content must mint a fresh [`deletion_id`] (else it would collide
+    /// with the overruled one and be rejected by the peer that restored it).
     pub fn resurrect(&mut self, rel: &str, strategy: Box<dyn SyncStrategy>, bytes: &[u8]) {
-        self.tombstones.remove(rel);
+        let superseded = self.tombstones.remove(rel).map(|t| t.ids).unwrap_or_default();
         let kind = self.manifest.kind_for(rel);
         let backing = self.make_backing(rel);
         let mut res = Resource {
@@ -277,7 +331,7 @@ impl Workspace {
             strategy,
             backing,
             seen: Vec::new(),
-            superseded: Vec::new(),
+            superseded,
         };
         res.store(bytes);
         self.resources.insert(rel.to_string(), res);
@@ -316,11 +370,9 @@ impl Workspace {
         }
         let strategy = kind.build(rel);
         let backing = self.make_backing(rel);
-        // A creation of a tombstoned path is a local re-creation.
-        let mut superseded = Vec::new();
-        if let Some(t) = self.tombstones.remove(rel) {
-            push_superseded(&mut superseded, t.id);
-        }
+        // A creation of a tombstoned path is a local re-creation: it
+        // overrides every deletion the tombstone stands for.
+        let superseded = self.tombstones.remove(rel).map(|t| t.ids).unwrap_or_default();
         self.resources.insert(
             rel.to_string(),
             Resource {
@@ -350,17 +402,19 @@ impl Workspace {
                 res.seen = e.seen;
                 res.superseded = e.superseded;
             } else if !self.root.join(&rel).exists() {
-                // Live last run, gone now: deleted while we were offline.
-                self.tombstones.insert(
-                    rel,
-                    Tombstone { id: rand::random::<u64>(), seen: e.seen, reasserted: false },
-                );
+                // Live last run, gone now: deleted while we were offline. Same
+                // deterministic id the live delete would have minted.
+                let ids = vec![deletion_id(&rel, &e.seen, &e.superseded)];
+                self.tombstones.insert(rel, Tombstone { ids, seen: e.seen, reasserted: false });
                 self.dirty = true;
             } // else: on disk but no resource (e.g. manifest now maps it to a stub) — leave it alone
         }
         for (rel, t) in idx.tombstones {
             if let Some(res) = self.resources.get_mut(&rel) {
-                push_superseded(&mut res.superseded, t.id); // re-created while offline
+                // Re-created while offline: overrides all the tombstone's ids.
+                for id in t.ids {
+                    push_deletion_id(&mut res.superseded, id);
+                }
                 self.dirty = true;
             } else {
                 self.tombstones.insert(rel, t);
@@ -626,7 +680,7 @@ mod tests {
         let added = ws.refresh_disk().unwrap();
         assert!(added.contains(&"a.bin".to_string()));
         assert!(!ws.is_tombstoned("a.bin"));
-        assert_eq!(ws.get_mut("a.bin").unwrap().superseded, vec![t.id]);
+        assert_eq!(ws.get_mut("a.bin").unwrap().superseded, t.ids);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -639,10 +693,10 @@ mod tests {
         ws.get_mut("b.bin").unwrap().note_state();
         let original_fp = ws.get_mut("b.bin").unwrap().seen.clone();
 
-        ws.apply_remote_delete("b.bin", 42, &[[9u8; 32]]).unwrap();
+        ws.apply_remote_delete("b.bin", &[42], &[[9u8; 32]]).unwrap();
         assert!(!root.join("b.bin").exists());
         let t = ws.tombstone("b.bin").unwrap();
-        assert_eq!(t.id, 42);
+        assert_eq!(t.ids, vec![42]);
         assert_eq!(t.seen.last(), Some(&[9u8; 32]));
         for h in &original_fp {
             assert!(t.seen.contains(h));
@@ -687,7 +741,7 @@ mod tests {
         drop(ws);
 
         let ws = Workspace::new(&root, Manifest::default(), false).unwrap();
-        assert_eq!(ws.tombstone("b.bin").unwrap().id, t.id);
+        assert_eq!(ws.tombstone("b.bin").unwrap().ids, t.ids);
         let mut ws = ws;
         assert_eq!(ws.get_mut("a.bin").unwrap().seen, a_seen_before);
 
@@ -727,7 +781,7 @@ mod tests {
         let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
         assert!(ws.paths().contains(&"d.bin".to_string()));
         assert!(!ws.is_tombstoned("d.bin"));
-        assert_eq!(ws.get_mut("d.bin").unwrap().superseded, vec![t.id]);
+        assert_eq!(ws.get_mut("d.bin").unwrap().superseded, t.ids);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -769,7 +823,7 @@ mod tests {
         let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
         ws.get_mut("ro/g.bin").unwrap().note_state();
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let r = ws.apply_remote_delete("ro/g.bin", 7, &[]);
+        let r = ws.apply_remote_delete("ro/g.bin", &[7], &[]);
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(r.is_err());
         assert!(ro.join("g.bin").is_file());
@@ -801,7 +855,7 @@ mod tests {
         ws.save_index_if_dirty(); // still dirty → retried
         drop(ws);
         let ws = Workspace::new(&root, Manifest::default(), false).unwrap();
-        assert_eq!(ws.tombstone("f.bin").map(|x| x.id), Some(t.id));
+        assert_eq!(ws.tombstone("f.bin").map(|x| x.ids.clone()), Some(t.ids));
         std::fs::remove_dir_all(&root).ok();
     }
 }

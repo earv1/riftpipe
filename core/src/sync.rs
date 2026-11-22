@@ -103,16 +103,19 @@ pub enum SyncMsg {
     /// ignores it; drivers intercept.
     Version { proto: u32 },
     /// Folder-mode **tombstone** on the strategy channel: "I deleted `path`".
-    /// `id` names this deletion (random per delete, carried unchanged by every
-    /// peer that adopts the tombstone, so a peer that has since RE-CREATED the
-    /// file can recognize — and reject — the old deletion). `seen` is the
+    /// `ids` name the deletion(s) this tombstone stands for (oldest first;
+    /// carried unchanged by every peer that adopts the tombstone, merged when
+    /// two peers delete independently), so a peer that has since RE-CREATED
+    /// the file can recognize — and reject — an old deletion: it keeps the file
+    /// if ANY id is one it overrode. Receivers ignore ids beyond a small cap.
+    /// `seen` is the
     /// deleter's recent content fingerprints (blake3-32 of what each replica
     /// materializes, oldest first): a peer applies the delete only if its own
     /// current fingerprint is one the deleter had already seen; otherwise it
     /// holds a concurrent edit, which wins (it answers with a self-contained
     /// `StratDelta` and the deleter resurrects the file). [`Syncer`] ignores it.
     /// APPENDED (wire index 7): peers that predate it skip it cleanly.
-    StratDelete { path: String, id: u64, seen: Vec<[u8; 32]> },
+    StratDelete { path: String, ids: Vec<u64>, seen: Vec<[u8; 32]> },
 }
 
 /// What travels over a gossip-mesh topic: tree [`SyncMsg`]s plus periodic
@@ -657,7 +660,7 @@ mod wire_compat {
             (SyncMsg::StratAdvert { path: "p".into(), sv: vec![], reply: true }, 4),
             (SyncMsg::StratDelta { path: "p".into(), bytes: vec![] }, 5),
             (SyncMsg::Version { proto: 1 }, 6),
-            (SyncMsg::StratDelete { path: "p".into(), id: 1, seen: vec![] }, 7),
+            (SyncMsg::StratDelete { path: "p".into(), ids: vec![1], seen: vec![] }, 7),
         ];
         for (msg, index) in cases {
             let bytes = postcard::to_allocvec(&msg).unwrap();
@@ -685,7 +688,7 @@ mod wire_compat {
 
         let advert = SyncMsg::StratAdvert { path: "a.bin".into(), sv: vec![1, 2], reply: true };
         let delta = SyncMsg::StratDelta { path: "a.bin".into(), bytes: vec![3] };
-        let del = SyncMsg::StratDelete { path: "a.bin".into(), id: 9, seen: vec![[7u8; 32]] };
+        let del = SyncMsg::StratDelete { path: "a.bin".into(), ids: vec![9], seen: vec![[7u8; 32]] };
         for msg in [advert, delta, del] {
             let bytes = postcard::to_allocvec(&msg).unwrap();
             assert!(
@@ -701,19 +704,19 @@ mod wire_compat {
         ));
     }
 
-    /// `StratDelete` round-trips its fields (path, id, seen).
+    /// `StratDelete` round-trips its fields (path, ids, seen).
     #[test]
     fn strat_delete_round_trips() {
         let msg = SyncMsg::StratDelete {
             path: "d/x.bin".into(),
-            id: u64::MAX,
+            ids: vec![u64::MAX, 3],
             seen: vec![[1; 32], [2; 32]],
         };
         let bytes = postcard::to_allocvec(&msg).unwrap();
         match postcard::from_bytes::<SyncMsg>(&bytes).unwrap() {
-            SyncMsg::StratDelete { path, id, seen } => {
+            SyncMsg::StratDelete { path, ids, seen } => {
                 assert_eq!(path, "d/x.bin");
-                assert_eq!(id, u64::MAX);
+                assert_eq!(ids, vec![u64::MAX, 3]);
                 assert_eq!(seen, vec![[1; 32], [2; 32]]);
             }
             _ => panic!("expected StratDelete"),
@@ -832,7 +835,7 @@ mod wire_compat {
             s.apply(SyncMsg::StratDelta { path: "x.bin".into(), bytes: vec![1] });
         assert!(persist.is_none() && replies.is_empty());
         let (persist, replies) =
-            s.apply(SyncMsg::StratDelete { path: "x.bin".into(), id: 1, seen: vec![] });
+            s.apply(SyncMsg::StratDelete { path: "x.bin".into(), ids: vec![1], seen: vec![] });
         assert!(persist.is_none() && replies.is_empty());
     }
 }

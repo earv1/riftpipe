@@ -30,18 +30,21 @@
 //! ## Deletes
 //! A file-backed resource that was materialized at least once (non-empty
 //! `seen` fingerprint history) and is now missing from disk is a local delete:
-//! the resource becomes a tombstone (random `id` + its `seen`) and a
-//! `StratDelete` goes out. A peer applies it only if its own current
+//! the resource becomes a tombstone (deterministic deletion id + its `seen`)
+//! and a `StratDelete` goes out. A peer applies it only if its own current
 //! fingerprint is one the deleter had seen; otherwise it holds a concurrent
 //! edit, which wins — it answers with a self-contained `StratDelta`, and the
 //! deleter, receiving a delta for a tombstoned path, resurrects the file. An
 //! incremental delta that can't stand alone instead re-asserts the delete (at
 //! most once per heartbeat). An advert for a tombstoned path is answered with
 //! the `StratDelete` (how a peer that was offline learns of it). A file
-//! re-created locally drops its tombstone and remembers that deletion's `id`
-//! as `superseded`, so an old copy of the deletion is rejected. Tombstones and
-//! last-known files persist in `<root>/.riftpipe-folder-index`, so deletes
-//! made while offline are detected at startup.
+//! re-created locally drops its tombstone and remembers all its deletion `ids`
+//! as `superseded`, so an old copy of any of them is rejected. A delete for a
+//! path already deleted here merges its ids into the tombstone; ids are
+//! deterministic (same content + history → same id), so independent deletes
+//! that never met still match. Tombstones and last-known files persist in
+//! `<root>/.riftpipe-folder-index`, so deletes made while offline are
+//! detected at startup.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,7 +61,7 @@ use crate::net::negotiate::negotiate_session_halves;
 use crate::net::transport::{accept_link, connect_link};
 use crate::net::{Counters, Result, Sink, Source};
 use crate::sync::pipe::{Role, SessionOutcome};
-use crate::sync::workspace::{Hash, Tombstone, Workspace};
+use crate::sync::workspace::{Hash, Tombstone, Workspace, DELETION_IDS_CAP, SEEN_CAP};
 
 /// Re-advertise cadence — and the liveness beat: every heartbeat starts with a
 /// `Version` frame, so even an empty workspace proves it's alive.
@@ -80,7 +83,7 @@ fn delta(path: &str, bytes: Vec<u8>) -> Vec<u8> {
 }
 
 fn delete_frame(path: &str, t: &Tombstone) -> Vec<u8> {
-    encode(&SyncMsg::StratDelete { path: path.to_string(), id: t.id, seen: t.seen.clone() })
+    encode(&SyncMsg::StratDelete { path: path.to_string(), ids: t.ids.clone(), seen: t.seen.clone() })
 }
 
 fn encode(msg: &SyncMsg) -> Vec<u8> {
@@ -180,7 +183,7 @@ fn apply_inbound(ws: &mut Workspace, msg: SyncMsg) -> Vec<Vec<u8>> {
                 }
             }
         }
-        SyncMsg::StratDelete { path, id, seen } => remote_delete(ws, &path, id, &seen, &mut out),
+        SyncMsg::StratDelete { path, ids, seen } => remote_delete(ws, &path, &ids, &seen, &mut out),
         _ => {}
     }
     out
@@ -206,10 +209,16 @@ fn delta_for_tombstone(ws: &mut Workspace, path: &str, bytes: &[u8], out: &mut V
 
 /// A peer deleted `path`. Delete here unless we hold content the deleter
 /// never saw (a concurrent edit — edit wins: answer with a self-contained
-/// delta so the deleter resurrects) or we re-created the file after that very
-/// deletion. Tombstoned or never-known paths: no-op.
-fn remote_delete(ws: &mut Workspace, path: &str, id: u64, seen: &[Hash], out: &mut Vec<Vec<u8>>) {
+/// delta so the deleter resurrects) or we re-created the file after any of
+/// those deletions. Already deleted here: merge the peer's ids + fingerprints
+/// into our tombstone (so a later re-creation overrides them too). Never-known
+/// paths: no-op. Only the newest `DELETION_IDS_CAP` ids / `SEEN_CAP`
+/// fingerprints are considered, so a peer can't make us hold a huge list.
+fn remote_delete(ws: &mut Workspace, path: &str, ids: &[u64], seen: &[Hash], out: &mut Vec<Vec<u8>>) {
+    let ids = &ids[ids.len().saturating_sub(DELETION_IDS_CAP)..];
+    let seen = &seen[seen.len().saturating_sub(SEEN_CAP)..];
     if ws.is_tombstoned(path) {
+        ws.merge_remote_delete(path, ids, seen);
         return;
     }
     let Some(empty_sv) = ws.fresh_strategy(path).map(|s| s.state_vector()) else { return };
@@ -219,7 +228,7 @@ fn remote_delete(ws: &mut Workspace, path: &str, id: u64, seen: &[Hash], out: &m
         res.note_state(); // an unscanned local edit counts
     }
     let full = res.strategy.delta_since(&empty_sv); // self-contained: merges into a fresh strategy
-    let keep = if res.superseded.contains(&id) {
+    let keep = if ids.iter().any(|id| res.superseded.contains(id)) {
         true
     } else if bytes.is_empty() || full.is_none() {
         false
@@ -231,7 +240,7 @@ fn remote_delete(ws: &mut Workspace, path: &str, id: u64, seen: &[Hash], out: &m
             out.push(delta(path, d));
         }
         ws.mark_dirty();
-    } else if let Err(e) = ws.apply_remote_delete(path, id, seen) {
+    } else if let Err(e) = ws.apply_remote_delete(path, ids, seen) {
         eprintln!("[folder] could not delete {path} (peer's delete; kept, will retry): {e}");
     }
 }
@@ -919,6 +928,151 @@ mod tests {
 
         std::fs::remove_dir_all(&ra).ok();
         std::fs::remove_dir_all(&rb).ok();
+    }
+
+    /// Both peers delete the same file at once (each then ignores — merges —
+    /// the other's delete, since the path is already gone), then A restores
+    /// byte-identical content. The restore must survive: B's re-asserted
+    /// deletion is one A's re-creation overrode. Then a genuinely new delete of
+    /// the restored file by B must still apply (fresh id, not the overruled one).
+    #[test]
+    fn concurrent_deletes_then_identical_restore_survives() {
+        let ra = dir("cd-a");
+        let rb = dir("cd-b");
+        std::fs::write(ra.join("h.bin"), b"precious").unwrap();
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        std::fs::remove_file(ra.join("h.bin")).unwrap();
+        std::fs::remove_file(rb.join("h.bin")).unwrap();
+        let (fa, fb) = (collect_local(&mut a), collect_local(&mut b));
+        pump(&mut a, &mut b, fb, fa);
+        assert!(a.is_tombstoned("h.bin") && b.is_tombstoned("h.bin"));
+
+        std::fs::write(ra.join("h.bin"), b"precious").unwrap();
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+        let (ha, hb) = (advertise_all(&mut a), advertise_all(&mut b));
+        pump(&mut a, &mut b, hb, ha);
+        assert_eq!(std::fs::read(ra.join("h.bin")).unwrap(), b"precious");
+        assert_eq!(std::fs::read(rb.join("h.bin")).unwrap(), b"precious");
+        assert!(!a.is_tombstoned("h.bin") && !b.is_tombstoned("h.bin"));
+
+        std::fs::remove_file(rb.join("h.bin")).unwrap();
+        let fb = collect_local(&mut b);
+        pump(&mut a, &mut b, fb, vec![]);
+        let (ha, hb) = (advertise_all(&mut a), advertise_all(&mut b));
+        pump(&mut a, &mut b, hb, ha);
+        assert!(!ra.join("h.bin").exists() && !rb.join("h.bin").exists());
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    /// Same, but the two deletes NEVER reach each other (link down; on
+    /// reconnect neither advertises a deleted path). Deterministic deletion
+    /// ids make both tombstones carry the same id, so A's restore still
+    /// overrides B's deletion.
+    #[test]
+    fn deletes_that_never_met_then_identical_restore_survives() {
+        let ra = dir("dn-a");
+        let rb = dir("dn-b");
+        std::fs::write(ra.join("n.bin"), b"keep me").unwrap();
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        std::fs::remove_file(ra.join("n.bin")).unwrap();
+        std::fs::remove_file(rb.join("n.bin")).unwrap();
+        let (_dropped_a, _dropped_b) = (collect_local(&mut a), collect_local(&mut b));
+        let (ha, hb) = (advertise_all(&mut a), advertise_all(&mut b));
+        pump(&mut a, &mut b, hb, ha);
+
+        std::fs::write(ra.join("n.bin"), b"keep me").unwrap();
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+        let (ha, hb) = (advertise_all(&mut a), advertise_all(&mut b));
+        pump(&mut a, &mut b, hb, ha);
+        assert_eq!(std::fs::read(ra.join("n.bin")).unwrap(), b"keep me");
+        assert_eq!(std::fs::read(rb.join("n.bin")).unwrap(), b"keep me");
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    /// A deletes and sends, then crashes before saving its index: on restart
+    /// the delete is re-detected from the stale index and must mint the SAME
+    /// id B adopted, so an identical restore on A still survives.
+    #[test]
+    fn crash_before_index_save_then_identical_restore_survives() {
+        let ra = dir("cs-a");
+        let rb = dir("cs-b");
+        std::fs::write(ra.join("c.bin"), b"crash test").unwrap();
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+        a.save_index_if_dirty();
+
+        std::fs::remove_file(ra.join("c.bin")).unwrap();
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+        assert!(b.is_tombstoned("c.bin"));
+        drop(a); // crash: the tombstone was never saved
+
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        assert_eq!(a.tombstone("c.bin").unwrap().ids, b.tombstone("c.bin").unwrap().ids);
+
+        std::fs::write(ra.join("c.bin"), b"crash test").unwrap();
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+        let (ha, hb) = (advertise_all(&mut a), advertise_all(&mut b));
+        pump(&mut a, &mut b, hb, ha);
+        assert_eq!(std::fs::read(ra.join("c.bin")).unwrap(), b"crash test");
+        assert_eq!(std::fs::read(rb.join("c.bin")).unwrap(), b"crash test");
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    /// A peer's delete for a path we already deleted is merged, not ignored:
+    /// its id joins our tombstone, so our later re-creation overrides it and
+    /// the peer's re-assert of that id is rejected. A huge id list is capped.
+    #[test]
+    fn already_deleted_path_merges_a_peers_deletion_id() {
+        let ra = dir("mi-a");
+        std::fs::write(ra.join("m.bin"), b"mine").unwrap();
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let _ = collect_local(&mut a);
+        std::fs::remove_file(ra.join("m.bin")).unwrap();
+        let _ = collect_local(&mut a);
+        let seen = a.tombstone("m.bin").unwrap().seen.clone();
+
+        let peer_delete = encode(&SyncMsg::StratDelete {
+            path: "m.bin".into(),
+            ids: vec![0xDEAD_BEEF],
+            seen: seen.clone(),
+        });
+        assert!(deliver(&mut a, &peer_delete).is_empty());
+        assert!(a.tombstone("m.bin").unwrap().ids.contains(&0xDEAD_BEEF));
+
+        let flood = encode(&SyncMsg::StratDelete { path: "m.bin".into(), ids: (0..1000).collect(), seen: vec![] });
+        let _ = deliver(&mut a, &flood);
+        assert!(a.tombstone("m.bin").unwrap().ids.len() <= DELETION_IDS_CAP);
+        // The flood pushed 0xDEAD_BEEF out of the capped list; merge it back.
+        let _ = deliver(&mut a, &peer_delete);
+
+        std::fs::write(ra.join("m.bin"), b"mine").unwrap();
+        let _ = collect_local(&mut a);
+        let replies = deliver(&mut a, &peer_delete);
+        assert_eq!(std::fs::read(ra.join("m.bin")).unwrap(), b"mine");
+        assert!(!a.is_tombstoned("m.bin"));
+        assert!(matches!(
+            postcard::from_bytes::<SyncMsg>(&replies[0]).unwrap(),
+            SyncMsg::StratDelta { .. }
+        ));
+
+        std::fs::remove_dir_all(&ra).ok();
     }
 
     #[tokio::test]

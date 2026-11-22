@@ -187,7 +187,7 @@ over riftpipe's wasm file API). What remains:
   from webrtc-rs's 5s/25s/2s defaults) so a vanished direct peer is detected
   faster at the transport layer too.
 - **Folder deletes sync** — *done.* `riftpipe_core::sync::SyncMsg` gained an
-  APPENDED `StratDelete { path, id, seen }` variant (wire index 7;
+  APPENDED `StratDelete { path, ids, seen }` variant (wire index 7;
   `PROTOCOL_VERSION` 3 → 4, since a pre-bump peer silently ignores deletes and
   keeps the files). A file-backed resource that was materialized at least
   once and then goes missing from disk (watcher/poll scan, or a startup
@@ -202,9 +202,12 @@ over riftpipe's wasm file API). What remains:
   `StratAdvert` for a tombstoned path re-asserts the delete (how an
   offline-at-delete-time peer learns on reconnect); a non-self-contained
   delta re-asserts too, at most once per heartbeat (loop guard). Re-creating
-  a tombstoned path locally drops the tombstone and remembers its id as
-  `superseded`, so an old copy of that deletion held by a peer is rejected
-  even for a byte-identical re-creation. Tombstones + last-known live files
+  a tombstoned path locally drops the tombstone and remembers its ids as
+  `superseded`, so an old copy of those deletions held by a peer is rejected
+  even for a byte-identical re-creation. Deletion ids are deterministic
+  (blake3 of path + last fingerprint + superseded ids) and independent
+  deletes of one path merge their ids, so concurrent deletes followed by an
+  identical restore can't lose the restored file. Tombstones + last-known live files
   persist in `<root>/.riftpipe-folder-index` (postcard, atomic write), so
   deletes made or received while offline survive a restart. Out of scope,
   tracked as the next bullet: `sync::tree`/`sync::mesh` (browser/kanban).
