@@ -21,15 +21,15 @@ await a.locator(".auth-bar").screenshot({ path: `${out}/auth-unlocked.png` });
 await a.locator(".lock-btn").click();
 await wait(2500);
 await a.locator(".auth-bar").screenshot({ path: `${out}/auth-owner-empty.png` });
-await b.locator(".auth-bar").screenshot({ path: `${out}/auth-viewer.png` });
+await b.locator(".auth-bar").screenshot({ path: `${out}/auth-no-access.png` });
 // B asks; the request lands in A's inbox.
 await b.locator(".ask-btn").click();
 await wait(2000);
-await b.locator(".auth-bar").screenshot({ path: `${out}/auth-viewer-waiting.png` });
+await b.locator(".auth-bar").screenshot({ path: `${out}/auth-no-access-waiting.png` });
 await a.locator(".req").first().waitFor({ timeout: 8000 });
 await a.locator(".auth-bar").screenshot({ path: `${out}/auth-owner-inbox.png` });
 await a.locator(".approve-btn").first().click();
 await wait(2500);
 await b.locator(".auth-bar").screenshot({ path: `${out}/auth-editor.png` });
-console.log("wrote auth-unlocked/owner-empty/viewer/viewer-waiting/owner-inbox/editor.png to", out);
+console.log("wrote auth-unlocked/owner-empty/no-access/no-access-waiting/owner-inbox/editor.png to", out);
 await browser.close();

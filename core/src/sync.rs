@@ -41,7 +41,8 @@ pub fn is_text_path(path: &str) -> bool {
 /// v3: device-linking auth wire types — `MeshMsg::Trust` (replicated trust log)
 /// and `MeshMsg::SignedSync` (signed writes). Both APPENDED, so an open-mode
 /// board stays wire-compatible; enforcement is opt-in per board.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// v4: epoch-sealed content for restricted boards — MeshMsg::Epoch (admin-signed wrapped epoch keys) and MeshMsg::Sealed (content under the current epoch key). Both APPENDED; open boards are wire-identical, the bump only surfaces the upgrade.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Per-chunk payload budget for [`encode_mesh_frames`]. iroh-gossip's message
 /// limit defaults to 4096 bytes and is enforced on SEND AND RECEIVE — so
@@ -140,6 +141,12 @@ pub enum MeshMsg {
     /// and — on approval — replies with a `Trust` grant. Self-authenticating via
     /// its signature; peers that predate it skip the unknown variant. APPENDED.
     Request(crate::onboard::JoinRequest),
+    /// An Admin-signed epoch announcement carrying wrapped epoch keys (restricted
+    /// boards). APPENDED (v4): older peers skip it.
+    Epoch(crate::epoch::EpochAnnounce),
+    /// Content (`Sync`/`SignedSync`) sealed under an epoch key — only devices
+    /// wrapped into that epoch can open it. APPENDED (v4).
+    Sealed(crate::epoch::SealedMsg),
 }
 
 /// FNV-1a 64-bit — a tiny, dependency-free content hash for chunk ids. Not
@@ -696,6 +703,9 @@ mod wire_compat {
             (MeshMsg::Version { id: [0; 32], proto: 1 }, 3),
             (MeshMsg::Trust(k.genesis()), 4),
             (MeshMsg::SignedSync(SignedWrite { author: [0; 32], sig: vec![], payload: vec![] }), 5),
+            (MeshMsg::Request(crate::onboard::JoinRequest::create(&k, "x")), 6),
+            (MeshMsg::Epoch(crate::epoch::EpochAnnounce::create(&k, 1, [0; 8], vec![])), 7),
+            (MeshMsg::Sealed(crate::epoch::SealedMsg { seq: 1, id: [0; 8], body: vec![] }), 8),
         ];
         for (msg, index) in cases {
             let bytes = postcard::to_allocvec(&msg).unwrap();
@@ -719,6 +729,43 @@ mod wire_compat {
             assert!(
                 postcard::from_bytes::<LegacyMeshMsg>(&bytes).is_err(),
                 "legacy peers must reject (and thus skip) post-v0 frames",
+            );
+        }
+    }
+
+    /// A v3 peer (device-linking auth, no epoch support) rejects the APPENDED
+    /// `Epoch`/`Sealed` variants and skips them, rather than misdecoding.
+    #[test]
+    fn v3_peers_skip_epoch_and_sealed() {
+        use crate::identity::{DeviceKey, SignedWrite};
+        let k = DeviceKey::from_seed(&[6u8; 32]);
+
+        /// The mesh wire enum exactly as v3 peers know it.
+        #[derive(serde::Deserialize)]
+        enum LegacyV3MeshMsg {
+            #[allow(dead_code)]
+            Sync(SyncMsg),
+            #[allow(dead_code)]
+            Presence { id: [u8; 32], neighbors: Vec<[u8; 32]> },
+            #[allow(dead_code)]
+            Chunk { id: u64, index: u32, total: u32, bytes: Vec<u8> },
+            #[allow(dead_code)]
+            Version { id: [u8; 32], proto: u32 },
+            #[allow(dead_code)]
+            Trust(crate::identity::TrustEntry),
+            #[allow(dead_code)]
+            SignedSync(SignedWrite),
+            #[allow(dead_code)]
+            Request(crate::onboard::JoinRequest),
+        }
+
+        let epoch = MeshMsg::Epoch(crate::epoch::EpochAnnounce::create(&k, 1, [0; 8], vec![]));
+        let sealed = MeshMsg::Sealed(crate::epoch::SealedMsg { seq: 1, id: [0; 8], body: vec![1] });
+        for msg in [epoch, sealed] {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            assert!(
+                postcard::from_bytes::<LegacyV3MeshMsg>(&bytes).is_err(),
+                "v3 peers must reject (and thus skip) epoch-sealed frames",
             );
         }
     }

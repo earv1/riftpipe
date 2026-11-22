@@ -200,6 +200,8 @@ pub struct TrustLog {
     pending: Vec<TrustEntry>,
     /// Dedup — entry ids already applied (idempotent replay).
     applied: HashSet<[u8; 32]>,
+    /// Devices removed by an applied Revoke (cleared by a later re-grant).
+    revoked: HashSet<DeviceId>,
 }
 
 impl TrustLog {
@@ -227,6 +229,12 @@ impl TrustLog {
         let mut v: Vec<_> = self.roles.iter().map(|(id, r)| (*id, *r)).collect();
         v.sort_by_key(|(id, _)| *id);
         v
+    }
+
+    /// Was `id` removed by an applied Revoke (and not re-granted since)? Distinct from
+    /// "not authorized": a device whose grant simply hasn't arrived yet is NOT revoked.
+    pub fn is_revoked(&self, id: &DeviceId) -> bool {
+        self.revoked.contains(id)
     }
 
     /// Ingest one entry. Returns `true` if it is (now) applied. Invalid entries
@@ -302,6 +310,7 @@ impl TrustLog {
                 match self.role(by) {
                     Some(Role::Admin) => {
                         self.roles.insert(*device, *role);
+                        self.revoked.remove(device);
                         Outcome::Applied
                     }
                     // Granter not (yet) a known Admin: its own grant may still
@@ -321,6 +330,7 @@ impl TrustLog {
                 let self_leave = by == device;
                 if by_is_admin || self_leave {
                     self.roles.remove(device);
+                    self.revoked.insert(*device);
                     Outcome::Applied
                 } else {
                     // `by` might be an admin we don't know yet, or a Member (never
@@ -556,5 +566,43 @@ mod tests {
         w.author = founder.id();
         assert!(w.author_verified().is_none(), "sig doesn't match the claimed author's key");
         assert!(w.verified(&log).is_none());
+    }
+
+    #[test]
+    fn is_revoked_tracks_revoke_and_regrant() {
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let mut log = TrustLog::new();
+        log.apply(founder.genesis());
+        log.apply(founder.grant(phone.id(), Role::Member, nonce(1)));
+        assert!(!log.is_revoked(&phone.id()));
+
+        log.apply(founder.revoke(phone.id(), nonce(2)));
+        assert!(log.is_revoked(&phone.id()));
+        assert!(!log.is_authorized(&phone.id()));
+
+        log.apply(founder.grant(phone.id(), Role::Member, nonce(3)));
+        assert!(!log.is_revoked(&phone.id()));
+        assert!(log.is_authorized(&phone.id()));
+    }
+
+    #[test]
+    fn ungranted_is_not_revoked_and_member_revoke_does_not_mark() {
+        let founder = DeviceKey::generate();
+        let random = DeviceKey::generate();
+        let member = DeviceKey::generate();
+        let target = DeviceKey::generate();
+        let mut log = TrustLog::new();
+        log.apply(founder.genesis());
+        log.apply(founder.grant(member.id(), Role::Member, nonce(1)));
+        log.apply(founder.grant(target.id(), Role::Member, nonce(2)));
+
+        // Never granted at all.
+        assert!(!log.is_revoked(&random.id()));
+
+        // A Member's revoke of another device is deferred and never applies.
+        assert!(!log.apply(member.revoke(target.id(), nonce(3))));
+        assert!(!log.is_revoked(&target.id()));
+        assert!(log.is_authorized(&target.id()));
     }
 }

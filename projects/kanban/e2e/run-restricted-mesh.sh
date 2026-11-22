@@ -3,11 +3,13 @@
 # gossip mesh: a founder hosts a --restricted board, grants one device, and a
 # second UNAUTHORIZED device is rejected.
 #
-#   founder (restricted, grants B) ── mesh ── B (authorized): writes sync
-#                                       └───── C (ungranted):  writes REJECTED
+#   founder (restricted, grants B) ── mesh ── B (authorized): reads + writes sync
+#                                       └───── C (ungranted):  connected, but wrapped
+#                                                               into nothing — no read, no write
 #
-# Read is open (all hold the link), so the founder's file reaches everyone; only
-# WRITES are gated. Exit 0 on pass.
+# Read is now gated too: an un-granted device is a gossip member (it learns the
+# founder's epoch) but is never wrapped into it, so it receives no content.
+# Exit 0 on pass.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$ROOT"
@@ -35,7 +37,8 @@ for _ in $(seq 1 30); do [ -f "$FOUNDER.ticket" ] && break; sleep 0.3; done
 TICKET="$(cat "$FOUNDER.ticket" 2>/dev/null || true)"
 [ -n "$TICKET" ] || { echo "FAIL: founder never printed a ticket"; cat "$WORK/founder.log"; exit 1; }
 
-# The founder writes a file — read is open, so it must reach BOTH joiners.
+# The founder writes a file — read is gated now, so it must reach the granted
+# member but NOT the un-granted outsider.
 echo "hello from founder" > "$FOUNDER/from_founder.txt"
 
 echo "== authorized member joins =="
@@ -51,19 +54,18 @@ sleep 4
 echo "authorized member write" > "$MEMBER/from_member.txt"
 echo "ungranted outsider write" > "$OUTSIDER/from_outsider.txt"
 
-# Wait for convergence of the allowed writes.
+# Wait for convergence of the allowed read+write (the outsider must NOT read).
 ok=0
 for _ in $(seq 1 40); do
   if [ -f "$FOUNDER/from_member.txt" ] \
-     && [ -f "$MEMBER/from_founder.txt" ] \
-     && [ -f "$OUTSIDER/from_founder.txt" ]; then ok=1; break; fi
+     && [ -f "$MEMBER/from_founder.txt" ]; then ok=1; break; fi
   sleep 0.5
 done
 
 echo "== results =="
 fail=0
-if [ "$ok" = 1 ]; then echo "OK: authorized member write reached founder; founder's write reached both"; else
-  echo "FAIL: authorized/open writes did not converge"; fail=1; fi
+if [ "$ok" = 1 ]; then echo "OK: authorized member write reached founder; founder's write reached the member"; else
+  echo "FAIL: authorized writes did not converge"; fail=1; fi
 
 # The key security assertion: give the rejected write ample time, then confirm
 # it never reached the founder or the member.
@@ -74,7 +76,12 @@ else
   echo "OK: the unauthorized outsider's write was rejected everywhere"
 fi
 
+if [ -f "$OUTSIDER/from_founder.txt" ]; then echo "FAIL: un-granted outsider READ the founder's file (read must be gated)"; fail=1
+else echo "OK: the un-granted outsider could not read the board"; fi
+grep -q "no key for epoch 1" "$WORK/outsider.log" && echo "OK: outsider is connected (saw epoch 1, holds no key)" \
+  || { echo "FAIL: outsider never saw the founder's epoch (not connected?)"; fail=1; }
+
 grep -q "protocol-mismatch" "$WORK"/*.log && { echo "FAIL: unexpected protocol mismatch"; fail=1; }
 
-[ "$fail" = 0 ] && echo "PASS: device-linking auth enforces over the mesh" || echo "FAILED"
+[ "$fail" = 0 ] && echo "PASS: restricted mesh gates reads and writes" || echo "FAILED"
 exit "$fail"

@@ -179,10 +179,11 @@ async fn restricted_mesh_accepts_an_authorized_writer() {
     std::fs::remove_dir_all(&db).ok();
 }
 
-/// The security proof, END-TO-END over the real mesh: an UNAUTHORIZED device's
-/// signed write is rejected by a restricted founder — while the founder's own
-/// write still reaches that device (proving they're genuinely connected and it
-/// is the write-authorization, not a failed connection, doing the rejecting).
+/// The security proof, END-TO-END over the real mesh: on a restricted board an
+/// UNGRANTED device is connected (it learns the founder's epoch 1 from the
+/// catch-up) but is never wrapped in — so it can't READ the founder's sealed
+/// file, and its own writes never land on the founder (it holds no key to seal
+/// them, and the founder would reject them as unauthorized anyway).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restricted_mesh_rejects_an_unauthorized_writer() {
     use riftpipe_core::identity::DeviceKey;
@@ -194,10 +195,9 @@ async fn restricted_mesh_rejects_an_unauthorized_writer() {
     let host = MeshConn::join(secret, None).await.expect("host join");
     let host_addr = dialable_addr(&host).await;
 
-    // Founder writes a file that MUST reach the outsider (read is open — they
-    // have the link — so this proves the two are actually connected).
-    let (_tx_a, mut rx_a) = push_file(&df, "from_founder.bin", b"reaches everyone");
-    // Outsider writes a file that MUST be rejected (it's not an authorized writer).
+    // Founder writes a file that must NOT reach the outsider (read is gated).
+    let (_tx_a, mut rx_a) = push_file(&df, "from_founder.bin", b"members only");
+    // Outsider writes a file that must never reach the founder.
     let (_tx_c, mut rx_c) = push_file(&dc, "from_outsider.bin", b"should be dropped");
 
     let df_task = df.clone();
@@ -209,31 +209,122 @@ async fn restricted_mesh_rejects_an_unauthorized_writer() {
         let _ = riftpipe::sync::mesh::run(host, &df_task, &mut peer, &mut rx_a, false).await;
     });
     let (dc_task, addr) = (dc.clone(), host_addr.clone());
+    let (stop_c, stop_c_rx) = tokio::sync::oneshot::channel::<()>();
     let c_task = tokio::spawn(async move {
         let mut peer = TreePeer::new();
         peer.set_identity(DeviceKey::from_seed(&[52u8; 32]), true); // signs, but ungranted
-        let _ = riftpipe::sync::mesh::join_and_run(secret, addr, &dc_task, &mut peer, &mut rx_c, false).await;
+        tokio::select! {
+            _ = riftpipe::sync::mesh::join_and_run(secret, addr, &dc_task, &mut peer, &mut rx_c, false) => {}
+            _ = stop_c_rx => {}
+        }
+        peer
     });
 
-    // The founder's write reaches the connected outsider.
-    let on_outsider = dc.join("from_founder.bin");
+    // Ample time to connect, catch up, and (wrongly) exchange content.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let _ = stop_c.send(());
+    let c_peer = c_task.await.unwrap();
+
+    assert_eq!(c_peer.epoch_known(), Some(1), "the outsider is connected: it learned the founder's epoch");
+    assert_eq!(c_peer.epoch_held(), None, "an ungranted device is never wrapped into the epoch");
+    assert!(
+        !dc.join("from_founder.bin").exists(),
+        "an ungranted device must not READ the restricted founder's content",
+    );
+    assert!(
+        !df.join("from_outsider.bin").exists(),
+        "an unauthorized device's write must never land on the restricted founder",
+    );
+
+    a_task.abort();
+    std::fs::remove_dir_all(&df).ok();
+    std::fs::remove_dir_all(&dc).ok();
+}
+
+fn hex(b: &[u8; 32]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+async fn wait_for(paths: &[PathBuf], what: &str) {
     tokio::time::timeout(BUDGET, async {
-        while !on_outsider.is_file() {
+        while !paths.iter().all(|p| p.is_file()) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("founder's write should reach the connected outsider (read is open)");
+    .unwrap_or_else(|_| panic!("timed out: {what}"));
+}
 
-    // Give the outsider's rejected write ample time; it must NEVER reach the founder.
+/// READ REVOCATION end-to-end over the real mesh: founder grants B and C, both are
+/// wrapped into epoch 1 and read the founder's file. The founder revokes C on the
+/// LIVE board (the same control file `riftpipe revoke` writes) → rotation to epoch 2
+/// wrapped to {founder, B}. New content from the founder and from B reaches the other;
+/// C — still connected, still holding epoch 1 — decrypts none of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restricted_mesh_revoked_device_loses_read_after_rotation() {
+    use riftpipe_core::identity::{DeviceKey, Role};
+    let (df, db, dc) = (dir("rv-founder"), dir("rv-member"), dir("rv-revoked"));
+    let secret = riftpipe_core::crypto::generate_secret();
+    let host = MeshConn::join(secret, None).await.expect("host join");
+    let host_addr = dialable_addr(&host).await;
+    let b_id = DeviceKey::from_seed(&[62u8; 32]).id();
+    let c_id = DeviceKey::from_seed(&[63u8; 32]).id();
+
+    let (tx_a, mut rx_a) = push_file(&df, "before.bin", b"epoch one");
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let (_tx_c, mut rx_c) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+
+    let df_task = df.clone();
+    let a_task = tokio::spawn(async move {
+        let founder = DeviceKey::from_seed(&[61u8; 32]);
+        let mut peer = TreePeer::new();
+        peer.set_identity(DeviceKey::from_seed(&[61u8; 32]), true);
+        peer.add_trust(founder.genesis());
+        peer.add_trust(founder.grant(b_id, Role::Member, [1u8; 16]));
+        peer.add_trust(founder.grant(c_id, Role::Member, [2u8; 16]));
+        let _ = riftpipe::sync::mesh::run(host, &df_task, &mut peer, &mut rx_a, false).await;
+    });
+    let (db_task, addr_b) = (db.clone(), host_addr.clone());
+    let b_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        peer.set_identity(DeviceKey::from_seed(&[62u8; 32]), true);
+        let _ = riftpipe::sync::mesh::join_and_run(secret, addr_b, &db_task, &mut peer, &mut rx_b, false).await;
+    });
+    let (stop_c, stop_c_rx) = tokio::sync::oneshot::channel::<()>();
+    let (dc_task, addr_c) = (dc.clone(), host_addr.clone());
+    let c_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        peer.set_identity(DeviceKey::from_seed(&[63u8; 32]), true);
+        tokio::select! {
+            _ = riftpipe::sync::mesh::join_and_run(secret, addr_c, &dc_task, &mut peer, &mut rx_c, false) => {}
+            _ = stop_c_rx => {}
+        }
+        peer
+    });
+
+    wait_for(&[db.join("before.bin"), dc.join("before.bin")], "B and C read epoch-1 content").await;
+
+    riftpipe::sync::control::append(&df, "revoke", &hex(&c_id)).unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    std::fs::write(df.join("after.bin"), b"epoch two").unwrap();
+    tx_a.send(df.join("after.bin")).unwrap();
+    std::fs::write(db.join("after_b.bin"), b"member, epoch two").unwrap();
+    tx_b.send(db.join("after_b.bin")).unwrap();
+    wait_for(&[db.join("after.bin"), df.join("after_b.bin")], "remaining members keep syncing").await;
+
     tokio::time::sleep(Duration::from_secs(4)).await;
-    assert!(
-        !df.join("from_outsider.bin").exists(),
-        "an unauthorized device's signed write must be rejected by the restricted founder",
-    );
+    assert!(!dc.join("after.bin").exists(), "revoked C must not decrypt the founder's post-rotation write");
+    assert!(!dc.join("after_b.bin").exists(), "revoked C must not decrypt B's post-rotation write");
+
+    let _ = stop_c.send(());
+    let c_peer = c_task.await.unwrap();
+    assert_eq!(c_peer.epoch_held(), Some(1), "C kept only the epoch it was wrapped into");
+    assert_eq!(c_peer.epoch_known(), Some(2), "C saw the rotation but holds no key for it");
 
     a_task.abort();
-    c_task.abort();
-    std::fs::remove_dir_all(&df).ok();
-    std::fs::remove_dir_all(&dc).ok();
+    b_task.abort();
+    for d in [&df, &db, &dc] {
+        std::fs::remove_dir_all(d).ok();
+    }
 }

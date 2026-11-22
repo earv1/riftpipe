@@ -16,11 +16,11 @@ riftpipe.io/.sh available. "Open a rift, pipe through it.")
 
 ## Repo / branch state
 - GitHub: **https://github.com/earv1/riftpipe** (public).
-- Current work: branch **`protocol-versioning`** (off `origin/main`, which
-  already has the `serverless-browser-kanban` work) — protocol versioning,
-  mesh sealing, signed writes + trust log, the browser
-  claim/request-to-join flow, the generic file API, and the synced event log
-  (see `What's done`).
+- Current work: branch **`epoch-seal`** (off `protocol-versioning`, off
+  `origin/main`, which already has the `serverless-browser-kanban` work) —
+  protocol versioning, mesh sealing, signed writes + trust log, the browser
+  claim/request-to-join flow, the generic file API, the synced event log, and
+  now epoch-sealed content + read revocation (see `What's done`).
 - **Guardrail:** a hook blocks committing/pushing to `main` (and any command
   containing the word "main") — the user pushes branches and merges PRs. Claude
   does not commit on `main`; current work is left in the working tree.
@@ -125,6 +125,14 @@ src/:
   deleted; plus a generic synced **event log** (`logEvent`/`readEvents`,
   `events/<device-id>.jsonl`, `riftpipe:event`). Details:
   `docs/planned/roadmap.md` §Security and items 8/17.
+- **Epoch-key mesh seal** (branch `epoch-seal`, July 2026): restricted/claimed
+  boards now seal content under a rotating epoch key (`core::epoch`,
+  `PROTOCOL_VERSION` 4) — read revocation by rotation, not just write-revoke.
+  `riftpipe revoke|grant <dir> <device-id>` drives it live on a running CLI
+  peer; the kanban owner gets a members list with "Remove". E2E:
+  `run-epoch-revoke.sh` (native), `run-browser-auth.sh` /
+  `e2e/epoch-revoke.mjs` (browser). Details: `docs/planned/roadmap.md`
+  §Security.
 
 ## Planned (design docs)
 - **P2P kanban — files as the database** — see [`docs/planned/`](docs/planned/).
@@ -159,10 +167,10 @@ Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
    "filify", no kanban Rust at all; one wire protocol; `connect` over iroh +
    negotiation; `web/Cargo.lock` tracked; signaling demoted; real-relay test
    de-flaked).
-7. **Auth follow-through** (roadmap §Security): drive the mesh seal from
-   epoch keys; make approve also deliver a wrapped epoch key (grants are
-   write-only today — reads stay open to link holders); request/approve on the
-   native CLI; the WebAuthn browser ceremony.
+7. ~~**Auth follow-through**~~ (roadmap §Security) — *done:* the mesh seal now
+   runs on epoch keys, read revocation by rotation, and
+   `riftpipe revoke|grant <dir> <id>` on the native CLI (see `What's done`).
+   Remaining: the WebAuthn browser ceremony.
 8. **History view** — render `readEvents()` (the event log is produced but
    nothing displays it yet).
 Older/parallel: file-mirror reconnection;

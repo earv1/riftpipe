@@ -5,6 +5,7 @@
 //! CLI (`riftpipe`) and the browser crate (`riftpipe-web`) share one document model.
 
 pub mod crypto;
+pub mod epoch;
 pub mod identity;
 pub mod keywrap;
 pub mod onboard;

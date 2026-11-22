@@ -3,6 +3,7 @@
 //!   strategy  the `SyncStrategy` adapter trait + `Kind` (the Strategy seam, §17)
 //!   algo      concrete algorithms behind it (text CRDT, rsync, wal*, image*)
 //!   backing   where a resource's bytes live: file vs. in-memory (§17.5)
+//!   control   live admin commands (revoke/grant) for a running mesh peer, via <dir>/.riftpipe-control
 //!   manifest  riftpipe.toml: glob -> algorithm (§17)
 //!   workspace a folder of resources, each bound to a SyncStrategy + backing (§17)
 //!   folder    multiplexed reconnecting session: many resources over one link
@@ -22,6 +23,7 @@
 
 pub mod algo;
 pub mod backing;
+pub mod control;
 pub mod folder;
 pub mod manifest;
 pub mod mesh;

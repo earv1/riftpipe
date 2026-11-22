@@ -23,8 +23,13 @@ via `npm run diagrams` — edit the model, not the images.
   means any *holder* can still forge messages attributed to other peers, freeze a
   file, or replace a document — sealing stops outsiders, not insiders. Closing
   that needs **signing** (below), which isn't built yet.
-- **There is no per-person revocation.** Removing one person means minting a new
-  board (new secret ⇒ new link) and re-sharing with everyone else.
+- **Restricted (claimed) boards seal content under a rotating epoch key.** Each
+  approved device gets the key wrapped to its own encryption key; removing a
+  device rotates to a new epoch wrapped only to those remaining, so the removed
+  device decrypts nothing from then on (`PROTOCOL_VERSION` 4). **Open boards are
+  unchanged:** the link is still full read + write access, and removing one
+  person there still means minting a new board (new secret ⇒ new link) and
+  re-sharing with everyone else.
 
 If a board is sensitive, treat the URL like a password: possession is full access,
 and anyone you share it with is fully trusted until signing lands.
@@ -99,15 +104,56 @@ blinds the relay to the *topic* and makes the content unreadable even to a peer
 that reaches the swarm on a guessed address. The relay still sees **connection
 metadata** (which endpoints talk, when).
 
+## Restricted boards: epoch-sealed content
+
+A **restricted** CLI board (`connect … --restricted`) or a **claimed** browser
+board means true **Restricted** access, not "view open, write gated": content
+is sealed a *second* time, inside the outer board-secret frame, under the
+current **epoch key** (`core::epoch`, `PROTOCOL_VERSION` 4). The topic and the
+outer seal stay exactly as described above — a rotated topic would split the
+swarm and strand late joiners — so content, not the rendezvous, is what
+rotates.
+
+- **Two-layer seal.** `MeshMsg::Sealed` carries `Sync`/`SignedSync` sealed
+  under `MeshCipher::from_epoch(key)`, bound to `(seq, id)` as AEAD associated
+  data so a header can't be swapped onto another body. A not-yet-approved
+  device still exchanges `Request`/`Trust`/`Epoch` control messages under the
+  outer seal only — it just can't open `Sealed` content.
+- **Wrapped keys travel Admin-signed.** `MeshMsg::Epoch(EpochAnnounce)` carries
+  one wrapped copy of the epoch key per authorized device, signed by an Admin;
+  peers accept an announce only from a signer their trust log already knows is
+  an Admin. An 8-byte key fingerprint (not the key) identifies "which epoch,"
+  so two Admins rotating at the same instant converge on the same winner
+  everywhere.
+- **Any online Admin rotates on revoke, and auto add-wraps on grant.** An
+  Admin rotates whenever the epoch it holds still wraps a device the trust log
+  has just revoked (`riftpipe revoke <dir> <id>`, or the browser owner's
+  "Remove"); any online Admin also wraps a newly-granted device into the
+  current epoch without a rotation, which is what makes `--grant`/"Approve"
+  deliver read access, not just write access.
+- **Older epochs keep working for the session.** Keys are kept as long as the
+  process runs, so content sealed under any epoch you hold still opens; a
+  message for an epoch you don't hold yet is parked (bounded) and replayed
+  once its key arrives.
+- **What a revoked device sees.** It stays a gossip member — it still opens
+  `Presence`/`Version`/the trust log (including its own `Revoke`)/`Request`s/
+  `Epoch` announces, so it learns device ids and how many devices are wrapped
+  in, but not the keys. Every content message sealed under the new epoch fails
+  to open (native logs `[epoch] no key for epoch N — this device is not
+  wrapped in`; the browser reports `canRead: false`), and its own writes are
+  rejected everywhere. It keeps whatever it already decrypted. During the
+  propagation window, a remaining member that hasn't yet received the new
+  epoch still seals under the old one, which the revoked device can still
+  read — inherent to eventual consistency, not a bug.
+
 ## Still open
 
 - **Signing (insider authenticity) + read/write split** — described above; the
   next security step.
-- **Per-person revocation.** Bearer capabilities can't be revoked individually.
-  Rotation *is* the revocation story: mint a new secret ⇒ new topic ⇒ new link
-  (the "New board" button already does exactly this), and re-share with the people
-  you still trust. Each such rollout that changes the wire is a `PROTOCOL_VERSION`
-  bump.
+- **Anyone-with-link Viewer mode.** `core::epoch::AccessMode::LinkViewer`
+  exists and both drivers route reads/writes through the one `mode()` switch,
+  but it isn't reachable yet — it needs an Admin-signed access setting to pick
+  it, with no content-wire change once that lands.
 
 ## How other local-first / P2P systems handle this
 
@@ -116,7 +162,7 @@ the shipped sealing model was built from.
 
 | System | Share capability | Rendezvous vs read key | Read/write split | Revocation | Authenticity |
 |---|---|---|---|---|---|
-| **riftpipe (today)** | Link = 32-byte secret + host address | **`topic = H(secret)`** — blinded; frames AEAD-sealed with `KDF(secret)` | None yet (link = full access) | None per-person (new secret ⇒ new link) | Sealed but **unsigned** (any holder can forge) |
+| **riftpipe (today)** | Link = 32-byte secret + host address | **`topic = H(secret)`** — blinded; frames AEAD-sealed with `KDF(secret)` | None yet (link = full access) | Restricted boards: rotate + re-wrap to remaining; open boards: new link | Sealed but **unsigned** (any holder can forge) |
 | **[iroh-docs](https://docs.rs/iroh-docs/latest/iroh_docs/sync/enum.Capability.html)** | `DocTicket` = capability + peer addrs | NamespaceId (public key) is the read cap | **Yes**: `Read(NamespaceId)` vs `Write(NamespaceSecret)` | None documented | Namespace + author signatures |
 | **[Hypercore](https://docs.pears.com/building-blocks/hypercore)** | 32-byte public key | **`discoveryKey = hash(publicKey)`** — swarm can't derive read key | Yes (single-writer: secret signs, public reads); Autobase adds `addWriter`/`removeWriter` | Writer removal via Autobase | Per-block signatures |
 | **[Earthstar](https://earthstar-project.org/docs/how-it-works)** | Share **address** (read) + **secret** (write) | Address = discovery **and** read | **Yes** (address vs secret; `~@name` path ownership) | None — "make a new share and migrate" | Per-document signatures |

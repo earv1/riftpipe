@@ -323,11 +323,27 @@ over riftpipe's wasm file API). What remains:
   inbox → approve → edit access; `shot-auth.mjs` screenshots it). Native
   peers skip `MeshMsg::Request` (their catch-all) — the CLI still grants via
   `--grant <device-id>`.
-  *Remaining is integration + interactive glue, not new crypto:* driving the
-  mesh seal from epoch keys (replacing the static board-secret cipher); having
-  approve also deliver a wrapped epoch key (today a grant is write access only —
-  reads stay open to anyone with the link); request/approve on the native CLI;
-  and the WebAuthn browser ceremony on top of these lib calls.
+  *Remaining is interactive glue, not new crypto:* the WebAuthn browser
+  ceremony on top of these lib calls. (Driving the mesh seal from epoch keys,
+  approve delivering a wrapped epoch key, and request/approve on the native
+  CLI are now shipped — see "Epoch-key mesh seal" below.)
+- **Epoch-key mesh seal — done (`PROTOCOL_VERSION` 4).** `core::epoch::EpochBook`
+  wires the content key into the mesh for real: on a **Restricted** board,
+  `Sync`/`SignedSync` is sealed a second time under the current epoch key
+  (`MeshMsg::Sealed`), identified by an 8-byte key fingerprint so two admins
+  rotating at once still agree everywhere on "current." Wrapped keys travel in
+  an Admin-signed `MeshMsg::Epoch`: any online Admin rotates on revoke and
+  auto add-wraps a newly-granted device without one. Older epochs are kept
+  for the session (content sealed under them still opens; out-of-order
+  content is parked and replayed once its key arrives); a revoked device
+  stays a gossip member (sees control-plane metadata, never the keys).
+  **Behaviour change:** a claimed/`--restricted` board now means true
+  **no-access** for an ungranted device, not "view only" — see `SECURITY.md`
+  §"Restricted boards: epoch-sealed content". **Proven over the real mesh:**
+  native (`restricted_mesh_revoked_device_loses_read_after_rotation`,
+  `run-epoch-revoke.sh`) and browser (`epoch-revoke.mjs`,
+  `run-browser-auth.sh`); live via `riftpipe revoke|grant <dir> <id>` and the
+  kanban owner's members-list "Remove" button.
 - **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md). Built so
   far (above): device keys + signed trust log, write signing, onboarding, the
   claim/request-to-join flow, and the `core::passkey` verifier; *not* built:

@@ -1,6 +1,6 @@
 import { createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, connectPeer, newBoard, watch, storageSupported, auth, type AuthState, type PendingRequest, type Card } from "./api.ts";
+import { getBoard, addCard, patchCard, connectPeer, newBoard, watch, storageSupported, auth, type AuthState, type PendingRequest, type Member, type Card } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 
 export function App() {
@@ -19,17 +19,21 @@ export function App() {
   // Auth/login state (from the lib): whether the board is locked (has an
   // author), and whether this device is the author / authorized to write.
   const [authState, setAuthState] = createSignal<AuthState>(
-    { locked: false, device: "", authorized: false, isAuthor: false, author: "", requested: false },
+    { locked: false, device: "", authorized: false, isAuthor: false, author: "", requested: false, canRead: true, epoch: 0 },
   );
   // The author's inbox: who has asked for write access (device id + safety code).
   const [pending, setPending] = createSignal<PendingRequest[]>([]);
+  // Every authorized device (restricted boards): lets the owner remove one.
+  const [members, setMembers] = createSignal<Member[]>([]);
   const refreshAuth = () => {
     setAuthState(auth.state());
     setPending(auth.pending());
+    setMembers(auth.members());
   };
   const lock = () => { auth.lockBoard(); refreshAuth(); };
   const askForAccess = () => { auth.requestAccess(); refreshAuth(); };
   const approve = (device: string) => { auth.grantDevice(device); refreshAuth(); };
+  const revoke = (device: string) => { auth.revokeDevice(device); refreshAuth(); };
 
   // A mesh peer announced a different riftpipe protocol version (or predates
   // versioning). Detection lives in the library; we only render its event.
@@ -167,7 +171,7 @@ export function App() {
         <Show when={!authState().locked}>
           <button
             class="lock-btn"
-            title="Become this board's owner — only you (and people you grant) can edit; others can view"
+            title="Become this board's owner — only you (and people you approve) can read or edit"
             onClick={lock}
           >
             🔓 Claim board (you become the owner)
@@ -192,17 +196,33 @@ export function App() {
               )}
             </For>
           </Show>
+          <Show when={members().some((m) => !m.me)}>
+            <span class="auth-hint">members:</span>
+            <For each={members().filter((m) => !m.me)}>
+              {(m) => (
+                <span class="member">
+                  <span class="req-id" title={`device ${m.device}`}>{m.device.slice(0, 8)}… · {m.role}</span>
+                  <Show when={!m.founder}>
+                    <button class="revoke-btn" title="Remove this device — it can't read anything new" onClick={() => revoke(m.device)}>Remove</button>
+                  </Show>
+                </span>
+              )}
+            </For>
+          </Show>
         </Show>
-        <Show when={authState().locked && authState().authorized && !authState().isAuthor}>
+        <Show when={authState().locked && authState().authorized && !authState().isAuthor && authState().canRead}>
           <span class="auth-status editor">🔒 Claimed · you can edit</span>
         </Show>
+        <Show when={authState().locked && authState().authorized && !authState().isAuthor && !authState().canRead}>
+          <span class="auth-status pending-key">🔒 Claimed · approved — waiting for the board key</span>
+        </Show>
         <Show when={authState().locked && !authState().authorized}>
-          <span class="auth-status viewer">🔒 Claimed · view only</span>
+          <span class="auth-status no-access">🔒 Claimed · no access</span>
           <Show
             when={!authState().requested}
             fallback={<span class="auth-hint">✓ access requested — waiting for the owner to approve</span>}
           >
-            <button class="ask-btn" onClick={askForAccess}>Ask for edit access</button>
+            <button class="ask-btn" onClick={askForAccess}>Ask to join</button>
           </Show>
         </Show>
         <span class="device-id" title="this browser's device id">

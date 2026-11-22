@@ -190,9 +190,11 @@ needed yet — but adopting Biscuit's format up front avoids a migration.
   both *people* and *devices* — an identity is a set of device keys, and each is
   a signed entry. Replicated like any file; peers verify signatures on apply.
 - **Revocation.** Short capability TTLs plus an optional signed revocation list
-  (gossiped like any file). Per-person *read* revocation still needs seal-key
-  rotation (the group-key-rotation frontier) — deferred until actually needed;
-  "New board" (new secret ⇒ new link) is the blunt version we already have.
+  (gossiped like any file). Per-person *read* revocation is **shipped** via
+  seal-key (epoch) rotation — see
+  [`docs/security/architecture.md`](../security/architecture.md#granting--revoking-access);
+  "New board" (new secret ⇒ new link) remains the blunt version for open
+  boards.
 
 ## Device linking & recovery
 
@@ -255,8 +257,9 @@ machinery beyond the verification seam.
    invite-based onboarding (single-use tokens, à la `@localfirst/auth`'s Seitan
    pattern); per-device keys with QR/short-code linking + single-device
    revocation; a recovery-key path for the zero-devices case.
-5. **Read revocation** — seal-key rotation on removal. The hard, frontier rung;
-   defer.
+5. ~~**Read revocation** — seal-key rotation on removal.~~ **Shipped** —
+   `core::epoch::EpochBook`; see
+   [`docs/security/architecture.md`](../security/architecture.md).
 
 ## Alternatives considered (and why not)
 
@@ -278,4 +281,6 @@ machinery beyond the verification seam.
   trade.
 - Where the capability + membership log live in the tree, and their sync/verify
   rules (a new `Kind` in the strategy layer, or a `core::sync` resource kind?).
-- Whether to gate *reads* at all in v1 (seal key stays shared) or only *writes*.
+- ~~Whether to gate *reads* at all in v1~~ — **answered**: yes, on Restricted
+  boards (content sealed under epoch keys); open boards still don't gate
+  reads (the link remains the read capability).

@@ -40,9 +40,12 @@ A working vertical slice over a board *directory* (no SQLite, no new sync engine
   merges fire `riftpipe:file-changed`, which `fs.ts`'s `watch` funnels (with
   local writes and sibling tabs) into a reconcile (only the changed card
   re-renders).
-- **Claim / request-to-join auth bar:** the first opener claims the board
-  (becomes the owner); others are view-only and can "Ask for edit access"; the
-  owner approves from an inbox (`e2e/lock-grant.mjs`).
+- **Claim / request-to-join auth bar, with epoch-sealed read revocation:** the
+  first opener claims the board (becomes the owner; content is now sealed
+  under a rotating epoch key); others see "no access" until approved and can
+  "Ask to join"; the owner approves from an inbox and can **Remove** a member
+  from the auth bar's members list, which rotates the read key — the removed
+  device decrypts nothing new (`e2e/lock-grant.mjs`, `e2e/epoch-revoke.mjs`).
 - **Demos:** two/three-browser e2e flows over iroh + the gossip mesh
   (`e2e/run-iroh*.sh`).
 
