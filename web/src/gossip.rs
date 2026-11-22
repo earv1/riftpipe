@@ -185,7 +185,7 @@ const TRUST_STORE_PREFIX: &str = "riftpipe:trust:v2:";
 /// localStorage: the pre-v2, board-unscoped `hex(postcard(Vec<TrustEntry>))`.
 /// Migrated once, and only into this browser's own hosted board (see
 /// [`load_trust_entries`]).
-const LEGACY_TRUST_STORE_KEY: &str = "riftpipe:trust";
+pub(crate) const LEGACY_TRUST_STORE_KEY: &str = "riftpipe:trust";
 /// localStorage key prefix: `riftpipe:epochs:<hex topic>` = `hex(postcard(Vec<EpochAnnounce>))`
 /// — verified announces only (wraps are ciphertext to their recipients); raw
 /// epoch keys are never stored, they're re-opened with the device seed on load.

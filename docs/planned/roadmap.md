@@ -77,11 +77,15 @@ sense to do it, not strict priority.
 
 ### Done
 
-- **Merge two independent boards** — peers prime their stored tree on connect
-  (`opfs::prime_all`) and the sync layer unions distinct files + resolves a
-  same-path file by origin (`core::sync`). Verified `run-iroh-merge.sh`: two
-  browsers each with their own card connect over iroh and both see both. Converges
-  for N peers (`three_independent_trees_converge`). *Remaining nits:* primed
+- **Peers of one board merge their stored trees** — peers prime their stored tree
+  on connect (`opfs::prime_all`) and the sync layer unions distinct files +
+  resolves a same-path file by origin (`core::sync`). Converges for N peers
+  (`three_independent_trees_converge`). **Browser trees are scoped per board**
+  (`.boards/<hex topic>/` in OPFS): opening another board's link no longer merges
+  this browser's other board into it — that primed a *claimed* board's files into
+  any board opened next, as plain Sync. Verified `run-board-isolation.sh` (was
+  `run-iroh-merge.sh`): a claimed board's card never reaches another board.
+  *Remaining nits:* primed
   `meta.toml` (LWW) uses wall-clock now() so a same-card meta conflict is racy
   (cards rarely collide); and pasting a share link into a **solo tab** reconnects
   best-effort via a `hashchange` listener. On reconnect we now tear down the prior
@@ -153,10 +157,10 @@ over riftpipe's wasm file API). What remains:
 
 ## Smaller
 
-14. ~~"New board" UX~~ — *done:* a confirm-guarded topbar button wipes the
-    local OPFS board, drops the persisted iroh identity (new key ⇒ new topic
-    ⇒ fresh share ticket), clears the hash, and reloads as the host of an
-    empty board.
+14. ~~"New board" UX~~ — *done:* a confirm-guarded topbar button drops the
+    persisted iroh identity + board secret (new topic ⇒ fresh share ticket and
+    a fresh, empty per-board OPFS tree), clears the hash, and reloads as the
+    host of an empty board. The old board's files stay in its own tree.
 15. ~~Consolidate `opfs_root` helpers~~ — *done* (one `web/src/opfs.rs` module).
 16. ~~TypeScript-first glue (npm wrapper)~~ — *done (local package; publishing
     is release engineering for later).* `npm/`: zero-runtime-dependency

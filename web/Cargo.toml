@@ -60,6 +60,7 @@ features = [
     "FileSystemFileHandle",
     "FileSystemGetFileOptions",
     "FileSystemGetDirectoryOptions",
+    "FileSystemRemoveOptions",
     "FileSystemWritableFileStream",
     "WritableStream",
     "File",
