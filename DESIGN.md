@@ -634,7 +634,9 @@ something else reads it.
   local-only `prior` — the ids the deleted resource had itself superseded —
   capped at 64), so a stale copy of any deletion from any earlier step held
   by a peer is rejected (the receiver keeps the file if any incoming id is
-  superseded) even for a byte-identical re-creation. Deletion ids are
+  superseded) even for a byte-identical re-creation; an empty re-created
+  file answers with a zero-length `StratDelta` (no strategy emits one), on
+  which the deleter resurrects the file empty, so the two converge. Deletion ids are
   **deterministic** — blake3(path, last fingerprint, superseded ids) — so two
   peers that delete the same content independently (even if the deletes
   never meet, or one is re-detected at startup after a crash) mint the same

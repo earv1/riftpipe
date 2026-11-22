@@ -41,7 +41,9 @@
 //! re-created locally drops its tombstone and remembers its whole chain as
 //! `superseded` — the tombstone's `ids` plus `prior`, the ids the deleted
 //! resource had itself superseded — so an old copy of any deletion from any
-//! earlier delete/re-create step is rejected. A delete for a
+//! earlier delete/re-create step is rejected (if the re-created file is
+//! empty, the answer is a zero-length `StratDelta` — see `EMPTY_CONTENT` —
+//! and the deleter resurrects it empty). A delete for a
 //! path already deleted here merges its ids into the tombstone; ids are
 //! deterministic (same content + history → same id), so independent deletes
 //! that never met still match. Tombstones and last-known files persist in
@@ -103,6 +105,14 @@ fn delta(path: &str, bytes: Vec<u8>) -> Vec<u8> {
 fn delete_frame(path: &str, t: &Tombstone) -> Vec<u8> {
     encode(&SyncMsg::StratDelete { path: path.to_string(), ids: t.ids.clone(), seen: t.seen.clone() })
 }
+
+/// A zero-length `StratDelta` payload means "self-contained, EMPTY content".
+/// No strategy ever emits one (their deltas always carry encoding bytes), and
+/// no strategy can express "empty" as a self-contained delta (an empty
+/// replica has nothing to send), so this is the one strategy-agnostic way to
+/// say it. Only a tombstoned receiver acts on it (it resurrects the file
+/// empty); a live receiver ignores it.
+const EMPTY_CONTENT: &[u8] = b"";
 
 fn encode(msg: &SyncMsg) -> Vec<u8> {
     // postcard on an in-memory Vec cannot fail for these shapes.
@@ -176,6 +186,9 @@ fn apply_inbound(ws: &mut Workspace, msg: SyncMsg) -> Vec<Vec<u8>> {
                 delta_for_tombstone(ws, &path, &bytes, &mut out);
                 return out;
             }
+            if bytes == EMPTY_CONTENT {
+                return out; // only matters to a tombstoned path
+            }
             let mut stored = false;
             if let Some(res) = ws.ensure(&path) {
                 if let Some(nb) = res.strategy.merge(&bytes) {
@@ -213,6 +226,12 @@ fn apply_inbound(ws: &mut Workspace, msg: SyncMsg) -> Vec<Vec<u8>> {
 /// agrees or answers with a self-contained delta.
 fn delta_for_tombstone(ws: &mut Workspace, path: &str, bytes: &[u8], out: &mut Vec<Vec<u8>>) {
     let Some(mut fresh) = ws.fresh_strategy(path) else { return };
+    if bytes == EMPTY_CONTENT {
+        // The peer re-created the file empty, overriding our
+        // deletion — come back empty too.
+        ws.resurrect(path, fresh, b"");
+        return;
+    }
     if let Some(nb) = fresh.merge(bytes) {
         ws.resurrect(path, fresh, &nb);
         return;
@@ -254,9 +273,16 @@ fn remote_delete(ws: &mut Workspace, path: &str, ids: &[u64], seen: &[Hash], out
         !seen.contains(&res.strategy.fingerprint())
     };
     if keep {
-        if let Some(d) = full {
-            out.push(delta(path, d));
+        // Nothing self-contained to send means our content is empty (we kept
+        // it because we re-created the file after this deletion). Send
+        // EMPTY_CONTENT so the deleter resurrects it empty, instead of both
+        // sides holding their state forever and re-sending this exchange
+        // every heartbeat. Note the state so the empty file now counts as
+        // materialized (a later local delete of it is detected and synced).
+        if full.is_none() {
+            res.note_state();
         }
+        out.push(delta(path, full.unwrap_or_else(|| EMPTY_CONTENT.to_vec())));
         ws.mark_dirty();
     } else if let Err(e) = ws.apply_remote_delete(path, ids, seen) {
         eprintln!("[folder] could not delete {path} (peer's delete; kept, will retry): {e}");
@@ -1181,6 +1207,57 @@ mod tests {
         pump(&mut a, &mut b, hb, ha);
         assert_eq!(std::fs::read(ra.join("g.bin")).unwrap(), b"shared");
         assert_eq!(std::fs::read(rb.join("g.bin")).unwrap(), b"shared");
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
+    }
+
+    /// A deletes a file, B applies, then A re-creates it EMPTY. A's re-creation
+    /// supersedes B's tombstone but has no self-contained delta to offer, so
+    /// it sends EMPTY_CONTENT and B resurrects the file empty: the two
+    /// converge, and the next heartbeat is quiet (no delete re-assert, no
+    /// delta). A later delete of the empty file then propagates normally.
+    #[test]
+    fn recreated_empty_file_converges() {
+        let ra = dir("em-a");
+        let rb = dir("em-b");
+        std::fs::write(ra.join("e.bin"), b"had content").unwrap();
+        std::fs::write(ra.join("e.md"), "had text\n").unwrap();
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+        sync_pair(&mut a, &mut b);
+
+        for f in ["e.bin", "e.md"] {
+            std::fs::remove_file(ra.join(f)).unwrap();
+        }
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+        assert!(b.is_tombstoned("e.bin") && b.is_tombstoned("e.md"));
+
+        for f in ["e.bin", "e.md"] {
+            std::fs::write(ra.join(f), b"").unwrap();
+        }
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+        let (ha, hb) = (advertise_all(&mut a), advertise_all(&mut b));
+        pump(&mut a, &mut b, hb, ha);
+        for f in ["e.bin", "e.md"] {
+            assert_eq!(std::fs::read(rb.join(f)).unwrap(), b"", "{f} on B");
+            assert_eq!(std::fs::read(ra.join(f)).unwrap(), b"", "{f} on A");
+            assert!(!a.is_tombstoned(f) && !b.is_tombstoned(f));
+        }
+
+        // Converged: a heartbeat from A draws no delete or delta from B.
+        let replies: Vec<Vec<u8>> = advertise_all(&mut a).iter().flat_map(|f| deliver(&mut b, f)).collect();
+        assert!(replies.iter().all(|r| !matches!(
+            postcard::from_bytes::<SyncMsg>(r),
+            Ok(SyncMsg::StratDelete { .. } | SyncMsg::StratDelta { .. })
+        )));
+
+        std::fs::remove_file(ra.join("e.bin")).unwrap();
+        let fa = collect_local(&mut a);
+        pump(&mut a, &mut b, vec![], fa);
+        assert!(!rb.join("e.bin").exists());
 
         std::fs::remove_dir_all(&ra).ok();
         std::fs::remove_dir_all(&rb).ok();
