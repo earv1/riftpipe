@@ -162,27 +162,85 @@ pub(crate) fn page_board_topic() -> [u8; 32] {
 /// and nudge the UI to re-read (the page may have read another board's tree).
 async fn enter_board(topic: [u8; 32]) -> [u8; 32] {
     crate::opfs::set_active_board(topic);
-    if let Some(owner) = legacy_root_owner(&topic) {
-        crate::opfs::adopt_legacy_root(&owner).await;
+    if crate::opfs::has_legacy_root().await {
+        match legacy_root_decision(&topic) {
+            LegacyRoot::Adopt(board) => crate::opfs::adopt_legacy_root(&board).await,
+            LegacyRoot::Quarantine => crate::opfs::quarantine_legacy_root().await,
+        };
     }
     dispatch_file_changed("");
     topic
 }
 
-/// Which board a pre-scoping OPFS root (one tree shared by every board this
-/// browser opened) belongs to: this browser's own hosted board if it has one;
-/// else — only if no board was ever claimed here (no legacy trust log, so all
-/// of it was open-board content) — the board being opened. Otherwise `None`:
-/// leave it at the root, unsynced, rather than risk moving claimed content
-/// into another board.
-fn legacy_root_owner(opening: &[u8; 32]) -> Option<[u8; 32]> {
-    if let Some(secret) = persisted_board_secret() {
-        return Some(riftpipe_core::crypto::topic_from_secret(&secret));
+/// What happens to a pre-scoping OPFS root (one tree shared by every board this
+/// browser opened).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyRoot {
+    /// Move it into this board's tree.
+    Adopt([u8; 32]),
+    /// Move it into `.legacy-root/`: kept, never synced, adopted, or wiped.
+    Quarantine,
+}
+
+/// localStorage: the legacy-root decision, made once (`board:<hex>` or
+/// `quarantine`) so a retry of a partial move, or a later page with a different
+/// hosted board / link, never sends the tree elsewhere.
+const LEGACY_ROOT_DECISION_KEY: &str = "riftpipe:legacy-root";
+
+/// The (sticky) legacy-root decision; decided on first use with
+/// [`decide_legacy_root`] and stored.
+fn legacy_root_decision(opening: &[u8; 32]) -> LegacyRoot {
+    let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
+    let stored = storage.as_ref().and_then(|s| s.get_item(LEGACY_ROOT_DECISION_KEY).ok().flatten());
+    if let Some(d) = stored.as_deref().and_then(parse_legacy_root) {
+        return d;
     }
-    let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten())?;
-    match storage.get_item(crate::gossip::LEGACY_TRUST_STORE_KEY) {
-        Ok(None) => Some(*opening),
-        _ => None,
+    let d = decide_legacy_root(
+        persisted_board_secret().map(|s| riftpipe_core::crypto::topic_from_secret(&s)),
+        crate::gossip::legacy_trust_founder(),
+        load_or_create_device().id(),
+        *opening,
+    );
+    if let Some(s) = &storage {
+        let v = match d {
+            LegacyRoot::Adopt(b) => format!("board:{}", to_hex(&b)),
+            LegacyRoot::Quarantine => "quarantine".to_string(),
+        };
+        let _ = s.set_item(LEGACY_ROOT_DECISION_KEY, &v);
+    }
+    d
+}
+
+fn parse_legacy_root(v: &str) -> Option<LegacyRoot> {
+    if v == "quarantine" {
+        return Some(LegacyRoot::Quarantine);
+    }
+    v.strip_prefix("board:").and_then(hex32).map(LegacyRoot::Adopt)
+}
+
+/// Where a pre-scoping root tree may safely go. It is the union of everything
+/// this browser opened, so it may hold claimed content. Adopt it only if no
+/// other device's claim was ever seen here — no legacy trust log, or one this
+/// device founded (that log then migrates into the same hosted board, so the
+/// adopted files stay claimed):
+/// - into this browser's own hosted board, if it has one;
+/// - else, with no legacy log at all (all of it was open-board content), into
+///   the board being opened;
+/// - otherwise quarantine.
+fn decide_legacy_root(
+    hosted: Option<[u8; 32]>,
+    legacy_founder: Option<Option<[u8; 32]>>,
+    me: [u8; 32],
+    opening: [u8; 32],
+) -> LegacyRoot {
+    let no_foreign_claim = match legacy_founder {
+        None => true,
+        Some(founder) => founder == Some(me),
+    };
+    match (hosted, legacy_founder) {
+        (Some(h), _) if no_foreign_claim => LegacyRoot::Adopt(h),
+        (None, None) => LegacyRoot::Adopt(opening),
+        _ => LegacyRoot::Quarantine,
     }
 }
 
@@ -507,6 +565,45 @@ impl TreeSync {
     fn send(&self, msg: &SyncMsg) {
         if let Ok(bytes) = postcard::to_allocvec(msg) {
             let _ = self.outbound.unbounded_send(bytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    /// The legacy-root decision: adopt only where no other device's claim was
+    /// ever seen; otherwise quarantine.
+    #[wasm_bindgen_test]
+    fn legacy_root_goes_only_where_it_is_safe() {
+        let (me, other, hosted, opening) = ([1; 32], [2; 32], [3; 32], [4; 32]);
+        assert_eq!(decide_legacy_root(Some(hosted), None, me, opening), LegacyRoot::Adopt(hosted));
+        assert_eq!(decide_legacy_root(Some(hosted), Some(Some(me)), me, opening), LegacyRoot::Adopt(hosted));
+        assert_eq!(decide_legacy_root(Some(hosted), Some(Some(other)), me, opening), LegacyRoot::Quarantine,
+            "a foreign founder's claim was seen: never into our (unclaimed) hosted board");
+        assert_eq!(decide_legacy_root(Some(hosted), Some(None), me, opening), LegacyRoot::Quarantine);
+        assert_eq!(decide_legacy_root(None, None, me, opening), LegacyRoot::Adopt(opening), "all open content");
+        assert_eq!(decide_legacy_root(None, Some(Some(me)), me, opening), LegacyRoot::Quarantine,
+            "joining another board: our claimed content must not go there");
+        assert_eq!(decide_legacy_root(None, Some(Some(other)), me, opening), LegacyRoot::Quarantine);
+    }
+
+    /// Decided once: the stored answer wins over whatever the state is later
+    /// (e.g. a hosted secret minted after the first visit).
+    #[wasm_bindgen_test]
+    fn legacy_root_decision_is_sticky() {
+        let store = web_sys::window().unwrap().local_storage().unwrap().unwrap();
+        let prior = store.get_item(LEGACY_ROOT_DECISION_KEY).unwrap();
+        store.set_item(LEGACY_ROOT_DECISION_KEY, "quarantine").unwrap();
+        assert_eq!(legacy_root_decision(&[9; 32]), LegacyRoot::Quarantine);
+        let b = [7u8; 32];
+        store.set_item(LEGACY_ROOT_DECISION_KEY, &format!("board:{}", to_hex(&b))).unwrap();
+        assert_eq!(legacy_root_decision(&[9; 32]), LegacyRoot::Adopt(b));
+        match prior {
+            Some(p) => store.set_item(LEGACY_ROOT_DECISION_KEY, &p).unwrap(),
+            None => store.remove_item(LEGACY_ROOT_DECISION_KEY).unwrap(),
         }
     }
 }

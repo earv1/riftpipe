@@ -709,6 +709,17 @@ fn load_trust_entries(topic: &[u8; 32], me: &[u8; 32]) -> Vec<TrustEntry> {
     entries
 }
 
+/// The legacy board-unscoped trust log's founder: `None` if there is no legacy
+/// log, `Some(None)` if it has no (valid) genesis.
+pub(crate) fn legacy_trust_founder() -> Option<Option<[u8; 32]>> {
+    let entries = load_hex_postcard::<Vec<TrustEntry>>(LEGACY_TRUST_STORE_KEY)?;
+    let mut legacy = TrustLog::new();
+    for e in entries {
+        legacy.apply(e);
+    }
+    Some(legacy.founder())
+}
+
 /// Persist the accepted epoch announces for `topic` (never raw keys).
 /// Read-union-write, like [`persist_trust_entries`] (announces are unique by
 /// signature).

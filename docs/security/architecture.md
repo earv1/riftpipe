@@ -135,6 +135,14 @@ requires an explicit wrap.
   (and so never unlocks) a claimed one; native peers keep nothing
   on disk and relearn every epoch from the swarm each session, the same as
   the native trust log.
+- **Browser files are per board** — OPFS is one per origin, so each board's
+  synced tree lives in `.boards/<topic>/` and a claimed board's files can never
+  be primed or pushed into another board. A pre-scoping tree at the OPFS root
+  is handled once on upgrade (decision stored in `riftpipe:legacy-root`): it is
+  adopted only where no other device's claim was ever seen here (the hosted
+  board when the legacy trust log is absent or founded by this device; the
+  opened board when there is no legacy log at all); otherwise it is moved to
+  `.legacy-root/`, kept as is but never synced, adopted, or wiped.
 
 ## What the relay / an outsider sees
 

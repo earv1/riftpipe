@@ -172,13 +172,9 @@ export async function connectPeer(): Promise<boolean> {
  * — they are never wiped, and never carried into the new board.
  */
 export async function newBoard(): Promise<void> {
-  // Wipe only a pre-scoping tree still at the OPFS root (it belonged to the
-  // old board — it must not be adopted by the new one). `.boards/` stays.
-  const root = await navigator.storage.getDirectory();
-  // deno-lint-ignore no-explicit-any — async iteration isn't in TS's lib yet
-  for await (const name of (root as any).keys()) {
-    if (!name.startsWith(".")) await root.removeEntry(name, { recursive: true }).catch(() => {});
-  }
+  // Nothing in OPFS is wiped: boards live under `.boards/<topic>/`, and a
+  // pre-scoping tree was already adopted or quarantined (`.legacy-root/`, never
+  // synced) on the first connect — decided once, so a new board can't adopt it.
   localStorage.removeItem("riftpipe:iroh_sk");
   // Drop the board secret too: a new board must mint a fresh secret, so it gets
   // a new topic (H(secret)) and a brand-new, unrelated share link.

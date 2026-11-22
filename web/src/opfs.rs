@@ -245,6 +245,27 @@ pub async fn adopt_legacy_root(into: &[u8; 32]) -> bool {
     move_entries(&root, names, &dest).await
 }
 
+/// Where a pre-scoping root tree goes when it can't safely be adopted by a
+/// board: dot-prefixed, so it is never synced, primed, adopted or wiped.
+pub const LEGACY_QUARANTINE_DIR: &str = ".legacy-root";
+
+/// Does the OPFS root still hold a pre-scoping synced tree?
+pub async fn has_legacy_root() -> bool {
+    match opfs_root().await {
+        Ok(root) => !legacy_root_entries(&root).await.is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Move the pre-scoping root tree into [`LEGACY_QUARANTINE_DIR`], kept as is
+/// (same paths) and out of every board. Returns whether anything moved.
+pub async fn quarantine_legacy_root() -> bool {
+    let Ok(root) = opfs_root().await else { return false };
+    let Ok(dest) = subdir(&root, LEGACY_QUARANTINE_DIR, true).await else { return false };
+    let names = legacy_root_entries(&root).await;
+    move_entries(&root, names, &dest).await
+}
+
 /// Move the entries `names` of `src` (files and whole directories) to the same
 /// paths under `dest`, never losing data: each text file is removed only after
 /// its copy was written; dot-prefixed and non-UTF-8 files are left where they
@@ -383,6 +404,22 @@ mod tests {
         set_active_board(c);
         assert!(read_path("riftdoc-notes").await.is_none(), "not adopted");
         assert_eq!(read_path("legacy-board.md").await.as_deref(), Some("# board"), "a tree file is adopted");
+    }
+
+    /// A quarantined legacy root keeps its files, out of every board: never in a
+    /// board tree, and never adopted afterwards.
+    #[wasm_bindgen_test]
+    async fn quarantined_legacy_root_stays_out_of_boards() {
+        let c = riftpipe_core::crypto::generate_secret();
+        let root = opfs_root().await.unwrap();
+        write_text(&subdir(&root, "claimedtickets", true).await.unwrap(), "card.md", "secret card").await.unwrap();
+        assert!(has_legacy_root().await);
+        assert!(quarantine_legacy_root().await);
+        assert!(!has_legacy_root().await, "nothing left to adopt");
+        let q = subdir(&subdir(&root, LEGACY_QUARANTINE_DIR, false).await.unwrap(), "claimedtickets", false).await.unwrap();
+        assert_eq!(read_text(&q, "card.md").await.as_deref(), Some("secret card"), "kept, same path");
+        assert!(!adopt_legacy_root(&c).await, "a later adoption finds nothing");
+        assert!(tree_files(board_root(&c).await.unwrap()).await.is_empty());
     }
 
     /// A pre-scoping tree at the OPFS root moves into the board it's adopted by.
