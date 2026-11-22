@@ -13,7 +13,9 @@ flagged per flow.
 
 ## Create a board
 
-*(Shipped: genesis + secret. Planned: epoch keys + access setting.)*
+*(Shipped: genesis + secret + first epoch key. Planned: a switchable
+general-access setting — today's mode is fixed at creation, Restricted or
+open Editor.)*
 
 The founder's first device bootstraps everything: it generates its keypair,
 self-signs the **genesis** (making itself the founding Admin), mints the board
@@ -38,7 +40,8 @@ board to Anyone-with-link (Viewer or Editor), so no approval step is needed.
 
 ## Request to join (Restricted mode)
 
-*(Planned. The Google-Docs "request access" flow.)*
+*(Shipped: browser Ask/Approve — `e2e/lock-grant.mjs`; CLI `--grant <id>` at
+startup or live via `riftpipe grant <dir> <id>`.)*
 
 When the board is **Restricted**, the link gets a newcomer onto the mesh but
 grants no access. They broadcast a **signed join request** (with a name/note so
@@ -70,7 +73,8 @@ can add themselves.
 
 ## Revoke a member
 
-*(Write-revoke: shipped mechanism. Read-revoke via rotation: planned.)*
+*(Shipped: CLI `riftpipe revoke <dir> <id>`; browser "Remove" on a member —
+read-revoke rotates the epoch key, the write-revoke mechanism is unchanged.)*
 
 Removing access is two steps for two capabilities. The **write** side is easy: an
 Admin signs a **Revoke**, and every peer that receives it rejects that key's
