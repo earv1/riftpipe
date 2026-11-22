@@ -279,8 +279,7 @@ impl Auth {
     /// Ingest a trust entry (idempotent), remember it for neighbor catch-up, and
     /// persist. The wire/load is the source; we persist our own converged view.
     pub fn add_trust(&mut self, e: TrustEntry) {
-        let id = *blake3::hash(&postcard::to_allocvec(&e).unwrap_or_default()).as_bytes();
-        let fresh = self.seen.insert(id);
+        let fresh = self.seen.insert(trust_entry_id(&e));
         if fresh {
             self.entries.push(e.clone());
         }
@@ -614,10 +613,26 @@ fn epoch_store_key(topic: &[u8; 32]) -> String {
     format!("{EPOCH_STORE_PREFIX}{}", hex32(topic))
 }
 
-/// Persist the converged trust log for `topic` so a claimed board — and its
-/// author + grants — survives a reload.
+/// Content address of a trust entry (dedups the persisted union).
+fn trust_entry_id(e: &TrustEntry) -> [u8; 32] {
+    *blake3::hash(&postcard::to_allocvec(e).unwrap_or_default()).as_bytes()
+}
+
+/// `stored` plus every item of `ours` not already in it (by `id`) — the
+/// persisted sets are content-addressed, so a union never loses anything.
+fn union_by<T: Clone>(mut stored: Vec<T>, ours: &[T], id: impl Fn(&T) -> [u8; 32]) -> Vec<T> {
+    let have: std::collections::HashSet<[u8; 32]> = stored.iter().map(&id).collect();
+    stored.extend(ours.iter().filter(|e| !have.contains(&id(e))).cloned());
+    stored
+}
+
+/// Persist the trust log for `topic` so a claimed board — and its author +
+/// grants — survives a reload. Read-union-write: another tab may have stored
+/// entries we haven't seen (a revoke), and overwriting would roll them back.
 fn persist_trust_entries(topic: &[u8; 32], entries: &[TrustEntry]) {
-    store_hex_postcard(&trust_store_key(topic), &entries);
+    let key = trust_store_key(topic);
+    let stored = load_hex_postcard::<Vec<TrustEntry>>(&key).unwrap_or_default();
+    store_hex_postcard(&key, &union_by(stored, entries, trust_entry_id));
 }
 
 /// The trust log persisted for `topic`. Else a one-time look at the legacy
@@ -654,8 +669,12 @@ fn load_trust_entries(topic: &[u8; 32], me: &[u8; 32]) -> Vec<TrustEntry> {
 }
 
 /// Persist the accepted epoch announces for `topic` (never raw keys).
+/// Read-union-write, like [`persist_trust_entries`] (announces are unique by
+/// signature).
 fn persist_epochs(topic: &[u8; 32], announces: &[EpochAnnounce]) {
-    store_hex_postcard(&epoch_store_key(topic), &announces);
+    let key = epoch_store_key(topic);
+    let stored = load_hex_postcard::<Vec<EpochAnnounce>>(&key).unwrap_or_default();
+    store_hex_postcard(&key, &union_by(stored, announces, |a| *blake3::hash(&a.sig).as_bytes()));
 }
 
 /// The epoch announces persisted for `topic`.
@@ -1325,6 +1344,31 @@ mod tests {
         deliver(&acc, &mut fresh);
         assert_eq!(fresh.trust.founder(), Some(owner.my_id()), "the real log takes over");
         assert!(!fresh.take_claim_to_mark(), "already marked (the hint came from the marker)");
+    }
+
+    /// Two tabs on one board persist through a read-union-write: neither tab's
+    /// write rolls back an entry or announce only the other has seen.
+    #[wasm_bindgen_test]
+    fn two_tabs_persist_the_union() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        let mut tab1 = Auth::load(DeviceKey::from_seed(&[51; 32]), topic);
+        tab1.lock_as_author().unwrap();
+        let mut tab2 = Auth::load(DeviceKey::from_seed(&[51; 32]), topic);
+        assert!(tab2.is_author(), "tab 2 loaded the claim");
+        let (x, y) = ([52; 32], [53; 32]);
+        tab1.make_grant(x).unwrap();
+        tab2.make_grant(y).unwrap(); // tab 2 never saw the grant of x
+        tab1.make_revoke(x).unwrap();
+        tab2.make_grant([54; 32]).unwrap(); // must not roll the revoke back
+
+        let reloaded = Auth::load(DeviceKey::from_seed(&[51; 32]), topic);
+        assert!(reloaded.trust.is_revoked(&x), "tab 1's revoke survived tab 2's later write");
+        assert!(reloaded.trust.is_authorized(&y) && reloaded.trust.is_authorized(&[54; 32]));
+
+        let stored = load_epochs(&topic);
+        for a in tab1.epochs.announces().iter().chain(tab2.epochs.announces()) {
+            assert!(stored.iter().any(|s| s.sig == a.sig), "every tab's announce is persisted");
+        }
     }
 
     /// Offline: a claimed board seals content under an epoch key that only
