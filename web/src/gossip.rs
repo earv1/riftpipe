@@ -173,24 +173,63 @@ impl MeshKeepAlive {
 /// core so native and browser peers speak the same layout.
 use riftpipe_core::sync::MeshMsg;
 
+use riftpipe_core::epoch::{AccessMode, EpochAnnounce, EpochBook, Ingested};
 use riftpipe_core::identity::{DeviceKey, Role, TrustEntry, TrustLog};
 use riftpipe_core::onboard::JoinRequest;
+use riftpipe_core::sync::SyncMsg;
 
-const TRUST_STORE_KEY: &str = "riftpipe:trust";
+/// localStorage: `hex(postcard((topic, Vec<TrustEntry>)))` — the trust log is
+/// scoped to its board, so a stale genesis from another board can't lock you out.
+const TRUST_STORE_KEY: &str = "riftpipe:trust:v2";
+/// localStorage: the pre-v2, board-unscoped `hex(postcard(Vec<TrustEntry>))`,
+/// migrated once into [`TRUST_STORE_KEY`].
+const LEGACY_TRUST_STORE_KEY: &str = "riftpipe:trust";
+/// localStorage: `hex(postcard((topic, Vec<EpochAnnounce>)))` — verified announces
+/// only (wraps are ciphertext to their recipients); raw epoch keys are never
+/// stored, they're re-opened with the device seed on load.
+const EPOCH_STORE_KEY: &str = "riftpipe:epochs";
+
+/// What handling a message (or an auth action) produced, for the driver to act
+/// on: content to apply to the syncer, messages to broadcast to the swarm, and
+/// whether to broadcast our full state too (we just gained a read key, or an
+/// admin just wrapped a newcomer in).
+#[derive(Default)]
+struct Accepted {
+    apply: Vec<SyncMsg>,
+    send: Vec<MeshMsg>,
+    send_full_state: bool,
+}
+
+impl Accepted {
+    fn merge(&mut self, o: Accepted) {
+        self.apply.extend(o.apply);
+        self.send.extend(o.send);
+        self.send_full_state |= o.send_full_state;
+    }
+}
 
 /// Device-linking auth for a browser mesh session. The model is **lock =
-/// authorship**: a board is *locked* exactly when it has an author (a genesis
-/// in the trust log). The first opener locks it by adding their genesis, which
-/// broadcasts live; from then on every peer signs its writes and rejects
-/// unsigned or unauthorized ones. Before that (no author) the board is open —
-/// plain unsigned writes, anyone with the link edits. The device identity is
-/// always present (persisted); the trust log persists too, so a locked board
-/// stays locked across reloads. See `docs/security/`.
+/// authorship**: a board is *locked* (claimed) exactly when it has an author (a
+/// genesis in the trust log). The first opener locks it by adding their genesis,
+/// which broadcasts live. Before that (no author) the board is open — plain
+/// unsigned writes, anyone with the link reads and edits. A claimed board is
+/// **Restricted**: every peer signs its writes and rejects unsigned or
+/// unauthorized ones, and content is sealed under the current epoch key, wrapped
+/// only to approved devices — so an un-approved device can't read, and a removed
+/// device is rotated out of new content. The device identity is always present
+/// (persisted); the trust log and the epoch announces persist too, scoped to the
+/// board, so a claimed board stays claimed (and readable) across reloads. See
+/// `docs/security/`.
 pub struct Auth {
     identity: DeviceKey,
+    /// The board's gossip topic (`H(secret)`) — scopes the persisted trust log
+    /// and epochs to this board.
+    topic: [u8; 32],
     trust: TrustLog,
     entries: Vec<TrustEntry>,
     seen: std::collections::HashSet<[u8; 32]>,
+    /// Epoch keys this device can open, and (as owner) whom to wrap next.
+    epochs: EpochBook,
     /// Access requests received from would-be writers (owner side), deduped by
     /// requesting device id — the "someone asked" inbox the UI renders.
     requests: Vec<JoinRequest>,
@@ -200,20 +239,29 @@ pub struct Auth {
 }
 
 impl Auth {
-    /// Build from this device's identity, restoring any persisted trust log so
-    /// a locked board stays locked across reloads.
-    pub fn load(identity: DeviceKey) -> Self {
+    /// Build from this device's identity, restoring the trust log and epoch
+    /// announces persisted for `topic` (the board's gossip topic), so a claimed
+    /// board stays claimed — and readable — across reloads.
+    pub fn load(identity: DeviceKey, topic: [u8; 32]) -> Self {
+        let epochs = EpochBook::new(&identity);
         let mut a = Auth {
             identity,
+            topic,
             trust: TrustLog::new(),
             entries: Vec::new(),
             seen: Default::default(),
+            epochs,
             requests: Vec::new(),
             my_request: None,
         };
-        for e in load_trust_entries() {
+        for e in load_trust_entries(&topic) {
             a.add_trust(e);
         }
+        for an in load_epochs(&topic) {
+            a.epochs.ingest(an, &a.trust);
+        }
+        // Anything this produces is in the book and goes out with the catch-up.
+        let _ = a.maintain();
         a
     }
 
@@ -227,7 +275,7 @@ impl Auth {
         }
         self.trust.apply(e);
         if fresh {
-            persist_trust_entries(&self.entries);
+            persist_trust_entries(&self.topic, &self.entries);
         }
         // A grant may have resolved pending asks: drop any request whose device
         // is now authorized, and clear our own once we're in.
@@ -242,6 +290,24 @@ impl Auth {
     fn locked(&self) -> bool {
         self.trust.founder().is_some()
     }
+
+    /// How this board gates reads and writes — the **only** place the browser
+    /// decides: claimed = `Restricted`, unclaimed = `LinkEditor`. A general-access
+    /// setting (e.g. `LinkViewer`) would be chosen here; see `core::epoch::AccessMode`.
+    fn mode(&self) -> AccessMode {
+        if self.locked() {
+            AccessMode::Restricted
+        } else {
+            AccessMode::LinkEditor
+        }
+    }
+
+    /// Can we read new content? Always on an open board; on a restricted one only
+    /// while we hold the latest epoch key.
+    fn can_read(&self) -> bool {
+        !self.mode().seals_content() || self.epochs.holds_latest()
+    }
+
     fn my_id(&self) -> [u8; 32] {
         self.identity.id()
     }
@@ -251,39 +317,72 @@ impl Auth {
     fn is_author(&self) -> bool {
         self.trust.founder() == Some(self.my_id())
     }
+    fn is_admin(&self) -> bool {
+        self.trust.role(&self.my_id()) == Some(Role::Admin)
+    }
 
-    /// Become the board's author (lock it) if it has none yet. Returns the
-    /// genesis entry to broadcast.
-    fn lock_as_author(&mut self) -> Option<TrustEntry> {
+    fn fresh_nonce() -> [u8; 16] {
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&riftpipe_core::crypto::generate_secret()[..16]);
+        nonce
+    }
+
+    /// Become the board's author (lock it) if it has none yet, minting epoch 1.
+    /// Returns the genesis + epoch announce to broadcast.
+    fn lock_as_author(&mut self) -> Option<Accepted> {
         if self.locked() {
             return None;
         }
         let g = self.identity.genesis();
         self.add_trust(g.clone());
-        Some(g)
+        let mut acc = self.maintain();
+        acc.send.insert(0, MeshMsg::Trust(g));
+        Some(acc)
     }
 
-    /// Grant `device` Member write access (we must be an Admin). Returns the
-    /// grant entry to broadcast.
-    fn make_grant(&mut self, device: [u8; 32]) -> Option<TrustEntry> {
-        if self.trust.role(&self.my_id()) != Some(Role::Admin) {
+    /// Grant `device` Member access (we must be an Admin) and wrap it into the
+    /// current epoch if we know its encryption key. Returns what to broadcast.
+    fn make_grant(&mut self, device: [u8; 32]) -> Option<Accepted> {
+        if !self.is_admin() {
             return None;
         }
-        let mut nonce = [0u8; 16];
-        nonce.copy_from_slice(&riftpipe_core::crypto::generate_secret()[..16]);
-        let e = self.identity.grant(device, Role::Member, nonce);
+        let e = self.identity.grant(device, Role::Member, Self::fresh_nonce());
         self.add_trust(e.clone());
-        Some(e)
+        let mut acc = self.maintain();
+        acc.send.insert(0, MeshMsg::Trust(e));
+        Some(acc)
     }
 
-    /// Wrap an outgoing write: a `SignedSync` when the board is locked, else a
-    /// plain `Sync` (open collaboration).
-    fn sign(&self, msg: riftpipe_core::sync::SyncMsg) -> MeshMsg {
-        if self.locked() {
+    /// Remove `device` (we must be an Admin; never the founder, never ourselves):
+    /// a signed revoke, then a rotation to a new epoch it isn't wrapped into, so it
+    /// can't read anything new. Returns what to broadcast.
+    fn make_revoke(&mut self, device: [u8; 32]) -> Option<Accepted> {
+        if !self.is_admin() || self.trust.founder() == Some(device) || device == self.my_id() {
+            return None;
+        }
+        let e = self.identity.revoke(device, Self::fresh_nonce());
+        self.add_trust(e.clone());
+        let mut acc = self.maintain();
+        acc.send.insert(0, MeshMsg::Trust(e));
+        Some(acc)
+    }
+
+    /// Wrap an outgoing write: a `SignedSync` when the mode requires signed writes,
+    /// else a plain `Sync` — then, on a restricted board, sealed under the latest
+    /// epoch we hold. `None` when restricted and we hold no epoch key (the edit
+    /// stays in the syncer and goes out with our full state once we're wrapped in).
+    fn sign(&self, msg: SyncMsg) -> Option<MeshMsg> {
+        let mode = self.mode();
+        let signed = if mode.requires_signed_writes() {
             let payload = postcard::to_allocvec(&msg).unwrap_or_default();
             MeshMsg::SignedSync(self.identity.sign_write(payload))
         } else {
             MeshMsg::Sync(msg)
+        };
+        if mode.seals_content() {
+            self.epochs.seal(&signed)
+        } else {
+            Some(signed)
         }
     }
 
@@ -300,10 +399,23 @@ impl Auth {
         Some(MeshMsg::Request(req))
     }
 
-    /// Record an incoming access request (owner side): keep it if it's
-    /// authentically signed and not already authorized/known. Deduped by device.
+    /// Our signed join request while we're approved but can't read (restricted,
+    /// not holding the latest epoch key) — broadcast to the whole swarm so an
+    /// Admin (maybe not a direct neighbor) learns our encryption key and wraps us in.
+    fn read_request(&self) -> Option<MeshMsg> {
+        (self.mode().seals_content() && self.authorized() && !self.epochs.holds_latest())
+            .then(|| MeshMsg::Request(JoinRequest::create(&self.identity, String::new())))
+    }
+
+    /// Record an incoming access request: an authentic one teaches the epoch book
+    /// the device's encryption key (owner side: whom to wrap); it joins the inbox
+    /// if the device isn't already authorized. Deduped by device.
     fn ingest_request(&mut self, req: JoinRequest) {
-        if !req.verify() || self.trust.is_authorized(&req.device_id) {
+        if !req.verify() {
+            return;
+        }
+        self.epochs.learn_request(&req);
+        if self.trust.is_authorized(&req.device_id) {
             return;
         }
         if !self.requests.iter().any(|r| r.device_id == req.device_id) {
@@ -316,10 +428,18 @@ impl Auth {
         &self.requests
     }
 
+    /// Authorized devices with their roles, sorted by id.
+    fn members(&self) -> Vec<([u8; 32], Role)> {
+        self.trust.devices()
+    }
+
     /// The messages to catch a neighbor up (gossip is ephemeral): every trust
-    /// entry, plus our own outstanding ask so a late-arriving owner sees it.
+    /// entry, then every accepted epoch announce (trust first, so their signers
+    /// are known Admins), plus our own outstanding ask so a late-arriving owner
+    /// sees it.
     fn catchup(&self) -> Vec<MeshMsg> {
         let mut out: Vec<MeshMsg> = self.entries.iter().cloned().map(MeshMsg::Trust).collect();
+        out.extend(self.epochs.announces().iter().cloned().map(MeshMsg::Epoch));
         if !self.authorized() {
             if let Some(req) = &self.my_request {
                 out.push(MeshMsg::Request(req.clone()));
@@ -328,53 +448,171 @@ impl Auth {
         out
     }
 
-    /// Auth-aware receive for a data message: ingest a trust entry, or enforce +
-    /// return the inner `SyncMsg` to apply. `None` = handled or rejected.
-    fn accept(&mut self, gm: MeshMsg) -> Option<riftpipe_core::sync::SyncMsg> {
+    /// The content inside a `Sync` / `SignedSync` (already opened if it arrived
+    /// sealed), if it passes the write gate: unsigned only when the mode doesn't
+    /// require signed writes; signed verified against the trust log when gated,
+    /// else just author-verified.
+    fn content_of(&self, gm: MeshMsg) -> Option<SyncMsg> {
+        let gated = self.mode().requires_signed_writes();
         match gm {
-            MeshMsg::Trust(e) => {
-                self.add_trust(e);
-                None
-            }
-            MeshMsg::Request(req) => {
-                self.ingest_request(req);
-                None
-            }
-            // Unsigned writes are accepted only on an unlocked board.
-            MeshMsg::Sync(s) => (!self.locked()).then_some(s),
+            MeshMsg::Sync(s) => (!gated).then_some(s),
             MeshMsg::SignedSync(sw) => {
-                let ok = if self.locked() {
+                let ok = if gated {
                     sw.verified(&self.trust).is_some() // authorized writer
                 } else {
                     sw.author_verified().is_some() // open: any authentic signature
                 };
-                ok.then(|| postcard::from_bytes::<riftpipe_core::sync::SyncMsg>(&sw.payload).ok())
-                    .flatten()
+                ok.then(|| postcard::from_bytes::<SyncMsg>(&sw.payload).ok()).flatten()
             }
             _ => None,
         }
     }
-}
 
-/// Persist the converged trust log (postcard→hex in localStorage) so a locked
-/// board — and its author + grants — survives a reload.
-fn persist_trust_entries(entries: &[TrustEntry]) {
-    if let Some(store) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let bytes = postcard::to_allocvec(entries).unwrap_or_default();
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let _ = store.set_item(TRUST_STORE_KEY, &hex);
+    /// Admin housekeeping on a restricted board (see `EpochBook::maintain`): the
+    /// founder mints epoch 1, an epoch still wrapping a revoked device is rotated
+    /// away, newly authorized devices are wrapped in (then our full state goes out
+    /// so they catch up). Empty on an open board or for non-admins.
+    fn maintain(&mut self) -> Accepted {
+        let mut acc = Accepted::default();
+        if !self.mode().seals_content() {
+            return acc;
+        }
+        let m = self.epochs.maintain(&self.identity, &self.trust);
+        if let Some((seq, n)) = m.rotated {
+            web_sys::console::info_1(&format!("[epoch] rotated to epoch {seq} — {n} device(s) wrapped in").into());
+        }
+        if !m.announces.is_empty() {
+            persist_epochs(&self.topic, self.epochs.announces());
+        }
+        acc.send = m.announces.into_iter().map(MeshMsg::Epoch).collect();
+        acc.send_full_state = m.added > 0;
+        acc
+    }
+
+    /// Act on what accepting announce(s) changed: persist, apply content parked
+    /// for a newly-held key, broadcast our full state on our first key (it carries
+    /// edits made while keyless), then run Admin maintenance.
+    fn followups(&mut self, ing: Ingested) -> Accepted {
+        if ing.changed {
+            persist_epochs(&self.topic, self.epochs.announces());
+        }
+        if let Some(seq) = ing.unheld {
+            web_sys::console::info_1(
+                &format!("[epoch] no key for epoch {seq} — this device is not wrapped in (revoked, or not yet approved)").into(),
+            );
+        }
+        let mut acc = Accepted {
+            apply: ing.released.into_iter().filter_map(|m| self.content_of(m)).collect(),
+            send: Vec::new(),
+            send_full_state: ing.gained_first_key,
+        };
+        acc.merge(self.maintain());
+        acc
+    }
+
+    /// Auth-aware receive for every data message (`Trust` / `Request` / `Epoch` /
+    /// `Sealed` / `Sync` / `SignedSync`): ingest auth state, or gate content and
+    /// return it to apply. On a restricted board reads are epoch-gated: only
+    /// `Sealed` content is accepted, and only if we hold its epoch key.
+    fn accept(&mut self, gm: MeshMsg) -> Accepted {
+        match gm {
+            MeshMsg::Trust(e) => {
+                let was_authorized = self.authorized();
+                self.add_trust(e);
+                let ing = self.epochs.retry_pending(&self.trust);
+                let mut acc = self.followups(ing);
+                // Just approved but keyless: announce ourselves so an Admin wraps us in.
+                if !was_authorized {
+                    acc.send.extend(self.read_request());
+                }
+                acc
+            }
+            MeshMsg::Request(req) => {
+                self.ingest_request(req);
+                self.maintain()
+            }
+            MeshMsg::Epoch(a) => {
+                let ing = self.epochs.ingest(a, &self.trust);
+                self.followups(ing)
+            }
+            MeshMsg::Sealed(s) => {
+                let mut acc = Accepted::default();
+                if self.mode().seals_content() {
+                    if let Ok(inner) = self.epochs.open(s) {
+                        acc.apply.extend(self.content_of(inner));
+                    }
+                }
+                acc
+            }
+            // Restricted: content travels sealed only — an unsealed write is dropped.
+            gm @ (MeshMsg::Sync(_) | MeshMsg::SignedSync(_)) => {
+                let mut acc = Accepted::default();
+                if !self.mode().seals_content() {
+                    acc.apply.extend(self.content_of(gm));
+                }
+                acc
+            }
+            _ => Accepted::default(),
+        }
     }
 }
 
-fn load_trust_entries() -> Vec<TrustEntry> {
-    let Some(store) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
-        return Vec::new();
-    };
-    let Ok(Some(hex)) = store.get_item(TRUST_STORE_KEY) else { return Vec::new() };
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
+}
+
+/// Store `value` as `hex(postcard(value))` under `key`.
+fn store_hex_postcard<T: serde::Serialize>(key: &str, value: &T) {
+    if let Some(store) = local_storage() {
+        let bytes = postcard::to_allocvec(value).unwrap_or_default();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let _ = store.set_item(key, &hex);
+    }
+}
+
+/// Read a `hex(postcard(T))` value from `key`; `None` if absent or undecodable.
+fn load_hex_postcard<T: serde::de::DeserializeOwned>(key: &str) -> Option<T> {
+    let hex = local_storage()?.get_item(key).ok()??;
     let bytes: Vec<u8> = (0..hex.len() / 2)
         .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
         .collect();
-    postcard::from_bytes(&bytes).unwrap_or_default()
+    postcard::from_bytes(&bytes).ok()
+}
+
+/// Persist the converged trust log for `topic` so a claimed board — and its
+/// author + grants — survives a reload.
+fn persist_trust_entries(topic: &[u8; 32], entries: &[TrustEntry]) {
+    store_hex_postcard(TRUST_STORE_KEY, &(topic, entries));
+}
+
+/// The trust log persisted for `topic`; else a one-time migration of the legacy
+/// board-unscoped log (the key is removed); else empty.
+fn load_trust_entries(topic: &[u8; 32]) -> Vec<TrustEntry> {
+    if let Some((stored, entries)) = load_hex_postcard::<([u8; 32], Vec<TrustEntry>)>(TRUST_STORE_KEY) {
+        if &stored == topic {
+            return entries;
+        }
+    }
+    if let Some(entries) = load_hex_postcard::<Vec<TrustEntry>>(LEGACY_TRUST_STORE_KEY) {
+        if let Some(store) = local_storage() {
+            let _ = store.remove_item(LEGACY_TRUST_STORE_KEY);
+        }
+        return entries;
+    }
+    Vec::new()
+}
+
+/// Persist the accepted epoch announces for `topic` (never raw keys).
+fn persist_epochs(topic: &[u8; 32], announces: &[EpochAnnounce]) {
+    store_hex_postcard(EPOCH_STORE_KEY, &(topic, announces));
+}
+
+/// The epoch announces persisted for `topic` (empty on a topic mismatch).
+fn load_epochs(topic: &[u8; 32]) -> Vec<EpochAnnounce> {
+    match load_hex_postcard::<([u8; 32], Vec<EpochAnnounce>)>(EPOCH_STORE_KEY) {
+        Some((stored, announces)) if &stored == topic => announces,
+        _ => Vec::new(),
+    }
 }
 
 /// File-tree sync over the gossip mesh. Local pushes broadcast to everyone; received
@@ -501,20 +739,37 @@ impl GossipTreeSync {
                             }
                             // feed() never yields a Chunk (it refuses nesting).
                             MeshMsg::Chunk { .. } => {}
-                            // Data messages (Sync / SignedSync / Trust) — auth
-                            // decides: a trust entry is ingested; a write is
-                            // verified/enforced and, if accepted, applied. Any
-                            // replies are signed on the way back out.
+                            // Data messages (Trust / Request / Epoch / Sealed /
+                            // Sync / SignedSync) — auth decides: auth state is
+                            // ingested; a write is opened (if sealed), verified
+                            // and, if accepted, applied. Whatever auth wants
+                            // broadcast goes to the whole swarm; replies are
+                            // signed (and sealed) on the way back out. No borrow
+                            // is held across an `.await`.
                             other => {
-                                let inner = au.borrow_mut().accept(other);
-                                if let Some(msg) = inner {
+                                let acc = au.borrow_mut().accept(other);
+                                for m in &acc.send {
+                                    send(&snd, &cph, m, false).await;
+                                }
+                                for msg in acc.apply {
                                     let (persist, replies) = sy.borrow_mut().apply(msg);
                                     if let Some((path, bytes)) = persist {
                                         on_merged(path, bytes);
                                     }
                                     for r in replies {
                                         let mm = au.borrow().sign(r);
-                                        send(&snd, &cph, &mm, false).await;
+                                        if let Some(mm) = mm {
+                                            send(&snd, &cph, &mm, false).await;
+                                        }
+                                    }
+                                }
+                                if acc.send_full_state {
+                                    let full = sy.borrow().full_state();
+                                    for msg in full {
+                                        let mm = au.borrow().sign(msg);
+                                        if let Some(mm) = mm {
+                                            send(&snd, &cph, &mm, false).await;
+                                        }
                                     }
                                 }
                             }
@@ -528,15 +783,24 @@ impl GossipTreeSync {
                         send(&snd, &cph, &MeshMsg::Version { id: my_id, proto: ours }, false).await;
                         // Catch the new neighbor up: the trust log first (so it
                         // learns the authorized set — gossip is ephemeral), then
-                        // our whole (signed) tree. Direct neighbors only.
+                        // the epoch announces, then our whole (signed, sealed)
+                        // tree. Direct neighbors only — except our read request
+                        // (approved but keyless), which goes to the whole swarm
+                        // since the admin may not be a direct neighbor.
                         let catchup = au.borrow().catchup();
                         for m in catchup {
                             send(&snd, &cph, &m, true).await;
                         }
+                        let rr = au.borrow().read_request();
+                        if let Some(r) = rr {
+                            send(&snd, &cph, &r, false).await;
+                        }
                         let full = sy.borrow().full_state();
                         for msg in full {
                             let mm = au.borrow().sign(msg);
-                            send(&snd, &cph, &mm, true).await;
+                            if let Some(mm) = mm {
+                                send(&snd, &cph, &mm, true).await;
+                            }
                         }
                         let list = snapshot(&receiver);
                         *nb.borrow_mut() = list.iter().copied().collect();
@@ -587,35 +851,60 @@ impl GossipTreeSync {
     }
 
     pub fn push_text(&self, path: &str, content: &str) {
-        if let Some(msg) = self.syncer.borrow_mut().local_text(path, content) {
-            self.broadcast(self.auth.borrow().sign(msg));
+        let msg = self.syncer.borrow_mut().local_text(path, content);
+        if let Some(msg) = msg {
+            let mm = self.auth.borrow().sign(msg);
+            if let Some(mm) = mm {
+                self.broadcast(mm);
+            }
         }
     }
 
     pub fn push_lww(&self, path: &str, bytes: &[u8]) {
         let now = js_sys::Date::now() as u64;
         let msg = self.syncer.borrow_mut().local_lww(path, bytes.to_vec(), now);
-        self.broadcast(self.auth.borrow().sign(msg));
+        let mm = self.auth.borrow().sign(msg);
+        if let Some(mm) = mm {
+            self.broadcast(mm);
+        }
     }
 
-    /// Lock the board: become its author (genesis) if it has none, and broadcast
-    /// the genesis live so every peer starts enforcing. `false` if already locked.
+    /// Lock (claim) the board: become its author (genesis) if it has none, mint
+    /// epoch 1, and broadcast both live so every peer starts enforcing. `false`
+    /// if already locked.
     pub fn lock(&self) -> bool {
-        match self.auth.borrow_mut().lock_as_author() {
-            Some(g) => {
-                self.broadcast(MeshMsg::Trust(g));
+        // Bind first so the auth borrow is released before `dispatch` re-borrows.
+        let acc = self.auth.borrow_mut().lock_as_author();
+        match acc {
+            Some(acc) => {
+                self.dispatch(acc);
                 true
             }
             None => false,
         }
     }
 
-    /// Grant `device` write access (we must be the author/Admin) and broadcast
-    /// the grant live. `false` if we can't grant.
+    /// Grant `device` write access (we must be the author/Admin), wrap it into
+    /// the current epoch, and broadcast it live. `false` if we can't grant.
     pub fn grant_device(&self, device: [u8; 32]) -> bool {
-        match self.auth.borrow_mut().make_grant(device) {
-            Some(e) => {
-                self.broadcast(MeshMsg::Trust(e));
+        let acc = self.auth.borrow_mut().make_grant(device);
+        match acc {
+            Some(acc) => {
+                self.dispatch(acc);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove `device` (we must be the author/Admin; never the founder): a signed
+    /// revoke plus a read-key rotation, broadcast live — it can't decrypt anything
+    /// new. `false` if we can't revoke it.
+    pub fn revoke_device(&self, device: [u8; 32]) -> bool {
+        let acc = self.auth.borrow_mut().make_revoke(device);
+        match acc {
+            Some(acc) => {
+                self.dispatch(acc);
                 true
             }
             None => false,
@@ -653,8 +942,32 @@ impl GossipTreeSync {
         serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
     }
 
+    /// Authorized devices as a JSON array of `{device, role, founder, me}`
+    /// (`role` is `"admin"` or `"member"`) — the owner's members list.
+    pub fn members(&self) -> String {
+        let a = self.auth.borrow();
+        let founder = a.trust.founder();
+        let me = a.my_id();
+        let items: Vec<serde_json::Value> = a
+            .members()
+            .into_iter()
+            .map(|(device, role)| {
+                serde_json::json!({
+                    "device": hex32(&device),
+                    "role": match role { Role::Admin => "admin", Role::Member => "member" },
+                    "founder": founder == Some(device),
+                    "me": device == me,
+                })
+            })
+            .collect();
+        serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
+    }
+
     /// JSON snapshot for the UI: `{locked, device, authorized, isAuthor, author,
-    /// requested}` — `requested` is true once we've asked and are still waiting.
+    /// requested, canRead, epoch}` — `requested` is true once we've asked and are
+    /// still waiting; `canRead` is false on a claimed board until this device is
+    /// wrapped into the latest epoch (or after it was removed); `epoch` is the
+    /// latest epoch seq we hold (0 = none).
     pub fn auth_state(&self) -> String {
         let a = self.auth.borrow();
         serde_json::json!({
@@ -664,12 +977,32 @@ impl GossipTreeSync {
             "isAuthor": a.is_author(),
             "author": a.trust.founder().map(|f| hex32(&f)).unwrap_or_default(),
             "requested": a.my_request.is_some(),
+            "canRead": a.can_read(),
+            "epoch": a.epochs.latest_held_seq().unwrap_or(0),
         })
         .to_string()
     }
 
+    /// Broadcast what an auth action produced: its messages, then (if asked) our
+    /// full state, signed and sealed. Auth actions never yield content to apply.
+    fn dispatch(&self, acc: Accepted) {
+        let mut msgs = acc.send;
+        if acc.send_full_state {
+            let full = self.syncer.borrow().full_state();
+            let a = self.auth.borrow();
+            msgs.extend(full.into_iter().filter_map(|m| a.sign(m)));
+        }
+        self.broadcast_all(msgs);
+    }
+
     fn broadcast(&self, gm: MeshMsg) {
-        let frames = riftpipe_core::sync::encode_mesh_frames(&gm);
+        self.broadcast_all(vec![gm]);
+    }
+
+    /// Encode and seal every frame of every message, sent in order from ONE task
+    /// (so e.g. a trust entry precedes the epoch announce it authorizes).
+    fn broadcast_all(&self, msgs: Vec<MeshMsg>) {
+        let frames: Vec<Vec<u8>> = msgs.iter().flat_map(riftpipe_core::sync::encode_mesh_frames).collect();
         let sender = self.sender.clone();
         let cipher = self.cipher.clone();
         wasm_bindgen_futures::spawn_local(async move {
@@ -774,6 +1107,16 @@ pub(crate) fn active_grant(device: [u8; 32]) -> bool {
     GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.grant_device(device)).unwrap_or(false))
 }
 
+/// Remove a device (hex id) from the active board: revoke + read-key rotation.
+pub(crate) fn active_revoke(device: [u8; 32]) -> bool {
+    GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.revoke_device(device)).unwrap_or(false))
+}
+
+/// Authorized devices on the active board (JSON array).
+pub(crate) fn active_members() -> String {
+    GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.members()).unwrap_or_else(|| "[]".into()))
+}
+
 /// Ask for write access on the active (locked) board.
 pub(crate) fn active_request_access() -> bool {
     GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.request_access()).unwrap_or(false))
@@ -788,7 +1131,7 @@ pub(crate) fn active_pending_requests() -> String {
 pub(crate) fn active_auth_state() -> String {
     GOSSIP.with(|c| {
         c.borrow().as_ref().map(|bs| bs.auth_state()).unwrap_or_else(|| {
-            r#"{"locked":false,"device":"","authorized":false,"isAuthor":false,"author":"","requested":false}"#.into()
+            r#"{"locked":false,"device":"","authorized":false,"isAuthor":false,"author":"","requested":false,"canRead":true,"epoch":0}"#.into()
         })
     })
 }
@@ -837,6 +1180,62 @@ mod tests {
 
     async fn sleep_ms(ms: u32) {
         gloo_timers::future::TimeoutFuture::new(ms).await;
+    }
+
+    /// `MeshMsg` isn't `Clone`: copy one through its wire encoding.
+    fn dup(m: &MeshMsg) -> MeshMsg {
+        postcard::from_bytes(&postcard::to_allocvec(m).unwrap()).unwrap()
+    }
+
+    /// Deliver every message `acc` wants broadcast to `to`, in order.
+    fn deliver(acc: &Accepted, to: &mut Auth) {
+        for m in &acc.send {
+            to.accept(dup(m));
+        }
+    }
+
+    /// Offline: a claimed board seals content under an epoch key that only
+    /// approved devices hold, and removing a device rotates it out — it can't
+    /// open anything sealed afterwards while the remaining member still can.
+    #[wasm_bindgen_test]
+    fn claimed_board_seals_and_revoke_rotates() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        let mut a = Auth::load(DeviceKey::from_seed(&[11; 32]), topic);
+        let acc = a.lock_as_author().expect("unclaimed board locks");
+        assert_eq!(a.epochs.latest_held_seq(), Some(1), "claiming mints epoch 1");
+
+        let mut b = Auth::load(DeviceKey::from_seed(&[12; 32]), topic);
+        let mut c = Auth::load(DeviceKey::from_seed(&[13; 32]), topic);
+        let (b_id, c_id) = (b.my_id(), c.my_id());
+        deliver(&acc, &mut b);
+        deliver(&acc, &mut c);
+        assert!(b.locked() && !b.can_read(), "an un-approved device can't read a claimed board");
+
+        a.accept(b.request_access().expect("b asks"));
+        a.accept(c.request_access().expect("c asks"));
+        let gb = a.make_grant(b_id).expect("owner grants b");
+        deliver(&gb, &mut b);
+        deliver(&gb, &mut c);
+        let gc = a.make_grant(c_id).expect("owner grants c");
+        deliver(&gc, &mut b);
+        deliver(&gc, &mut c);
+        assert!(b.can_read() && c.can_read(), "approved devices are wrapped into the epoch");
+
+        let lww = |path: &str, bytes: &[u8]| SyncMsg::Lww { path: path.into(), version: 1, bytes: bytes.to_vec() };
+        let s = a.sign(lww("x", b"1")).expect("owner seals");
+        assert!(matches!(s, MeshMsg::Sealed(_)), "claimed-board content is sealed");
+        assert_eq!(b.accept(dup(&s)).apply.len(), 1, "a member opens sealed content");
+
+        let r = a.make_revoke(c_id).expect("owner removes c");
+        deliver(&r, &mut b);
+        deliver(&r, &mut c);
+        assert!(!c.can_read(), "the removed device lost read");
+        assert!(b.can_read(), "the remaining member still reads");
+        assert_eq!(a.epochs.latest_held_seq(), Some(2), "removal rotated the epoch");
+
+        let s2 = a.sign(lww("y", b"2")).expect("owner seals under the new epoch");
+        assert_eq!(b.accept(dup(&s2)).apply.len(), 1, "remaining member opens new content");
+        assert!(c.accept(dup(&s2)).apply.is_empty(), "removed device can't open new content");
     }
 
     /// Two browser peers join the same gossip topic (one bootstraps off the other)
@@ -901,14 +1300,14 @@ mod tests {
             sleep_ms(50).await;
         }
         let host_addr = host_mesh.addr();
-        let host_bs = GossipTreeSync::new(host_mesh, Rc::new(|_, _| {}), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32])));
+        let host_bs = GossipTreeSync::new(host_mesh, Rc::new(|_, _| {}), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32]), riftpipe_core::crypto::topic_from_secret(&secret)));
 
         let join_sk = SecretKey::generate();
         let joiner_mesh = Mesh::join(join_sk, secret, Some(host_addr)).await.expect("joiner");
         let got: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::new(RefCell::new(Vec::new()));
         let g = got.clone();
         let _joiner_bs =
-            GossipTreeSync::new(joiner_mesh, Rc::new(move |p, b| g.borrow_mut().push((p, b))), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32])));
+            GossipTreeSync::new(joiner_mesh, Rc::new(move |p, b| g.borrow_mut().push((p, b))), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32]), riftpipe_core::crypto::topic_from_secret(&secret)));
 
         // Let the swarm form, then the host pushes a file.
         sleep_ms(2500).await;

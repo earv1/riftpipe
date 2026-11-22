@@ -102,7 +102,7 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
         None => true,
     };
 
-    let (mesh, my_ticket) = if is_host {
+    let (mesh, my_ticket, topic) = if is_host {
         // Our own link is authoritative for the secret if present (survives a
         // localStorage wipe that kept the URL); else persist-or-mint one.
         let secret = match &parsed {
@@ -112,18 +112,19 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
         persist_board_secret(&secret);
         let mesh = Mesh::join(sk, secret, None).await.map_err(|e| JsValue::from_str(&e))?;
         let addr = mesh.wait_for_addr().await;
-        (mesh, Some(ticket_of(&secret, &addr)))
+        (mesh, Some(ticket_of(&secret, &addr)), riftpipe_core::crypto::topic_from_secret(&secret))
     } else {
         // Joiner: the link carries everything — the secret and the host to dial.
         let (secret, addr) = parsed.unwrap();
         let mesh = Mesh::join(sk, secret, Some(addr)).await.map_err(|e| JsValue::from_str(&e))?;
-        (mesh, None)
+        (mesh, None, riftpipe_core::crypto::topic_from_secret(&secret))
     };
 
-    // Device-linking auth: always carry this device's identity + the persisted
-    // trust log. The board is "open" until someone locks it (adds a genesis);
-    // `lockBoard()` does that live. See `web::gossip::Auth`.
-    let auth = crate::gossip::Auth::load(load_or_create_device());
+    // Device-linking auth: always carry this device's identity + the trust log
+    // and epoch announces persisted for this board (its topic). The board is
+    // "open" until someone locks it (adds a genesis); `lockBoard()` does that
+    // live. See `web::gossip::Auth`.
+    let auth = crate::gossip::Auth::load(load_or_create_device(), topic);
     crate::gossip::set_active(GossipTreeSync::new(mesh, on_merged, auth));
     wasm_bindgen_futures::spawn_local(crate::opfs::prime_all());
 
@@ -187,6 +188,30 @@ pub fn grant_device(hex_id: String) -> bool {
     }
 }
 
+/// **Remove** a device (hex id): signed revoke + read-key rotation — it can't decrypt
+/// anything new. Owner/Admin only; the founder can't be removed. `false` if we
+/// can't remove it or the id is malformed.
+#[wasm_bindgen(js_name = revokeDevice)]
+pub fn revoke_device(hex_id: String) -> bool {
+    match hex32(&hex_id) {
+        Some(id) => {
+            let ok = crate::gossip::active_revoke(id);
+            if ok {
+                crate::events::log("auth.revoke", serde_json::json!({ "device": hex_id }));
+            }
+            ok
+        }
+        None => false,
+    }
+}
+
+/// Authorized devices as JSON `[{device, role, founder, me}]` (`role` is
+/// `"admin"` or `"member"`) — the owner's members list.
+#[wasm_bindgen(js_name = boardMembers)]
+pub fn board_members() -> String {
+    crate::gossip::active_members()
+}
+
 /// **Ask for access**: request write access on a locked board. Broadcasts a
 /// signed join request so the author sees it in their approval inbox. `true` if
 /// a request went out, `false` if the board is open or we're already authorized.
@@ -208,8 +233,10 @@ pub fn pending_requests() -> String {
 }
 
 /// Auth state of the active board as JSON:
-/// `{locked, device, authorized, isAuthor, author, requested}` — what the login
-/// UI renders.
+/// `{locked, device, authorized, isAuthor, author, requested, canRead, epoch}` —
+/// what the login UI renders. `canRead` is false on a claimed board until this
+/// device is wrapped into the latest epoch (or once it was removed); `epoch` is
+/// the latest epoch seq this device holds (0 = none).
 #[wasm_bindgen(js_name = authState)]
 pub fn auth_state() -> String {
     crate::gossip::active_auth_state()
