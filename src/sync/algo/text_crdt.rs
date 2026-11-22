@@ -78,6 +78,10 @@ impl SyncStrategy for TextCrdtSyncer {
             None
         }
     }
+
+    fn fingerprint(&self) -> [u8; 32] {
+        *blake3::hash(self.doc.content().as_bytes()).as_bytes()
+    }
 }
 
 #[cfg(test)]
@@ -105,6 +109,20 @@ mod tests {
         let cb = String::from_utf8(b.state_after()).unwrap();
         assert_eq!(ca, cb, "diverged: {ca:?} vs {cb:?}");
         assert!(ca.contains("cat") && ca.contains("dog"), "lost an edit: {ca:?}");
+    }
+
+    /// `fingerprint` tracks materialized content: equal after a merge brings
+    /// both sides to the same text, and differs after a further local edit.
+    #[test]
+    fn fingerprint_tracks_content() {
+        let mut a = TextCrdtSyncer::new("a");
+        let mut b = TextCrdtSyncer::new("b");
+        a.observe(b"hi");
+        let da = a.push_delta().unwrap();
+        b.merge(&da);
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        a.observe(b"hi!");
+        assert_ne!(a.fingerprint(), b.fingerprint());
     }
 
     /// The pull path recovers a peer that missed a push.

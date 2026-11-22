@@ -62,6 +62,13 @@ pub trait SyncStrategy: Send {
     /// Merge a delta from a peer. Returns the new materialized bytes **iff** they
     /// changed — the caller writes them to the backing (disk / memory).
     fn merge(&mut self, delta: &[u8]) -> Option<Vec<u8>>;
+
+    /// blake3 of the content this replica currently materializes (what `merge`
+    /// would write). Two replicas with equal fingerprints hold equivalent
+    /// content — for formats with a canonical form (lww-record) that's the
+    /// canonical bytes, so a hand-formatted file and a peer's canonical rewrite
+    /// compare equal. Folder deletes compare these to decide delete-vs-edit.
+    fn fingerprint(&self) -> [u8; 32];
 }
 
 /// The set of sync algorithms a workspace can assign to a resource. Serialized

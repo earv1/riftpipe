@@ -40,4 +40,7 @@ impl SyncStrategy for ImageSyncer {
     fn merge(&mut self, _delta: &[u8]) -> Option<Vec<u8>> {
         todo!("image: composite received tiles")
     }
+    fn fingerprint(&self) -> [u8; 32] {
+        todo!("image: fingerprint of the composited tiles")
+    }
 }

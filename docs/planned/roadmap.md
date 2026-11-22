@@ -174,13 +174,50 @@ over riftpipe's wasm file API). What remains:
     exact fill) — events reached clients ~7 stale. Frames now pad to two
     chunks so each event's data line is forced out by its own padding.
 
-- **Folder-mode dead-link detection is slow** (observed 2026-07-18 while
-  verifying the wire unification): a sharer whose WebRTC-direct joiner dies
-  stays in the dead session well past 45s — heartbeat sends don't error
-  promptly on a dead data channel — so a NEW joiner can't connect until it
-  notices. Reconnect + catch-up work once it does (and across full restarts).
-  Fix candidates: a recv-idle timeout in `folder::session`, or surfacing
-  data-channel close from the WebRTC transport as a link error.
+- ~~Folder-mode dead-link detection is slow~~ (observed 2026-07-18 while
+  verifying the wire unification) — *done.* Both fix candidates landed:
+  `folder::session` now has a 15s recv-idle timeout
+  (`folder::RECV_IDLE_TIMEOUT`) that treats silence as a dead link even when
+  the transport never reports a close, and every heartbeat (5s) opens with a
+  `Version` frame so an idle-but-alive, empty workspace still proves it's
+  there. The WebRTC transport also now surfaces death directly: a data
+  channel's `on_close` and the peer connection reaching
+  Failed/Closed both latch recv to end in `None` (link EOF), and ICE
+  timeouts are tightened (disconnected 3s / failed 7s / keepalive 1s, down
+  from webrtc-rs's 5s/25s/2s defaults) so a vanished direct peer is detected
+  faster at the transport layer too.
+- **Folder deletes sync** — *done.* `riftpipe_core::sync::SyncMsg` gained an
+  APPENDED `StratDelete { path, ids, seen }` variant (wire index 7;
+  `PROTOCOL_VERSION` 3 → 4 — one bump shared with the epoch-key mesh seal —
+  since a pre-bump peer silently ignores deletes and keeps the files). A
+  file-backed resource that was materialized at least once and then goes missing from disk (watcher/poll scan, or a startup
+  index comparison after being offline) becomes a tombstone and sends
+  `StratDelete`. Delete-vs-concurrent-edit is judged by content via
+  `SyncStrategy::fingerprint()` (blake3 of what a replica materializes —
+  canonical bytes for `lww-record`, so formatting differences don't count as
+  a conflict): a receiver deletes only if its own current fingerprint is one
+  the deleter had already seen (`seen`, capped at 8, oldest first); otherwise
+  the concurrent edit wins (add-wins, matching Syncthing/Dropbox) and it
+  answers with a self-contained delta so the deleter resurrects the file. A
+  `StratAdvert` for a tombstoned path re-asserts the delete (how an
+  offline-at-delete-time peer learns on reconnect); a non-self-contained
+  delta re-asserts too, at most once per heartbeat (loop guard). Re-creating
+  a tombstoned path locally drops the tombstone and remembers its ids as
+  `superseded`, so an old copy of those deletions held by a peer is rejected
+  even for a byte-identical re-creation. Deletion ids are deterministic
+  (blake3 of path + last fingerprint + superseded ids) and independent
+  deletes of one path merge their ids, so concurrent deletes followed by an
+  identical restore can't lose the restored file. Tombstones + last-known live files
+  persist in `<root>/.riftpipe-folder-index` (postcard, atomic write), so
+  deletes made or received while offline survive a restart. Out of scope,
+  tracked as the next bullet: `sync::tree`/`sync::mesh` (browser/kanban).
+- **tree/mesh (browser) deletes** — not built. The core `Syncer` (text CRDT +
+  whole-file LWW) that `sync::tree`/`sync::mesh` and the browser/kanban ride
+  has no delete notion; folder mode's tombstone design doesn't transfer
+  as-is because kanban already has its own "delete" (cards are archived via
+  a `meta.toml` field, never removed). Needs a `Syncer`-level tombstone (wire
+  + merge + browser OPFS removal) and a kanban decision on how archiving and
+  a real delete interact. Separate plan.
 
 - ~~Mesh messages over 4 KiB are silently lost~~ — *fixed, by chunking (no
   reload needed).* Rather than raising iroh-gossip's 4 KiB frame limit (it's
@@ -327,7 +364,7 @@ over riftpipe's wasm file API). What remains:
   ceremony on top of these lib calls. (Driving the mesh seal from epoch keys,
   approve delivering a wrapped epoch key, and request/approve on the native
   CLI are now shipped — see "Epoch-key mesh seal" below.)
-- **Epoch-key mesh seal — done (`PROTOCOL_VERSION` 4).** `core::epoch::EpochBook`
+- **Epoch-key mesh seal — done (`PROTOCOL_VERSION` 4, shared with folder deletes).** `core::epoch::EpochBook`
   wires the content key into the mesh for real: on a **Restricted** board,
   `Sync`/`SignedSync` is sealed a second time under the current epoch key
   (`MeshMsg::Sealed`), identified by an 8-byte key fingerprint so two admins

@@ -228,6 +228,10 @@ impl SyncStrategy for LwwRecordSyncer {
         let after = self.materialize();
         (after != before).then_some(after)
     }
+
+    fn fingerprint(&self) -> [u8; 32] {
+        *blake3::hash(&self.materialize()).as_bytes()
+    }
 }
 
 #[cfg(test)]
@@ -350,5 +354,16 @@ mod tests {
         let d = a.push_delta().expect("changed keys to push");
         assert!(a.push_delta().is_none(), "watermark advanced");
         assert_eq!(b.merge(&d).as_deref(), Some(b"x = 1\n".as_slice()));
+    }
+
+    /// `fingerprint` is the canonical hash, so formatting differences (spacing,
+    /// comments, key order) don't matter — only live key/value content does.
+    #[test]
+    fn fingerprint_ignores_formatting() {
+        let mut a = LwwRecordSyncer::new("m");
+        let mut b = LwwRecordSyncer::new("m");
+        a.observe(b"b = 2\n# note\na=1\n");
+        b.observe(b"a = 1\nb = 2\n");
+        assert_eq!(a.fingerprint(), b.fingerprint());
     }
 }
