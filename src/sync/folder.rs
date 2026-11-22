@@ -34,7 +34,7 @@ use notify::{RecursiveMode, Watcher};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, MissedTickBehavior};
 
-use riftpipe_core::sync::SyncMsg;
+use riftpipe_core::sync::{SyncMsg, PROTOCOL_VERSION};
 
 use crate::net::secure::authenticate;
 use crate::net::negotiate::negotiate_session_halves;
@@ -67,17 +67,18 @@ fn encode(msg: &SyncMsg) -> Vec<u8> {
     postcard::to_allocvec(msg).expect("SyncMsg encodes")
 }
 
-/// Scan local backings for changes and push them — the shared body of the
-/// filesystem-watch arm and the fallback poll. Picks up newly-created files,
-/// then for each resource `observe`s its bytes; on a real change it pushes a
-/// delta and a reply-expecting advert. Returns `false` if a send failed, so the caller
-/// can treat that as `LinkClosed`. (Self-write safe: merging a remote change
-/// stores bytes that `observe` then reports as *unchanged*, so a scan triggered
-/// by our own write is a no-op — no echo, no extra dedup needed.)
-async fn scan_local(ws: &mut Workspace, sink: &mut dyn Sink) -> bool {
+/// One local scan: new files + changed files → frames to send (delta, then a
+/// reply-expecting advert, per changed resource). Picks up newly-created
+/// files, then for each resource `observe`s its bytes; on a real change it
+/// queues a delta and a reply-expecting advert. (Self-write safe: merging a
+/// remote change stores bytes that `observe` then reports as *unchanged*, so
+/// a scan triggered by our own write is a no-op — no echo, no extra dedup
+/// needed.)
+fn collect_local(ws: &mut Workspace) -> Vec<Vec<u8>> {
     let _ = ws.refresh_disk(); // pick up newly-created files
+    let mut out = Vec::new();
     for path in ws.paths() {
-        // Observe under a short borrow, then send without holding it.
+        // Observe under a short borrow, then queue without holding it.
         let (changed, push, sv) = match ws.get_mut(&path) {
             Some(res) => {
                 let bytes = res.backing.load();
@@ -91,13 +92,61 @@ async fn scan_local(ws: &mut Workspace, sink: &mut dyn Sink) -> bool {
         };
         if changed {
             if let Some(d) = push {
-                if sink.send(delta(&path, d)).await.is_err() {
-                    return false;
+                out.push(delta(&path, d));
+            }
+            out.push(advert(&path, sv, true));
+        }
+    }
+    out
+}
+
+/// Version frame + a reply-expecting advert for every resource (connect + heartbeat).
+fn advertise_all(ws: &mut Workspace) -> Vec<Vec<u8>> {
+    let mut out = vec![encode(&SyncMsg::Version { proto: PROTOCOL_VERSION })];
+    for path in ws.paths() {
+        let sv = match ws.get_mut(&path) {
+            Some(r) => r.strategy.state_vector(),
+            None => continue,
+        };
+        out.push(advert(&path, sv, true));
+    }
+    out
+}
+
+/// Apply one decoded inbound message; the frames to send back. `Version` and
+/// non-strategy messages yield nothing (the session handles `Version`).
+/// Receiving an unknown path auto-creates the resource (peer-driven discovery).
+fn apply_inbound(ws: &mut Workspace, msg: SyncMsg) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    match msg {
+        SyncMsg::StratDelta { path, bytes } => {
+            if let Some(res) = ws.ensure(&path) {
+                if let Some(nb) = res.strategy.merge(&bytes) {
+                    res.backing.store(&nb);
                 }
             }
-            if sink.send(advert(&path, sv, true)).await.is_err() {
-                return false;
+        }
+        SyncMsg::StratAdvert { path, sv, reply } => {
+            if let Some(res) = ws.ensure(&path) {
+                if let Some(d) = res.strategy.delta_since(&sv) {
+                    out.push(delta(&path, d));
+                }
+                if reply {
+                    out.push(advert(&path, res.strategy.state_vector(), false));
+                }
             }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Send every frame in order; `false` on the first send error, so the caller
+/// can treat that as `LinkClosed`.
+async fn send_all(sink: &mut dyn Sink, frames: Vec<Vec<u8>>) -> bool {
+    for f in frames {
+        if sink.send(f).await.is_err() {
+            return false;
         }
     }
     true
@@ -125,23 +174,10 @@ pub async fn session(
     tokio::pin!(idle);
     let mut mismatch_warned = false;
 
-    // Announce our protocol version first, so a mismatched peer is surfaced.
-    if sink
-        .send(encode(&SyncMsg::Version { proto: riftpipe_core::sync::PROTOCOL_VERSION }))
-        .await
-        .is_err()
-    {
+    // On connect, announce our protocol version and advertise everything we
+    // hold so the peer can reconcile.
+    if !send_all(sink, advertise_all(ws)).await {
         return Ok(SessionOutcome::LinkClosed);
-    }
-    // On connect, advertise everything we hold so the peer can reconcile.
-    for path in ws.paths() {
-        let sv = match ws.get_mut(&path) {
-            Some(r) => r.strategy.state_vector(),
-            None => continue,
-        };
-        if sink.send(advert(&path, sv, true)).await.is_err() {
-            return Ok(SessionOutcome::LinkClosed);
-        }
     }
 
     loop {
@@ -153,14 +189,14 @@ pub async fn session(
                 // covers us either way.
                 if nudge.is_some() {
                     while watch_rx.try_recv().is_ok() {} // coalesce a burst of events
-                    if !scan_local(ws, sink).await {
+                    if !send_all(sink, collect_local(ws)).await {
                         return Ok(SessionOutcome::LinkClosed);
                     }
                 }
             }
             // Fallback: rescan slowly in case the watcher missed an event.
             _ = fallback.tick() => {
-                if !scan_local(ws, sink).await {
+                if !send_all(sink, collect_local(ws)).await {
                     return Ok(SessionOutcome::LinkClosed);
                 }
             }
@@ -174,59 +210,23 @@ pub async fn session(
                 // the tree/mesh drivers skip strategy messages — one envelope,
                 // two dialects, no cross-talk.
                 let Ok(msg) = postcard::from_bytes::<SyncMsg>(&bytes) else { continue };
-                let mut outgoing: Vec<Vec<u8>> = Vec::new();
-                match msg {
-                    SyncMsg::StratDelta { path, bytes } => {
-                        if let Some(res) = ws.ensure(&path) {
-                            if let Some(nb) = res.strategy.merge(&bytes) {
-                                res.backing.store(&nb);
-                            }
-                        }
+                if let SyncMsg::Version { proto } = msg {
+                    if proto != PROTOCOL_VERSION && !mismatch_warned {
+                        mismatch_warned = true;
+                        eprintln!(
+                            "[folder] protocol-mismatch theirs={proto} ours={PROTOCOL_VERSION} — \
+                             sync may be incomplete",
+                        );
                     }
-                    SyncMsg::StratAdvert { path, sv, reply } => {
-                        if let Some(res) = ws.ensure(&path) {
-                            if let Some(d) = res.strategy.delta_since(&sv) {
-                                outgoing.push(delta(&path, d));
-                            }
-                            if reply {
-                                outgoing.push(advert(&path, res.strategy.state_vector(), false));
-                            }
-                        }
-                    }
-                    SyncMsg::Version { proto } => {
-                        if proto != riftpipe_core::sync::PROTOCOL_VERSION && !mismatch_warned {
-                            mismatch_warned = true;
-                            eprintln!(
-                                "[folder] protocol-mismatch theirs={proto} ours={} — \
-                                 sync may be incomplete",
-                                riftpipe_core::sync::PROTOCOL_VERSION,
-                            );
-                        }
-                    }
-                    _ => {}
+                    continue;
                 }
-                for f in outgoing {
-                    if sink.send(f).await.is_err() {
-                        return Ok(SessionOutcome::LinkClosed);
-                    }
+                if !send_all(sink, apply_inbound(ws, msg)).await {
+                    return Ok(SessionOutcome::LinkClosed);
                 }
             }
             _ = heartbeat.tick() => {
-                if sink
-                    .send(encode(&SyncMsg::Version { proto: riftpipe_core::sync::PROTOCOL_VERSION }))
-                    .await
-                    .is_err()
-                {
+                if !send_all(sink, advertise_all(ws)).await {
                     return Ok(SessionOutcome::LinkClosed);
-                }
-                for path in ws.paths() {
-                    let sv = match ws.get_mut(&path) {
-                        Some(r) => r.strategy.state_vector(),
-                        None => continue,
-                    };
-                    if sink.send(advert(&path, sv, true)).await.is_err() {
-                        return Ok(SessionOutcome::LinkClosed);
-                    }
                 }
             }
             _ = &mut idle => {
@@ -338,6 +338,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Deliver one frame to `ws` the way `session` does; returns its replies.
+    fn deliver(ws: &mut Workspace, frame: &[u8]) -> Vec<Vec<u8>> {
+        match postcard::from_bytes::<SyncMsg>(frame) {
+            Ok(SyncMsg::Version { .. }) | Err(_) => Vec::new(),
+            Ok(msg) => apply_inbound(ws, msg),
+        }
+    }
+
+    /// Shuttle frames between A and B until neither produces more (≤ 32 rounds,
+    /// else panic — that's a ping-pong bug). `to_a` = frames headed for A.
+    fn pump(a: &mut Workspace, b: &mut Workspace, mut to_a: Vec<Vec<u8>>, mut to_b: Vec<Vec<u8>>) {
+        for _ in 0..32 {
+            if to_a.is_empty() && to_b.is_empty() {
+                return;
+            }
+            let (mut next_a, mut next_b) = (Vec::new(), Vec::new());
+            for f in to_b.drain(..) {
+                next_a.extend(deliver(b, &f));
+            }
+            for f in to_a.drain(..) {
+                next_b.extend(deliver(a, &f));
+            }
+            to_a = next_a;
+            to_b = next_b;
+        }
+        panic!("frames still flowing after 32 rounds");
+    }
+
+    /// Initial sync: both scan, pump, then one heartbeat round, pump.
+    fn sync_pair(a: &mut Workspace, b: &mut Workspace) {
+        let (fa, fb) = (collect_local(a), collect_local(b));
+        pump(a, b, fb, fa);
+        let (ha, hb) = (advertise_all(a), advertise_all(b));
+        pump(a, b, hb, ha);
+    }
+
+    fn text_manifest() -> Manifest {
+        Manifest::parse(
+            "default = \"rsync-file\"\n[[rule]]\nglob = \"**/*.md\"\nalgo = \"text-crdt\"\n[[rule]]\nglob = \"**/meta.toml\"\nalgo = \"lww-record\"\n",
+        )
+        .unwrap()
     }
 
     #[test]
@@ -519,5 +562,24 @@ mod tests {
         let (_sess_out, count) = tokio::join!(session(&mut ws, &mut wa, &mut sa, &mut ra_src), peer);
         assert!(count >= 3);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pump_syncs_new_files_both_ways() {
+        let ra = dir("pump-a");
+        let rb = dir("pump-b");
+        std::fs::write(ra.join("x.bin"), b"rsync bytes").unwrap();
+        std::fs::write(rb.join("notes.md"), "# hi\n").unwrap();
+
+        let mut a = Workspace::new(&ra, text_manifest(), false).unwrap();
+        let mut b = Workspace::new(&rb, text_manifest(), false).unwrap();
+
+        sync_pair(&mut a, &mut b);
+
+        assert_eq!(std::fs::read(ra.join("notes.md")).unwrap(), b"# hi\n");
+        assert_eq!(std::fs::read(rb.join("x.bin")).unwrap(), b"rsync bytes");
+
+        std::fs::remove_dir_all(&ra).ok();
+        std::fs::remove_dir_all(&rb).ok();
     }
 }
