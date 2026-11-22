@@ -614,6 +614,33 @@ something else reads it.
   to, so it can't ping-pong; the heartbeat re-advertises every 5s.
 - **`--memory`** holds resources in RAM (seeded once from disk) instead of
   mirroring to disk; **`--process <path>`** writes the §17.6 size+hash file.
+- **Deletes** — a file-backed resource that was materialized at least once
+  (non-empty `seen` fingerprint history) and is now missing from disk is a
+  local delete: the watcher/poll scan turns it into a tombstone and sends
+  `SyncMsg::StratDelete { path, id, seen }` (APPENDED wire variant, index 7;
+  `PROTOCOL_VERSION` 3 → 4). Delete-vs-concurrent-edit is judged by content,
+  not clocks: `seen` holds the deleter's recent **fingerprints**
+  (`SyncStrategy::fingerprint()`, blake3 of what the replica materializes —
+  canonical bytes for `lww-record`, so a hand-formatted file and a peer's
+  canonical rewrite compare equal); a receiver applies the delete only if its
+  own current fingerprint is one the deleter had already seen, otherwise the
+  concurrent edit wins (edit-wins/add-wins, like Syncthing/Dropbox) and it
+  replies with a self-contained delta so the deleter resurrects the file. A
+  `StratAdvert` for a tombstoned path re-asserts the delete (how a peer that
+  was offline at delete time learns of it on reconnect); an incremental delta
+  that can't stand alone also re-asserts, at most once per heartbeat. Locally
+  re-creating a tombstoned path drops the tombstone and remembers the old
+  deletion's id as `superseded`, so a stale copy of that deletion held by a
+  peer is rejected even for a byte-identical re-creation. Tombstones and
+  last-known live files persist in `<root>/.riftpipe-folder-index` (postcard,
+  atomic write), so a delete made while a peer was offline, or offline itself,
+  is still detected at startup. Out of scope: `sync::tree`/`sync::mesh` (the
+  browser/kanban `Syncer`) have no delete notion yet — a separate plan.
+- **Liveness** — a 15s recv-idle timeout (`folder::RECV_IDLE_TIMEOUT`) treats
+  a peer that sends nothing for that long as dead and reconnects, even if the
+  transport never reports a close; every heartbeat (5s) now starts with a
+  `Version` frame so an otherwise-silent, empty workspace still proves it's
+  alive.
 
 Verified end-to-end over loopback: a text file (text-crdt) and a binary blob
 (rsync) sync into a nested subdir A→B with discovery; a live edit on one side
