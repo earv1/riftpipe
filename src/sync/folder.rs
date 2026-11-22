@@ -280,21 +280,15 @@ pub async fn session(
         // Persist after every handled arm; a no-op when nothing changed.
         ws.save_index_if_dirty();
         tokio::select! {
-            // Primary path: the OS told us something under the root changed.
-            nudge = watch_rx.recv() => {
-                // `None` means the watcher was dropped (shouldn't happen while a
-                // session runs — the reconnect loop holds it); the fallback poll
-                // covers us either way.
-                if nudge.is_some() {
-                    while watch_rx.try_recv().is_ok() {} // coalesce a burst of events
-                    if !send_all(sink, collect_local(ws)).await {
-                        return Ok(SessionOutcome::LinkClosed);
-                    }
-                }
-            }
-            // Fallback: rescan slowly in case the watcher missed an event.
-            _ = fallback.tick() => {
-                if !send_all(sink, collect_local(ws)).await {
+            // Biased, polled top to bottom: the liveness beat first (a peer
+            // streaming at us must still hear from us), inbound frames before
+            // local rescans (an endless stream of fs events must not starve
+            // the link), and the idle timeout LAST, so a frame that is already
+            // queued when the deadline passes always wins over declaring the
+            // peer dead.
+            biased;
+            _ = heartbeat.tick() => {
+                if !send_all(sink, advertise_all(ws)).await {
                     return Ok(SessionOutcome::LinkClosed);
                 }
             }
@@ -322,8 +316,21 @@ pub async fn session(
                     return Ok(SessionOutcome::LinkClosed);
                 }
             }
-            _ = heartbeat.tick() => {
-                if !send_all(sink, advertise_all(ws)).await {
+            // Primary path: the OS told us something under the root changed.
+            nudge = watch_rx.recv() => {
+                // `None` means the watcher was dropped (shouldn't happen while a
+                // session runs — the reconnect loop holds it); the fallback poll
+                // covers us either way.
+                if nudge.is_some() {
+                    while watch_rx.try_recv().is_ok() {} // coalesce a burst of events
+                    if !send_all(sink, collect_local(ws)).await {
+                        return Ok(SessionOutcome::LinkClosed);
+                    }
+                }
+            }
+            // Fallback: rescan slowly in case the watcher missed an event.
+            _ = fallback.tick() => {
+                if !send_all(sink, collect_local(ws)).await {
                     return Ok(SessionOutcome::LinkClosed);
                 }
             }
@@ -622,6 +629,47 @@ mod tests {
         let out = out.unwrap();
         assert!(matches!(out, SessionOutcome::LinkClosed));
         assert!(t0.elapsed() >= Duration::from_secs(40));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `Source` whose single frame becomes ready at exactly `at` (then stays
+    /// silent). Cancel-safe: the deadline is fixed, so re-creating the `recv`
+    /// future on every `select!` iteration doesn't move it.
+    struct FrameAt {
+        at: tokio::time::Instant,
+        sent: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for FrameAt {
+        async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
+            if self.sent {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep_until(self.at).await;
+            self.sent = true;
+            Ok(Some(encode(&SyncMsg::Version { proto: PROTOCOL_VERSION })))
+        }
+    }
+
+    /// A frame that is ready at the very instant the idle deadline passes must
+    /// win: both timers fire in the same wakeup, and the biased `select!` polls
+    /// `source.recv()` before the idle arm. (Unbiased, this usually lost the
+    /// race and dropped a live link.) The frame resets the timer, so the session
+    /// ends one full timeout later.
+    #[tokio::test(start_paused = true)]
+    async fn frame_arriving_at_the_idle_deadline_beats_the_timeout() {
+        let root = dir("idle-race");
+        let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        let (a, b) = crate::net::mock_pair();
+        let (mut sa, _unused_src) = a.into_halves();
+        let (_ps, _pr) = b.into_halves();
+        let (_ta, mut wa) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let t0 = tokio::time::Instant::now();
+        let mut src = FrameAt { at: t0 + RECV_IDLE_TIMEOUT, sent: false };
+        let out = session(&mut ws, &mut wa, &mut sa, &mut src).await.unwrap();
+        assert!(matches!(out, SessionOutcome::LinkClosed));
+        assert!(t0.elapsed() >= RECV_IDLE_TIMEOUT * 2, "idle won the race at {:?}", t0.elapsed());
         std::fs::remove_dir_all(&root).ok();
     }
 
