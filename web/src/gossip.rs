@@ -583,6 +583,40 @@ impl Auth {
     }
 }
 
+impl Auth {
+    /// Another tab of this browser persisted board state (a `storage` event for
+    /// `key` = `value`): feed it in as if it arrived over gossip, so a tab opened
+    /// before a claim / grant / revoke / rotation in a sibling tab picks it up
+    /// (and stops writing plaintext) without waiting for the swarm.
+    fn sync_from_storage(&mut self, key: &str, value: &str) -> Accepted {
+        let mut acc = Accepted::default();
+        if key == trust_store_key(&self.topic) {
+            let was_authorized = self.authorized();
+            for e in decode_hex_postcard::<Vec<TrustEntry>>(value).unwrap_or_default() {
+                if !self.seen.contains(&trust_entry_id(&e)) {
+                    self.add_trust(e);
+                }
+            }
+            // The sibling stored its epochs right after its trust change: take
+            // them before maintenance, or this tab (same device — so also the
+            // founder) would mint a duplicate epoch of its own.
+            let mut ing = self.epochs.retry_pending(&self.trust);
+            for a in load_epochs(&self.topic) {
+                ing.absorb(self.epochs.ingest(a, &self.trust));
+            }
+            acc = self.followups(ing);
+            if !was_authorized {
+                acc.send.extend(self.read_request());
+            }
+        } else if key == epoch_store_key(&self.topic) {
+            for a in decode_hex_postcard::<Vec<EpochAnnounce>>(value).unwrap_or_default() {
+                acc.merge(self.accept(MeshMsg::Epoch(a)));
+            }
+        }
+        acc
+    }
+}
+
 fn local_storage() -> Option<web_sys::Storage> {
     web_sys::window().and_then(|w| w.local_storage().ok().flatten())
 }
@@ -598,7 +632,11 @@ fn store_hex_postcard<T: serde::Serialize>(key: &str, value: &T) {
 
 /// Read a `hex(postcard(T))` value from `key`; `None` if absent or undecodable.
 fn load_hex_postcard<T: serde::de::DeserializeOwned>(key: &str) -> Option<T> {
-    let hex = local_storage()?.get_item(key).ok()??;
+    decode_hex_postcard(&local_storage()?.get_item(key).ok()??)
+}
+
+/// Decode a stored `hex(postcard(T))` value.
+fn decode_hex_postcard<T: serde::de::DeserializeOwned>(hex: &str) -> Option<T> {
     let bytes: Vec<u8> = (0..hex.len() / 2)
         .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
         .collect();
@@ -695,7 +733,83 @@ pub struct GossipTreeSync {
     /// Device-linking auth (shared with the recv task): signs pushes and gates
     /// incoming writes.
     auth: std::rc::Rc<std::cell::RefCell<Auth>>,
+    /// Feeds sibling tabs' persisted trust/epoch changes into `auth`.
+    _storage: Option<StorageListener>,
     _keep: MeshKeepAlive,
+}
+
+/// A `storage` event listener on `window`, removed when dropped (the closure
+/// must not outlive its registration).
+struct StorageListener {
+    closure: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::StorageEvent)>,
+}
+
+impl StorageListener {
+    fn add(f: impl FnMut(web_sys::StorageEvent) + 'static) -> Option<StorageListener> {
+        use wasm_bindgen::JsCast;
+        let closure = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::StorageEvent)>::new(f);
+        web_sys::window()?
+            .add_event_listener_with_callback("storage", closure.as_ref().unchecked_ref())
+            .ok()?;
+        Some(StorageListener { closure })
+    }
+}
+
+impl Drop for StorageListener {
+    fn drop(&mut self) {
+        use wasm_bindgen::JsCast;
+        if let Some(w) = web_sys::window() {
+            let _ = w.remove_event_listener_with_callback("storage", self.closure.as_ref().unchecked_ref());
+        }
+    }
+}
+
+/// Act on auth output produced outside the receive loop: apply its content
+/// (firing `on_merged`), then broadcast its messages, the replies, and (if
+/// asked) our full state — all signed/sealed, in order, from one task.
+fn apply_and_broadcast(
+    acc: Accepted,
+    sy: &std::cell::RefCell<riftpipe_core::sync::Syncer>,
+    au: &std::cell::RefCell<Auth>,
+    on_merged: &dyn Fn(String, Vec<u8>),
+    sender: &GossipSender,
+    cipher: &std::rc::Rc<riftpipe_core::crypto::MeshCipher>,
+) {
+    let mut msgs = acc.send;
+    for msg in acc.apply {
+        let (persist, replies) = sy.borrow_mut().apply(msg);
+        if let Some((path, bytes)) = persist {
+            on_merged(path, bytes);
+        }
+        let a = au.borrow();
+        msgs.extend(replies.into_iter().filter_map(|r| a.sign(r)));
+    }
+    if acc.send_full_state {
+        let full = sy.borrow().full_state();
+        let a = au.borrow();
+        msgs.extend(full.into_iter().filter_map(|m| a.sign(m)));
+    }
+    broadcast_msgs(sender, cipher, msgs);
+}
+
+/// Encode and seal every frame of every message, sent in order from ONE task
+/// (so e.g. a trust entry precedes the epoch announce it authorizes).
+fn broadcast_msgs(sender: &GossipSender, cipher: &std::rc::Rc<riftpipe_core::crypto::MeshCipher>, msgs: Vec<MeshMsg>) {
+    if msgs.is_empty() {
+        return;
+    }
+    let frames: Vec<Vec<u8>> = msgs.iter().flat_map(riftpipe_core::sync::encode_mesh_frames).collect();
+    let sender = sender.clone();
+    let cipher = cipher.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        for b in frames {
+            let sealed = cipher.seal(&b);
+            let n = sealed.len();
+            if let Err(e) = sender.broadcast(sealed.into()).await {
+                web_sys::console::warn_1(&format!("[mesh] broadcast of {n} bytes failed: {e}").into());
+            }
+        }
+    });
 }
 
 /// Write the board's OPFS claimed-marker once it first has a founder, so the
@@ -744,6 +858,7 @@ impl GossipTreeSync {
         let routing = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
         let versions = Rc::new(RefCell::new(riftpipe_core::sync::VersionMonitor::new()));
         let topic = auth.topic;
+        let on_merged_storage = on_merged.clone();
         let auth = Rc::new(RefCell::new(auth));
         mark_claimed_if_due(&auth, topic);
 
@@ -925,7 +1040,22 @@ impl GossipTreeSync {
             }
         });
 
-        GossipTreeSync { syncer, sender, cipher, neighbors, routing, versions, auth, _keep: keep }
+        // Sibling tabs on this board persist claims/grants/revokes/epochs to
+        // localStorage; their `storage` events feed them in here. Weak refs:
+        // the listener must not keep a torn-down sync alive.
+        let storage = {
+            let (wsy, wau) = (Rc::downgrade(&syncer), Rc::downgrade(&auth));
+            let (snd, cph, on_merged) = (sender.clone(), cipher.clone(), on_merged_storage);
+            StorageListener::add(move |ev: web_sys::StorageEvent| {
+                let (Some(key), Some(value)) = (ev.key(), ev.new_value()) else { return };
+                let (Some(sy), Some(au)) = (wsy.upgrade(), wau.upgrade()) else { return };
+                let acc = au.borrow_mut().sync_from_storage(&key, &value);
+                mark_claimed_if_due(&au, topic);
+                apply_and_broadcast(acc, &sy, &au, &*on_merged, &snd, &cph);
+            })
+        };
+
+        GossipTreeSync { syncer, sender, cipher, neighbors, routing, versions, auth, _storage: storage, _keep: keep }
     }
 
     pub fn push_text(&self, path: &str, content: &str) {
@@ -1079,23 +1209,8 @@ impl GossipTreeSync {
         self.broadcast_all(vec![gm]);
     }
 
-    /// Encode and seal every frame of every message, sent in order from ONE task
-    /// (so e.g. a trust entry precedes the epoch announce it authorizes).
     fn broadcast_all(&self, msgs: Vec<MeshMsg>) {
-        let frames: Vec<Vec<u8>> = msgs.iter().flat_map(riftpipe_core::sync::encode_mesh_frames).collect();
-        let sender = self.sender.clone();
-        let cipher = self.cipher.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            for b in frames {
-                let sealed = cipher.seal(&b);
-                let n = sealed.len();
-                if let Err(e) = sender.broadcast(sealed.into()).await {
-                    web_sys::console::warn_1(
-                        &format!("[mesh] broadcast of {n} bytes failed: {e}").into(),
-                    );
-                }
-            }
-        });
+        broadcast_msgs(&self.sender, &self.cipher, msgs);
     }
 
     /// Direct neighbors in the swarm (this peer's connected peers), as hex ids.
@@ -1344,6 +1459,31 @@ mod tests {
         deliver(&acc, &mut fresh);
         assert_eq!(fresh.trust.founder(), Some(owner.my_id()), "the real log takes over");
         assert!(!fresh.take_claim_to_mark(), "already marked (the hint came from the marker)");
+    }
+
+    /// A tab opened before a sibling tab claimed the board picks the claim (and
+    /// the epoch) up from the sibling's `storage` events and stops sending
+    /// plaintext at once.
+    #[wasm_bindgen_test]
+    fn sibling_tab_claim_arrives_via_storage() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        let mut early = Auth::load(DeviceKey::from_seed(&[61; 32]), topic);
+        let lww = |p: &str| SyncMsg::Lww { path: p.into(), version: 1, bytes: b"1".to_vec() };
+        assert!(matches!(early.sign(lww("a")), Some(MeshMsg::Sync(_))), "open board: plain Sync");
+
+        let mut claimer = Auth::load(DeviceKey::from_seed(&[61; 32]), topic);
+        claimer.lock_as_author().unwrap();
+        let store = local_storage().unwrap();
+        let (tk, ek) = (trust_store_key(&topic), epoch_store_key(&topic));
+
+        let acc = early.sync_from_storage(&tk, &store.get_item(&tk).unwrap().unwrap());
+        assert!(early.locked() && early.is_author(), "the sibling's claim arrived");
+        assert!(acc.send.is_empty(), "no duplicate epoch minted: the sibling's was taken first");
+        assert_eq!(early.epochs.announces().len(), claimer.epochs.announces().len());
+        assert!(matches!(early.sign(lww("b")), Some(MeshMsg::Sealed(_))), "sealed from now on");
+        let again = early.sync_from_storage(&ek, &store.get_item(&ek).unwrap().unwrap());
+        assert!(again.send.is_empty() && again.apply.is_empty(), "the epochs event is idempotent");
+        assert!(early.sync_from_storage("riftpipe:unrelated", "00").send.is_empty());
     }
 
     /// Two tabs on one board persist through a read-union-write: neither tab's

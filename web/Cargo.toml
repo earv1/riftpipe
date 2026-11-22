@@ -54,6 +54,7 @@ features = [
     # OPFS (Origin Private File System) — local, serverless persistence.
     "Window",
     "Storage",
+    "StorageEvent",
     "Navigator",
     "StorageManager",
     "FileSystemDirectoryHandle",
