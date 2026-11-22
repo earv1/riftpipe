@@ -1249,17 +1249,24 @@ mod tests {
     /// open anything sealed afterwards while the remaining member still can.
     #[wasm_bindgen_test]
     fn claimed_board_seals_and_revoke_rotates() {
-        let topic = riftpipe_core::crypto::generate_secret();
-        let mut a = Auth::load(DeviceKey::from_seed(&[11; 32]), topic);
+        // The three devices share one page's localStorage: give each its own
+        // (random) topic so none starts from another's persisted claim/epochs —
+        // everything b and c know must arrive over the "wire" below.
+        let topic = riftpipe_core::crypto::generate_secret;
+        let mut a = Auth::load(DeviceKey::from_seed(&[11; 32]), topic());
         let acc = a.lock_as_author().expect("unclaimed board locks");
         assert_eq!(a.epochs.latest_held_seq(), Some(1), "claiming mints epoch 1");
 
-        let mut b = Auth::load(DeviceKey::from_seed(&[12; 32]), topic);
-        let mut c = Auth::load(DeviceKey::from_seed(&[13; 32]), topic);
+        let mut b = Auth::load(DeviceKey::from_seed(&[12; 32]), topic());
+        let mut c = Auth::load(DeviceKey::from_seed(&[13; 32]), topic());
         let (b_id, c_id) = (b.my_id(), c.my_id());
+        assert!(!b.locked() && !c.locked(), "b and c start fresh");
         deliver(&acc, &mut b);
         deliver(&acc, &mut c);
         assert!(b.locked() && !b.can_read(), "an un-approved device can't read a claimed board");
+        assert_eq!(b.epochs.latest_known_seq(), Some(1), "b learned epoch 1 from the wire");
+        let early = a.sign(SyncMsg::Lww { path: "early".into(), version: 1, bytes: b"0".to_vec() }).expect("owner seals");
+        assert!(b.accept(dup(&early)).apply.is_empty(), "un-approved b can't open sealed content");
 
         a.accept(b.request_access().expect("b asks"));
         a.accept(c.request_access().expect("c asks"));
