@@ -179,10 +179,11 @@ async fn restricted_mesh_accepts_an_authorized_writer() {
     std::fs::remove_dir_all(&db).ok();
 }
 
-/// The security proof, END-TO-END over the real mesh: an UNAUTHORIZED device's
-/// signed write is rejected by a restricted founder — while the founder's own
-/// write still reaches that device (proving they're genuinely connected and it
-/// is the write-authorization, not a failed connection, doing the rejecting).
+/// The security proof, END-TO-END over the real mesh: on a restricted board an
+/// UNGRANTED device is connected (it learns the founder's epoch 1 from the
+/// catch-up) but is never wrapped in — so it can't READ the founder's sealed
+/// file, and its own writes never land on the founder (it holds no key to seal
+/// them, and the founder would reject them as unauthorized anyway).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restricted_mesh_rejects_an_unauthorized_writer() {
     use riftpipe_core::identity::DeviceKey;
@@ -194,10 +195,9 @@ async fn restricted_mesh_rejects_an_unauthorized_writer() {
     let host = MeshConn::join(secret, None).await.expect("host join");
     let host_addr = dialable_addr(&host).await;
 
-    // Founder writes a file that MUST reach the outsider (read is open — they
-    // have the link — so this proves the two are actually connected).
-    let (_tx_a, mut rx_a) = push_file(&df, "from_founder.bin", b"reaches everyone");
-    // Outsider writes a file that MUST be rejected (it's not an authorized writer).
+    // Founder writes a file that must NOT reach the outsider (read is gated).
+    let (_tx_a, mut rx_a) = push_file(&df, "from_founder.bin", b"members only");
+    // Outsider writes a file that must never reach the founder.
     let (_tx_c, mut rx_c) = push_file(&dc, "from_outsider.bin", b"should be dropped");
 
     let df_task = df.clone();
@@ -209,31 +209,34 @@ async fn restricted_mesh_rejects_an_unauthorized_writer() {
         let _ = riftpipe::sync::mesh::run(host, &df_task, &mut peer, &mut rx_a, false).await;
     });
     let (dc_task, addr) = (dc.clone(), host_addr.clone());
+    let (stop_c, stop_c_rx) = tokio::sync::oneshot::channel::<()>();
     let c_task = tokio::spawn(async move {
         let mut peer = TreePeer::new();
         peer.set_identity(DeviceKey::from_seed(&[52u8; 32]), true); // signs, but ungranted
-        let _ = riftpipe::sync::mesh::join_and_run(secret, addr, &dc_task, &mut peer, &mut rx_c, false).await;
+        tokio::select! {
+            _ = riftpipe::sync::mesh::join_and_run(secret, addr, &dc_task, &mut peer, &mut rx_c, false) => {}
+            _ = stop_c_rx => {}
+        }
+        peer
     });
 
-    // The founder's write reaches the connected outsider.
-    let on_outsider = dc.join("from_founder.bin");
-    tokio::time::timeout(BUDGET, async {
-        while !on_outsider.is_file() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("founder's write should reach the connected outsider (read is open)");
+    // Ample time to connect, catch up, and (wrongly) exchange content.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let _ = stop_c.send(());
+    let c_peer = c_task.await.unwrap();
 
-    // Give the outsider's rejected write ample time; it must NEVER reach the founder.
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(c_peer.epoch_known(), Some(1), "the outsider is connected: it learned the founder's epoch");
+    assert_eq!(c_peer.epoch_held(), None, "an ungranted device is never wrapped into the epoch");
+    assert!(
+        !dc.join("from_founder.bin").exists(),
+        "an ungranted device must not READ the restricted founder's content",
+    );
     assert!(
         !df.join("from_outsider.bin").exists(),
-        "an unauthorized device's signed write must be rejected by the restricted founder",
+        "an unauthorized device's write must never land on the restricted founder",
     );
 
     a_task.abort();
-    c_task.abort();
     std::fs::remove_dir_all(&df).ok();
     std::fs::remove_dir_all(&dc).ok();
 }

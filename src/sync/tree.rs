@@ -25,10 +25,16 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, MissedTickBehavior};
 
-use riftpipe_core::identity::{DeviceKey, TrustEntry, TrustLog};
+use riftpipe_core::epoch::{AccessMode, EpochBook, Ingested, OpenError};
+use riftpipe_core::identity::{DeviceKey, Role, TrustEntry, TrustLog};
+use riftpipe_core::onboard::JoinRequest;
 use riftpipe_core::sync::{MeshMsg, SyncMsg, Syncer};
 
 use crate::net::{anyerr, Result, Sink, Source};
+
+fn hex32(b: &[u8; 32]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
 
 fn escapes(path: &str) -> bool {
     Path::new(path).components().any(|c| matches!(c, Component::ParentDir | Component::RootDir))
@@ -83,8 +89,21 @@ pub struct TreePeer {
     /// Entry ids already stored (blake3 of the postcard), so replays don't grow
     /// `trust_entries`.
     trust_seen: HashSet<[u8; 32]>,
-    /// When true (restricted mode), unsigned or unauthorized writes are rejected.
-    require_signed: bool,
+    /// The one access switch — see `riftpipe_core::epoch::AccessMode`. `Restricted`
+    /// (`--restricted`) seals content under epoch keys and rejects unsigned or
+    /// unauthorized writes; `LinkEditor` (the default) is the open board.
+    mode: AccessMode,
+    // --- epoch-sealed content (protocol v4, restricted boards) ---
+    /// Epoch keys, announces, and wrap targets. `Some` iff an identity is set.
+    epochs: Option<EpochBook>,
+    /// Our signed join request — the binding from device id to wrap-target key that
+    /// an Admin needs to wrap us into the current epoch. `Some` iff an identity is set.
+    my_request: Option<JoinRequest>,
+    /// Epochs already reported as "dropped content (no key)", so the breadcrumb
+    /// fires once per epoch.
+    no_key_reported: HashSet<u64>,
+    /// An open peer received sealed content once already (warned to rejoin restricted).
+    warned_restricted: bool,
 }
 
 impl TreePeer {
@@ -97,16 +116,38 @@ impl TreePeer {
             trust: TrustLog::new(),
             trust_entries: Vec::new(),
             trust_seen: HashSet::new(),
-            require_signed: false,
+            mode: AccessMode::LinkEditor,
+            epochs: None,
+            my_request: None,
+            no_key_reported: HashSet::new(),
+            warned_restricted: false,
         }
     }
 
     /// Enable device-linking auth: sign our writes with `key`, and — when
-    /// `require_signed` — reject writes that aren't signed by an authorized
+    /// `restricted` — gate the board: content is sealed under epoch keys only
+    /// wrapped devices can open, and writes must be signed by an authorized
     /// device. Open mode (the default) leaves both off.
-    pub fn set_identity(&mut self, key: DeviceKey, require_signed: bool) {
+    pub fn set_identity(&mut self, key: DeviceKey, restricted: bool) {
+        self.mode = if restricted { AccessMode::Restricted } else { AccessMode::LinkEditor };
+        self.epochs = Some(EpochBook::new(&key));
+        self.my_request = Some(JoinRequest::create(&key, "cli"));
         self.identity = Some(key);
-        self.require_signed = require_signed;
+    }
+
+    /// How this peer gates reads/writes.
+    pub fn mode(&self) -> AccessMode {
+        self.mode
+    }
+
+    /// Seq of the latest epoch this peer has seen announced (held or not).
+    pub fn epoch_known(&self) -> Option<u64> {
+        self.epochs.as_ref()?.latest_known_seq()
+    }
+
+    /// Seq of the latest epoch this peer holds the key for.
+    pub fn epoch_held(&self) -> Option<u64> {
+        self.epochs.as_ref()?.latest_held_seq()
     }
 
     /// This device's id, if an identity is set.
@@ -124,44 +165,67 @@ impl TreePeer {
         self.trust.apply(entry)
     }
 
-    /// The trust entries to catch a new neighbor up (so a late joiner learns the
-    /// authorized set).
-    pub(crate) fn trust_catchup(&self) -> Vec<MeshMsg> {
-        self.trust_entries.iter().cloned().map(MeshMsg::Trust).collect()
+    /// The auth state to catch a new neighbor up (gossip is ephemeral, so a late
+    /// joiner must be re-sent it): every trust entry, then every accepted epoch
+    /// announce — trust first, so the announces' signers are known Admins.
+    pub(crate) fn auth_catchup(&self) -> Vec<MeshMsg> {
+        let trust = self.trust_entries.iter().cloned().map(MeshMsg::Trust);
+        let epochs = self.epochs.iter().flat_map(|b| b.announces().iter().cloned().map(MeshMsg::Epoch));
+        trust.chain(epochs).collect()
+    }
+
+    /// Our signed join request, while we can't read the board (restricted, and not
+    /// holding the latest epoch key) — broadcast to the whole swarm so an Admin
+    /// (maybe not a direct neighbor) can wrap us in once we're granted.
+    pub(crate) fn read_request(&self) -> Option<MeshMsg> {
+        if !self.mode.seals_content() || self.epochs.as_ref().is_some_and(|b| b.holds_latest()) {
+            return None;
+        }
+        self.my_request.clone().map(MeshMsg::Request)
+    }
+
+    /// Session start (after `seed`): a restricted founder mints epoch 1. The
+    /// announces stay in the book and reach peers via `auth_catchup`.
+    pub(crate) fn startup(&mut self) -> Vec<MeshMsg> {
+        self.maintenance()
     }
 
     /// Wrap an outgoing write for the mesh: a `SignedSync` if we have an
-    /// identity, else a plain `Sync` (open mode).
-    pub(crate) fn sign_mesh(&self, msg: SyncMsg) -> MeshMsg {
-        match &self.identity {
+    /// identity, else a plain `Sync` (open mode) — then, on a restricted board,
+    /// sealed under the current epoch. `None` when restricted and we hold no epoch
+    /// key yet (the edit stays in the syncer and goes out with our full state once
+    /// we're wrapped in).
+    pub(crate) fn sign_mesh(&self, msg: SyncMsg) -> Option<MeshMsg> {
+        let signed = match &self.identity {
             Some(key) => {
                 let payload = postcard::to_allocvec(&msg).unwrap_or_default();
                 MeshMsg::SignedSync(key.sign_write(payload))
             }
             None => MeshMsg::Sync(msg),
+        };
+        if self.mode.seals_content() {
+            self.epochs.as_ref()?.seal(&signed)
+        } else {
+            Some(signed)
         }
     }
 
-    /// Auth-aware receive for a data-carrying mesh message (`Sync` /
-    /// `SignedSync` / `Trust`): enforce signing when required, verify a signed
+    /// Accept one content message (`Sync` / `SignedSync`, already opened if it
+    /// arrived sealed): enforce signing when the mode requires it, verify a signed
     /// write against the trust log, apply + persist, and return replies already
-    /// wrapped for the wire. `Presence`/`Version`/`Chunk` are handled by the
-    /// driver, not here.
-    pub(crate) fn authorize_and_apply(&mut self, msg: MeshMsg, dir: &Path) -> Vec<MeshMsg> {
+    /// wrapped for the wire.
+    fn apply_content(&mut self, msg: MeshMsg, dir: &Path) -> Vec<MeshMsg> {
+        let require_signed = self.mode.requires_signed_writes();
         let inner = match msg {
-            MeshMsg::Trust(entry) => {
-                self.add_trust(entry);
-                return Vec::new(); // gossip already floods it to current members
-            }
             MeshMsg::Sync(s) => {
-                if self.require_signed {
-                    return Vec::new(); // unsigned write rejected in restricted mode
+                if require_signed {
+                    return Vec::new(); // unsigned write rejected on a gated board
                 }
                 s
             }
             MeshMsg::SignedSync(sw) => {
-                let ok = if self.require_signed {
-                    // Restricted: signature valid AND author authorized.
+                let ok = if require_signed {
+                    // Gated: signature valid AND author authorized.
                     sw.verified(&self.trust).is_some()
                 } else {
                     // Open: accept any authentically-signed write.
@@ -175,10 +239,172 @@ impl TreePeer {
                     Err(_) => return Vec::new(),
                 }
             }
-            _ => return Vec::new(), // Presence/Version/Chunk not routed here
+            _ => return Vec::new(),
         };
         let replies = self.apply_and_persist(inner, dir);
-        replies.into_iter().map(|r| self.sign_mesh(r)).collect()
+        replies.into_iter().filter_map(|r| self.sign_mesh(r)).collect()
+    }
+
+    /// Auth-aware receive for every mesh message the driver doesn't handle itself
+    /// (`Trust` / `Epoch` / `Request` / `Sealed` / `Sync` / `SignedSync`). On a
+    /// restricted board, reads are epoch-gated: only `Sealed` content is accepted,
+    /// and only if we hold its epoch key. Returns messages to broadcast, already
+    /// wrapped for the wire. `Presence`/`Version`/`Chunk` are handled by the driver.
+    pub(crate) fn authorize_and_apply(&mut self, msg: MeshMsg, dir: &Path) -> Vec<MeshMsg> {
+        match msg {
+            MeshMsg::Trust(e) => {
+                self.add_trust(e);
+                self.after_trust_change(dir)
+            }
+            MeshMsg::Epoch(a) => {
+                let Some(book) = self.epochs.as_mut() else { return Vec::new() };
+                let ing = book.ingest(a, &self.trust);
+                self.epoch_followups(ing, dir)
+            }
+            MeshMsg::Request(req) => {
+                if let Some(b) = self.epochs.as_mut() {
+                    b.learn_request(&req);
+                }
+                self.maintenance()
+            }
+            MeshMsg::Sealed(s) => {
+                if !self.mode.seals_content() {
+                    if !self.warned_restricted {
+                        self.warned_restricted = true;
+                        eprintln!("[epoch] this board is restricted — rejoin with --restricted to request access");
+                    }
+                    return Vec::new();
+                }
+                let Some(book) = self.epochs.as_mut() else { return Vec::new() };
+                match book.open(s) {
+                    Ok(inner) => self.apply_content(inner, dir),
+                    Err(OpenError::NoKey { seq }) => {
+                        if self.no_key_reported.insert(seq) {
+                            eprintln!("[epoch] dropped content sealed under epoch {seq} (no key)");
+                        }
+                        Vec::new()
+                    }
+                    Err(OpenError::Invalid) => Vec::new(),
+                }
+            }
+            // Restricted: content travels sealed only — an unsealed write is dropped.
+            MeshMsg::Sync(_) | MeshMsg::SignedSync(_) if self.mode.seals_content() => Vec::new(),
+            MeshMsg::Sync(_) | MeshMsg::SignedSync(_) => self.apply_content(msg, dir),
+            _ => Vec::new(), // Presence/Version/Chunk not routed here
+        }
+    }
+
+    /// The trust log changed: announces deferred for an unknown signer may now
+    /// apply, and an Admin may need to rotate (a revoke) or wrap (a grant).
+    fn after_trust_change(&mut self, dir: &Path) -> Vec<MeshMsg> {
+        let Some(book) = self.epochs.as_mut() else { return Vec::new() };
+        let ing = book.retry_pending(&self.trust);
+        self.epoch_followups(ing, dir)
+    }
+
+    /// Act on what accepting announce(s) changed: report an epoch we're not wrapped
+    /// into, apply content that was parked for a newly-held key, broadcast our full
+    /// state on our first key (it carries edits made while keyless), then run Admin
+    /// maintenance.
+    fn epoch_followups(&mut self, ing: Ingested, dir: &Path) -> Vec<MeshMsg> {
+        let mut out = Vec::new();
+        if let Some(seq) = ing.unheld {
+            eprintln!("[epoch] no key for epoch {seq} — this device is not wrapped in (revoked, or not yet approved)");
+        }
+        for m in ing.released {
+            out.extend(self.apply_content(m, dir));
+        }
+        if ing.gained_first_key {
+            let n = self.epoch_held().unwrap_or(0);
+            eprintln!("[epoch] read key acquired (epoch {n})");
+            out.extend(self.sealed_full_state());
+        }
+        out.extend(self.maintenance());
+        out
+    }
+
+    /// Admin housekeeping on a restricted board (see `EpochBook::maintain`): mint
+    /// epoch 1 as founder, rotate away from a revoked device, add-wrap newly
+    /// authorized devices. After an add-wrap our full state goes out sealed, so the
+    /// newcomer catches up.
+    fn maintenance(&mut self) -> Vec<MeshMsg> {
+        if !self.mode.seals_content() {
+            return Vec::new();
+        }
+        let (Some(key), Some(book)) = (self.identity.as_ref(), self.epochs.as_mut()) else {
+            return Vec::new();
+        };
+        let m = book.maintain(key, &self.trust);
+        if let Some((seq, n)) = m.rotated {
+            eprintln!("[epoch] rotated to epoch {seq} — {n} device(s) wrapped in");
+        }
+        if m.added > 0 {
+            eprintln!("[epoch] wrapped the current epoch to {} more device(s)", m.added);
+        }
+        let mut out: Vec<MeshMsg> = m.announces.into_iter().map(MeshMsg::Epoch).collect();
+        if m.added > 0 {
+            out.extend(self.sealed_full_state());
+        }
+        out
+    }
+
+    /// Our whole tree, wrapped for the wire (sealed on a restricted board).
+    fn sealed_full_state(&self) -> Vec<MeshMsg> {
+        self.full_state().into_iter().filter_map(|s| self.sign_mesh(s)).collect()
+    }
+
+    /// Admin action on a live board: sign a `Revoke` for `id`, apply it, and run
+    /// the follow-ups (on a restricted board: rotate to a new epoch the revoked
+    /// device isn't wrapped into). Returns everything to broadcast.
+    #[allow(dead_code)] // driven by the live control file (next step: `riftpipe revoke|grant`)
+    pub(crate) fn revoke_device(&mut self, id: [u8; 32], dir: &Path) -> Vec<MeshMsg> {
+        let entry = {
+            let Some(key) = self.identity.as_ref() else {
+                eprintln!("[auth] revoke ignored: no device identity (not --restricted)");
+                return Vec::new();
+            };
+            if self.trust.role(&key.id()) != Some(Role::Admin) {
+                eprintln!("[auth] revoke ignored: this device is not an Admin");
+                return Vec::new();
+            }
+            if self.trust.founder() == Some(id) {
+                eprintln!("[auth] revoke ignored: the founder can't be revoked");
+                return Vec::new();
+            }
+            key.revoke(id, rand::random::<[u8; 16]>())
+        };
+        self.add_trust(entry.clone());
+        eprintln!("[auth] revoked device {}", hex32(&id));
+        let mut out = vec![MeshMsg::Trust(entry)];
+        out.extend(self.after_trust_change(dir));
+        out
+    }
+
+    /// Admin action on a live board: grant `id` as a Member and run the follow-ups
+    /// (on a restricted board: wrap it into the current epoch once its request is
+    /// known). Returns everything to broadcast.
+    #[allow(dead_code)] // driven by the live control file (next step: `riftpipe revoke|grant`)
+    pub(crate) fn grant_device(&mut self, id: [u8; 32], dir: &Path) -> Vec<MeshMsg> {
+        let entry = {
+            let Some(key) = self.identity.as_ref() else {
+                eprintln!("[auth] grant ignored: no device identity (not --restricted)");
+                return Vec::new();
+            };
+            if self.trust.role(&key.id()) != Some(Role::Admin) {
+                eprintln!("[auth] grant ignored: this device is not an Admin");
+                return Vec::new();
+            }
+            if self.trust.founder() == Some(id) {
+                eprintln!("[auth] grant ignored: the founder is already the owner");
+                return Vec::new();
+            }
+            key.grant(id, Role::Member, rand::random::<[u8; 16]>())
+        };
+        self.add_trust(entry.clone());
+        eprintln!("[auth] granted device {} (Member)", hex32(&id));
+        let mut out = vec![MeshMsg::Trust(entry)];
+        out.extend(self.after_trust_change(dir));
+        out
     }
 
     /// The push decision for one local file, shared by every driver (link +
@@ -451,6 +677,7 @@ pub async fn connect(
 mod tests {
     use super::*;
     use crate::net::mock_pair;
+    use riftpipe_core::identity::DeviceKey;
     use tokio::time::{sleep, timeout};
 
     fn dir(tag: &str) -> PathBuf {
@@ -460,50 +687,126 @@ mod tests {
         std::fs::canonicalize(&d).unwrap()
     }
 
-    /// Device-linking auth enforcement: in a restricted-mode peer, a write from
-    /// an AUTHORIZED device is applied to disk; writes that are unauthorized or
-    /// unsigned are rejected. Exercises `authorize_and_apply` directly (no
-    /// network), which is what the mesh driver calls per incoming message.
-    #[test]
-    fn signed_writes_enforce_authorization() {
-        use riftpipe_core::identity::{DeviceKey, Role};
+    /// A restricted-mode peer (`--restricted`) with the device key from `seed`.
+    fn restricted_peer(seed: u8) -> TreePeer {
+        let mut p = TreePeer::new();
+        p.set_identity(DeviceKey::from_seed(&[seed; 32]), true);
+        p
+    }
 
+    /// What the mesh does when `joiner` meets `founder`: the keyless joiner's
+    /// signed request reaches the founder (who add-wraps it if granted), then the
+    /// founder's catch-up (trust log + epoch announces) reaches the joiner.
+    fn join(founder: &mut TreePeer, df: &Path, joiner: &mut TreePeer, dj: &Path) {
+        let req = joiner.read_request().expect("keyless restricted joiner announces itself");
+        founder.authorize_and_apply(req, df);
+        for m in founder.auth_catchup() {
+            joiner.authorize_and_apply(m, dj);
+        }
+    }
+
+    fn lww(path: &str, bytes: &[u8]) -> SyncMsg {
+        SyncMsg::Lww { path: path.into(), version: 1000, bytes: bytes.to_vec() }
+    }
+
+    /// Founder (seed 1) of a restricted board with Members seed 2 and seed 3,
+    /// both joined and wrapped into epoch 1.
+    fn restricted_board(tag: &str) -> (TreePeer, PathBuf, TreePeer, PathBuf, TreePeer, PathBuf) {
+        use riftpipe_core::identity::Role;
         let founder_key = DeviceKey::from_seed(&[1u8; 32]);
-        let member_key = DeviceKey::from_seed(&[2u8; 32]);
-        let outsider_key = DeviceKey::from_seed(&[3u8; 32]);
-
-        // Founder hosts a restricted board: genesis (self = Admin) + a grant for
-        // the member. (In the product these arrive via device-linking / a
-        // request-approve; here we hand them to the peer directly.)
-        let d = dir("auth");
-        let mut founder = TreePeer::new();
-        founder.set_identity(DeviceKey::from_seed(&[1u8; 32]), true);
+        let (df, dm, dc) = (dir(&format!("{tag}-f")), dir(&format!("{tag}-m")), dir(&format!("{tag}-c")));
+        let mut founder = restricted_peer(1);
         founder.add_trust(founder_key.genesis());
-        founder.add_trust(founder_key.grant(member_key.id(), Role::Member, [7u8; 16]));
+        founder.add_trust(founder_key.grant(DeviceKey::from_seed(&[2u8; 32]).id(), Role::Member, [7u8; 16]));
+        founder.add_trust(founder_key.grant(DeviceKey::from_seed(&[3u8; 32]).id(), Role::Member, [8u8; 16]));
+        founder.startup();
+        assert_eq!(founder.epoch_held(), Some(1), "the founder mints epoch 1 at startup");
 
-        // Helper: a signed write of an LWW file from `key`.
-        let signed = |key: &DeviceKey, path: &str, bytes: &[u8]| {
-            let msg = SyncMsg::Lww { path: path.into(), version: 1000, bytes: bytes.to_vec() };
-            MeshMsg::SignedSync(key.sign_write(postcard::to_allocvec(&msg).unwrap()))
-        };
+        let (mut member, mut revokee) = (restricted_peer(2), restricted_peer(3));
+        join(&mut founder, &df, &mut member, &dm);
+        join(&mut founder, &df, &mut revokee, &dc);
+        assert_eq!(member.epoch_held(), Some(1));
+        assert_eq!(revokee.epoch_held(), Some(1));
+        assert!(member.read_request().is_none(), "a wrapped peer stops asking");
+        (founder, df, member, dm, revokee, dc)
+    }
 
-        // Authorized member → applied to disk.
-        founder.authorize_and_apply(signed(&member_key, "state.bin", b"ok"), &d);
-        assert_eq!(std::fs::read(d.join("state.bin")).unwrap(), b"ok", "authorized write persisted");
+    /// Restricted-mode enforcement (`authorize_and_apply`, no network — what the
+    /// mesh driver calls per incoming message): content is accepted only sealed
+    /// under an epoch AND signed by an authorized device; unsealed or unsigned
+    /// writes are dropped, and a revoked device's sealed write is rejected.
+    #[test]
+    fn restricted_mode_requires_sealed_authorized_writes() {
+        let (mut founder, df, member, dm, revokee, dc) = restricted_board("auth");
 
-        // Unauthorized device (validly signed, but not in the trust log) → rejected.
-        founder.authorize_and_apply(signed(&outsider_key, "evil.bin", b"x"), &d);
-        assert!(!d.join("evil.bin").exists(), "unauthorized signed write rejected");
+        let sealed = member.sign_mesh(lww("state.bin", b"ok")).expect("a wrapped member seals");
+        assert!(matches!(sealed, MeshMsg::Sealed(_)));
+        founder.authorize_and_apply(sealed, &df);
+        assert_eq!(std::fs::read(df.join("state.bin")).unwrap(), b"ok", "sealed authorized write persisted");
 
-        // Unsigned write in restricted mode → rejected.
-        let plain = MeshMsg::Sync(SyncMsg::Lww { path: "unsigned.bin".into(), version: 1000, bytes: b"y".to_vec() });
-        founder.authorize_and_apply(plain, &d);
-        assert!(!d.join("unsigned.bin").exists(), "unsigned write rejected in restricted mode");
+        let member_key = DeviceKey::from_seed(&[2u8; 32]);
+        let unsealed =
+            MeshMsg::SignedSync(member_key.sign_write(postcard::to_allocvec(&lww("unsealed.bin", b"x")).unwrap()));
+        founder.authorize_and_apply(unsealed, &df);
+        assert!(!df.join("unsealed.bin").exists(), "unsealed write dropped on a restricted board");
 
+        founder.authorize_and_apply(MeshMsg::Sync(lww("unsigned.bin", b"y")), &df);
+        assert!(!df.join("unsigned.bin").exists(), "unsigned write dropped on a restricted board");
+
+        let out = founder.revoke_device(DeviceKey::from_seed(&[3u8; 32]).id(), &df);
+        assert!(out.iter().any(|m| matches!(m, MeshMsg::Epoch(_))), "revoke rotates the epoch");
+
+        let evil = revokee.sign_mesh(lww("evil.bin", b"z")).expect("still holds epoch 1");
+        founder.authorize_and_apply(evil, &df);
+        assert!(!df.join("evil.bin").exists(), "a revoked device's sealed write is rejected");
+
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// Read revocation: after the founder revokes a member, new content is sealed
+    /// under an epoch the revoked member isn't wrapped into — the remaining member
+    /// reads it, the revoked one doesn't.
+    #[test]
+    fn rotation_blinds_the_revoked_member() {
+        let (mut founder, df, mut member, dm, mut revokee, dc) = restricted_board("rot");
+        for m in founder.revoke_device(DeviceKey::from_seed(&[3u8; 32]).id(), &df) {
+            let copy: MeshMsg = postcard::from_bytes(&postcard::to_allocvec(&m).unwrap()).unwrap();
+            member.authorize_and_apply(copy, &dm);
+            revokee.authorize_and_apply(m, &dc);
+        }
+
+        let after = founder.sign_mesh(lww("after.bin", b"epoch two")).unwrap();
+        let copy: MeshMsg = postcard::from_bytes(&postcard::to_allocvec(&after).unwrap()).unwrap();
+        member.authorize_and_apply(copy, &dm);
+        revokee.authorize_and_apply(after, &dc);
+        assert_eq!(std::fs::read(dm.join("after.bin")).unwrap(), b"epoch two");
+        assert!(!dc.join("after.bin").exists(), "the revoked member can't open epoch 2");
+
+        assert_eq!(member.epoch_held(), Some(2));
+        assert_eq!(revokee.epoch_held(), Some(1));
+        assert_eq!(revokee.epoch_known(), Some(2));
+
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// An open peer (no identity) can't read a restricted board's sealed content:
+    /// it is dropped, nothing persists.
+    #[test]
+    fn open_peer_ignores_sealed_content() {
+        use riftpipe_core::epoch::SealedMsg;
+        let d = dir("open-sealed");
+        let mut peer = TreePeer::new();
+        let out = peer.authorize_and_apply(MeshMsg::Sealed(SealedMsg { seq: 1, id: [0; 8], body: vec![1] }), &d);
+        assert!(out.is_empty());
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "nothing persisted");
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// Open mode (the default — no identity, `require_signed` off) is unchanged:
+    /// Open mode (the default — no identity, `LinkEditor`) is unchanged:
     /// plain unsigned writes still apply, so the shipped kanban flow keeps working.
     #[test]
     fn open_mode_still_accepts_unsigned_writes() {

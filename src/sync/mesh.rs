@@ -7,7 +7,9 @@
 //!
 //! Mirrors `web/src/gossip.rs`'s `GossipTreeSync` behavior exactly:
 //! - received `Sync` → merge via the shared `Syncer`, persist, broadcast replies
-//! - `NeighborUp` → broadcast our whole tree (`full_state`) + a `Presence`
+//!   (on a restricted board content travels as epoch-`Sealed`; see `TreePeer`)
+//! - `NeighborUp` → trust log + epoch announces, our whole tree (`full_state`),
+//!   and a `Presence`
 //! - `NeighborDown` → drop the neighbor + re-broadcast `Presence`
 //! - local file change → `.md` as text CRDT, else LWW with a ms timestamp
 //!
@@ -168,6 +170,9 @@ pub async fn run(
     // NeighborUp, or the full_state() catch-up broadcasts an empty tree
     // (the browser host primes OPFS the same way).
     peer.seed(dir);
+    // A restricted founder mints epoch 1 here. The announces stay in the book
+    // and reach peers through the `NeighborUp` catch-up.
+    let _ = peer.startup();
 
     // A failed send must not kill the session (convergence is repaired by the
     // next catch-up), but it must be VISIBLE — a silently dropped broadcast
@@ -239,9 +244,11 @@ pub async fn run(
                 }
                 for p in batch {
                     if let Some(msg) = peer.local_change(&p, dir) {
-                        // Signed when this peer has an identity, else a plain Sync.
-                        let mm = peer.sign_mesh(msg);
-                        broadcast(&sender, &cipher, &mm).await;
+                        // Signed when this peer has an identity, else a plain Sync;
+                        // sealed on a restricted board (`None` until we hold a key).
+                        if let Some(mm) = peer.sign_mesh(msg) {
+                            broadcast(&sender, &cipher, &mm).await;
+                        }
                     }
                 }
             }
@@ -251,8 +258,9 @@ pub async fn run(
                 scan_files(dir, &mut files);
                 for p in files {
                     if let Some(msg) = peer.local_change(&p, dir) {
-                        let mm = peer.sign_mesh(msg);
-                        broadcast(&sender, &cipher, &mm).await;
+                        if let Some(mm) = peer.sign_mesh(msg) {
+                            broadcast(&sender, &cipher, &mm).await;
+                        }
                     }
                 }
             }
@@ -296,10 +304,11 @@ pub async fn run(
                             }
                             // feed() never yields a Chunk (it refuses nesting).
                             MeshMsg::Chunk { .. } => {}
-                            // Sync / SignedSync / Trust — auth-aware apply
-                            // (`authorize_and_apply` enforces signing, verifies,
-                            // persists, prints SYNCED:{path}). Replies come back
-                            // already wrapped for the wire.
+                            // Sync / SignedSync / Trust / Request / Epoch / Sealed —
+                            // auth-aware apply (`authorize_and_apply` opens sealed
+                            // content, enforces signing, verifies, persists, prints
+                            // SYNCED:{path}, and runs epoch housekeeping). Replies
+                            // come back already wrapped for the wire.
                             other => {
                                 for reply in peer.authorize_and_apply(other, dir) {
                                     broadcast(&sender, &cipher, &reply).await;
@@ -318,15 +327,23 @@ pub async fn run(
                             &MeshMsg::Version { id: my_id_bytes, proto: PROTOCOL_VERSION },
                         )
                         .await;
-                        // Catch the new neighbor up: first the trust log (so it
-                        // learns the authorized set — gossip is ephemeral), then
-                        // our whole tree. Direct neighbors only.
-                        for m in peer.trust_catchup() {
+                        // Catch the new neighbor up: first the trust log and the
+                        // epoch announces (so it learns the authorized set and
+                        // any wrapped keys — gossip is ephemeral), then our whole
+                        // tree. Direct neighbors only.
+                        for m in peer.auth_catchup() {
                             broadcast_neighbors(&sender, &cipher, &m).await;
                         }
+                        // A restricted peer without the current key asks the
+                        // WHOLE swarm: the Admin who can wrap it may not be a
+                        // direct neighbor.
+                        if let Some(r) = peer.read_request() {
+                            broadcast(&sender, &cipher, &r).await;
+                        }
                         for msg in peer.full_state() {
-                            let mm = peer.sign_mesh(msg);
-                            broadcast_neighbors(&sender, &cipher, &mm).await;
+                            if let Some(mm) = peer.sign_mesh(msg) {
+                                broadcast_neighbors(&sender, &cipher, &mm).await;
+                            }
                         }
                         let list: Vec<[u8; 32]> =
                             receiver.neighbors().map(|n| *n.as_bytes()).collect();
