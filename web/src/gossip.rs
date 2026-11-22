@@ -515,6 +515,21 @@ impl Auth {
         acc
     }
 
+    /// Are our writes held back right now (restricted, and `EpochBook::can_seal`
+    /// says no: no key, the epoch we hold isn't the latest, or it still wraps a
+    /// revoked device)?
+    fn writes_held(&self) -> bool {
+        self.mode().seals_content() && !self.epochs.can_seal(&self.trust)
+    }
+
+    /// A hold that lifted without a new key (e.g. the revoked device was
+    /// re-granted before the rotation reached us): send the held writes too.
+    fn release_if_unheld(&self, was_held: bool, acc: &mut Accepted) {
+        if was_held && !self.writes_held() {
+            acc.send_full_state = true;
+        }
+    }
+
     /// Act on what accepting announce(s) changed: persist, apply content parked
     /// for a newly-held key, broadcast our full state on any newly-held key (it
     /// carries edits held back while keyless or while our latest epoch still
@@ -546,10 +561,11 @@ impl Auth {
     fn accept(&mut self, gm: MeshMsg) -> Accepted {
         match gm {
             MeshMsg::Trust(e) => {
-                let was_authorized = self.authorized();
+                let (was_authorized, was_held) = (self.authorized(), self.writes_held());
                 self.add_trust(e);
                 let ing = self.epochs.retry_pending(&self.trust);
                 let mut acc = self.followups(ing);
+                self.release_if_unheld(was_held, &mut acc);
                 // Just approved but keyless: announce ourselves so an Admin wraps us in.
                 if !was_authorized {
                     acc.send.extend(self.read_request());
@@ -594,7 +610,7 @@ impl Auth {
     fn sync_from_storage(&mut self, key: &str, value: &str) -> Accepted {
         let mut acc = Accepted::default();
         if key == trust_store_key(&self.topic) {
-            let was_authorized = self.authorized();
+            let (was_authorized, was_held) = (self.authorized(), self.writes_held());
             for e in decode_hex_postcard::<Vec<TrustEntry>>(value).unwrap_or_default() {
                 if !self.seen.contains(&trust_entry_id(&e)) {
                     self.add_trust(e);
@@ -608,6 +624,7 @@ impl Auth {
                 ing.absorb(self.epochs.ingest(a, &self.trust));
             }
             acc = self.followups(ing);
+            self.release_if_unheld(was_held, &mut acc);
             if !was_authorized {
                 acc.send.extend(self.read_request());
             }
@@ -707,6 +724,17 @@ fn load_trust_entries(topic: &[u8; 32], me: &[u8; 32]) -> Vec<TrustEntry> {
     }
     persist_trust_entries(topic, &entries);
     entries
+}
+
+/// The legacy board-unscoped trust log's founder: `None` if there is no legacy
+/// log, `Some(None)` if it has no (valid) genesis.
+pub(crate) fn legacy_trust_founder() -> Option<Option<[u8; 32]>> {
+    let entries = load_hex_postcard::<Vec<TrustEntry>>(LEGACY_TRUST_STORE_KEY)?;
+    let mut legacy = TrustLog::new();
+    for e in entries {
+        legacy.apply(e);
+    }
+    Some(legacy.founder())
 }
 
 /// Persist the accepted epoch announces for `topic` (never raw keys).
@@ -1567,6 +1595,34 @@ mod tests {
         let s2 = a.sign(lww("y", b"2")).expect("owner seals under the new epoch");
         assert_eq!(b.accept(dup(&s2)).apply.len(), 1, "remaining member opens new content");
         assert!(c.accept(dup(&s2)).apply.is_empty(), "removed device can't open new content");
+    }
+
+    /// A hold that lifts without a new key — the revoked device is re-granted
+    /// before the rotation reaches us — still sends the held writes.
+    #[wasm_bindgen_test]
+    fn regrant_lifts_the_hold_and_resends() {
+        let topic = riftpipe_core::crypto::generate_secret;
+        let mut a = Auth::load(DeviceKey::from_seed(&[71; 32]), topic());
+        let claim = a.lock_as_author().unwrap();
+        let mut b = Auth::load(DeviceKey::from_seed(&[72; 32]), topic());
+        let mut c = Auth::load(DeviceKey::from_seed(&[73; 32]), topic());
+        deliver(&claim, &mut b);
+        deliver(&claim, &mut c);
+        a.accept(b.request_access().unwrap());
+        a.accept(c.request_access().unwrap());
+        let (b_id, c_id) = (b.my_id(), c.my_id());
+        for g in [a.make_grant(b_id).unwrap(), a.make_grant(c_id).unwrap()] {
+            deliver(&g, &mut b);
+        }
+        assert!(!b.writes_held(), "b holds the current epoch");
+
+        let revoke = a.make_revoke(c_id).unwrap();
+        b.accept(dup(&revoke.send[0])); // the revoke, not (yet) the rotation
+        assert!(b.writes_held(), "epoch 1 still wraps revoked c: held");
+        let regrant = a.make_grant(c_id).unwrap();
+        let lifted = b.accept(dup(&regrant.send[0]));
+        assert!(!b.writes_held(), "c is no longer revoked: epoch 1 is sealable again");
+        assert!(lifted.send_full_state, "the hold lifted without a new key: resend the held writes");
     }
 
     /// Two browser peers join the same gossip topic (one bootstraps off the other)

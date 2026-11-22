@@ -17,7 +17,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     File, FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions,
-    FileSystemGetFileOptions, FileSystemRemoveOptions, FileSystemWritableFileStream,
+    FileSystemGetFileOptions, FileSystemWritableFileStream,
 };
 
 /// Parent of every board's tree: `.boards/<hex topic>/`.
@@ -75,13 +75,18 @@ pub async fn read_text(dir: &FileSystemDirectoryHandle, name: &str) -> Option<St
 
 /// Write text to a file in `dir` (created if absent).
 pub async fn write_text(dir: &FileSystemDirectoryHandle, name: &str, content: &str) -> Result<(), JsValue> {
+    write_bytes(dir, name, content.as_bytes()).await
+}
+
+/// Write bytes to a file in `dir` (created if absent).
+pub async fn write_bytes(dir: &FileSystemDirectoryHandle, name: &str, bytes: &[u8]) -> Result<(), JsValue> {
     let opts = FileSystemGetFileOptions::new();
     opts.set_create(true);
     let handle: FileSystemFileHandle =
         JsFuture::from(dir.get_file_handle_with_options(name, &opts)).await?.unchecked_into();
     let w: FileSystemWritableFileStream =
         JsFuture::from(handle.create_writable()).await?.unchecked_into();
-    JsFuture::from(w.write_with_u8_array(content.as_bytes())?).await?;
+    JsFuture::from(w.write_with_u8_array(bytes)?).await?;
     JsFuture::from(w.close()).await?;
     Ok(())
 }
@@ -95,9 +100,14 @@ pub async fn write_path(path: &str, bytes: &[u8]) -> Result<(), JsValue> {
 /// Write bytes to `path` on board `topic`'s tree — the sync layer lands a peer's
 /// merged file in the board it arrived on, even if the page has since switched.
 pub async fn write_path_in(topic: &[u8; 32], path: &str, bytes: &[u8]) -> Result<(), JsValue> {
+    write_path_under(&board_root(topic).await?, path, bytes).await
+}
+
+/// Write bytes to `path` under directory `root`, creating dirs as needed.
+async fn write_path_under(root: &FileSystemDirectoryHandle, path: &str, bytes: &[u8]) -> Result<(), JsValue> {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let Some((file, dirs)) = parts.split_last() else { return Ok(()) };
-    let mut dir = board_root(topic).await?;
+    let mut dir = root.clone();
     for d in dirs {
         dir = subdir(&dir, d, true).await?;
     }
@@ -204,38 +214,90 @@ pub async fn tree_files(root: FileSystemDirectoryHandle) -> Vec<(String, String)
     out
 }
 
-/// One-time upgrade from the pre-scoping layout, where the synced tree sat at
-/// the OPFS root: move the root's (non-dot) text files and directories into
-/// board `into`'s tree, overwriting (the root copy is the real data; a seed may
-/// have been written before this ran). Binary root files (`RiftDoc::persist`)
-/// stay. Returns whether anything moved.
-pub async fn adopt_legacy_root(into: &[u8; 32]) -> bool {
-    let Ok(root) = opfs_root().await else { return false };
-    let mut moved = false;
-    for name in list(&root).await {
+/// Root-level file extensions that belong to a pre-scoping synced tree. Other
+/// root files — e.g. `RiftDoc::persist(name)` documents, which live at the OPFS
+/// root by design — are never part of a board and stay where they are.
+const LEGACY_ROOT_FILE_EXTS: &[&str] = &["md", "markdown", "txt", "toml", "json", "jsonl", "yaml", "yml", "csv"];
+
+/// The OPFS root's entries that made up the pre-scoping synced tree: its
+/// (non-dot) directories, and root files with a known tree extension.
+async fn legacy_root_entries(root: &FileSystemDirectoryHandle) -> Vec<String> {
+    let mut names = Vec::new();
+    for name in list(root).await {
         if name.starts_with('.') {
             continue;
         }
-        if read_text(&root, &name).await.is_none() && subdir(&root, &name, false).await.is_err() {
-            continue; // binary file: not part of the synced tree
+        let tree_file = name.rsplit_once('.').is_some_and(|(_, ext)| LEGACY_ROOT_FILE_EXTS.contains(&ext));
+        if tree_file || subdir(root, &name, false).await.is_ok() {
+            names.push(name);
         }
-        let Ok(sub) = subdir(&root, &name, false).await else {
-            // A text file at the root.
-            if let Some(text) = read_text(&root, &name).await {
-                if write_path_in(into, &name, text.as_bytes()).await.is_ok() {
-                    let _ = JsFuture::from(root.remove_entry(&name)).await;
+    }
+    names
+}
+
+/// One-time upgrade from the pre-scoping layout, where the synced tree sat at
+/// the OPFS root: move it ([`legacy_root_entries`]) into board `into`'s tree,
+/// overwriting (the root copy is the real data; a seed may have been written
+/// before this ran). Returns whether anything moved.
+pub async fn adopt_legacy_root(into: &[u8; 32]) -> bool {
+    let (Ok(root), Ok(dest)) = (opfs_root().await, board_root(into).await) else { return false };
+    let names = legacy_root_entries(&root).await;
+    move_entries(&root, names, &dest).await
+}
+
+/// Where a pre-scoping root tree goes when it can't safely be adopted by a
+/// board: dot-prefixed, so it is never synced, primed, adopted or wiped.
+pub const LEGACY_QUARANTINE_DIR: &str = ".legacy-root";
+
+/// Does the OPFS root still hold a pre-scoping synced tree?
+pub async fn has_legacy_root() -> bool {
+    match opfs_root().await {
+        Ok(root) => !legacy_root_entries(&root).await.is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Move the pre-scoping root tree into [`LEGACY_QUARANTINE_DIR`], kept as is
+/// (same paths) and out of every board. Returns whether anything moved.
+pub async fn quarantine_legacy_root() -> bool {
+    let Ok(root) = opfs_root().await else { return false };
+    let Ok(dest) = subdir(&root, LEGACY_QUARANTINE_DIR, true).await else { return false };
+    let names = legacy_root_entries(&root).await;
+    move_entries(&root, names, &dest).await
+}
+
+/// Move the entries `names` of `src` (files and whole directories) to the same
+/// paths under `dest`, never losing data: each text file is removed only after
+/// its copy was written; dot-prefixed and non-UTF-8 files are left where they
+/// are; a directory is then removed only if it ended up empty (non-recursive —
+/// a failure just leaves it). Returns whether any file moved.
+async fn move_entries(src: &FileSystemDirectoryHandle, names: Vec<String>, dest: &FileSystemDirectoryHandle) -> bool {
+    let mut moved = false;
+    // (parent, name) of every directory visited, parents before children.
+    let mut dirs: Vec<(FileSystemDirectoryHandle, String)> = Vec::new();
+    let mut stack: Vec<(FileSystemDirectoryHandle, String, Vec<String>)> = vec![(src.clone(), String::new(), names)];
+    while let Some((dir, prefix, entries)) = stack.pop() {
+        for name in entries {
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+            if let Some(text) = read_text(&dir, &name).await {
+                if write_path_under(dest, &path, text.as_bytes()).await.is_ok()
+                    && JsFuture::from(dir.remove_entry(&name)).await.is_ok()
+                {
                     moved = true;
                 }
+            } else if let Ok(sub) = subdir(&dir, &name, false).await {
+                let children = list(&sub).await;
+                dirs.push((dir.clone(), name));
+                stack.push((sub, path, children));
             }
-            continue;
-        };
-        for (path, text) in tree_files(sub).await {
-            let _ = write_path_in(into, &format!("{name}/{path}"), text.as_bytes()).await;
         }
-        let opts = FileSystemRemoveOptions::new();
-        opts.set_recursive(true);
-        let _ = JsFuture::from(root.remove_entry_with_options(&name, &opts)).await;
-        moved = true;
+    }
+    // Deepest first; a non-empty directory (kept files) fails to remove: fine.
+    for (parent, name) in dirs.into_iter().rev() {
+        let _ = JsFuture::from(parent.remove_entry(&name)).await;
     }
     moved
 }
@@ -304,6 +366,60 @@ mod tests {
         mark_board_claimed(&a).await;
         assert!(board_claimed(&a).await && !board_claimed(&b).await);
         assert!(tree_files(board_root(&a).await.unwrap()).await.is_empty(), "the marker is never primed");
+    }
+
+    /// Moving the legacy root never loses data: a file is removed only after its
+    /// copy is written, and files the move can't carry (dot-prefixed, non-UTF-8)
+    /// stay put along with their directory.
+    #[wasm_bindgen_test]
+    async fn legacy_move_keeps_what_it_cannot_carry() {
+        let c = riftpipe_core::crypto::generate_secret();
+        let root = opfs_root().await.unwrap();
+        let dir = subdir(&root, "legacykeep", true).await.unwrap();
+        write_text(&dir, "card.md", "text card").await.unwrap();
+        write_text(&dir, ".local", "machine-local").await.unwrap();
+        write_bytes(&dir, "blob.bin", &[0xff, 0xfe, 0x00, 0x80]).await.unwrap();
+        assert!(adopt_legacy_root(&c).await);
+
+        set_active_board(c);
+        assert_eq!(read_path("legacykeep/card.md").await.as_deref(), Some("text card"));
+        let kept = subdir(&root, "legacykeep", false).await.expect("the directory stays: it isn't empty");
+        let mut left = list(&kept).await;
+        left.sort();
+        assert_eq!(left, vec![".local".to_string(), "blob.bin".to_string()], "only the moved file left");
+        let opts = web_sys::FileSystemRemoveOptions::new();
+        opts.set_recursive(true);
+        let _ = JsFuture::from(root.remove_entry_with_options("legacykeep", &opts)).await;
+    }
+
+    /// `RiftDoc::persist` documents live at the OPFS root by design: never
+    /// adopted into a board, even when their bytes happen to be valid UTF-8.
+    #[wasm_bindgen_test]
+    async fn legacy_adoption_skips_riftdoc_root_files() {
+        let c = riftpipe_core::crypto::generate_secret();
+        opfs_write("riftdoc-notes", b"utf8 crdt bytes").await.unwrap();
+        opfs_write("legacy-board.md", b"# board").await.unwrap();
+        adopt_legacy_root(&c).await;
+        assert_eq!(opfs_read("riftdoc-notes").await.unwrap().as_deref(), Some(&b"utf8 crdt bytes"[..]), "RiftDoc file stays");
+        set_active_board(c);
+        assert!(read_path("riftdoc-notes").await.is_none(), "not adopted");
+        assert_eq!(read_path("legacy-board.md").await.as_deref(), Some("# board"), "a tree file is adopted");
+    }
+
+    /// A quarantined legacy root keeps its files, out of every board: never in a
+    /// board tree, and never adopted afterwards.
+    #[wasm_bindgen_test]
+    async fn quarantined_legacy_root_stays_out_of_boards() {
+        let c = riftpipe_core::crypto::generate_secret();
+        let root = opfs_root().await.unwrap();
+        write_text(&subdir(&root, "claimedtickets", true).await.unwrap(), "card.md", "secret card").await.unwrap();
+        assert!(has_legacy_root().await);
+        assert!(quarantine_legacy_root().await);
+        assert!(!has_legacy_root().await, "nothing left to adopt");
+        let q = subdir(&subdir(&root, LEGACY_QUARANTINE_DIR, false).await.unwrap(), "claimedtickets", false).await.unwrap();
+        assert_eq!(read_text(&q, "card.md").await.as_deref(), Some("secret card"), "kept, same path");
+        assert!(!adopt_legacy_root(&c).await, "a later adoption finds nothing");
+        assert!(tree_files(board_root(&c).await.unwrap()).await.is_empty());
     }
 
     /// A pre-scoping tree at the OPFS root moves into the board it's adopted by.
