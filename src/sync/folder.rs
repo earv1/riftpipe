@@ -43,6 +43,17 @@ use crate::net::{Counters, Result, Sink, Source};
 use crate::sync::pipe::{Role, SessionOutcome};
 use crate::sync::workspace::Workspace;
 
+/// Re-advertise cadence — and the liveness beat: every heartbeat starts with a
+/// `Version` frame, so even an empty workspace proves it's alive.
+const HEARTBEAT: Duration = Duration::from_secs(5);
+/// A peer that sends NOTHING for this long is treated as dead, even if the
+/// transport never reports a close (a WebRTC data channel to a vanished peer
+/// keeps accepting sends and never yields EOF). 3 × HEARTBEAT: tolerates two
+/// lost/late beats. Known limit: a single frame that takes longer than this
+/// to arrive (a huge rsync delta on a slow link) trips it and the session
+/// reconnects.
+pub const RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn advert(path: &str, sv: Vec<u8>, reply: bool) -> Vec<u8> {
     encode(&SyncMsg::StratAdvert { path: path.to_string(), sv, reply })
 }
@@ -93,9 +104,10 @@ async fn scan_local(ws: &mut Workspace, sink: &mut dyn Sink) -> bool {
 }
 
 /// One sync session over a single link, driving every resource in `ws`. Returns
-/// `LinkClosed` on any link error (so the reconnect loop re-dials); folder mode
-/// has no stdin, so it never returns `StdinClosed`. `watch_rx` is owned by the
-/// reconnect loop (fed by a filesystem watcher) and **persists across sessions**.
+/// `LinkClosed` on any link error, or after `RECV_IDLE_TIMEOUT` of silence (so
+/// the reconnect loop re-dials); folder mode has no stdin, so it never returns
+/// `StdinClosed`. `watch_rx` is owned by the reconnect loop (fed by a
+/// filesystem watcher) and **persists across sessions**.
 pub async fn session(
     ws: &mut Workspace,
     watch_rx: &mut UnboundedReceiver<()>,
@@ -107,8 +119,11 @@ pub async fn session(
     // primary path — the `watch_rx` arm below is what reacts promptly.
     let mut fallback = interval(Duration::from_secs(2));
     fallback.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut heartbeat = interval(Duration::from_secs(5));
+    let mut heartbeat = interval(HEARTBEAT);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let idle = tokio::time::sleep(RECV_IDLE_TIMEOUT);
+    tokio::pin!(idle);
+    let mut mismatch_warned = false;
 
     // Announce our protocol version first, so a mismatched peer is surfaced.
     if sink
@@ -154,6 +169,7 @@ pub async fn session(
                     Err(_) | Ok(None) => return Ok(SessionOutcome::LinkClosed),
                     Ok(Some(b)) => b,
                 };
+                idle.as_mut().reset(tokio::time::Instant::now() + RECV_IDLE_TIMEOUT);
                 // Undecodable or non-strategy messages are skipped, exactly as
                 // the tree/mesh drivers skip strategy messages — one envelope,
                 // two dialects, no cross-talk.
@@ -178,7 +194,8 @@ pub async fn session(
                         }
                     }
                     SyncMsg::Version { proto } => {
-                        if proto != riftpipe_core::sync::PROTOCOL_VERSION {
+                        if proto != riftpipe_core::sync::PROTOCOL_VERSION && !mismatch_warned {
+                            mismatch_warned = true;
                             eprintln!(
                                 "[folder] protocol-mismatch theirs={proto} ours={} — \
                                  sync may be incomplete",
@@ -195,6 +212,13 @@ pub async fn session(
                 }
             }
             _ = heartbeat.tick() => {
+                if sink
+                    .send(encode(&SyncMsg::Version { proto: riftpipe_core::sync::PROTOCOL_VERSION }))
+                    .await
+                    .is_err()
+                {
+                    return Ok(SessionOutcome::LinkClosed);
+                }
                 for path in ws.paths() {
                     let sv = match ws.get_mut(&path) {
                         Some(r) => r.strategy.state_vector(),
@@ -204,6 +228,13 @@ pub async fn session(
                         return Ok(SessionOutcome::LinkClosed);
                     }
                 }
+            }
+            _ = &mut idle => {
+                eprintln!(
+                    "[folder] no frames from peer for {}s — treating the link as dead",
+                    RECV_IDLE_TIMEOUT.as_secs()
+                );
+                return Ok(SessionOutcome::LinkClosed);
             }
         }
     }
@@ -404,5 +435,89 @@ mod tests {
             postcard::from_bytes::<SyncMsg>(&hello).unwrap(),
             SyncMsg::StratAdvert { .. } | SyncMsg::StratDelta { .. }
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_peer_is_declared_dead_after_idle_timeout() {
+        let root = dir("idle-silent");
+        let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        let (a, b) = crate::net::mock_pair();
+        let (mut sa, mut ra_src) = a.into_halves();
+        let (_ps, _pr) = b.into_halves();
+        let (_ta, mut wa) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let t0 = tokio::time::Instant::now();
+        let out = session(&mut ws, &mut wa, &mut sa, &mut ra_src).await.unwrap();
+        assert!(matches!(out, SessionOutcome::LinkClosed));
+        assert!(t0.elapsed() >= RECV_IDLE_TIMEOUT && t0.elapsed() < RECV_IDLE_TIMEOUT + Duration::from_secs(1));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chatty_peer_keeps_the_session_alive() {
+        let root = dir("idle-chatty");
+        let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        let (a, b) = crate::net::mock_pair();
+        let (mut sa, mut ra_src) = a.into_halves();
+        let (mut ps, pr) = b.into_halves();
+        let (_ta, mut wa) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let t0 = tokio::time::Instant::now();
+        let peer = async move {
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                ps.send(
+                    postcard::to_allocvec(&SyncMsg::Version {
+                        proto: riftpipe_core::sync::PROTOCOL_VERSION,
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+            drop(ps);
+            drop(pr);
+        };
+        let (out, ()) = tokio::join!(session(&mut ws, &mut wa, &mut sa, &mut ra_src), peer);
+        let out = out.unwrap();
+        assert!(matches!(out, SessionOutcome::LinkClosed));
+        assert!(t0.elapsed() >= Duration::from_secs(40));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_sends_version_even_with_an_empty_workspace() {
+        let root = dir("idle-beat");
+        let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        let (a, b) = crate::net::mock_pair();
+        let (mut sa, mut ra_src) = a.into_halves();
+        let (ps, mut pr) = b.into_halves();
+        let (_ta, mut wa) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let t0 = tokio::time::Instant::now();
+        let peer = async move {
+            let deadline = t0 + Duration::from_secs(11);
+            let mut count = 0;
+            loop {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match tokio::time::timeout(deadline - now, pr.recv()).await {
+                    Ok(Ok(Some(bytes))) => {
+                        if matches!(
+                            postcard::from_bytes::<SyncMsg>(&bytes),
+                            Ok(SyncMsg::Version { .. })
+                        ) {
+                            count += 1;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            drop(ps);
+            drop(pr);
+            count
+        };
+        let (_sess_out, count) = tokio::join!(session(&mut ws, &mut wa, &mut sa, &mut ra_src), peer);
+        assert!(count >= 3);
+        std::fs::remove_dir_all(&root).ok();
     }
 }
