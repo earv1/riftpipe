@@ -52,6 +52,24 @@ pub struct Tombstone {
     pub reasserted: bool,
 }
 
+/// Folder index file (inside the root; dot-prefixed so the scan never
+/// syncs it): last-known live files + tombstones, so deletes survive restarts.
+pub const INDEX_FILE: &str = ".riftpipe-folder-index";
+const INDEX_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize, Default)]
+struct LiveEntry {
+    seen: Vec<Hash>,
+    superseded: Vec<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IndexFile {
+    version: u32,
+    live: std::collections::BTreeMap<String, LiveEntry>,
+    tombstones: std::collections::BTreeMap<String, Tombstone>,
+}
+
 /// One synced thing: its algorithm + where its bytes live.
 pub struct Resource {
     pub kind: Kind,
@@ -108,6 +126,7 @@ impl Workspace {
         for rel in ws.scan_disk()? {
             ws.create(&rel);
         }
+        ws.load_index();
         Ok(ws)
     }
 
@@ -308,6 +327,63 @@ impl Workspace {
             },
         );
         self.dirty = true;
+    }
+
+    /// Restore `seen`/`superseded` for live resources and tombstones for
+    /// deleted paths from the last saved index, detecting offline changes.
+    fn load_index(&mut self) {
+        let Ok(bytes) = std::fs::read(self.root.join(INDEX_FILE)) else { return };
+        let idx: IndexFile = match postcard::from_bytes::<IndexFile>(&bytes) {
+            Ok(i) if i.version == INDEX_VERSION => i,
+            _ => {
+                eprintln!("[riftpipe] ignoring unreadable {INDEX_FILE}");
+                return;
+            }
+        };
+        for (rel, e) in idx.live {
+            if let Some(res) = self.resources.get_mut(&rel) {
+                res.seen = e.seen;
+                res.superseded = e.superseded;
+            } else if !self.root.join(&rel).exists() {
+                // Live last run, gone now: deleted while we were offline.
+                self.tombstones.insert(
+                    rel,
+                    Tombstone { id: rand::random::<u64>(), seen: e.seen, reasserted: false },
+                );
+                self.dirty = true;
+            } // else: on disk but no resource (e.g. manifest now maps it to a stub) — leave it alone
+        }
+        for (rel, t) in idx.tombstones {
+            if let Some(res) = self.resources.get_mut(&rel) {
+                push_superseded(&mut res.superseded, t.id); // re-created while offline
+                self.dirty = true;
+            } else {
+                self.tombstones.insert(rel, t);
+            }
+        }
+    }
+
+    /// Persist the index if anything changed (atomic: tmp + rename). Errors are
+    /// logged, never fatal. Only file-backed, materialized resources are "live".
+    pub fn save_index_if_dirty(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        let live = self
+            .resources
+            .iter()
+            .filter(|(_, r)| r.backing.on_disk() && !r.seen.is_empty())
+            .map(|(p, r)| (p.clone(), LiveEntry { seen: r.seen.clone(), superseded: r.superseded.clone() }))
+            .collect();
+        let tombstones = self.tombstones.iter().map(|(p, t)| (p.clone(), t.clone())).collect();
+        let idx = IndexFile { version: INDEX_VERSION, live, tombstones };
+        let Ok(bytes) = postcard::to_allocvec(&idx) else { return };
+        let tmp = self.root.join(format!("{INDEX_FILE}.tmp"));
+        if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, self.root.join(INDEX_FILE)))
+        {
+            eprintln!("[riftpipe] could not save {INDEX_FILE}: {e}");
+        }
     }
 
     /// Recursively list files under `root` as `/`-separated relative paths,
@@ -575,6 +651,89 @@ mod tests {
         assert!(!ws.is_tombstoned("c.bin"));
         assert!(!ws.get_mut("c.bin").unwrap().seen.is_empty());
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn index_round_trip_restores_seen_and_tombstones() {
+        let root = unique_dir("index-round-trip");
+        std::fs::write(root.join("a.bin"), b"hi").unwrap();
+        std::fs::write(root.join("b.bin"), b"bye").unwrap();
+        let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        ws.get_mut("a.bin").unwrap().note_state();
+        ws.get_mut("b.bin").unwrap().note_state();
+        let a_seen_before = ws.get_mut("a.bin").unwrap().seen.clone();
+
+        std::fs::remove_file(root.join("b.bin")).unwrap();
+        let t = ws.record_local_delete("b.bin").unwrap();
+        ws.save_index_if_dirty();
+        drop(ws);
+
+        let ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        assert_eq!(ws.tombstone("b.bin").unwrap().id, t.id);
+        let mut ws = ws;
+        assert_eq!(ws.get_mut("a.bin").unwrap().seen, a_seen_before);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn file_deleted_while_offline_becomes_a_tombstone() {
+        let root = unique_dir("offline-delete");
+        std::fs::write(root.join("c.bin"), b"hi").unwrap();
+        let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        ws.get_mut("c.bin").unwrap().note_state();
+        let seen_before = ws.get_mut("c.bin").unwrap().seen.clone();
+        ws.save_index_if_dirty();
+        drop(ws);
+
+        std::fs::remove_file(root.join("c.bin")).unwrap();
+        let ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        assert!(ws.is_tombstoned("c.bin"));
+        assert_eq!(ws.tombstone("c.bin").unwrap().seen, seen_before);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn file_recreated_while_offline_supersedes_its_tombstone() {
+        let root = unique_dir("offline-recreate");
+        std::fs::write(root.join("d.bin"), b"hi").unwrap();
+        let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        ws.get_mut("d.bin").unwrap().note_state();
+        std::fs::remove_file(root.join("d.bin")).unwrap();
+        let t = ws.record_local_delete("d.bin").unwrap();
+        ws.save_index_if_dirty();
+        drop(ws);
+
+        std::fs::write(root.join("d.bin"), b"hi again").unwrap();
+        let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        assert!(ws.paths().contains(&"d.bin".to_string()));
+        assert!(!ws.is_tombstoned("d.bin"));
+        assert_eq!(ws.get_mut("d.bin").unwrap().superseded, vec![t.id]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn corrupt_index_is_ignored() {
+        let root = unique_dir("corrupt-index");
+        std::fs::write(root.join(INDEX_FILE), b"junk").unwrap();
+        let ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        assert!(ws.tombstone_paths().is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn index_file_is_never_a_resource() {
+        let root = unique_dir("index-not-a-resource");
+        std::fs::write(root.join("e.bin"), b"hi").unwrap();
+        let mut ws = Workspace::new(&root, Manifest::default(), false).unwrap();
+        ws.get_mut("e.bin").unwrap().note_state();
+        ws.save_index_if_dirty();
+        let added = ws.refresh_disk().unwrap();
+        assert!(!added.iter().any(|p| p.starts_with('.')));
+        assert!(!ws.paths().contains(&INDEX_FILE.to_string()));
         std::fs::remove_dir_all(&root).ok();
     }
 }
