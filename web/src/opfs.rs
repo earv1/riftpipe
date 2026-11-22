@@ -214,23 +214,34 @@ pub async fn tree_files(root: FileSystemDirectoryHandle) -> Vec<(String, String)
     out
 }
 
-/// One-time upgrade from the pre-scoping layout, where the synced tree sat at
-/// the OPFS root: move the root's (non-dot) text files and directories into
-/// board `into`'s tree, overwriting (the root copy is the real data; a seed may
-/// have been written before this ran). Binary root files (`RiftDoc::persist`)
-/// stay. Returns whether anything moved.
-pub async fn adopt_legacy_root(into: &[u8; 32]) -> bool {
-    let (Ok(root), Ok(dest)) = (opfs_root().await, board_root(into).await) else { return false };
+/// Root-level file extensions that belong to a pre-scoping synced tree. Other
+/// root files — e.g. `RiftDoc::persist(name)` documents, which live at the OPFS
+/// root by design — are never part of a board and stay where they are.
+const LEGACY_ROOT_FILE_EXTS: &[&str] = &["md", "markdown", "txt", "toml", "json", "jsonl", "yaml", "yml", "csv"];
+
+/// The OPFS root's entries that made up the pre-scoping synced tree: its
+/// (non-dot) directories, and root files with a known tree extension.
+async fn legacy_root_entries(root: &FileSystemDirectoryHandle) -> Vec<String> {
     let mut names = Vec::new();
-    for name in list(&root).await {
+    for name in list(root).await {
         if name.starts_with('.') {
             continue;
         }
-        if read_text(&root, &name).await.is_none() && subdir(&root, &name, false).await.is_err() {
-            continue; // binary file: not part of the synced tree
+        let tree_file = name.rsplit_once('.').is_some_and(|(_, ext)| LEGACY_ROOT_FILE_EXTS.contains(&ext));
+        if tree_file || subdir(root, &name, false).await.is_ok() {
+            names.push(name);
         }
-        names.push(name);
     }
+    names
+}
+
+/// One-time upgrade from the pre-scoping layout, where the synced tree sat at
+/// the OPFS root: move it ([`legacy_root_entries`]) into board `into`'s tree,
+/// overwriting (the root copy is the real data; a seed may have been written
+/// before this ran). Returns whether anything moved.
+pub async fn adopt_legacy_root(into: &[u8; 32]) -> bool {
+    let (Ok(root), Ok(dest)) = (opfs_root().await, board_root(into).await) else { return false };
+    let names = legacy_root_entries(&root).await;
     move_entries(&root, names, &dest).await
 }
 
@@ -358,6 +369,20 @@ mod tests {
         let opts = web_sys::FileSystemRemoveOptions::new();
         opts.set_recursive(true);
         let _ = JsFuture::from(root.remove_entry_with_options("legacykeep", &opts)).await;
+    }
+
+    /// `RiftDoc::persist` documents live at the OPFS root by design: never
+    /// adopted into a board, even when their bytes happen to be valid UTF-8.
+    #[wasm_bindgen_test]
+    async fn legacy_adoption_skips_riftdoc_root_files() {
+        let c = riftpipe_core::crypto::generate_secret();
+        opfs_write("riftdoc-notes", b"utf8 crdt bytes").await.unwrap();
+        opfs_write("legacy-board.md", b"# board").await.unwrap();
+        adopt_legacy_root(&c).await;
+        assert_eq!(opfs_read("riftdoc-notes").await.unwrap().as_deref(), Some(&b"utf8 crdt bytes"[..]), "RiftDoc file stays");
+        set_active_board(c);
+        assert!(read_path("riftdoc-notes").await.is_none(), "not adopted");
+        assert_eq!(read_path("legacy-board.md").await.as_deref(), Some("# board"), "a tree file is adopted");
     }
 
     /// A pre-scoping tree at the OPFS root moves into the board it's adopted by.
