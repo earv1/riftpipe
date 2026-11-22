@@ -148,6 +148,25 @@ pub async fn list(dir: &FileSystemDirectoryHandle) -> Vec<String> {
     names
 }
 
+/// Never-synced marker in a board's tree: the board is claimed.
+const CLAIMED_MARKER: &str = ".claimed";
+
+/// Record next to board `topic`'s files that it is claimed — so a browser that
+/// loses its localStorage (trust log) but keeps OPFS still treats it as claimed.
+pub async fn mark_board_claimed(topic: &[u8; 32]) {
+    if let Ok(root) = board_root(topic).await {
+        let _ = write_text(&root, CLAIMED_MARKER, "claimed\n").await;
+    }
+}
+
+/// Is board `topic` marked claimed ([`mark_board_claimed`])?
+pub async fn board_claimed(topic: &[u8; 32]) -> bool {
+    match board_root(topic).await {
+        Ok(root) => read_text(&root, CLAIMED_MARKER).await.is_some(),
+        Err(_) => false,
+    }
+}
+
 /// Push **every** file of board `topic`'s tree into the active sync, so a peer
 /// we connect to merges with our pre-existing state — not just live edits. This
 /// is **folder-generic**: `.md` files sync as text CRDTs, everything else as LWW,
@@ -275,6 +294,16 @@ mod tests {
         let mut on_a: Vec<String> = tree_files(board_root(&a).await.unwrap()).await.into_iter().map(|(p, _)| p).collect();
         on_a.sort();
         assert_eq!(on_a, vec!["late.md".to_string(), "tickets/x/card.md".to_string()]);
+    }
+
+    /// The claimed marker is per board and never part of the synced tree.
+    #[wasm_bindgen_test]
+    async fn claimed_marker_is_per_board_and_unsynced() {
+        let (a, b) = (riftpipe_core::crypto::generate_secret(), riftpipe_core::crypto::generate_secret());
+        assert!(!board_claimed(&a).await);
+        mark_board_claimed(&a).await;
+        assert!(board_claimed(&a).await && !board_claimed(&b).await);
+        assert!(tree_files(board_root(&a).await.unwrap()).await.is_empty(), "the marker is never primed");
     }
 
     /// A pre-scoping tree at the OPFS root moves into the board it's adopted by.

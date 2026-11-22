@@ -134,7 +134,10 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
     // and epoch announces persisted for this board (its topic). The board is
     // "open" until someone locks it (adds a genesis); `lockBoard()` does that
     // live. See `web::gossip::Auth`.
-    let auth = crate::gossip::Auth::load(load_or_create_device(), topic);
+    let mut auth = crate::gossip::Auth::load(load_or_create_device(), topic);
+    if crate::opfs::board_claimed(&topic).await {
+        auth.set_claimed_hint();
+    }
     crate::gossip::set_active(GossipTreeSync::new(mesh, on_merged, auth));
     wasm_bindgen_futures::spawn_local(crate::opfs::prime_all(topic));
 

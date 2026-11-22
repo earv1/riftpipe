@@ -238,6 +238,13 @@ pub struct Auth {
     /// Our own outstanding access request (viewer side), re-announced to new
     /// neighbors so a late-arriving owner still sees it. Cleared once granted.
     my_request: Option<JoinRequest>,
+    /// This board is known to be claimed (an OPFS marker next to its files)
+    /// even if the trust log hasn't arrived — e.g. localStorage was cleared but
+    /// OPFS kept. Treated as claimed: nothing goes out in plaintext and the
+    /// Claim button can't race the real founder.
+    claimed_hint: bool,
+    /// The OPFS claimed-marker is (being) written for this board.
+    claim_marked: bool,
 }
 
 impl Auth {
@@ -255,6 +262,8 @@ impl Auth {
             epochs,
             requests: Vec::new(),
             my_request: None,
+            claimed_hint: false,
+            claim_marked: false,
         };
         for e in load_trust_entries(&topic, &a.identity.id()) {
             a.add_trust(e);
@@ -288,9 +297,25 @@ impl Auth {
         }
     }
 
-    /// A board is locked once it has an author (genesis).
+    /// A board is locked once it has an author (genesis) — or once we know it
+    /// was claimed even before its trust log arrives ([`Self::set_claimed_hint`]).
     fn locked(&self) -> bool {
-        self.trust.founder().is_some()
+        self.trust.founder().is_some() || self.claimed_hint
+    }
+
+    /// The board's OPFS marker says it is claimed: treat it as claimed until the
+    /// trust log arrives (restricted, holding no key: nothing goes out unsealed).
+    pub fn set_claimed_hint(&mut self) {
+        self.claimed_hint = true;
+        self.claim_marked = true;
+    }
+
+    /// `true` once, when the board first has a founder and the OPFS claimed
+    /// marker hasn't been written yet — the driver writes it.
+    fn take_claim_to_mark(&mut self) -> bool {
+        let due = self.trust.founder().is_some() && !self.claim_marked;
+        self.claim_marked |= due;
+        due
     }
 
     /// How this board gates reads and writes — the **only** place the browser
@@ -654,6 +679,14 @@ pub struct GossipTreeSync {
     _keep: MeshKeepAlive,
 }
 
+/// Write the board's OPFS claimed-marker once it first has a founder, so the
+/// claim survives a lost localStorage (see [`Auth::set_claimed_hint`]).
+fn mark_claimed_if_due(auth: &std::rc::Rc<std::cell::RefCell<Auth>>, topic: [u8; 32]) {
+    if auth.borrow_mut().take_claim_to_mark() {
+        wasm_bindgen_futures::spawn_local(async move { crate::opfs::mark_board_claimed(&topic).await });
+    }
+}
+
 /// Surface a flagged peer: console.warn + a `riftpipe:protocol-mismatch`
 /// CustomEvent on `window` (detail: `{peer, theirs, ours}` JSON string), so
 /// ANY app on the library can show it — nothing app-specific here.
@@ -691,7 +724,9 @@ impl GossipTreeSync {
         let neighbors = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
         let routing = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
         let versions = Rc::new(RefCell::new(riftpipe_core::sync::VersionMonitor::new()));
+        let topic = auth.topic;
         let auth = Rc::new(RefCell::new(auth));
+        mark_claimed_if_due(&auth, topic);
 
         let (sy, nb, rt, vs, snd, cph, au) = (
             syncer.clone(),
@@ -771,6 +806,7 @@ impl GossipTreeSync {
                             // is held across an `.await`.
                             other => {
                                 let acc = au.borrow_mut().accept(other);
+                                mark_claimed_if_due(&au, topic);
                                 for m in &acc.send {
                                     send(&snd, &cph, m, false).await;
                                 }
@@ -900,6 +936,8 @@ impl GossipTreeSync {
         let acc = self.auth.borrow_mut().lock_as_author();
         match acc {
             Some(acc) => {
+                let topic = self.auth.borrow().topic;
+                mark_claimed_if_due(&self.auth, topic);
                 self.dispatch(acc);
                 true
             }
@@ -1263,6 +1301,30 @@ mod tests {
             Some(s) => store.set_item("riftpipe:board_secret", &s).unwrap(),
             None => store.remove_item("riftpipe:board_secret").unwrap(),
         }
+    }
+
+    /// Offline: a board known claimed only from its OPFS marker (localStorage —
+    /// and so the trust log — lost) sends nothing in plaintext, accepts no
+    /// unsealed writes, and can't be re-claimed, until the real log arrives.
+    #[wasm_bindgen_test]
+    fn claimed_hint_holds_writes_until_the_trust_log_arrives() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        let mut fresh = Auth::load(DeviceKey::from_seed(&[41; 32]), topic);
+        fresh.set_claimed_hint();
+        assert!(fresh.locked() && !fresh.can_read(), "treated as claimed, no key yet");
+        let lww = SyncMsg::Lww { path: "x".into(), version: 1, bytes: b"1".to_vec() };
+        assert!(fresh.sign(lww).is_none(), "nothing goes out unsealed");
+        let plain = MeshMsg::Sync(SyncMsg::Lww { path: "y".into(), version: 1, bytes: b"2".to_vec() });
+        assert!(fresh.accept(plain).apply.is_empty(), "unsealed writes are dropped");
+        assert!(fresh.lock_as_author().is_none(), "a known-claimed board can't be re-claimed");
+
+        let mut owner = Auth::load(DeviceKey::from_seed(&[42; 32]), riftpipe_core::crypto::generate_secret());
+        let acc = owner.lock_as_author().unwrap();
+        assert!(owner.take_claim_to_mark(), "a fresh claim is marked once");
+        assert!(!owner.take_claim_to_mark());
+        deliver(&acc, &mut fresh);
+        assert_eq!(fresh.trust.founder(), Some(owner.my_id()), "the real log takes over");
+        assert!(!fresh.take_claim_to_mark(), "already marked (the hint came from the marker)");
     }
 
     /// Offline: a claimed board seals content under an epoch key that only
