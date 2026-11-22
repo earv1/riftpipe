@@ -168,3 +168,18 @@ requires an explicit wrap.
 - **TreeKEM-style O(log n) rotation** — unneeded at our scale.
 - **Provider-verified identity** (Google/passkey token in a join request) — an
   optional add-on, never required; see `auth.md`.
+
+## Known limits
+
+- **Self-removal with no admin online.** A device may revoke itself, but only
+  an Admin rotates. Until one is online, the latest epoch still wraps a revoked
+  device and every member holds its writes (`EpochBook::can_seal`); they go out
+  once the new epoch (or a re-grant) lifts the hold.
+- **Legacy trust-log migration (browser upgrade).** The pre-v2
+  `riftpipe:trust` key held the log of whichever board was open last. It
+  migrates into this browser's hosted board only if its founder is this
+  device — but that founder check can't tell a board this device hosted from a
+  *joined* board it first claimed, so the latter's log (and the old shared
+  OPFS tree adopted alongside) can land on the hosted board, which then looks
+  claimed by this device. A foreign-founded log is dropped (gossip restores the
+  real one) and the old tree goes to `.legacy-root/` instead.

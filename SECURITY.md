@@ -158,6 +158,22 @@ rotates.
   but it isn't reachable yet — it needs an Admin-signed access setting to pick
   it, with no content-wire change once that lands.
 
+### Known limits
+
+- **A self-removal with no admin online holds every member's writes.** A
+  device may revoke itself, but only an Admin rotates the epoch. Until an
+  Admin comes online and rotates, the latest epoch still wraps a revoked
+  device, so remaining members hold their writes (never sealing under an epoch
+  the leaver can read) and send them once the new epoch arrives.
+- **Browser upgrade from the shared-tree layout.** The old single
+  `riftpipe:trust` log migrates into this browser's own hosted board only if
+  this device founded it. That log was written by whichever board was open
+  last, so a log this device founded on a *joined* board it first claimed
+  lands on the hosted board (which then looks claimed by this device), along
+  with the old shared OPFS tree adopted there. A tree that can't be adopted
+  safely is kept in `.legacy-root/` (never synced). See
+  `docs/security/architecture.md`.
+
 ## How other local-first / P2P systems handle this
 
 Researched 2026-07-19 from primary sources. The recurring patterns below are what
