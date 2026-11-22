@@ -15,6 +15,7 @@
 //!     (sent on connect, on a local change, and on the heartbeat).
 //!   * `StratAdvert reply: false` — an advertisement *in reply* (no further
 //!     reply, so the exchange can't ping-pong forever).
+//!   * `StratDelete`              — a tombstone: "I deleted this path" (see Deletes).
 //!
 //! Non-strategy variants (`Hello`, `TextDelta`, …) are ignored here, as the
 //! text/LWW `Syncer` ignores strategy messages — one envelope, two dialects.
@@ -25,6 +26,22 @@
 //! answers with *its* signatures, and we then compute and push the rsync
 //! delta. Receiving an unknown path auto-creates the resource (peer-driven
 //! discovery).
+//!
+//! ## Deletes
+//! A file-backed resource that was materialized at least once (non-empty
+//! `seen` fingerprint history) and is now missing from disk is a local delete:
+//! the resource becomes a tombstone (random `id` + its `seen`) and a
+//! `StratDelete` goes out. A peer applies it only if its own current
+//! fingerprint is one the deleter had seen; otherwise it holds a concurrent
+//! edit, which wins — it answers with a self-contained `StratDelta`, and the
+//! deleter, receiving a delta for a tombstoned path, resurrects the file. An
+//! incremental delta that can't stand alone instead re-asserts the delete (at
+//! most once per heartbeat). An advert for a tombstoned path is answered with
+//! the `StratDelete` (how a peer that was offline learns of it). A file
+//! re-created locally drops its tombstone and remembers that deletion's `id`
+//! as `superseded`, so an old copy of the deletion is rejected. Tombstones and
+//! last-known files persist in `<root>/.riftpipe-folder-index`, so deletes
+//! made while offline are detected at startup.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,7 +58,7 @@ use crate::net::negotiate::negotiate_session_halves;
 use crate::net::transport::{accept_link, connect_link};
 use crate::net::{Counters, Result, Sink, Source};
 use crate::sync::pipe::{Role, SessionOutcome};
-use crate::sync::workspace::Workspace;
+use crate::sync::workspace::{Hash, Tombstone, Workspace};
 
 /// Re-advertise cadence — and the liveness beat: every heartbeat starts with a
 /// `Version` frame, so even an empty workspace proves it's alive.
@@ -62,46 +79,60 @@ fn delta(path: &str, bytes: Vec<u8>) -> Vec<u8> {
     encode(&SyncMsg::StratDelta { path: path.to_string(), bytes })
 }
 
+fn delete_frame(path: &str, t: &Tombstone) -> Vec<u8> {
+    encode(&SyncMsg::StratDelete { path: path.to_string(), id: t.id, seen: t.seen.clone() })
+}
+
 fn encode(msg: &SyncMsg) -> Vec<u8> {
     // postcard on an in-memory Vec cannot fail for these shapes.
     postcard::to_allocvec(msg).expect("SyncMsg encodes")
 }
 
 /// One local scan: new files + changed files → frames to send (delta, then a
-/// reply-expecting advert, per changed resource). Picks up newly-created
-/// files, then for each resource `observe`s its bytes; on a real change it
-/// queues a delta and a reply-expecting advert. (Self-write safe: merging a
-/// remote change stores bytes that `observe` then reports as *unchanged*, so
-/// a scan triggered by our own write is a no-op — no echo, no extra dedup
-/// needed.)
+/// reply-expecting advert, per changed resource), and a `StratDelete` per
+/// file that vanished from disk. Picks up newly-created files (including
+/// re-creations of tombstoned paths), then for each resource `observe`s its
+/// bytes; on a real change it queues a delta and a reply-expecting advert.
+/// (Self-write safe: merging a remote change stores bytes that `observe` then
+/// reports as *unchanged*, so a scan triggered by our own write is a no-op —
+/// no echo, no extra dedup needed.)
 fn collect_local(ws: &mut Workspace) -> Vec<Vec<u8>> {
-    let _ = ws.refresh_disk(); // pick up newly-created files
+    let _ = ws.refresh_disk(); // new files, and re-creations of tombstoned paths
     let mut out = Vec::new();
+    let mut deleted = Vec::new();
+    let mut changed = false;
     for path in ws.paths() {
-        // Observe under a short borrow, then queue without holding it.
-        let (changed, push, sv) = match ws.get_mut(&path) {
-            Some(res) => {
-                let bytes = res.backing.load();
-                if res.strategy.observe(&bytes) {
-                    (true, res.strategy.push_delta(), res.strategy.state_vector())
-                } else {
-                    (false, None, Vec::new())
-                }
-            }
-            None => continue,
-        };
-        if changed {
-            if let Some(d) = push {
+        let Some(res) = ws.get_mut(&path) else { continue };
+        if res.locally_deleted() {
+            deleted.push(path);
+            continue;
+        }
+        let bytes = res.backing.load();
+        if res.strategy.observe(&bytes) {
+            res.note_state();
+            changed = true;
+            if let Some(d) = res.strategy.push_delta() {
                 out.push(delta(&path, d));
             }
-            out.push(advert(&path, sv, true));
+            out.push(advert(&path, res.strategy.state_vector(), true));
         }
+    }
+    for path in deleted {
+        if let Some(t) = ws.record_local_delete(&path) {
+            out.push(delete_frame(&path, &t));
+        }
+    }
+    if changed {
+        ws.mark_dirty();
     }
     out
 }
 
-/// Version frame + a reply-expecting advert for every resource (connect + heartbeat).
+/// Version frame + a reply-expecting advert for every resource (connect +
+/// heartbeat). Re-arms every tombstone's once-per-heartbeat re-assert guard.
+/// Tombstoned paths aren't resources, so they're never advertised.
 fn advertise_all(ws: &mut Workspace) -> Vec<Vec<u8>> {
+    ws.rearm_tombstones();
     let mut out = vec![encode(&SyncMsg::Version { proto: PROTOCOL_VERSION })];
     for path in ws.paths() {
         let sv = match ws.get_mut(&path) {
@@ -120,13 +151,26 @@ fn apply_inbound(ws: &mut Workspace, msg: SyncMsg) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     match msg {
         SyncMsg::StratDelta { path, bytes } => {
+            if ws.is_tombstoned(&path) {
+                delta_for_tombstone(ws, &path, &bytes, &mut out);
+                return out;
+            }
+            let mut stored = false;
             if let Some(res) = ws.ensure(&path) {
                 if let Some(nb) = res.strategy.merge(&bytes) {
-                    res.backing.store(&nb);
+                    res.store(&nb);
+                    stored = true;
                 }
+            }
+            if stored {
+                ws.mark_dirty();
             }
         }
         SyncMsg::StratAdvert { path, sv, reply } => {
+            if let Some(t) = ws.tombstone(&path) {
+                out.push(delete_frame(&path, t)); // we deleted it — tell them
+                return out;
+            }
             if let Some(res) = ws.ensure(&path) {
                 if let Some(d) = res.strategy.delta_since(&sv) {
                     out.push(delta(&path, d));
@@ -136,9 +180,60 @@ fn apply_inbound(ws: &mut Workspace, msg: SyncMsg) -> Vec<Vec<u8>> {
                 }
             }
         }
+        SyncMsg::StratDelete { path, id, seen } => remote_delete(ws, &path, id, &seen, &mut out),
         _ => {}
     }
     out
+}
+
+/// A delta for a path we deleted means the peer holds content we lack. If it
+/// materializes standalone, edit wins → resurrect. If not (an incremental
+/// delta), re-assert the delete — once per heartbeat — so the peer either
+/// agrees or answers with a self-contained delta.
+fn delta_for_tombstone(ws: &mut Workspace, path: &str, bytes: &[u8], out: &mut Vec<Vec<u8>>) {
+    let Some(mut fresh) = ws.fresh_strategy(path) else { return };
+    if let Some(nb) = fresh.merge(bytes) {
+        ws.resurrect(path, fresh, &nb);
+        return;
+    }
+    if let Some(t) = ws.tombstone_mut(path) {
+        if !t.reasserted {
+            t.reasserted = true;
+            out.push(delete_frame(path, t));
+        }
+    }
+}
+
+/// A peer deleted `path`. Delete here unless we hold content the deleter
+/// never saw (a concurrent edit — edit wins: answer with a self-contained
+/// delta so the deleter resurrects) or we re-created the file after that very
+/// deletion. Tombstoned or never-known paths: no-op.
+fn remote_delete(ws: &mut Workspace, path: &str, id: u64, seen: &[Hash], out: &mut Vec<Vec<u8>>) {
+    if ws.is_tombstoned(path) {
+        return;
+    }
+    let Some(empty_sv) = ws.fresh_strategy(path).map(|s| s.state_vector()) else { return };
+    let Some(res) = ws.get_mut(path) else { return }; // never had it
+    let bytes = res.backing.load();
+    if res.strategy.observe(&bytes) {
+        res.note_state(); // an unscanned local edit counts
+    }
+    let full = res.strategy.delta_since(&empty_sv); // self-contained: merges into a fresh strategy
+    let keep = if res.superseded.contains(&id) {
+        true
+    } else if bytes.is_empty() || full.is_none() {
+        false
+    } else {
+        !seen.contains(&res.strategy.fingerprint())
+    };
+    if keep {
+        if let Some(d) = full {
+            out.push(delta(path, d));
+        }
+        ws.mark_dirty();
+    } else {
+        ws.apply_remote_delete(path, id, seen);
+    }
 }
 
 /// Send every frame in order; `false` on the first send error, so the caller
@@ -156,7 +251,8 @@ async fn send_all(sink: &mut dyn Sink, frames: Vec<Vec<u8>>) -> bool {
 /// `LinkClosed` on any link error, or after `RECV_IDLE_TIMEOUT` of silence (so
 /// the reconnect loop re-dials); folder mode has no stdin, so it never returns
 /// `StdinClosed`. `watch_rx` is owned by the reconnect loop (fed by a
-/// filesystem watcher) and **persists across sessions**.
+/// filesystem watcher) and **persists across sessions**. The folder index
+/// (tombstones + last-known files) is persisted whenever it changed.
 pub async fn session(
     ws: &mut Workspace,
     watch_rx: &mut UnboundedReceiver<()>,
@@ -181,6 +277,8 @@ pub async fn session(
     }
 
     loop {
+        // Persist after every handled arm; a no-op when nothing changed.
+        ws.save_index_if_dirty();
         tokio::select! {
             // Primary path: the OS told us something under the root changed.
             nudge = watch_rx.recv() => {
@@ -465,8 +563,9 @@ mod tests {
     }
 
     /// A non-strategy message (the tree dialect) arriving on a folder session
-    /// must be ignored — no resource created, no reply. (The session loop's
-    /// `_ => {}` arm; here we just pin that the dialects are distinguishable.)
+    /// must be ignored — no resource created, no reply. (`apply_inbound`'s
+    /// `_ => {}` arm; here we just pin that the dialects are distinguishable
+    /// from the strategy messages `StratAdvert` / `StratDelta` / `StratDelete`.)
     #[test]
     fn tree_dialect_messages_are_not_strategy_messages() {
         let hello = postcard::to_allocvec(&SyncMsg::Hello {
