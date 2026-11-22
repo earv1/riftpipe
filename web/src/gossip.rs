@@ -256,7 +256,7 @@ impl Auth {
             requests: Vec::new(),
             my_request: None,
         };
-        for e in load_trust_entries(&topic) {
+        for e in load_trust_entries(&topic, &a.identity.id()) {
             a.add_trust(e);
         }
         for an in load_epochs(&topic) {
@@ -595,26 +595,37 @@ fn persist_trust_entries(topic: &[u8; 32], entries: &[TrustEntry]) {
     store_hex_postcard(&trust_store_key(topic), &entries);
 }
 
-/// The trust log persisted for `topic`. Else, if `topic` is this browser's own
-/// hosted board (`H(persisted board secret)`), a one-time migration of the
-/// legacy board-unscoped log (the legacy key is removed) — it was written by
-/// the board this browser hosts, so it must not land on any other board. Else empty.
-fn load_trust_entries(topic: &[u8; 32]) -> Vec<TrustEntry> {
+/// The trust log persisted for `topic`. Else a one-time look at the legacy
+/// board-unscoped log, on this browser's own hosted board only
+/// (`H(persisted board secret)`): it was written by whichever board was open
+/// last (hosted OR joined), so it is migrated only if its founder is `me` (a
+/// board this device claimed); any other founder's log could lock the host out
+/// of its own board, so it's dropped and gossip restores the real one. Either
+/// way the legacy key is removed. Else empty.
+fn load_trust_entries(topic: &[u8; 32], me: &[u8; 32]) -> Vec<TrustEntry> {
     if let Some(entries) = load_hex_postcard::<Vec<TrustEntry>>(&trust_store_key(topic)) {
         return entries;
     }
     let own_board = crate::tree_sync::persisted_board_secret()
         .is_some_and(|s| &riftpipe_core::crypto::topic_from_secret(&s) == topic);
-    if own_board {
-        if let Some(entries) = load_hex_postcard::<Vec<TrustEntry>>(LEGACY_TRUST_STORE_KEY) {
-            persist_trust_entries(topic, &entries);
-            if let Some(store) = local_storage() {
-                let _ = store.remove_item(LEGACY_TRUST_STORE_KEY);
-            }
-            return entries;
-        }
+    if !own_board {
+        return Vec::new();
     }
-    Vec::new()
+    let Some(entries) = load_hex_postcard::<Vec<TrustEntry>>(LEGACY_TRUST_STORE_KEY) else {
+        return Vec::new();
+    };
+    if let Some(store) = local_storage() {
+        let _ = store.remove_item(LEGACY_TRUST_STORE_KEY);
+    }
+    let mut legacy = TrustLog::new();
+    for e in &entries {
+        legacy.apply(e.clone());
+    }
+    if legacy.founder() != Some(*me) {
+        return Vec::new();
+    }
+    persist_trust_entries(topic, &entries);
+    entries
 }
 
 /// Persist the accepted epoch announces for `topic` (never raw keys).
@@ -1224,19 +1235,29 @@ mod tests {
         assert!(a2.locked() && a2.is_author(), "board A is still claimed after board B persisted");
         assert!(a2.can_read() && a2.epochs.latest_held_seq() == Some(1), "A re-opens its epoch key");
 
-        // Legacy log: left alone on a foreign board, migrated into our own.
+        // Legacy log: left alone on a foreign board; on our own hosted board,
+        // dropped if someone else founded it (it could lock us out of our own
+        // board), migrated only if we did.
         let store = local_storage().expect("localStorage");
-        let legacy = vec![DeviceKey::from_seed(&[33; 32]).genesis()];
-        store_hex_postcard(LEGACY_TRUST_STORE_KEY, &legacy);
+        let other_founder = vec![DeviceKey::from_seed(&[33; 32]).genesis()];
+        store_hex_postcard(LEGACY_TRUST_STORE_KEY, &other_founder);
         let foreign = Auth::load(DeviceKey::from_seed(&[34; 32]), riftpipe_core::crypto::generate_secret());
         assert!(!foreign.locked(), "legacy log must not migrate into a board we don't host");
         assert!(store.get_item(LEGACY_TRUST_STORE_KEY).unwrap().is_some(), "legacy log kept");
 
-        let own_secret = riftpipe_core::crypto::generate_secret();
         let prior_secret = store.get_item("riftpipe:board_secret").unwrap();
+        let own_secret = riftpipe_core::crypto::generate_secret();
         crate::tree_sync::persist_board_secret(&own_secret);
         let own = Auth::load(DeviceKey::from_seed(&[34; 32]), riftpipe_core::crypto::topic_from_secret(&own_secret));
-        assert!(own.locked(), "legacy log migrates into our own hosted board");
+        assert!(!own.locked(), "another founder's legacy log must not lock the host out of its own board");
+        assert!(store.get_item(LEGACY_TRUST_STORE_KEY).unwrap().is_none(), "the foreign legacy log is dropped");
+
+        let mine = vec![DeviceKey::from_seed(&[35; 32]).genesis()];
+        store_hex_postcard(LEGACY_TRUST_STORE_KEY, &mine);
+        let own_secret = riftpipe_core::crypto::generate_secret();
+        crate::tree_sync::persist_board_secret(&own_secret);
+        let own = Auth::load(DeviceKey::from_seed(&[35; 32]), riftpipe_core::crypto::topic_from_secret(&own_secret));
+        assert!(own.locked() && own.is_author(), "our own legacy claim migrates into our hosted board");
         assert!(store.get_item(LEGACY_TRUST_STORE_KEY).unwrap().is_none(), "legacy key removed after migration");
         match prior_secret {
             Some(s) => store.set_item("riftpipe:board_secret", &s).unwrap(),
