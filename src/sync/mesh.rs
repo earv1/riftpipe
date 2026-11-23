@@ -85,18 +85,42 @@ pub fn load_or_create_host(dir: &Path, fresh: bool) -> Result<(SecretKey, [u8; 3
     if let Ok(text) = std::fs::read_to_string(&path) {
         let mut lines = text.lines();
         if let (Some(k), Some(s)) = (lines.next().and_then(parse_hex32), lines.next().and_then(parse_hex32)) {
+            // A resumed file loosened by hand (or by an older build) goes back to owner-only.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                }
+            }
             return Ok((SecretKey::from_bytes(&k), s));
         }
     }
     let sk = SecretKey::generate();
     let secret = riftpipe_core::crypto::generate_secret();
-    std::fs::write(&path, format!("{}\n{}\n", hex32(&sk.to_bytes()), hex32(&secret))).map_err(anyerr)?;
+    write_owner_only(&path, &format!("{}\n{}\n", hex32(&sk.to_bytes()), hex32(&secret))).map_err(anyerr)?;
+    Ok((sk, secret))
+}
+
+/// Write `contents` to `path` so it is NEVER readable by others, not even
+/// briefly: a fresh tmp file created with mode 0600 (unix), then renamed over
+/// `path` (which replaces any looser-permissioned file there).
+fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    Ok((sk, secret))
+    let mut f = opts.open(&tmp)?;
+    f.write_all(contents.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)
 }
 
 /// Refuse to resume a board `dir` already hosted when `restricted`, unless
@@ -664,6 +688,29 @@ mod tests {
         assert_ne!(sk3.to_bytes(), sk1.to_bytes(), "--new-board mints a fresh key");
         assert_ne!(secret3, secret1, "--new-board mints a fresh board secret");
 
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// The host file is owner-only whichever way it comes to be: minted over a
+    /// corrupt world-readable file (replaced, never chmod-ed after the fact),
+    /// or resumed after being loosened. No tmp file is left behind.
+    #[cfg(unix)]
+    #[test]
+    fn host_file_is_owner_only_when_minted_or_resumed() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let d = dir("host-perms");
+        let host = d.join(HOST_FILE);
+        std::fs::write(&host, "corrupt\n").unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (sk, _) = load_or_create_host(&d, false).unwrap();
+        assert_eq!(mode(&host), 0o600, "minted owner-only");
+        assert!(!d.join(format!("{HOST_FILE}.tmp")).exists(), "no tmp left behind");
+
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (sk2, _) = load_or_create_host(&d, false).unwrap();
+        assert_eq!(sk2.to_bytes(), sk.to_bytes(), "resumed, not re-minted");
+        assert_eq!(mode(&host), 0o600, "a loosened file is tightened on resume");
         std::fs::remove_dir_all(&d).ok();
     }
 
