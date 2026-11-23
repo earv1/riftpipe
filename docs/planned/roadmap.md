@@ -366,10 +366,9 @@ over riftpipe's wasm file API). What remains:
   inbox → approve → edit access; `shot-auth.mjs` screenshots it). Native
   peers skip `MeshMsg::Request` (their catch-all) — the CLI still grants via
   `--grant <device-id>`.
-  *Remaining is interactive glue, not new crypto:* the WebAuthn browser
-  ceremony on top of these lib calls. (Driving the mesh seal from epoch keys,
-  approve delivering a wrapped epoch key, and request/approve on the native
-  CLI are now shipped — see "Epoch-key mesh seal" below.)
+  (Driving the mesh seal from epoch keys, approve delivering a wrapped epoch
+  key, and request/approve on the native CLI are now shipped — see "Epoch-key
+  mesh seal" below; the WebAuthn ceremony is "Passkey device-linking" below.)
 - **Epoch-key mesh seal — done (`PROTOCOL_VERSION` 4, shared with folder deletes).** `core::epoch::EpochBook`
   wires the content key into the mesh for real: on a **Restricted** board,
   `Sync`/`SignedSync` is sealed a second time under the current epoch key
@@ -387,10 +386,26 @@ over riftpipe's wasm file API). What remains:
   `run-epoch-revoke.sh`) and browser (`epoch-revoke.mjs`,
   `run-browser-auth.sh`); live via `riftpipe revoke|grant <dir> <id>` and the
   kanban owner's members-list "Remove" button.
+- **Passkey device-linking — done (`PROTOCOL_VERSION` 5).** The owner claims
+  with a passkey ("🔑 Claim with passkey", or "🔑 Add passkey" after a plain
+  claim): an Admin-signed `TrustEntry::Passkey` registers the WebAuthn
+  credential's public key on the trust log. Another of the owner's devices
+  holding the same passkey (platform-synced, a security key, a phone) clicks
+  "🔑 Link with my passkey": its assertion over
+  `blake3(founder, device, nonce)` rides a `TrustEntry::PasskeyLink`, every
+  peer verifies it offline (`core::passkey` — signature, `rpIdHash`, UP,
+  type, challenge), and the device joins as an Admin with no approve click;
+  an online Admin then wraps it into the epoch. The ceremony is generic
+  (`web/src/passkey.rs`: `passkeySupported` / `claimWithPasskey` /
+  `linkWithPasskey`; RP ID = page hostname, IP origins unsupported). **Proven
+  in real browsers** with CDP virtual authenticators (`e2e/passkey-link.mjs`
+  in `run-browser-auth.sh`). Not built: passkey revocation, attestation, the
+  QR link variant, a CLI ceremony — see `SECURITY.md` §"Passkey device
+  linking".
 - **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md). Built so
   far (above): device keys + signed trust log, write signing, onboarding, the
-  claim/request-to-join flow, and the `core::passkey` verifier; *not* built:
-  Biscuit capabilities and the browser passkey ceremony. Two planes:
+  claim/request-to-join flow, the `core::passkey` verifier and passkey
+  device-linking; *not* built: Biscuit capabilities. Two planes:
   centralized *issuance* (an identity vouches for you, touched once) +
   decentralized *offline* verification (peers check a Biscuit capability
   against a root public key; data stays P2P). **Cemented identity: passkeys /

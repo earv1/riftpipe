@@ -133,6 +133,11 @@ src/:
   `run-epoch-revoke.sh` (native), `run-browser-auth.sh` /
   `e2e/epoch-revoke.mjs` (browser). Details: `docs/planned/roadmap.md`
   §Security.
+- **Passkey ceremony** (branch `passkey-ceremony`): claim/add/link with a
+  passkey, verified offline (`core::passkey`, `TrustEntry::Passkey`/
+  `PasskeyLink`, `web/src/passkey.rs`); e2e `passkey-link.mjs` in
+  `run-browser-auth.sh`; `PROTOCOL_VERSION` 5. Details: `SECURITY.md`
+  §"Passkey device linking".
 
 ## Planned (design docs)
 - **P2P kanban — files as the database** — see [`docs/planned/`](docs/planned/).
@@ -173,7 +178,9 @@ Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
 7. ~~**Auth follow-through**~~ (roadmap §Security) — *done:* the mesh seal now
    runs on epoch keys, read revocation by rotation, and
    `riftpipe revoke|grant <dir> <id>` on the native CLI (see `What's done`).
-   Remaining: the WebAuthn browser ceremony.
+   The WebAuthn browser ceremony shipped too (passkey device-linking).
+   Remaining: passkey revocation; the QR / short-code link variant; the CLI
+   has no passkey ceremony (it only verifies).
 8. **History view** — render `readEvents()` (the event log is produced but
    nothing displays it yet).
 Older/parallel: file-mirror reconnection;

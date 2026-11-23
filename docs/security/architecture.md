@@ -13,8 +13,9 @@ via `npm run diagrams` — edit the model, not the images.
 > **Status.** *Shipped:* the sealed mesh (secret-derived topic + AEAD frames,
 > `PROTOCOL_VERSION` 2), `core::identity` (device keys + signed trust log),
 > per-client encryption keys (`core::keywrap`), epoch-key wrapping
-> (`core::epoch::EpochBook`), request-to-join, and read-revocation by epoch
-> rotation (`PROTOCOL_VERSION` 4). *Planned:* the Anyone-with-link **Viewer**
+> (`core::epoch::EpochBook`), request-to-join, read-revocation by epoch
+> rotation (`PROTOCOL_VERSION` 4), and passkey device-linking
+> (`PROTOCOL_VERSION` 5). *Planned:* the Anyone-with-link **Viewer**
 > access mode. This doc describes the whole model; each section flags what is
 > built vs planned.
 
@@ -112,9 +113,13 @@ requires an explicit wrap.
 
 ## Granting & revoking access
 
-- **Add your own device** — co-present, high assurance: the new device shows its
-  pubkey out-of-band (QR / short code), an Admin confirms and signs a grant +
-  wraps the current epoch key. (`user-flows.md` → *Link a device*.)
+- **Add your own device by passkey** (shipped): the owner registers a passkey
+  at claim; another device asserts it and every peer verifies offline — no
+  approve click (`core::identity` `Passkey`/`PasskeyLink`; `SECURITY.md` →
+  *Passkey device linking*).
+- **Add your own device** — co-present, high assurance (planned): the new
+  device shows its pubkey out-of-band (QR / short code), an Admin confirms and
+  signs a grant + wraps the current epoch key. (`user-flows.md` → *Link a device*.)
 - **Add another person** — asynchronous, à la Google Docs: they open the link and
   broadcast a signed **join request**; an Admin approves (grant + wrap) whenever
   next online. Identity assurance is a spectrum — self-asserted name → out-of-band
@@ -166,8 +171,10 @@ requires an explicit wrap.
 - **Concurrent-admin conflict resolution** (A revokes B while B revokes A) — v1
   merges by set-union, not a canonical order.
 - **TreeKEM-style O(log n) rotation** — unneeded at our scale.
-- **Provider-verified identity** (Google/passkey token in a join request) — an
+- **Provider-verified identity** (Google token in a join request) — an
   optional add-on, never required; see `auth.md`.
+- **Passkey revocation** — a registered passkey keeps linking devices while its
+  registrant is an Admin; there's no entry to retire it yet.
 
 ## Known limits
 

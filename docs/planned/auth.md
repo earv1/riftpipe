@@ -1,7 +1,8 @@
 # Auth & identity (planned)
 
-**Status: design, not built.** The sealing layer that closes the *outsider*
-threats (secret-derived topic + AEAD frames) is shipped — see
+**Status: mostly design; the passkey front door is built for device-linking**
+(`PROTOCOL_VERSION` 5 — see *As built* below). The sealing layer that closes
+the *outsider* threats (secret-derived topic + AEAD frames) is shipped — see
 [`SECURITY.md`](../../SECURITY.md). This document is the plan for the *next*
 layer: **who** a peer is, and **what** they're allowed to do — without hosting a
 server or committing a secret.
@@ -229,6 +230,52 @@ key, losing one device means appending a signed "remove device N" from any other
 device; every other device keeps working and the lost one is locked out of
 future writes. A shared/copied key can't do this.
 
+### As built (protocol v5)
+
+Passkey device-linking shipped as a variant of the flow above where the
+**passkey** is the out-of-band binding, so there's no QR step and no approve
+click. Decisions:
+
+1. **Passkeys are optional when claiming.** "Claim board" stays; "🔑 Claim with
+   passkey" sits next to it and an owner without one gets "🔑 Add passkey" —
+   passkeys don't work on IP origins, Windows Hello mints RS256, and older
+   WebKit lacks `getPublicKey()`.
+2. **Two appended `TrustEntry` variants** (`core::identity`): `Passkey { cred,
+   role, by, nonce, sig }` (an Admin registers a credential, Ed25519-signed) and
+   `PasskeyLink { device, cred_id, nonce, assertion }` (a device joins, vouched
+   for by a WebAuthn assertion whose challenge is
+   `blake3(postcard(("riftpipe-passkey-link-v1", founder, device, nonce)))`).
+   Every peer verifies offline (`core::passkey::PasskeyCredential::verify`):
+   `rpIdHash`, the UP flag, `type == webauthn.get`, the challenge, and the
+   ES256/EdDSA signature. The founder in the challenge scopes it to one board.
+3. **No proof-of-possession at registration** — one prompt at claim, not two;
+   only an Admin can register, and an Admin can already grant anyone.
+4. **A passkey-linked device is an Admin** (the role in the registration; the
+   UI always registers Admin). A passkey speaks only while its registrant is
+   still an Admin.
+5. **RP ID = `location.hostname`** (`earv1.github.io` on Pages, `localhost` in
+   tests); IP origins are unsupported and the buttons are hidden there. The
+   credential's public data is kept in `localStorage["riftpipe:passkey"]` and
+   reused, so there's one passkey per RP ID, not per board.
+6. **The public key comes from `response.getPublicKey()` (SPKI DER)**, parsed
+   with fixed DER prefixes in core (`PasskeyCredential::from_spki`) — no
+   CBOR/COSE parser.
+7. **The ceremony lives in the generic `riftpipe-web` crate**
+   (`web/src/passkey.rs`, `#[wasm_bindgen(inline_js)]` over
+   `navigator.credentials`: `passkeySupported` / `claimWithPasskey` /
+   `linkWithPasskey`); the kanban app only renders buttons.
+8. **Read access after linking:** the device broadcasts its `PasskeyLink`, then
+   its read request; any online Admin's `maintain()` wraps it into the current
+   epoch — an Admin holding the epoch key must be online, as after an approve.
+9. **`PROTOCOL_VERSION` 4 → 5.** A v4 peer skips `Trust` frames carrying the
+   new variants, so it never authorizes a passkey-linked device; the bump
+   surfaces the mismatch (indexes pinned in `core::sync::wire_compat`).
+
+Proved end to end by `projects/kanban/e2e/passkey-link.mjs` (in
+`run-browser-auth.sh`, CDP virtual authenticators). Not built: passkey
+revocation, attestation, the QR variant, a CLI ceremony, and PRF protection of
+the at-rest device seed.
+
 ### Linking ≠ recovery (decide recovery up front)
 
 - **Linking** adds a device *while you have* an authorized one — above.
@@ -252,7 +299,8 @@ machinery beyond the verification seam.
 2. **Capabilities** — introduce Biscuit; verify offline against a root key;
    root = self-signed genesis to start (pure P2P, zero infra).
 3. **Identity front door** — wire passkeys (then Google/PKCE) so a real or
-   self-sovereign identity vouches for the signing key.
+   self-sovereign identity vouches for the signing key. *Passkeys: done for
+   device linking* (`PROTOCOL_VERSION` 5, *As built* above); Google not built.
 4. **Membership + roles + device linking** — the signed log; role-gated writes;
    invite-based onboarding (single-use tokens, à la `@localfirst/auth`'s Seitan
    pattern); per-device keys with QR/short-code linking + single-device
