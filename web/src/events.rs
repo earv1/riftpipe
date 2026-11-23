@@ -11,8 +11,18 @@
 //! Event files are whole-file LWW over best-effort gossip. If a segment's one
 //! push is dropped but the restarted (short) active file lands, a live peer
 //! would lose those lines until it reconnects — so for
-//! [`SEGMENT_REPUSH_WINDOW_MS`] after a rotation, appends re-push the recent
-//! segments too (at most once per [`SEGMENT_REPUSH_MIN_GAP_MS`] each).
+//! [`SEGMENT_REPUSH_WINDOW_MS`] after a rotation, pushes re-send the recent
+//! segments too (at most once per [`SEGMENT_REPUSH_MIN_GAP_MS`] each), and one
+//! re-push is scheduled that long after each rotation.
+//!
+//! Pushes are **batched**: an append writes OPFS (and fires `riftpipe:event`)
+//! at once, but the active file goes to the mesh on a trailing
+//! [`EVENT_PUSH_DEBOUNCE_MS`] timer (at most [`EVENT_PUSH_MAX_WAIT_MS`] after
+//! the oldest unpushed line). `mesh.merge` lines don't trigger a push of their
+//! own; they ride along with the next one, or go out after
+//! [`MERGE_PUSH_DELAY_MS`]. Without this every remote merge made every peer
+//! re-broadcast its log — N² multi-chunk traffic per board write, crowding out
+//! the board files themselves on best-effort gossip.
 //!
 //! Appends within a tab go through one writer queue, so concurrent `log` /
 //! `logEvent` calls never lose lines to each other's read-modify-write. Sibling
@@ -93,6 +103,7 @@ pub const SEGMENT_REPUSH_MIN_GAP_MS: f64 = 5_000.0;
 
 /// A segment rotated in this tab recently, for [`due_repushes`].
 pub(crate) struct RecentSegment {
+    pub board: [u8; 32],
     pub path: String,
     pub rotated_ms: f64,
     pub pushed_ms: f64,
@@ -116,6 +127,115 @@ pub(crate) fn due_repushes(recent: &mut Vec<RecentSegment>, now_ms: f64, window_
 thread_local! {
     /// Segments this tab rotated within the re-push window.
     static RECENT_SEGMENTS: RefCell<Vec<RecentSegment>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Trailing debounce for pushing the active log after an app/auth event.
+pub const EVENT_PUSH_DEBOUNCE_MS: f64 = 500.0;
+/// A steady stream of appends still pushes at least this often.
+pub const EVENT_PUSH_MAX_WAIT_MS: f64 = 2_000.0;
+/// A `mesh.merge`-only change is pushed this long after it (or sooner, with the
+/// next app/auth event).
+pub const MERGE_PUSH_DELAY_MS: f64 = 15_000.0;
+
+/// When the active log is next due on the mesh: `first_ms` is the oldest
+/// unpushed append, `due_ms` the push time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FlushPlan {
+    pub first_ms: f64,
+    pub due_ms: f64,
+}
+
+/// Plan the next push after an append at `now_ms`. `trailing` (app/auth
+/// events) debounces by `delay_ms` but never past `max_wait_ms` after the
+/// oldest unpushed append; otherwise (`mesh.merge`) the push is due `delay_ms`
+/// out and an already-planned earlier push is never postponed.
+pub(crate) fn plan_flush(cur: Option<FlushPlan>, now_ms: f64, delay_ms: f64, trailing: bool, max_wait_ms: f64) -> FlushPlan {
+    let first_ms = cur.map_or(now_ms, |c| c.first_ms);
+    let due_ms = if trailing {
+        (now_ms + delay_ms).min(first_ms + max_wait_ms)
+    } else {
+        cur.map_or(now_ms + delay_ms, |c| c.due_ms.min(now_ms + delay_ms))
+    };
+    FlushPlan { first_ms, due_ms }
+}
+
+/// The active log as last written, awaiting (or past) its push.
+struct ActiveLog {
+    board: [u8; 32],
+    path: String,
+    content: String,
+    dirty: bool,
+}
+
+thread_local! {
+    static FLUSH: RefCell<Option<FlushPlan>> = const { RefCell::new(None) };
+    static ACTIVE: RefCell<Option<ActiveLog>> = const { RefCell::new(None) };
+}
+
+/// Plan a push after an append and arm a timer for it.
+fn schedule_flush(now: f64, kind: &str) {
+    let (delay, trailing) =
+        if kind == "mesh.merge" { (MERGE_PUSH_DELAY_MS, false) } else { (EVENT_PUSH_DEBOUNCE_MS, true) };
+    let plan = FLUSH.with(|f| {
+        let p = plan_flush(*f.borrow(), now, delay, trailing, EVENT_PUSH_MAX_WAIT_MS);
+        *f.borrow_mut() = Some(p);
+        p
+    });
+    let wait = (plan.due_ms - now).max(0.0) as u32;
+    wasm_bindgen_futures::spawn_local(async move {
+        gloo_timers::future::TimeoutFuture::new(wait).await;
+        let now = js_sys::Date::now();
+        let due = FLUSH.with(|f| {
+            let mut f = f.borrow_mut();
+            match *f {
+                Some(p) if now + 1.0 >= p.due_ms => {
+                    *f = None;
+                    true
+                }
+                _ => false,
+            }
+        });
+        if due {
+            push_pending(false).await;
+        }
+    });
+}
+
+/// Push what's pending: recent segments due a re-push, then the active log if
+/// it changed since its last push (or, with `force`, regardless). Dropped if
+/// the page has switched boards since — another board's log must never reach
+/// this board's mesh.
+async fn push_pending(force: bool) {
+    let board = crate::opfs::active_board();
+    let now = js_sys::Date::now();
+    let segs = RECENT_SEGMENTS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.retain(|s| s.board == board);
+        due_repushes(&mut r, now, SEGMENT_REPUSH_WINDOW_MS, SEGMENT_REPUSH_MIN_GAP_MS)
+    });
+    for seg in &segs {
+        if let Some(bytes) = crate::opfs::read_path(seg).await {
+            crate::tree_sync::push(seg, bytes.as_bytes());
+        }
+    }
+    let force = force || !segs.is_empty();
+    let active = ACTIVE.with(|a| {
+        let mut a = a.borrow_mut();
+        match a.as_mut() {
+            Some(l) if l.board != board => {
+                *a = None;
+                None
+            }
+            Some(l) if l.dirty || force => {
+                l.dirty = false;
+                Some((l.path.clone(), l.content.clone()))
+            }
+            _ => None,
+        }
+    });
+    if let Some((path, content)) = active {
+        crate::tree_sync::push(&path, content.as_bytes());
+    }
 }
 
 const RESERVED: [&str; 3] = ["ts", "device", "kind"];
@@ -220,30 +340,28 @@ async fn write_one(kind: &str, data: serde_json::Value) {
     let line = event_line(&ts, &device, kind, data);
     let path = log_path(&device);
 
+    let board = crate::opfs::active_board();
     let current = crate::opfs::read_path(&path).await.unwrap_or_default();
     let planned = plan_append(&current, &line, SEGMENT_MAX_BYTES);
     let now = js_sys::Date::now();
-    // Re-push recently rotated segments first (before any new rotation is
-    // recorded, so a fresh segment's own push below isn't doubled).
-    let due = RECENT_SEGMENTS.with(|r| {
-        due_repushes(&mut r.borrow_mut(), now, SEGMENT_REPUSH_WINDOW_MS, SEGMENT_REPUSH_MIN_GAP_MS)
-    });
-    for seg in due {
-        if let Some(bytes) = crate::opfs::read_path(&seg).await {
-            crate::tree_sync::push(&seg, bytes.as_bytes());
-        }
-    }
     if let Some(archive) = planned.archive {
         let seq = next_segment_seq(&crate::opfs::list_path("events").await, &device);
         let seg = segment_path(&device, seq);
         if crate::opfs::write_path(&seg, archive.as_bytes()).await.is_err() {
             return;
         }
+        // A segment goes out at once (the restarted active file must not land
+        // first and shrink a peer's copy), then once more after the re-push gap.
         crate::tree_sync::push(&seg, archive.as_bytes());
-        RECENT_SEGMENTS.with(|r| r.borrow_mut().push(RecentSegment { path: seg, rotated_ms: now, pushed_ms: now }));
+        RECENT_SEGMENTS.with(|r| r.borrow_mut().push(RecentSegment { board, path: seg, rotated_ms: now, pushed_ms: now }));
+        wasm_bindgen_futures::spawn_local(async {
+            gloo_timers::future::TimeoutFuture::new(SEGMENT_REPUSH_MIN_GAP_MS as u32 + 50).await;
+            push_pending(true).await;
+        });
     }
     if crate::opfs::write_path(&path, planned.active.as_bytes()).await.is_ok() {
-        crate::tree_sync::push(&path, planned.active.as_bytes());
+        ACTIVE.with(|a| *a.borrow_mut() = Some(ActiveLog { board, path, content: planned.active, dirty: true }));
+        schedule_flush(now, kind);
         dispatch_event(&line);
     }
 }
@@ -376,7 +494,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn due_repushes_throttles_within_window_and_expires() {
-        let seg = |p: &str, t: f64| RecentSegment { path: p.into(), rotated_ms: t, pushed_ms: t };
+        let seg = |p: &str, t: f64| RecentSegment { board: [0; 32], path: p.into(), rotated_ms: t, pushed_ms: t };
         let mut recent = vec![seg("s1", 0.0), seg("s2", 1_000.0)];
         // Inside the gap of both: nothing due.
         assert!(due_repushes(&mut recent, 4_000.0, 30_000.0, 5_000.0).is_empty());
@@ -398,6 +516,27 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0], serde_json::json!({}));
         assert_eq!(v[1]["kind"], "k");
+    }
+
+    #[wasm_bindgen_test]
+    fn plan_flush_debounces_caps_and_defers_merges() {
+        let (d, w) = (500.0, 2_000.0);
+        // App event: due one debounce out; more appends extend it…
+        let p = plan_flush(None, 0.0, d, true, w);
+        assert_eq!(p, FlushPlan { first_ms: 0.0, due_ms: 500.0 });
+        let p = plan_flush(Some(p), 400.0, d, true, w);
+        assert_eq!(p.due_ms, 900.0);
+        // …but never past max-wait after the oldest unpushed append.
+        let p = plan_flush(Some(p), 1_800.0, d, true, w);
+        assert_eq!(p, FlushPlan { first_ms: 0.0, due_ms: 2_000.0 });
+        // A merge alone waits the long delay, and never postpones a plan.
+        let m = plan_flush(None, 0.0, 15_000.0, false, w);
+        assert_eq!(m.due_ms, 15_000.0);
+        assert_eq!(plan_flush(Some(m), 5_000.0, 15_000.0, false, w).due_ms, 15_000.0);
+        assert_eq!(plan_flush(Some(p), 1_900.0, 15_000.0, false, w).due_ms, 2_000.0);
+        // An app event after a merge pushes promptly, capped by the merge's age.
+        assert_eq!(plan_flush(Some(m), 1_000.0, d, true, w).due_ms, 1_500.0);
+        assert_eq!(plan_flush(Some(m), 9_000.0, d, true, w).due_ms, 2_000.0);
     }
 
     #[wasm_bindgen_test]
