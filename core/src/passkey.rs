@@ -311,6 +311,13 @@ mod tests {
         let mut ed_spki = SPKI_ED25519_PREFIX.to_vec();
         ed_spki.extend_from_slice(&ed_sk.verifying_key().to_bytes());
         assert!(PasskeyCredential::from_spki(vec![1], ALG_EDDSA, &ed_spki, "localhost").is_some());
+
+        // Trailing bytes after the key: not an exact SPKI, rejected.
+        for (alg, good) in [(ALG_ES256, &spki), (ALG_EDDSA, &ed_spki)] {
+            let mut trailing = good.clone();
+            trailing.push(0);
+            assert!(PasskeyCredential::from_spki(vec![1], alg, &trailing, "localhost").is_none(), "alg {alg}");
+        }
     }
 
     #[test]

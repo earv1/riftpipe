@@ -922,6 +922,87 @@ mod tests {
     }
 
     #[test]
+    fn re_registering_a_credential_id_with_another_key_is_a_no_op() {
+        let founder = DeviceKey::generate();
+        let admin2 = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let (other_sk, other) = soft_passkey(2, "localhost");
+        let same_id_other_key = PasskeyCredential { id: cred.id.clone(), ..other };
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        log.apply(founder.grant(admin2.id(), Role::Admin, nonce(1)));
+        assert!(log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(2))));
+        assert!(log.apply(admin2.register_passkey(same_id_other_key, Role::Member, nonce(3))), "applies, as a no-op");
+        assert_eq!(log.passkeys(), vec![(cred.clone(), Role::Admin)], "the first registration stands");
+
+        assert!(!log.apply(link(&other_sk, &cred, &founder.id(), phone.id(), nonce(4))), "the later key can't link");
+        assert!(log.apply(link(&sk, &cred, &founder.id(), phone.id(), nonce(5))));
+        assert_eq!(log.role(&phone.id()), Some(Role::Admin));
+    }
+
+    #[test]
+    fn a_revoked_passkey_linked_device_stays_removed_on_replay() {
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(1)));
+        let ln = link(&sk, &cred, &founder.id(), phone.id(), nonce(2));
+        log.apply(ln.clone());
+        log.apply(founder.revoke(phone.id(), nonce(3)));
+        log.apply(ln);
+        assert!(!log.is_authorized(&phone.id()) && log.is_revoked(&phone.id()));
+        // A fresh assertion (a new nonce) from the passkey re-links it — by design.
+        assert!(log.apply(link(&sk, &cred, &founder.id(), phone.id(), nonce(4))));
+        assert_eq!(log.role(&phone.id()), Some(Role::Admin));
+    }
+
+    #[test]
+    fn a_passkey_link_for_the_founder_is_a_no_op() {
+        let founder = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        log.apply(founder.register_passkey(cred.clone(), Role::Member, nonce(1)));
+        assert!(log.apply(link(&sk, &cred, &founder.id(), founder.id(), nonce(2))));
+        assert_eq!(log.role(&founder.id()), Some(Role::Admin), "the founder stays Admin");
+        assert_eq!(log.devices().len(), 1);
+    }
+
+    #[test]
+    fn an_eddsa_passkey_links_through_the_trust_log() {
+        use ed25519_dalek::Signer as _;
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let cred = PasskeyCredential {
+            id: vec![9; 16],
+            alg: crate::passkey::ALG_EDDSA,
+            public_key: sk.verifying_key().to_bytes().to_vec(),
+            rp_id: "localhost".into(),
+        };
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        assert!(log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(1))));
+
+        let ch = passkey_link_challenge(&BOARD, &founder.id(), &phone.id(), &nonce(2));
+        let mut ad = crate::passkey::rp_id_hash("localhost").to_vec();
+        ad.extend_from_slice(&[0x05, 0, 0, 0, 0]);
+        let cdj = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"http://localhost","crossOrigin":false}}"#,
+            crate::passkey::b64url(&ch)
+        )
+        .into_bytes();
+        let signature = sk.sign(&crate::passkey::assertion_message(&ad, &cdj)).to_bytes().to_vec();
+        let assertion = PasskeyAssertion { authenticator_data: ad, client_data_json: cdj, signature };
+        let entry = TrustEntry::PasskeyLink { device: phone.id(), cred_id: cred.id.clone(), nonce: nonce(2), assertion };
+        assert!(log.apply(entry));
+        assert_eq!(log.role(&phone.id()), Some(Role::Admin));
+    }
+
+    #[test]
     fn buffered_passkey_links_are_capped() {
         let founder = DeviceKey::generate();
         let (sk, cred) = soft_passkey(1, "localhost");
