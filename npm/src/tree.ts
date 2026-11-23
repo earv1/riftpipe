@@ -26,6 +26,22 @@ export interface ProtocolMismatch {
   ours: number;
 }
 
+/** Parse a restricted peer's inbox line for a new or changed join request:
+ *   [auth] access-request device=<64 hex> safety=<xxxx xxxx> name="..."
+ * `null` for any other line, or one whose name isn't valid JSON (a garbled
+ * line must not throw inside the stderr handler and take the host down). */
+export function parseAccessRequestLine(line: string): PendingRequest | null {
+  const r = line.match(/access-request device=([0-9a-f]{64}) safety=([0-9a-f]{4} [0-9a-f]{4}) name=(.*)$/);
+  if (!r) return null;
+  let name: unknown;
+  try {
+    name = JSON.parse(r[3]);
+  } catch {
+    return null;
+  }
+  return typeof name === "string" ? { device: r[1], safety: r[2], name } : null;
+}
+
 /** A live tree-sync session over `dir`. */
 export class TreeSession {
   /**
@@ -73,11 +89,8 @@ export class TreeSession {
         const ev = { peer: m[1], theirs: Number(m[2]), ours: Number(m[3]) };
         for (const cb of this.#mismatchCbs) cb(ev);
       }
-      // A restricted peer's inbox line for a new or changed join request:
-      //   [auth] access-request device=<64 hex> safety=<xxxx xxxx> name="..."
-      const r = line.match(/access-request device=([0-9a-f]{64}) safety=([0-9a-f]{4} [0-9a-f]{4}) name=(.*)$/);
-      if (r) {
-        const req = { device: r[1], safety: r[2], name: JSON.parse(r[3]) as string };
+      const req = parseAccessRequestLine(line);
+      if (req) {
         for (const cb of this.#accessRequestCbs) cb(req);
       }
       const k = line.match(/\[epoch\] read key acquired \(epoch (\d+)\)/);
