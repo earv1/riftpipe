@@ -446,3 +446,107 @@ async fn mesh_host_restart_resyncs_gap_edits() {
     std::fs::remove_dir_all(&dh).ok();
     std::fs::remove_dir_all(&dj).ok();
 }
+
+/// A host that CRASHES (a killed `connect --accept` process: no QUIC close, so
+/// the joiner still holds the dead connection) and restarts within the idle
+/// timeout. The restarted host re-dials the joiner, whose gossip silently swaps
+/// the connection in while hyparview's stale `pending_neighbor_requests` entry
+/// suppresses its `Neighbor` reply — so without `SwapRejoin` the host never
+/// gets a NeighborUp and the gap edits never arrive. The joiner must notice
+/// the swapped-in connection and re-Join.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mesh_host_crash_restart_resyncs_gap_edits() {
+    const RESTART_BUDGET: Duration = Duration::from_secs(90);
+
+    let dh = dir("crash-host");
+    let dj = dir("crash-joiner");
+    std::fs::write(dh.join("a.md"), "# v1\n").unwrap();
+    // The CLI loads this same identity + board secret from `<dh>/.riftpipe-host`.
+    let (sk, secret) = load_or_create_host(&dh, false).unwrap();
+    let topic = riftpipe_core::crypto::topic_from_secret(&secret);
+
+    let ticket_file = PathBuf::from(format!("{}.ticket", dh.display()));
+    let _ = std::fs::remove_file(&ticket_file);
+    let mut cli = std::process::Command::new(env!("CARGO_BIN_EXE_riftpipe"))
+        .args(["connect", "--accept"])
+        .arg(&dh)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn connect --accept");
+    let ticket = tokio::time::timeout(BUDGET, async {
+        loop {
+            if let Ok(t) = std::fs::read_to_string(&ticket_file) {
+                if !t.trim().is_empty() {
+                    return t.trim().to_string();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("CLI host never wrote its ticket");
+    let bytes: Vec<u8> = (0..ticket.len() / 2)
+        .map(|i| u8::from_str_radix(&ticket[i * 2..i * 2 + 2], 16).unwrap())
+        .collect();
+    let (t_secret, addr): ([u8; 32], iroh::EndpointAddr) = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(t_secret, secret, "the CLI hosts the persisted board");
+    assert_eq!(addr.id, sk.public(), "the CLI uses the persisted identity");
+
+    let (tx_j, mut rx_j) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let dj_task = dj.clone();
+    let joiner_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        let _ = riftpipe::sync::mesh::join_and_run(secret, addr, &dj_task, &mut peer, &mut rx_j, false).await;
+    });
+    wait_for(&[dj.join("a.md")], "joiner gets the CLI host's tree").await;
+    let peers_file = dh.join(".riftpipe-peers");
+    tokio::time::timeout(BUDGET, async {
+        while !peers_file.is_file() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("CLI host never noted the joiner in its PeerBook");
+
+    // Crash: SIGKILL, no graceful close — the joiner keeps the dead connection.
+    cli.kill().unwrap();
+    let _ = cli.wait();
+    let _ = std::fs::remove_file(&ticket_file);
+
+    std::fs::write(dj.join("a.md"), "# v1\ngap line\n").unwrap();
+    tx_j.send(dj.join("a.md")).unwrap();
+    std::fs::write(dj.join("gap.md"), "# gap\n").unwrap();
+    tx_j.send(dj.join("gap.md")).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Restart well inside the joiner's QUIC idle timeout, same identity.
+    let host2 = MeshConn::join_with(JoinOpts {
+        secret,
+        bootstrap: None,
+        secret_key: Some(sk),
+        peers: load_peer_book(&dh, topic),
+    })
+    .await
+    .expect("host restart join");
+    let (_tx_h2, mut rx_h2) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let dh_task2 = dh.clone();
+    let host_task2 = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        let _ = riftpipe::sync::mesh::run(host2, &dh_task2, &mut peer, &mut rx_h2, false).await;
+    });
+
+    let (gap, a_path) = (dh.join("gap.md"), dh.join("a.md"));
+    tokio::time::timeout(RESTART_BUDGET, async {
+        while !(gap.is_file() && std::fs::read(&a_path).ok() == Some(b"# v1\ngap line\n".to_vec())) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("crash-restarted host never pulled the joiner's gap edits");
+
+    host_task2.abort();
+    joiner_task.abort();
+    std::fs::remove_dir_all(&dh).ok();
+    std::fs::remove_dir_all(&dj).ok();
+}

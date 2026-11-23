@@ -13,7 +13,9 @@
 //!
 //! A restarted peer re-dials its remembered peers; total neighbor loss retries
 //! with backoff; NeighborUp sends a Hello so a one-sided reconnect pulls the
-//! other side's missed edits.
+//! other side's missed edits; a current neighbor that re-dials us (it restarted
+//! under the same key) is re-Joined (`SwapRejoin`: hyparview stale-pending
+//! workaround).
 
 use futures_util::{FutureExt, StreamExt};
 use iroh::address_lookup::MemoryLookup;
@@ -23,12 +25,45 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
-use riftpipe_core::reconnect::{link_state, rejoin_targets, LinkState, PeerBook, Rejoin};
+use riftpipe_core::reconnect::{
+    link_state, rejoin_targets, LinkState, PeerBook, Rejoin, SwapRejoin,
+};
 
 /// The gossip topic for a board secret — `H(secret)`, underivable without the
 /// share link. Identical to the native `sync::mesh::topic_of`.
 pub fn topic_of(secret: &[u8; 32]) -> TopicId {
     TopicId::from_bytes(riftpipe_core::crypto::topic_from_secret(secret))
+}
+
+/// Where [`GossipAccept`] reports accepted connections: the ACTIVE board session's
+/// channel (each [`Node::join`] installs its own, replacing the previous one).
+type IncomingSink =
+    std::sync::Arc<std::sync::Mutex<Option<futures_channel::mpsc::UnboundedSender<EndpointId>>>>;
+
+/// The gossip protocol handler, wrapped to report each accepted connection's
+/// remote id (a current neighbor dialing us anew has restarted — see
+/// [`SwapRejoin`]). The connection itself goes to gossip unchanged.
+#[derive(Debug, Clone)]
+struct GossipAccept {
+    gossip: Gossip,
+    incoming: IncomingSink,
+}
+
+impl iroh::protocol::ProtocolHandler for GossipAccept {
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
+        let id = conn.remote_id();
+        self.gossip
+            .handle_connection(conn)
+            .await
+            .map_err(iroh::protocol::AcceptError::from_err)?;
+        if let Some(tx) = self.incoming.lock().ok().and_then(|g| g.clone()) {
+            let _ = tx.unbounded_send(id);
+        }
+        Ok(())
+    }
 }
 
 /// A page-lifetime iroh endpoint with gossip mounted — bound ONCE per identity and
@@ -42,6 +77,7 @@ pub struct Node {
     /// Shared by every board joined on this endpoint: a joiner seeds its host's
     /// address here so it can dial it without waiting on discovery.
     lookup: MemoryLookup,
+    incoming: IncomingSink,
 }
 
 impl Node {
@@ -58,10 +94,11 @@ impl Node {
         // chunked (`core::sync::encode_mesh_frames`) so no peer — however old —
         // ever receives an over-limit frame.
         let gossip = Gossip::builder().spawn(endpoint.clone());
+        let incoming = IncomingSink::default();
         let router = Router::builder(endpoint.clone())
-            .accept(GOSSIP_ALPN, gossip.clone())
+            .accept(GOSSIP_ALPN, GossipAccept { gossip: gossip.clone(), incoming: incoming.clone() })
             .spawn();
-        Ok(Node { endpoint, _router: router, gossip, lookup })
+        Ok(Node { endpoint, _router: router, gossip, lookup, incoming })
     }
 
     pub fn id(&self) -> EndpointId {
@@ -113,10 +150,15 @@ impl Node {
             .await
             .map_err(|e| e.to_string())?;
         let (sender, receiver) = topic.split();
+        let (incoming_tx, incoming) = futures_channel::mpsc::unbounded();
+        if let Ok(mut sink) = self.incoming.lock() {
+            *sink = Some(incoming_tx);
+        }
         Ok(Mesh {
             node: self.clone(),
             sender,
             receiver,
+            incoming,
             my_id,
             bootstrap: bootstrap_id,
             cipher: riftpipe_core::crypto::MeshCipher::from_secret(&secret),
@@ -130,6 +172,8 @@ pub struct Mesh {
     node: Node,
     sender: GossipSender,
     receiver: GossipReceiver,
+    /// Remote ids of connections this endpoint accepted while this board is active.
+    incoming: futures_channel::mpsc::UnboundedReceiver<EndpointId>,
     my_id: EndpointId,
     /// The peer we bootstrapped off (`None` when we host) — kept so a TOTAL
     /// neighbor loss can re-join it: hyparview heals only from its passive
@@ -184,8 +228,9 @@ impl Mesh {
 
     /// Split into a broadcast sender, an event receiver, the bootstrap peer
     /// (for a re-join after total neighbor loss), the frame cipher (shared —
-    /// the recv task and the push path both seal/open with it), and the `Node`
-    /// (the endpoint/router/gossip must outlive both).
+    /// the recv task and the push path both seal/open with it), the `Node`
+    /// (the endpoint/router/gossip must outlive both), and the accepted-
+    /// connection ids.
     fn into_parts(
         self,
     ) -> (
@@ -194,6 +239,7 @@ impl Mesh {
         Option<EndpointId>,
         std::rc::Rc<riftpipe_core::crypto::MeshCipher>,
         Node,
+        futures_channel::mpsc::UnboundedReceiver<EndpointId>,
     ) {
         (
             self.sender,
@@ -201,6 +247,7 @@ impl Mesh {
             self.bootstrap,
             std::rc::Rc::new(self.cipher),
             self.node,
+            self.incoming,
         )
     }
 }
@@ -1024,7 +1071,7 @@ impl GossipTreeSync {
         use std::cell::RefCell;
         use std::rc::Rc;
         let my_id = *mesh.my_id().as_bytes();
-        let (sender, mut receiver, bootstrap, cipher, node) = mesh.into_parts();
+        let (sender, mut receiver, bootstrap, cipher, node, mut incoming) = mesh.into_parts();
         let (stop_tx, stop_rx) = futures_channel::oneshot::channel::<()>();
         let syncer = Rc::new(RefCell::new(syncer));
         let neighbors = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
@@ -1098,6 +1145,8 @@ impl GossipTreeSync {
             let mut rejoin = Rejoin::new();
             rejoin.on_neighbors(0, js_sys::Date::now() as u64);
             let mut ticks = gloo_timers::future::IntervalStream::new(1_000).fuse();
+            // Neighbors that restarted and re-dialed us: re-Join them (see `SwapRejoin`).
+            let mut swap = SwapRejoin::new();
             // Connection status for `status()` / `meshStatus()`: `ever` turns a
             // total neighbor loss into "reconnecting" rather than "waiting";
             // `online` (navigator.onLine, kept live by the online/offline
@@ -1109,6 +1158,7 @@ impl GossipTreeSync {
                 Stop,
                 Tick,
                 Net(Option<bool>),
+                Incoming(Option<EndpointId>),
                 Ev(Option<Result<Event, iroh_gossip::api::ApiError>>),
             }
             let mut stop = stop_rx.fuse();
@@ -1117,12 +1167,28 @@ impl GossipTreeSync {
                     _ = stop => Wake::Stop,
                     _ = ticks.next() => Wake::Tick,
                     n = net_rx.next() => Wake::Net(n),
+                    id = incoming.next() => Wake::Incoming(id),
                     ev = receiver.next().fuse() => Wake::Ev(ev),
                 };
                 let ev = match wake {
                     Wake::Stop => break,
                     Wake::Tick => {
                         let now = js_sys::Date::now() as u64;
+                        let swapped: Vec<EndpointId> = swap
+                            .due(now, &snapshot(&receiver))
+                            .iter()
+                            .filter_map(|b| EndpointId::from_bytes(b).ok())
+                            .collect();
+                        if !swapped.is_empty() {
+                            for id in &swapped {
+                                web_sys::console::info_1(
+                                    &format!("[mesh] neighbor {id} re-dialed us (restarted) — re-joining it").into(),
+                                );
+                            }
+                            if let Err(e) = snd.join_peers(swapped).await {
+                                web_sys::console::warn_1(&format!("[mesh] re-join failed: {e}").into());
+                            }
+                        }
                         if online && rejoin.due(now) {
                             let targets: Vec<EndpointId> =
                                 rejoin_targets(bootstrap.map(|b| *b.as_bytes()), &book, my_id)
@@ -1149,6 +1215,14 @@ impl GossipTreeSync {
                         continue;
                     }
                     Wake::Net(None) => continue,
+                    // An accepted connection: from a current neighbor, it means that
+                    // neighbor restarted and swapped its connection in — queue a re-Join.
+                    Wake::Incoming(Some(id)) => {
+                        let is_neighbor = snapshot(&receiver).contains(id.as_bytes());
+                        swap.on_incoming(*id.as_bytes(), is_neighbor, js_sys::Date::now() as u64);
+                        continue;
+                    }
+                    Wake::Incoming(None) => continue,
                     Wake::Ev(Some(Ok(ev))) => ev,
                     Wake::Ev(_) => break,
                 };

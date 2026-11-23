@@ -82,6 +82,56 @@ pub fn link_state(neighbors: usize, ever_connected: bool, online: bool) -> LinkS
     else if ever_connected { LinkState::Reconnecting } else { LinkState::Waiting }
 }
 
+/// How long after a swapped connection arrives we re-Join its peer (lets the gossip
+/// actor install the new connection first, so the Join doesn't go out on the dead one).
+pub const SWAP_REJOIN_DELAY_MS: u64 = 500;
+/// At most one swap re-Join per peer per this window (a flapping peer can't storm).
+pub const SWAP_REJOIN_MIN_MS: u64 = 5_000;
+
+/// Re-Join a peer that opened a NEW connection to us while we still count it as a
+/// neighbor — it restarted under the same key (a reloaded tab, a restarted CLI host).
+///
+/// Why: iroh-gossip's hyparview leaves the peer that sent the LAST `Neighbor` of a
+/// handshake (normally the joiner) with a stale `pending_neighbor_requests` entry for
+/// the other side. When that other side restarts and re-dials us, gossip swaps the
+/// connection in silently (it stays an active neighbor: no NeighborDown/Up here), and
+/// our reply to its `Join` (`send_neighbor`) is suppressed by the stale entry — so
+/// the restarted peer never gets a NeighborUp, never sends its Hello, and both sides
+/// sit "connected"/"waiting" forever. Our own `Join` makes the restarted peer add us
+/// (NeighborUp there) and answer with a `Neighbor` that clears the stale entry.
+///
+/// Pure: callers feed the remote id of every accepted gossip connection
+/// (`on_incoming`) and poll `due` from their 1 s tick.
+#[derive(Debug, Clone, Default)]
+pub struct SwapRejoin { pending: Vec<([u8; 32], u64)>, last: Vec<([u8; 32], u64)> }
+impl SwapRejoin {
+    pub fn new() -> Self { Self::default() }
+    /// An incoming connection from `id`; queued only if it's already a neighbor (a
+    /// first-time joiner isn't one yet and needs nothing).
+    pub fn on_incoming(&mut self, id: [u8; 32], is_neighbor: bool, now: u64) {
+        if is_neighbor && !self.pending.iter().any(|(x, _)| *x == id) {
+            self.pending.push((id, now + SWAP_REJOIN_DELAY_MS));
+        }
+    }
+    /// The peers to re-Join now: queued at least SWAP_REJOIN_DELAY_MS ago and still a
+    /// neighbor (else dropped), at most once per SWAP_REJOIN_MIN_MS per peer.
+    pub fn due(&mut self, now: u64, neighbors: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let last = &mut self.last;
+        last.retain(|(_, t)| now < t + SWAP_REJOIN_MIN_MS);
+        let mut out = Vec::new();
+        self.pending.retain(|&(id, at)| {
+            if now < at { return true; }
+            if !neighbors.contains(&id) { return false; }
+            // Rate-limited: keep it, it fires once the window opens.
+            if last.iter().any(|(x, _)| *x == id) { return true; }
+            last.push((id, now));
+            out.push(id);
+            false
+        });
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +223,30 @@ mod tests {
         assert_eq!(link_state(1, false, true), LinkState::Connected);
         assert_eq!(link_state(0, true, true), LinkState::Reconnecting);
         assert_eq!(link_state(3, true, false), LinkState::Offline);
+    }
+
+    #[test]
+    fn swap_rejoin_delays_rate_limits_and_ignores_strangers() {
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let mut g = SwapRejoin::new();
+        // Not a neighbor (a first-time joiner): never queued.
+        g.on_incoming(b, false, 0);
+        assert!(g.due(10_000, &[a, b]).is_empty());
+        // A neighbor's new connection: due only after the delay.
+        g.on_incoming(a, true, 0);
+        assert!(g.due(SWAP_REJOIN_DELAY_MS - 1, &[a]).is_empty());
+        assert_eq!(g.due(SWAP_REJOIN_DELAY_MS, &[a]), vec![a]);
+        assert!(g.due(SWAP_REJOIN_DELAY_MS + 1, &[a]).is_empty(), "fires once");
+        // A flapping peer: held while rate-limited, fired once when the window opens.
+        g.on_incoming(a, true, 1_000);
+        assert!(g.due(2_000, &[a]).is_empty(), "within SWAP_REJOIN_MIN_MS");
+        g.on_incoming(a, true, 3_000);
+        assert!(g.due(SWAP_REJOIN_DELAY_MS + SWAP_REJOIN_MIN_MS - 1, &[a]).is_empty());
+        assert_eq!(g.due(SWAP_REJOIN_DELAY_MS + SWAP_REJOIN_MIN_MS, &[a]), vec![a]);
+        assert!(g.due(9_000, &[a]).is_empty(), "the duplicate incoming was coalesced");
+        // Gone by the time it's due (NeighborDown already took over): dropped.
+        g.on_incoming(b, true, 20_000);
+        assert!(g.due(30_000, &[a]).is_empty());
+        assert!(g.due(40_000, &[a, b]).is_empty(), "the dropped entry doesn't resurface");
     }
 }

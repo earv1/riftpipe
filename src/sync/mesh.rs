@@ -15,6 +15,8 @@
 //! - local file change → `.md` as text CRDT, else LWW with a ms timestamp
 //! - every neighbor seen is noted in a per-board `PeerBook`, persisted to
 //!   `<dir>/.riftpipe-peers` so a restart can re-dial them
+//! - a NEW incoming connection from a current neighbor (it restarted under the
+//!   same key) → re-Join it (`SwapRejoin`: hyparview stale-pending workaround)
 //!
 //! Shape mirrors `sync/tree.rs`'s [`run`](super::tree::run): the caller owns
 //! the [`TreePeer`] and the watcher channel; one `select!` loop, no spawned
@@ -33,11 +35,11 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{interval, MissedTickBehavior};
 
 use riftpipe_core::crypto::{topic_from_secret, MeshCipher};
-use riftpipe_core::reconnect::{link_state, rejoin_targets, LinkState, PeerBook, Rejoin};
+use riftpipe_core::reconnect::{link_state, rejoin_targets, LinkState, PeerBook, Rejoin, SwapRejoin};
 use riftpipe_core::sync::{
     encode_mesh_frames, MeshAssembler, MeshMsg, PeerVersion, VersionMonitor, PROTOCOL_VERSION,
 };
@@ -116,6 +118,30 @@ pub fn save_peer_book(dir: &Path, book: &PeerBook) {
     }
 }
 
+/// The gossip protocol handler, wrapped to report each accepted connection's
+/// remote id (a current neighbor dialing us anew has restarted — see
+/// [`SwapRejoin`]). The connection itself goes to gossip unchanged.
+#[derive(Debug, Clone)]
+struct GossipAccept {
+    gossip: Gossip,
+    incoming: UnboundedSender<EndpointId>,
+}
+
+impl iroh::protocol::ProtocolHandler for GossipAccept {
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        let id = conn.remote_id();
+        self.gossip
+            .handle_connection(conn)
+            .await
+            .map_err(iroh::protocol::AcceptError::from_err)?;
+        let _ = self.incoming.send(id);
+        Ok(())
+    }
+}
+
 /// A joined gossip mesh for one shared tree: our endpoint (fresh identity),
 /// the spawned router, the split topic handles, and the frame cipher.
 pub struct MeshConn {
@@ -136,6 +162,8 @@ pub struct MeshConn {
     /// joiner that reconnects): dialed alongside `bootstrap` at join time and
     /// on total neighbor loss.
     peers: PeerBook,
+    /// Remote ids of accepted gossip connections (from [`GossipAccept`]).
+    incoming: UnboundedReceiver<EndpointId>,
 }
 
 /// Inputs to [`MeshConn::join_with`].
@@ -184,8 +212,9 @@ impl MeshConn {
         // chunked (`core::sync::encode_mesh_frames`) so no peer — however old —
         // ever receives an over-limit frame.
         let gossip = Gossip::builder().spawn(endpoint.clone());
+        let (incoming_tx, incoming) = tokio::sync::mpsc::unbounded_channel();
         let router = Router::builder(endpoint.clone())
-            .accept(GOSSIP_ALPN, gossip.clone())
+            .accept(GOSSIP_ALPN, GossipAccept { gossip: gossip.clone(), incoming: incoming_tx })
             .spawn();
         let topic = gossip
             .subscribe(topic_of(&secret), boot)
@@ -203,6 +232,7 @@ impl MeshConn {
             bootstrap: bootstrap_id,
             cipher,
             peers,
+            incoming,
         })
     }
 
@@ -271,6 +301,7 @@ pub async fn run(
         bootstrap,
         cipher,
         peers: mut book,
+        mut incoming,
     } = conn;
     let my_id_bytes = *my_id.as_bytes();
     // The gossiped routing map `id -> [neighbors]` (kept for parity with the
@@ -306,6 +337,8 @@ pub async fn run(
     }
     rejoin.on_neighbors(0, now_ms());
     report_status(&mut last_status, 0, false);
+    // Neighbors that restarted and re-dialed us: re-Join them (see `SwapRejoin`).
+    let mut swap = SwapRejoin::new();
 
     // A failed send must not kill the session (convergence is repaired by the
     // next catch-up), but it must be VISIBLE — a silently dropped broadcast
@@ -421,11 +454,23 @@ pub async fn run(
                     }
                 }
             }
-            // Total neighbor loss: re-dial the bootstrap + remembered peers with
+            // Re-Join restarted neighbors that re-dialed us (`SwapRejoin`). Total
+            // neighbor loss: re-dial the bootstrap + remembered peers with
             // backoff (hyparview only refills from its passive view and never
             // re-dials on its own; `on_online` isn't wired here — there's no
             // native "online" event, so the tick alone drives it).
             _ = rejoin_tick.tick() => {
+                let neighbors: Vec<[u8; 32]> = receiver.neighbors().map(|n| *n.as_bytes()).collect();
+                let swapped: Vec<EndpointId> = swap.due(now_ms(), &neighbors)
+                    .iter().filter_map(|b| EndpointId::from_bytes(b).ok()).collect();
+                if !swapped.is_empty() {
+                    for id in &swapped {
+                        eprintln!("[mesh] neighbor {id} re-dialed us (restarted) — re-joining it");
+                    }
+                    if let Err(e) = sender.join_peers(swapped).await {
+                        eprintln!("[mesh] re-join failed: {e}");
+                    }
+                }
                 if rejoin.due(now_ms()) {
                     let targets: Vec<EndpointId> = rejoin_targets(bootstrap.map(|b| *b.as_bytes()), &book, my_id_bytes)
                         .iter().filter_map(|b| EndpointId::from_bytes(b).ok()).collect();
@@ -436,6 +481,12 @@ pub async fn run(
                         }
                     }
                 }
+            }
+            // An accepted gossip connection: if it's from a current neighbor, that
+            // neighbor restarted and swapped its connection in — queue a re-Join.
+            Some(id) = incoming.recv() => {
+                let is_neighbor = receiver.neighbors().any(|n| n == id);
+                swap.on_incoming(*id.as_bytes(), is_neighbor, now_ms());
             }
             // Mesh events: remote edits → disk, membership → catch-up + presence.
             ev = receiver.next() => {
