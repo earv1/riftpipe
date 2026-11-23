@@ -102,9 +102,63 @@ impl Control {
     }
 }
 
-/// Trim, replace control characters with `?`, and cap to [`NAME_MAX_CHARS`] chars.
+/// Longest join-request name (in bytes) a peer even looks at: a canonical name
+/// is at most [`NAME_MAX_CHARS`] chars of at most 4 UTF-8 bytes each. Checked
+/// before any per-char work, so a huge name costs nothing to reject.
+pub const NAME_MAX_BYTES: usize = NAME_MAX_CHARS * 4;
+
+/// Invisible characters that change how the text around them renders: Unicode
+/// format characters (category Cf — bidi overrides/isolates, zero-width
+/// joiners/spaces, the BOM, soft hyphen, tag characters, …) plus the line and
+/// paragraph separators. `char::is_control` covers only Cc.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Trim, replace control and format characters (see [`is_format_char`]) with
+/// `?`, and cap to [`NAME_MAX_CHARS`] chars. Idempotent: a cleaned name cleans
+/// to itself, which is what [`is_canonical_name`] relies on.
 pub fn clean_name(s: &str) -> String {
-    s.trim().chars().map(|c| if c.is_control() { '?' } else { c }).take(NAME_MAX_CHARS).collect()
+    let capped: String = s
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() || is_format_char(c) { '?' } else { c })
+        .take(NAME_MAX_CHARS)
+        .collect();
+    capped.trim_end().to_string()
+}
+
+/// Is `name` exactly what [`clean_name`] would produce? A peer only accepts a
+/// join request whose signed name is canonical: the safety code hashes the raw
+/// name while Admins are shown the cleaned one, so a non-canonical name would let
+/// a requester grind invisible variations of one displayed name for a chosen
+/// safety code. A joiner cleans its name before signing (`--name`), and the
+/// browser sends `""`, so honest requests always pass.
+pub fn is_canonical_name(name: &str) -> bool {
+    name.len() <= NAME_MAX_BYTES && clean_name(name) == name
 }
 
 /// Drop whitespace and `-` and lowercase — so a safety code or device id typed
@@ -293,6 +347,42 @@ mod tests {
         assert_eq!(clean_name("  Bob\u{1b}[31m "), "Bob?[31m");
         assert_eq!(clean_name(&"x".repeat(100)).len(), 64);
         assert_eq!(clean_name(""), "");
+    }
+
+    #[test]
+    fn clean_name_strips_bidi_and_zero_width() {
+        assert_eq!(clean_name("Bob\u{202E}gnp.exe"), "Bob?gnp.exe");
+        assert_eq!(clean_name("B\u{200B}o\u{200D}b\u{2066}x\u{2069}"), "B?o?b?x?");
+        assert_eq!(clean_name("\u{FEFF}Bob\u{00AD}"), "?Bob?");
+        assert_eq!(clean_name("Bob\u{2028}Eve"), "Bob?Eve");
+        assert_eq!(clean_name("Zoë 🚀"), "Zoë 🚀");
+    }
+
+    #[test]
+    fn clean_name_is_idempotent_even_when_truncating_at_a_space() {
+        let cut_at_space = format!("{} b", "a".repeat(NAME_MAX_CHARS - 1));
+        let once = clean_name(&cut_at_space);
+        assert_eq!(once, "a".repeat(NAME_MAX_CHARS - 1));
+        assert_eq!(clean_name(&once), once);
+        for s in ["  Bob\u{1b}[31m ", "Bob\u{202E}x", &"é".repeat(100), " \u{2028} x \u{2029} "] {
+            let c = clean_name(s);
+            assert_eq!(clean_name(&c), c, "{s:?}");
+            assert!(is_canonical_name(&c), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn canonical_names_are_exactly_cleaned_and_bounded() {
+        assert!(is_canonical_name(""));
+        assert!(is_canonical_name("cli"));
+        assert!(is_canonical_name("e2e joiner"));
+        assert!(!is_canonical_name("Bob "), "trailing whitespace is hidden by the display");
+        assert!(!is_canonical_name("Bob\u{3000}"), "so is trailing Unicode whitespace");
+        assert!(!is_canonical_name("Bob\u{200B}"));
+        assert!(!is_canonical_name("Bob\u{7}"));
+        assert!(!is_canonical_name(&"x".repeat(NAME_MAX_CHARS + 1)));
+        assert!(!is_canonical_name(&" ".repeat(10_000_000)), "byte cap rejects before cleaning");
+        assert!(is_canonical_name(&"🚀".repeat(NAME_MAX_CHARS)), "64 four-byte chars fit the byte cap");
     }
 
     #[test]

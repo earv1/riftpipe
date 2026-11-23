@@ -31,7 +31,7 @@ use riftpipe_core::onboard::JoinRequest;
 use riftpipe_core::sync::{MeshMsg, SyncMsg, Syncer};
 
 use crate::net::{anyerr, Result, Sink, Source};
-use crate::sync::control::clean_name;
+use crate::sync::control::{clean_name, is_canonical_name, NAME_MAX_BYTES};
 
 /// Most verified join requests a peer keeps waiting (one per device); later ones
 /// are ignored with a one-time warning, so a link-holder can't grow it unbounded.
@@ -126,6 +126,8 @@ pub struct TreePeer {
     requests: Vec<JoinRequest>,
     /// The request list hit [`REQUEST_INBOX_CAP`] once already (warned).
     warned_inbox_full: bool,
+    /// A join request with a non-canonical name was dropped once already (warned).
+    warned_bad_name: bool,
 }
 
 impl TreePeer {
@@ -147,6 +149,7 @@ impl TreePeer {
             stale_epoch_reported: HashSet::new(),
             requests: Vec::new(),
             warned_inbox_full: false,
+            warned_bad_name: false,
         }
     }
 
@@ -389,6 +392,19 @@ impl TreePeer {
     /// device, capped at [`REQUEST_INBOX_CAP`]) and report it.
     fn ingest_request(&mut self, req: JoinRequest, dir: &Path) {
         let Some(book) = self.epochs.as_mut() else { return };
+        // Byte cap + canonical form first: an oversized name costs nothing, and
+        // the displayed name is exactly the signed one (see `is_canonical_name`).
+        if !is_canonical_name(&req.name) {
+            if !self.warned_bad_name {
+                self.warned_bad_name = true;
+                eprintln!(
+                    "[auth] ignoring a join request whose name isn't canonical (over {NAME_MAX_BYTES} bytes, \
+                     untrimmed, or with control/format characters) — device {}",
+                    hex32(&req.device_id)
+                );
+            }
+            return;
+        }
         if !book.learn_request(&req) {
             return;
         }
@@ -1240,6 +1256,29 @@ mod tests {
         let req = p.my_request().unwrap();
         assert_eq!(req.name, "Bob?");
         assert!(req.verify(), "re-signed over the cleaned name");
+    }
+
+    /// The safety code hashes the signed name while Admins see the cleaned one,
+    /// so only requests whose signed name is already canonical (and small) get in:
+    /// no invisible suffix to grind a chosen code with, no megabyte names held.
+    #[test]
+    fn requests_with_non_canonical_names_stay_out() {
+        let df = dir("inbox-canon");
+        let mut founder = founder_peer();
+        let huge = "x".repeat(1_000_000);
+        for (i, name) in ["Bob ", "Bob\u{3000}", "Bob\u{200B}", "Bob\u{202E}", "\u{7}Bob", huge.as_str()]
+            .into_iter()
+            .enumerate()
+        {
+            founder.authorize_and_apply(request_from(&[20 + i as u8; 32], name), &df);
+        }
+        assert!(founder.pending_requests().is_empty());
+        assert!(founder.warned_bad_name);
+
+        founder.authorize_and_apply(request_from(&[30u8; 32], ""), &df);
+        founder.authorize_and_apply(request_from(&[31u8; 32], "Bob"), &df);
+        assert_eq!(founder.pending_requests().len(), 2, "browser (\"\") and cleaned CLI names get in");
+        std::fs::remove_dir_all(&df).ok();
     }
 
     #[test]
