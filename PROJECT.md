@@ -16,11 +16,11 @@ riftpipe.io/.sh available. "Open a rift, pipe through it.")
 
 ## Repo / branch state
 - GitHub: **https://github.com/earv1/riftpipe** (public).
-- Current work: branch **`epoch-seal`** (off `protocol-versioning`, off
-  `origin/main`, which already has the `serverless-browser-kanban` work) —
-  protocol versioning, mesh sealing, signed writes + trust log, the browser
-  claim/request-to-join flow, the generic file API, the synced event log, and
-  now epoch-sealed content + read revocation (see `What's done`).
+- Current state: everything is on **`main`** (PR #2 merged 2026-11-22:
+  protocol versioning v4, mesh sealing, signed writes + trust log, the browser
+  claim/request-to-join flow, the generic file API, the synced event log,
+  epoch-sealed content + read revocation, per-board OPFS, folder deletes —
+  see `What's done`). New work goes on feature branches + PRs.
 - **Guardrail:** a hook blocks committing/pushing to `main` (and any command
   containing the word "main") — the user pushes branches and merges PRs. Claude
   does not commit on `main`; current work is left in the working tree.
