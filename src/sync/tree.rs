@@ -549,6 +549,13 @@ impl TreePeer {
         self.syncer.full_state()
     }
 
+    /// Version vectors + LWW inventory, no bodies — sent on `NeighborUp` so a
+    /// one-sided reconnect becomes bidirectional (the peer replies with
+    /// exactly what we lack).
+    pub(crate) fn hello(&self) -> SyncMsg {
+        self.syncer.hello()
+    }
+
     /// Load every file already on disk into the syncer — the native mirror of
     /// the browser's `opfs::prime_all`. Restores durable records first, so
     /// history and LWW versions survive a restart; files changed while down
