@@ -9,8 +9,8 @@
 //! since version X"; a fresh peer is X = empty). Structural (non-text) files are
 //! last-writer-wins; the same connect handshake carries their `(path, version)`
 //! inventory, so a peer that lacks or is stale on one receives it immediately —
-//! no re-touch needed. No I/O, no clock — callers persist the result and pass a
-//! millisecond `now` for LWW versions.
+//! no re-touch needed. No I/O, no clock — callers persist the result, and their
+//! [`DurablePath`] records, and pass a millisecond `now` for LWW versions.
 
 use std::collections::{HashMap, HashSet};
 
@@ -26,6 +26,43 @@ use crate::text::EgWalkerText;
 /// apps never pick a channel themselves.
 pub fn is_text_path(path: &str) -> bool {
     path.ends_with(".md")
+}
+
+/// The file name (no extension) a driver stores `path`'s durable record under:
+/// 32 hex chars of blake3(path) — fixed length, filesystem-safe, no path structure.
+pub fn record_name(path: &str) -> String {
+    blake3::hash(path.as_bytes()).as_bytes()[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// One path's durable sync state — what a driver stores (in a never-synced dot-dir)
+/// so a restarted peer resumes the SAME history: text keeps its eg-walker oplog (so
+/// its origin is unchanged and concurrent edits still merge), LWW keeps its version
+/// (so re-opening never re-stamps a stale file as newest). `disk` = blake3 of the
+/// bytes this state materializes. Disk format (postcard): APPEND variants only —
+/// pinned by `tests::durable_record_layout_is_pinned`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DurablePath {
+    pub path: String,
+    pub kind: DurableKind,
+    pub disk: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum DurableKind {
+    Text { ops: Vec<u8> },
+    Lww { version: u64 },
+}
+
+/// What [`Syncer::restore`] found.
+pub enum Restored {
+    /// The file matches the record: history restored, nothing new.
+    Clean,
+    /// The file changed while we were down: history restored + this local edit
+    /// (already applied to our state; the driver re-saves the record).
+    Changed(SyncMsg),
+    /// No file, a corrupt record, a kind/path mismatch, or the path already has
+    /// state: nothing restored — treat the file as new (or drop the record).
+    Unusable,
 }
 
 /// The riftpipe wire-protocol version, announced to peers so a mismatch can
@@ -123,6 +160,16 @@ pub enum SyncMsg {
     /// `StratDelta` and the deleter resurrects the file). [`Syncer`] ignores it.
     /// APPENDED (wire index 7): peers that predate it skip it cleanly.
     StratDelete { path: String, ids: Vec<u64>, seen: Vec<[u8; 32]> },
+}
+
+impl SyncMsg {
+    /// Replies to this message only matter to its sender's neighborhood: a `Hello`
+    /// is sent to direct neighbors only, so drivers send its replies (up to the
+    /// whole tree, for a fresh joiner) neighbors-only too instead of flooding the
+    /// swarm on every join. Everything else replies swarm-wide.
+    pub fn replies_go_to_neighbors(&self) -> bool {
+        matches!(self, SyncMsg::Hello { .. })
+    }
 }
 
 /// What travels over a gossip-mesh topic: tree [`SyncMsg`]s plus periodic
@@ -527,6 +574,67 @@ impl Syncer {
         entry.0 = now.max(entry.0 + 1);
         entry.1 = bytes.clone();
         SyncMsg::Lww { path: path.to_string(), version: entry.0, bytes }
+    }
+
+    /// The durable record for `path` (None if we hold no state for it). Call after
+    /// every local change or persisted merge of `path`.
+    pub fn durable(&self, path: &str) -> Option<DurablePath> {
+        if let Some(doc) = self.docs.get(path) {
+            let content = doc.content();
+            return Some(DurablePath {
+                path: path.to_string(),
+                kind: DurableKind::Text { ops: doc.encode_full() },
+                disk: *blake3::hash(content.as_bytes()).as_bytes(),
+            });
+        }
+        let (version, bytes) = self.lww.get(path)?;
+        Some(DurablePath {
+            path: path.to_string(),
+            kind: DurableKind::Lww { version: *version },
+            disk: *blake3::hash(bytes).as_bytes(),
+        })
+    }
+
+    /// Restore `rec` given the file's current bytes. Call BEFORE any apply/local_* for
+    /// that path (drivers restore before the session starts). New local ops are authored
+    /// under THIS syncer's agent; the record's ops (and so the origin) are kept as history.
+    /// `peer_vv` is untouched.
+    pub fn restore(&mut self, rec: DurablePath, file: Option<&[u8]>, now: u64) -> Restored {
+        let Some(file) = file else { return Restored::Unusable };
+        if self.docs.contains_key(&rec.path) || self.lww.contains_key(&rec.path) {
+            return Restored::Unusable;
+        }
+        let unchanged = *blake3::hash(file).as_bytes() == rec.disk;
+        match rec.kind {
+            DurableKind::Text { ops } => {
+                if !is_text_path(&rec.path) {
+                    return Restored::Unusable;
+                }
+                let mut doc = EgWalkerText::new(&self.agent);
+                if !doc.merge(&ops) || doc.origin().is_none() {
+                    return Restored::Unusable;
+                }
+                self.docs.insert(rec.path.clone(), doc);
+                if unchanged {
+                    return Restored::Clean;
+                }
+                match self.local_text(&rec.path, &String::from_utf8_lossy(file)) {
+                    Some(m) => Restored::Changed(m),
+                    None => Restored::Clean,
+                }
+            }
+            DurableKind::Lww { version } => {
+                if is_text_path(&rec.path) {
+                    return Restored::Unusable;
+                }
+                if unchanged {
+                    self.lww.insert(rec.path, (version, file.to_vec()));
+                    return Restored::Clean;
+                }
+                self.lww.insert(rec.path.clone(), (version, Vec::new()));
+                Restored::Changed(self.local_lww(&rec.path, file.to_vec(), now))
+            }
+        }
     }
 
     /// Apply a received message: returns `(bytes to persist, messages to send
@@ -1089,6 +1197,16 @@ mod chunking {
 mod tests {
     use super::*;
 
+    /// Only a Hello's replies stay with the neighborhood it came from.
+    #[test]
+    fn only_hello_replies_go_to_neighbors() {
+        assert!(SyncMsg::Hello { versions: vec![], lww_versions: vec![] }.replies_go_to_neighbors());
+        assert!(!SyncMsg::Resync { path: "a.md".into() }.replies_go_to_neighbors());
+        assert!(!SyncMsg::Lww { path: "m.toml".into(), version: 1, bytes: vec![] }.replies_go_to_neighbors());
+        let mut s = Syncer::new("r");
+        assert!(!s.local_text("a.md", "x").unwrap().replies_go_to_neighbors());
+    }
+
     /// Drive a message into `dst`, persisting + forwarding replies until quiescent.
     /// Returns the last persisted bytes for `path`, if any.
     fn deliver(dst: &mut Syncer, src_to_dst: SyncMsg) -> Vec<SyncMsg> {
@@ -1472,5 +1590,200 @@ mod tests {
             assert!(s.docs.contains_key("notes/a/doc.md"), "doc a everywhere");
             assert!(s.docs.contains_key("notes/c/doc.md"), "doc c everywhere");
         }
+    }
+
+    /// Apply each message to `s`; the last bytes it persisted for `path`, if any.
+    fn content_after(s: &mut Syncer, msgs: Vec<SyncMsg>, path: &str) -> Option<Vec<u8>> {
+        let mut out = None;
+        for m in msgs {
+            if let (Some((p, bytes)), _) = s.apply(m) {
+                if p == path {
+                    out = Some(bytes);
+                }
+            }
+        }
+        out
+    }
+
+    /// The origin carried by `path`'s `TextDelta` in `msgs`.
+    fn text_origin(msgs: &[SyncMsg], path: &str) -> Origin {
+        msgs.iter()
+            .find_map(|m| match m {
+                SyncMsg::TextDelta { path: p, origin, .. } if p == path => Some(origin.clone()),
+                _ => None,
+            })
+            .expect("a TextDelta for the path")
+    }
+
+    /// The version carried by `path`'s `Lww` in `msgs`.
+    fn lww_version(msgs: &[SyncMsg], path: &str) -> u64 {
+        msgs.iter()
+            .find_map(|m| match m {
+                SyncMsg::Lww { path: p, version, .. } if p == path => Some(*version),
+                _ => None,
+            })
+            .expect("an Lww for the path")
+    }
+
+    #[test]
+    fn restored_text_keeps_its_origin_and_merges_cleanly() {
+        let mut a = Syncer::new("a");
+        let mut c = Syncer::new("c");
+        let m = a.local_text("x.md", "hello\n").unwrap();
+        assert_eq!(content_after(&mut c, vec![m], "x.md").as_deref(), Some(&b"hello\n"[..]));
+        let rec = a.durable("x.md").unwrap();
+
+        let mut b = Syncer::new("b");
+        assert!(matches!(b.restore(rec, Some(b"hello\n"), 0), Restored::Clean));
+        let origin = text_origin(&a.full_state(), "x.md");
+        assert!(origin.is_some());
+        assert_eq!(text_origin(&b.full_state(), "x.md"), origin);
+
+        // A peer's concurrent edit on the shared history merges cleanly — not an
+        // origin-conflict adoption (b's origin is unchanged).
+        let edit = c.local_text("x.md", "hello world\n").unwrap();
+        assert_eq!(
+            content_after(&mut b, vec![edit], "x.md").as_deref(),
+            Some(&b"hello world\n"[..])
+        );
+        assert_eq!(b.docs["x.md"].origin(), origin);
+    }
+
+    #[test]
+    fn restore_turns_an_offline_file_change_into_a_local_edit() {
+        let mut a = Syncer::new("a");
+        let mut c = Syncer::new("c");
+        let m = a.local_text("x.md", "hello\n").unwrap();
+        content_after(&mut c, vec![m], "x.md");
+        let rec = a.durable("x.md").unwrap();
+
+        let mut b = Syncer::new("b");
+        let Restored::Changed(msg) = b.restore(rec, Some(b"hello again\n"), 0) else {
+            panic!("an offline change restores as Changed");
+        };
+        assert!(matches!(msg, SyncMsg::TextDelta { .. }));
+        assert_eq!(
+            content_after(&mut c, vec![msg], "x.md").as_deref(),
+            Some(&b"hello again\n"[..])
+        );
+        assert_eq!(c.docs["x.md"].origin(), a.docs["x.md"].origin());
+    }
+
+    #[test]
+    fn restored_lww_keeps_its_version() {
+        let mut a = Syncer::new("a");
+        a.local_lww("m.toml", b"x".to_vec(), 100);
+        let rec = a.durable("m.toml").unwrap();
+        let mut b = Syncer::new("b");
+        assert!(matches!(b.restore(rec, Some(b"x"), 9_999), Restored::Clean));
+        assert_eq!(lww_version(&b.full_state(), "m.toml"), 100);
+    }
+
+    #[test]
+    fn restored_lww_bumps_on_an_offline_change() {
+        let mut a = Syncer::new("a");
+        a.local_lww("m.toml", b"x".to_vec(), 100);
+        let rec = a.durable("m.toml").unwrap();
+        let mut b = Syncer::new("b");
+        let Restored::Changed(SyncMsg::Lww { path, version, bytes }) = b.restore(rec, Some(b"y"), 50)
+        else {
+            panic!("an offline LWW change restores as Changed(Lww)");
+        };
+        assert_eq!((path.as_str(), version, bytes.as_slice()), ("m.toml", 101, &b"y"[..]));
+        assert_eq!(lww_version(&b.full_state(), "m.toml"), 101);
+    }
+
+    #[test]
+    fn restore_refuses_missing_files_mismatched_kinds_and_corrupt_records() {
+        let mut a = Syncer::new("a");
+        a.local_text("x.md", "hello\n");
+        let rec = a.durable("x.md").unwrap();
+        let mut b = Syncer::new("b");
+
+        assert!(matches!(b.restore(rec.clone(), None, 0), Restored::Unusable));
+
+        let text_for_toml = DurablePath {
+            path: "m.toml".into(),
+            kind: DurableKind::Text { ops: a.docs["x.md"].encode_full() },
+            disk: [0; 32],
+        };
+        assert!(matches!(b.restore(text_for_toml, Some(b"x"), 0), Restored::Unusable));
+
+        let corrupt = DurablePath {
+            path: "y.md".into(),
+            kind: DurableKind::Text { ops: vec![1, 2, 3] },
+            disk: [0; 32],
+        };
+        assert!(matches!(b.restore(corrupt, Some(b"y"), 0), Restored::Unusable));
+        assert!(b.durable("y.md").is_none(), "a corrupt record leaves no state");
+
+        assert!(matches!(b.restore(rec.clone(), Some(b"hello\n"), 0), Restored::Clean));
+        assert!(matches!(b.restore(rec, Some(b"hello\n"), 0), Restored::Unusable));
+    }
+
+    #[test]
+    fn host_restart_then_hello_pulls_a_joiners_gap_edits() {
+        let mut h = Syncer::new("h1");
+        let mut j = Syncer::new("j");
+        let t = h.local_text("card.md", "# one\n").unwrap();
+        let l = h.local_lww("meta.toml", b"col=Todo".to_vec(), 1_000);
+        content_after(&mut j, vec![t, l], "card.md");
+        let rt = h.durable("card.md").unwrap();
+        let rl = h.durable("meta.toml").unwrap();
+        drop(h);
+
+        // The joiner edits while the host is down.
+        j.local_text("card.md", "# one\ngap\n");
+        j.local_lww("meta.toml", b"col=Done".to_vec(), 2_000);
+
+        let mut h2 = Syncer::new("h2");
+        assert!(matches!(h2.restore(rt, Some(b"# one\n"), 3_000), Restored::Clean));
+        assert!(matches!(h2.restore(rl, Some(b"col=Todo"), 3_000), Restored::Clean));
+
+        let (_, replies) = j.apply(h2.hello());
+        let mut persisted: HashMap<String, Vec<u8>> = HashMap::new();
+        for m in replies {
+            if let (Some((p, bytes)), _) = h2.apply(m) {
+                persisted.insert(p, bytes);
+            }
+        }
+        assert_eq!(persisted.get("card.md").map(Vec::as_slice), Some(&b"# one\ngap\n"[..]));
+        assert_eq!(persisted.get("meta.toml").map(Vec::as_slice), Some(&b"col=Done"[..]));
+
+        // The host's catch-up never regresses the joiner.
+        for m in h2.full_state() {
+            if let (Some((p, bytes)), _) = j.apply(m) {
+                let current = match j.docs.get(&p) {
+                    Some(doc) => doc.content().into_bytes(),
+                    None => j.lww[&p].1.clone(),
+                };
+                assert_eq!(bytes, current, "{p} persisted something other than its content");
+            }
+        }
+        assert_eq!(j.docs["card.md"].content(), "# one\ngap\n");
+        assert_eq!(j.lww["meta.toml"].1, b"col=Done");
+    }
+
+    #[test]
+    fn durable_record_layout_is_pinned() {
+        let lww = DurablePath { path: "a".into(), kind: DurableKind::Lww { version: 1 }, disk: [0; 32] };
+        let bytes = postcard::to_allocvec(&lww).unwrap();
+        let mut expected = vec![1u8, 97, 1, 1];
+        expected.extend_from_slice(&[0u8; 32]);
+        assert_eq!(bytes, expected);
+
+        let text = DurablePath { path: "a".into(), kind: DurableKind::Text { ops: vec![7] }, disk: [0; 32] };
+        let bytes = postcard::to_allocvec(&text).unwrap();
+        assert!(bytes.starts_with(&[1, 97, 0, 1, 7]), "got {bytes:?}");
+        assert_eq!(postcard::from_bytes::<DurablePath>(&bytes).unwrap(), text);
+    }
+
+    #[test]
+    fn record_name_is_fixed_length_hex() {
+        let n = record_name("tickets/tk_1/card.md");
+        assert_eq!(n.len(), 32);
+        assert!(n.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(n, record_name("tickets/tk_1/card.md"));
+        assert_ne!(record_name("a"), record_name("b"));
     }
 }

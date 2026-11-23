@@ -10,6 +10,7 @@ pub mod identity;
 pub mod keywrap;
 pub mod onboard;
 pub mod passkey;
+pub mod reconnect;
 pub mod sync;
 pub mod text;
 pub mod wal;

@@ -73,6 +73,27 @@ body {
   font-size: 0.85rem;
 }
 
+.mesh-status {
+  font-size: 0.8rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  background: #eef1f6;
+  color: #3b4352;
+}
+.mesh-status.connected {
+  background: #e6f4ea;
+  color: #1e6b34;
+}
+.mesh-status.waiting,
+.mesh-status.reconnecting {
+  background: #fff4e5;
+  color: #7a4d00;
+}
+.mesh-status.offline {
+  background: #fdecea;
+  color: #8a1f11;
+}
+
 .auth-bar {
   display: flex;
   align-items: center;

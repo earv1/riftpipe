@@ -45,8 +45,8 @@ sense to do it, not strict priority.
    ticket — across reloads. `irohConnect` hosts when the URL ticket is empty *or*
    its id equals ours (a reloaded host recognizes its own link), and joins
    otherwise. Proven deterministically headless (`persisted_iroh_identity_is_stable`)
-   + the two-browser `run-iroh` flow still passes. (Reconnecting an *already-joined*
-   peer after the host reloads is separate — that's live reconnection, below.)
+   + the two-browser `run-iroh` flow still passes. Reconnecting an *already-joined*
+   peer after the host reloads or restarts: see **Live reconnection — done**, below.
 
 5. **Multi-peer (N-writer)** — *done, as a gossip mesh.* A board is an **iroh-gossip
    topic** (= the host's EndpointId); peers broadcast `SyncMsg`s epidemically and the
@@ -60,6 +60,77 @@ sense to do it, not strict priority.
    hyparview will add cross-links over time, and gossiping more bootstrap peers would
    speed mesh healing. (LWW `full_state` catch-up landed — the Syncer caches
    structural bytes so `meta.toml` reaches new neighbors too.)
+
+- **Live reconnection — done.** A peer that reloads, restarts, switches boards in
+  its tab, or drops offline rejoins its board and both sides exchange what they
+  missed, with no manual re-share.
+  - *Reuse the endpoint (D1):* the page binds one `gossip::Node` per key; a board
+    switch drops the old `GossipTreeSync` (stop channel → topic left) and
+    re-subscribes on the same `Node`, so the key is never rebound in-tab.
+  - *Backoff rejoin (D2):* `core::reconnect::Rejoin` (1 s doubling to 16 s, reset on
+    any neighbor, `online` ⇒ retry now) re-dials the bootstrap plus a persisted
+    **PeerBook** (≤16 recently seen ids per board: `<dir>/.riftpipe-peers`,
+    localStorage `riftpipe:peers:<topic>`).
+  - *Host finds its joiners (D3):* a restarted host dials its PeerBook at subscribe
+    time, and every `NeighborUp` also sends a `SyncMsg::Hello`, so a one-sided
+    reconnect still pulls the other side's gap edits.
+  - *Swapped-connection re-Join (`core::reconnect::SwapRejoin`):* iroh-gossip's
+    hyparview leaves the peer that sent the last `Neighbor` of a handshake
+    (normally the joiner) with a stale `pending_neighbor_requests` entry. When the
+    other side restarts under the same key within the QUIC idle timeout and
+    re-dials, gossip silently swaps the connection in (no NeighborDown/Up), and the
+    joiner's reply to the new `Join` is suppressed by that stale entry — the
+    restarted host never gets a NeighborUp, the joiner never notices the loss, and
+    nothing syncs. Both drivers wrap the gossip protocol handler to see each
+    accepted connection's remote id; a connection from a *current neighbor* queues
+    a re-Join of it (≥0.5 s later, at most once per peer per 5 s, one log line).
+    Proven by `tests/mesh.rs::mesh_host_crash_restart_resyncs_gap_edits` (a
+    SIGKILLed CLI host; fails without the fix) and `run-reconnect.sh` /
+    `run-cli-host-restart.sh`. An upstream iroh-gossip fix would make it moot.
+  - *Durable sync records (D4):* `Syncer::durable/restore` + one `DurablePath` per
+    path in the never-synced `.riftpipe-sync/` (OPFS per board, natively
+    `<dir>/.riftpipe-sync/<hex topic>/` — also per board, so a reused dir never
+    ships another board's history), restored before the mesh starts — history,
+    CRDT origins and LWW versions survive a restart; files edited while down
+    become local edits on top. In the browser a merged file and its record go
+    through one serialized queue, file first, so a reload can't pair a new record
+    with the old file (which would author a revert of the merge).
+  - *CLI host identity (D5):* `connect --accept <dir>` persists its iroh key + board
+    secret in `<dir>/.riftpipe-host` (restart = same board); `--new-board` mints a
+    new link.
+  - *Status (D6):* `waiting | connected | reconnecting | offline` (`idle` with no
+    session) as the `riftpipe:mesh-status` event + `meshStatus()` in the browser
+    (kanban renders a pill), `[mesh] status=<s> peers=<n>` lines natively.
+  - *Wire (D7):* unchanged, no `PROTOCOL_VERSION` bump; the `DurablePath` disk
+    format is pinned by `durable_record_layout_is_pinned`.
+  - *Tests:* `core::reconnect` (incl. `SwapRejoin`) + `core::sync` durable/restore
+    unit tests (incl. `host_restart_then_hello_pulls_a_joiners_gap_edits`),
+    `sync::tree` record tests,
+    `tests/mesh.rs::mesh_host_restart_resyncs_gap_edits` and
+    `mesh_host_crash_restart_resyncs_gap_edits`, wasm
+    `reused_node_switches_topics_without_rebinding`, and the e2e suites
+    `projects/kanban/e2e/run-reconnect.sh` (host reload + long gap, in-tab board
+    switch, offline) and `run-cli-host-restart.sh` (CLI host restart, browser joiner).
+  - *Known limits:* a crash/reload in the few ms between a merged file landing and
+    its record landing can duplicate that one merged edit on the next start (fails
+    toward duplication, never loss); no app-level heartbeat or `pagehide` →
+    Disconnect, so a joiner notices a vanished host only via QUIC idle (~15–30 s)
+    and the pill can read "connected" that long; a `--restricted` CLI host doesn't
+    persist its trust log/epochs, and a restart would replay its `--grant`s under
+    fresh nonces (re-authorizing a device revoked live, on peers that saw the
+    revoke first) and re-mint epoch 1 — so `connect --accept --restricted` refuses
+    to resume a dir that already hosts a board; restart it with `--new-board`; the
+    legacy WebRTC/signaling `connectAndSync` path has no records or reconnection;
+    the npm wrapper doesn't parse `[mesh] status=` lines. Pre-existing and
+    separate: tree/mesh deletes, out-of-order OPFS writes of rapid merges to one
+    file, the fresh joiner's `ensureSeed` `board.md` origin race.
+  - *Needs real-network verification:* the host re-dialling remembered peers by id
+    only (n0 pkarr publish/resolve across real NATs; else recovery waits for the
+    joiner's rejoin after QUIC idle), detection latency on real relays, relay-home
+    stability across a CLI restart (a stale `MemoryLookup` entry leaves dialling
+    to pkarr), real offline (Wi-Fi off, sleep/wake, throttled background tabs —
+    Playwright's `setOffline` may not cut an established relay WebSocket), and
+    peers on different relay regions / browser ↔ CLI across networks.
 
 ## Data model / DB
 
@@ -85,16 +156,13 @@ sense to do it, not strict priority.
   this browser's other board into it — that primed a *claimed* board's files into
   any board opened next, as plain Sync. Verified `run-board-isolation.sh` (was
   `run-iroh-merge.sh`): a claimed board's card never reaches another board.
-  *Remaining nits:* primed
-  `meta.toml` (LWW) uses wall-clock now() so a same-card meta conflict is racy
-  (cards rarely collide); and pasting a share link into a **solo tab** reconnects
-  best-effort via a `hashchange` listener. On reconnect we now tear down the prior
-  session (`Endpoint::close()`), which is correct and needed for live reconnection —
-  but rebinding the **same persisted key** immediately still races (relay
-  re-registration), so in-tab reconnect *from a solo host* isn't reliable yet.
-  Opening the link fresh (new tab / reload) works cleanly. The remaining fix
-  (delay/await the same-key rebind, or reuse the endpoint instead of rebinding)
-  folds into **live reconnection**.
+  *Remaining nits:* ~~primed `meta.toml` (LWW) uses wall-clock now() so a same-card
+  meta conflict is racy~~ — fixed by durable sync records (a reopened board
+  restores each LWW file's version instead of re-stamping it); ~~in-tab reconnect
+  from a solo host races the same-key rebind (relay re-registration)~~ — fixed by
+  the reused page-lifetime `gossip::Node` (a pasted share link re-subscribes a
+  topic on the same endpoint; the key is never rebound). See **Live
+  reconnection — done**.
 
 ## Architecture / hygiene (from the July 2026 review + restructure)
 
@@ -245,11 +313,11 @@ over riftpipe's wasm file API). What remains:
   sets are gone; the web cell is a mirror for the `connectedPeers()` debug
   accessor); the `NeighborUp` full_state catch-up uses `broadcast_neighbors()`
   (direct neighbors only — the join no longer floods the whole swarm with the
-  tree); and on TOTAL neighbor loss a joiner `join_peers()`s its bootstrap
-  again (hyparview only refills from its passive view; the bootstrap address
-  is still in the MemoryLookup — this is the swarm half of live reconnection;
-  exercising it end-to-end needs a persistent-identity host restart, still
-  open below). `joined()`/`subscribe_and_join` deliberately NOT adopted: it
+  tree); and on TOTAL neighbor loss a peer `join_peers()`s its bootstrap
+  again — now with backoff, plus its remembered peers (hyparview only refills
+  from its passive view; the bootstrap address is still in the MemoryLookup —
+  this is the swarm half of live reconnection, proven end-to-end — see Live
+  reconnection, above). `joined()`/`subscribe_and_join` deliberately NOT adopted: it
   consumes the first `NeighborUp`, which our catch-up logic depends on — the
   library's own docs point to exactly our track-the-stream pattern. Kept
   app-level by design: late-joiner catch-up (gossip is ephemeral), the
