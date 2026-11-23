@@ -7,9 +7,11 @@ import {
   deviceHandle,
   deviceLabel,
   type HistoryEvent,
+  isWellFormedEvent,
   knownTitles,
   relativeTime,
   type Viewer,
+  wellFormed,
 } from "./history.ts";
 
 const NOW = Date.parse("2026-07-20T12:00:00Z");
@@ -169,4 +171,26 @@ Deno.test("dedupe — removes exact duplicates, keeps order", () => {
   const b: HistoryEvent = { ts: "2", device: "d", kind: "card.move", id: "tk_1" };
   const out = dedupe([a, b, { ...a }]);
   assert.deepEqual(out, [a, b]);
+});
+
+Deno.test("wellFormed — drops lines without string ts/device/kind, keeps order", () => {
+  const good1 = { ts: "2026-07-20T10:00:00Z", device: "d1", kind: "card.create", id: "tk_1" };
+  const good2 = { ts: "2026-07-20T11:00:00Z", device: "d2", kind: "x" };
+  const raw: unknown[] = [
+    null, 7, "line", [], {}, good1,
+    { ts: 1, device: "d", kind: "k" },
+    { ts: "t", device: null, kind: "k" },
+    { ts: "t", device: "d" },
+    good2,
+  ];
+  assert.deepEqual(wellFormed(raw), [good1, good2]);
+  assert.deepEqual(wellFormed(null), []);
+  assert.deepEqual(wellFormed({ ts: "t" }), []);
+  assert.equal(isWellFormedEvent(good1), true);
+  assert.equal(isWellFormedEvent([good1]), false);
+  // The renderers survive what's left.
+  const v: Viewer = { me: "d1", owner: "" };
+  const shown = boardActivity(wellFormed(raw), { showSync: true, limit: 10 }).items;
+  assert.deepEqual(shown.map((e) => deviceLabel(e.device, v)), ["unknown d2", "You"]);
+  assert.equal(knownTitles(wellFormed(raw)).size, 0);
 });

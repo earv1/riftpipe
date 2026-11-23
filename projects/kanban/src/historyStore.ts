@@ -3,7 +3,7 @@
 // changes never re-render the board (`App.tsx`'s `watch` ignores them too).
 import { createSignal } from "solid-js";
 import { readEvents, watchEvents, type RiftEvent } from "./events.ts";
-import { dedupe } from "./history.ts";
+import { dedupe, wellFormed } from "./history.ts";
 
 const [events, setEvents] = createSignal<RiftEvent[]>([]);
 const [now, setNow] = createSignal(Date.now());
@@ -15,7 +15,8 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 
 async function reload(): Promise<void> {
   try {
-    setEvents(dedupe(await readEvents()));
+    // Malformed lines (any peer can write events/* on an open board) are dropped.
+    setEvents(dedupe(wellFormed(await readEvents())));
   } catch {
     /* storage unavailable — keep the last view */
   }

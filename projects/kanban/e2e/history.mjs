@@ -3,6 +3,7 @@
 //     peers (no reload), with "You" vs a peer's handle + short id;
 //   - per-keystroke title saves coalesce into ONE card.edit;
 //   - events/* changes never re-render the board (boardRefreshes unchanged);
+//   - malformed event lines from a peer are dropped, not rendered or fatal;
 //   - mesh.merge rows hide behind "Show sync events";
 //   - 120 concurrent appends lose nothing and rotate into immutable segments,
 //     which sync to the peer byte-for-byte (after one settling append — gossip
@@ -160,6 +161,19 @@ try {
   const n1 = await b.evaluate(() => window.riftpipe.boardRefreshes());
   if (n1 !== n0) fail(`an events/* change must not refresh the board: boardRefreshes ${n0} → ${n1}`);
   console.log(`✓ test.ping reached B's Activity; board refreshes unchanged (${n0})`);
+
+  // 9b. Malformed lines in a synced log (any peer can write events/* on an
+  // open board) are dropped; the history view keeps rendering live.
+  await a.evaluate(() => window.riftpipe.writeFile("events/zz-malformed.jsonl", 'null\n{}\n{"kind":1}\n[1]\n"str"\n{"ts":"t","device":7,"kind":"k"}\n'));
+  if (!(await until(async () => (await b.evaluate(() => window.riftpipe.listDir("events"))).includes("zz-malformed.jsonl"), 15000))) {
+    fail("B should receive the malformed log file");
+  }
+  await a.evaluate(() => window.riftpipe.logEvent("test.after-malformed", {}));
+  if (!(await until(async () => (await rows(b, ".activity")).some((r) => r.kind === "test.after-malformed"), 15000))) {
+    fail("B's Activity should keep updating after malformed event lines arrive");
+  }
+  if ((await rows(b, ".activity")).some((r) => !r.kind || r.kind === "k")) fail("malformed lines must not render as rows");
+  console.log("✓ malformed event lines dropped; B's Activity still live");
 
   // 10. Sync events are hidden until toggled on.
   if ((await rows(b, ".activity")).some((r) => r.kind === "mesh.merge")) fail("mesh.merge rows should be hidden by default");

@@ -95,6 +95,21 @@ export function knownTitles(evs: HistoryEvent[]): Map<string, string> {
   return titles;
 }
 
+/** Whether `x` has an event's required shape: an object with string `ts`,
+ *  `device` and `kind`. Any peer with the link can write `events/*.jsonl` on an
+ *  open board, so a line like `null`, `{}` or `{"kind":1}` must not reach the
+ *  renderers (which call string methods on those fields). */
+export function isWellFormedEvent(x: unknown): x is HistoryEvent {
+  if (typeof x !== "object" || x === null || Array.isArray(x)) return false;
+  const e = x as Record<string, unknown>;
+  return typeof e.ts === "string" && typeof e.device === "string" && typeof e.kind === "string";
+}
+
+/** Only the well-formed events of `xs` (`[]` if `xs` isn't an array), in order. */
+export function wellFormed(xs: unknown): HistoryEvent[] {
+  return Array.isArray(xs) ? xs.filter(isWellFormedEvent) : [];
+}
+
 /** Drop exact duplicate lines (e.g. a merge seeing the same event twice),
  *  keeping the first occurrence and the original order. */
 export function dedupe<T extends HistoryEvent>(evs: T[]): T[] {
