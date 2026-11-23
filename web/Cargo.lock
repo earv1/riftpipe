@@ -3009,6 +3009,7 @@ dependencies = [
  "iroh",
  "iroh-gossip",
  "js-sys",
+ "p256",
  "postcard",
  "riftpipe-core",
  "serde",

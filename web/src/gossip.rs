@@ -174,7 +174,8 @@ impl MeshKeepAlive {
 use riftpipe_core::sync::MeshMsg;
 
 use riftpipe_core::epoch::{AccessMode, EpochAnnounce, EpochBook, Ingested};
-use riftpipe_core::identity::{DeviceKey, Role, TrustEntry, TrustLog};
+use riftpipe_core::identity::{passkey_link_challenge, DeviceKey, Role, TrustEntry, TrustLog};
+use riftpipe_core::passkey::{PasskeyAssertion, PasskeyCredential};
 use riftpipe_core::onboard::JoinRequest;
 use riftpipe_core::sync::SyncMsg;
 
@@ -390,6 +391,76 @@ impl Auth {
         self.add_trust(e.clone());
         let mut acc = self.maintain();
         acc.send.insert(0, MeshMsg::Trust(e));
+        Some(acc)
+    }
+
+    /// Register `cred` as a board passkey conferring Admin (we must be an Admin): a
+    /// device of ours presenting an assertion from it later joins with no approve click.
+    /// `None` if we can't, or it's already registered.
+    fn register_passkey(&mut self, cred: PasskeyCredential) -> Option<Accepted> {
+        if !self.is_admin() || self.trust.passkeys().iter().any(|(c, _)| c.id == cred.id) {
+            return None;
+        }
+        let e = self.identity.register_passkey(cred, Role::Admin, Self::fresh_nonce());
+        self.add_trust(e.clone());
+        Some(Accepted { send: vec![MeshMsg::Trust(e)], ..Default::default() })
+    }
+
+    /// "Claim with passkey": claim the board if unclaimed, then register `cred`.
+    /// `(registered, what to broadcast)` — broadcast even when registration fails
+    /// (the claim itself must still go out).
+    fn claim_with_passkey(&mut self, cred: PasskeyCredential) -> (bool, Accepted) {
+        let mut acc = Accepted::default();
+        if !self.locked() {
+            if let Some(l) = self.lock_as_author() {
+                acc.merge(l);
+            }
+        }
+        let reg = self.register_passkey(cred);
+        let ok = reg.is_some();
+        acc.merge(reg.unwrap_or_default());
+        (ok, acc)
+    }
+
+    /// Registered passkeys usable from relying party `rp_id` (a credential asserts only on its own RP id).
+    fn passkeys_for(&self, rp_id: &str) -> Vec<PasskeyCredential> {
+        self.trust.passkeys().into_iter().map(|(c, _)| c).filter(|c| c.rp_id == rp_id).collect()
+    }
+
+    /// What a passkey-link ceremony needs: `(challenge, nonce, credentials to allow)`.
+    /// `None` if there's nothing to link: no genesis yet, already authorized, or no
+    /// passkey registered for `rp_id`.
+    fn passkey_link_ask(&self, rp_id: &str) -> Option<([u8; 32], [u8; 16], Vec<PasskeyCredential>)> {
+        let founder = self.trust.founder()?;
+        if self.authorized() {
+            return None;
+        }
+        let creds = self.passkeys_for(rp_id);
+        if creds.is_empty() {
+            return None;
+        }
+        let nonce = Self::fresh_nonce();
+        Some((passkey_link_challenge(&founder, &self.my_id(), &nonce), nonce, creds))
+    }
+
+    /// Join with a passkey assertion (from the ceremony `passkey_link_ask` set up). It
+    /// is verified locally first, so a failed attempt is neither stored nor sent. On
+    /// success: the `PasskeyLink` entry, then our read request (so an online Admin
+    /// wraps us into the current epoch). `None` if it doesn't verify or authorize us.
+    fn link_by_passkey(&mut self, cred_id: Vec<u8>, nonce: [u8; 16], assertion: PasskeyAssertion) -> Option<Accepted> {
+        let founder = self.trust.founder()?;
+        let (cred, _) = self.trust.passkeys().into_iter().find(|(c, _)| c.id == cred_id)?;
+        if !cred.verify(&assertion, &passkey_link_challenge(&founder, &self.my_id(), &nonce)) {
+            return None;
+        }
+        let e = TrustEntry::PasskeyLink { device: self.my_id(), cred_id, nonce, assertion };
+        self.add_trust(e.clone());
+        if !self.authorized() {
+            return None;
+        }
+        let mut acc = self.maintain();
+        acc.send.insert(0, MeshMsg::Trust(e));
+        acc.send.extend(self.read_request());
         Some(acc)
     }
 
@@ -642,7 +713,7 @@ fn local_storage() -> Option<web_sys::Storage> {
 }
 
 /// Store `value` as `hex(postcard(value))` under `key`.
-fn store_hex_postcard<T: serde::Serialize>(key: &str, value: &T) {
+pub(crate) fn store_hex_postcard<T: serde::Serialize>(key: &str, value: &T) {
     if let Some(store) = local_storage() {
         let bytes = postcard::to_allocvec(value).unwrap_or_default();
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -651,7 +722,7 @@ fn store_hex_postcard<T: serde::Serialize>(key: &str, value: &T) {
 }
 
 /// Read a `hex(postcard(T))` value from `key`; `None` if absent or undecodable.
-fn load_hex_postcard<T: serde::de::DeserializeOwned>(key: &str) -> Option<T> {
+pub(crate) fn load_hex_postcard<T: serde::de::DeserializeOwned>(key: &str) -> Option<T> {
     decode_hex_postcard(&local_storage()?.get_item(key).ok()??)
 }
 
@@ -1152,6 +1223,36 @@ impl GossipTreeSync {
         }
     }
 
+    /// "Claim with passkey": claim the board if unclaimed, then register `cred` as a
+    /// board passkey. `false` if we can't (not unclaimed-by-us, or already registered).
+    pub fn claim_with_passkey(&self, cred: PasskeyCredential) -> bool {
+        // Bind first so the auth borrow is released before `dispatch` re-borrows.
+        let (ok, acc) = self.auth.borrow_mut().claim_with_passkey(cred);
+        let topic = self.auth.borrow().topic;
+        mark_claimed_if_due(&self.auth, topic);
+        self.dispatch(acc);
+        ok
+    }
+
+    /// What a passkey-link ceremony needs on this board: `(challenge, nonce,
+    /// credentials to allow)` for relying party `rp_id`.
+    pub fn passkey_link_ask(&self, rp_id: &str) -> Option<([u8; 32], [u8; 16], Vec<PasskeyCredential>)> {
+        self.auth.borrow().passkey_link_ask(rp_id)
+    }
+
+    /// Join with a passkey assertion against credential `cred_id`, broadcasting the
+    /// link live. `false` if it doesn't verify or authorize us.
+    pub fn link_by_passkey(&self, cred_id: Vec<u8>, nonce: [u8; 16], assertion: PasskeyAssertion) -> bool {
+        let acc = self.auth.borrow_mut().link_by_passkey(cred_id, nonce, assertion);
+        match acc {
+            Some(acc) => {
+                self.dispatch(acc);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Ask to become a writer on a locked board — broadcast a signed join
     /// request so the owner sees it and can approve. `false` when there's
     /// nothing to ask (open board, or already authorized).
@@ -1205,12 +1306,15 @@ impl GossipTreeSync {
     }
 
     /// JSON snapshot for the UI: `{locked, device, authorized, isAuthor, author,
-    /// requested, canRead, epoch}` — `requested` is true once we've asked and are
-    /// still waiting; `canRead` is false on a claimed board until this device is
-    /// wrapped into the latest epoch (or after it was removed); `epoch` is the
-    /// latest epoch seq we hold (0 = none).
+    /// requested, canRead, epoch, isAdmin, passkeys, passkeyHere}` — `requested` is
+    /// true once we've asked and are still waiting; `canRead` is false on a claimed
+    /// board until this device is wrapped into the latest epoch (or after it was
+    /// removed); `epoch` is the latest epoch seq we hold (0 = none); `passkeys` is
+    /// how many passkeys are registered on the board; `passkeyHere` is whether one
+    /// of them is usable from this page's relying party (hostname).
     pub fn auth_state(&self) -> String {
         let a = self.auth.borrow();
+        let host = web_sys::window().and_then(|w| w.location().hostname().ok()).unwrap_or_default();
         serde_json::json!({
             "locked": a.locked(),
             "device": hex32(&a.my_id()),
@@ -1220,6 +1324,9 @@ impl GossipTreeSync {
             "requested": a.my_request.is_some(),
             "canRead": a.can_read(),
             "epoch": a.epochs.latest_held_seq().unwrap_or(0),
+            "isAdmin": a.is_admin(),
+            "passkeys": a.trust.passkeys().len(),
+            "passkeyHere": !a.passkeys_for(&host).is_empty(),
         })
         .to_string()
     }
@@ -1353,11 +1460,28 @@ pub(crate) fn active_pending_requests() -> String {
     GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.pending_requests()).unwrap_or_else(|| "[]".into()))
 }
 
+/// "Claim with passkey" on the active board: claims it if unclaimed, then
+/// registers `cred`. `false` when not connected.
+pub(crate) fn active_claim_with_passkey(cred: PasskeyCredential) -> bool {
+    GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.claim_with_passkey(cred)).unwrap_or(false))
+}
+
+/// What a passkey-link ceremony needs on the active board for relying party
+/// `rp_id`. `None` when not connected.
+pub(crate) fn active_passkey_link_ask(rp_id: &str) -> Option<([u8; 32], [u8; 16], Vec<PasskeyCredential>)> {
+    GOSSIP.with(|c| c.borrow().as_ref().and_then(|bs| bs.passkey_link_ask(rp_id)))
+}
+
+/// Join the active board with a passkey assertion. `false` when not connected.
+pub(crate) fn active_link_by_passkey(cred_id: Vec<u8>, nonce: [u8; 16], assertion: PasskeyAssertion) -> bool {
+    GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.link_by_passkey(cred_id, nonce, assertion)).unwrap_or(false))
+}
+
 /// Auth state of the active board (JSON), or a safe default when not connected.
 pub(crate) fn active_auth_state() -> String {
     GOSSIP.with(|c| {
         c.borrow().as_ref().map(|bs| bs.auth_state()).unwrap_or_else(|| {
-            r#"{"locked":false,"device":"","authorized":false,"isAuthor":false,"author":"","requested":false,"canRead":true,"epoch":0}"#.into()
+            r#"{"locked":false,"device":"","authorized":false,"isAuthor":false,"author":"","requested":false,"canRead":true,"epoch":0,"isAdmin":false,"passkeys":0,"passkeyHere":false}"#.into()
         })
     })
 }
@@ -1713,5 +1837,77 @@ mod tests {
             "joiner received the file over the gossip mesh: {:?}",
             got.borrow(),
         );
+    }
+
+    fn soft_passkey(seed: u8, rp: &str) -> (p256::ecdsa::SigningKey, PasskeyCredential) {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+        let point = p256::ecdsa::VerifyingKey::from(&sk).to_encoded_point(false);
+        let cred = PasskeyCredential {
+            id: vec![seed; 16],
+            alg: riftpipe_core::passkey::ALG_ES256,
+            public_key: point.as_bytes().to_vec(),
+            rp_id: rp.into(),
+        };
+        (sk, cred)
+    }
+    fn soft_assert(sk: &p256::ecdsa::SigningKey, rp: &str, challenge: &[u8]) -> PasskeyAssertion {
+        use p256::ecdsa::signature::Signer as _;
+        let mut ad = riftpipe_core::passkey::rp_id_hash(rp).to_vec();
+        ad.extend_from_slice(&[0x05, 0, 0, 0, 0]);
+        let cdj = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"http://{rp}","crossOrigin":false}}"#,
+            riftpipe_core::passkey::b64url(challenge)
+        )
+        .into_bytes();
+        let sig: p256::ecdsa::Signature = sk.sign(&riftpipe_core::passkey::assertion_message(&ad, &cdj));
+        PasskeyAssertion { authenticator_data: ad, client_data_json: cdj, signature: sig.to_der().as_bytes().to_vec() }
+    }
+
+    /// Offline: the owner claims with a passkey; a second device of the same person
+    /// links by assertion (no approve click), becomes an Admin, and is wrapped into the
+    /// epoch from its read request. A wrong passkey can't link; a third peer verifies
+    /// the link offline and isn't authorized by it.
+    #[wasm_bindgen_test]
+    fn passkey_claim_then_link_a_second_device() {
+        let topic = riftpipe_core::crypto::generate_secret;
+        let mut a = Auth::load(DeviceKey::from_seed(&[81; 32]), topic());
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let (ok, claim) = a.claim_with_passkey(cred.clone());
+        assert!(ok && a.is_author(), "claimed and registered");
+        assert_eq!(a.passkeys_for("localhost"), vec![cred.clone()]);
+        assert!(a.passkeys_for("earv1.github.io").is_empty(), "a credential only asserts on its own RP id");
+        let early = a.sign(SyncMsg::Lww { path: "early".into(), version: 1, bytes: b"0".to_vec() }).unwrap();
+
+        let mut b = Auth::load(DeviceKey::from_seed(&[82; 32]), topic());
+        deliver(&claim, &mut b);
+        assert!(b.locked() && !b.authorized());
+        let (no, none) = b.claim_with_passkey(soft_passkey(3, "localhost").1);
+        assert!(!no && none.send.is_empty(), "a non-admin can't register a passkey");
+        assert!(b.passkey_link_ask("other.example").is_none());
+        let (challenge, nonce, creds) = b.passkey_link_ask("localhost").expect("a passkey to link with");
+        assert_eq!(creds, vec![cred.clone()]);
+
+        let (other_sk, _) = soft_passkey(2, "localhost");
+        assert!(b.link_by_passkey(cred.id.clone(), nonce, soft_assert(&other_sk, "localhost", &challenge)).is_none());
+        assert!(!b.authorized(), "a different passkey can't link");
+
+        let link = b.link_by_passkey(cred.id.clone(), nonce, soft_assert(&sk, "localhost", &challenge)).expect("linked");
+        assert!(b.authorized() && b.is_admin(), "a passkey-linked device is an Admin");
+        assert!(matches!(link.send[0], MeshMsg::Trust(TrustEntry::PasskeyLink { .. })));
+        assert!(link.send.iter().any(|m| matches!(m, MeshMsg::Request(_))), "asks to be wrapped in");
+
+        let mut wrap = Accepted::default();
+        for m in &link.send {
+            wrap.merge(a.accept(dup(m)));
+        }
+        assert_eq!(a.trust.role(&b.my_id()), Some(Role::Admin), "the owner verified the passkey offline");
+        deliver(&wrap, &mut b);
+        assert!(b.can_read(), "the owner wrapped the linked device into the epoch");
+        assert_eq!(b.accept(dup(&early)).apply.len(), 1, "it opens content sealed before it linked");
+
+        let mut c = Auth::load(DeviceKey::from_seed(&[83; 32]), topic());
+        deliver(&claim, &mut c);
+        c.accept(dup(&link.send[0]));
+        assert!(c.trust.is_authorized(&b.my_id()) && !c.authorized(), "c verifies b's link; it authorizes b, not c");
     }
 }
