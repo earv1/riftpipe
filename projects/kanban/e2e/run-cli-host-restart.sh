@@ -6,7 +6,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$ROOT"
-PORT=8153
+PORT="${PORT:-8153}"
 NDIR="$(mktemp -d)"
 export CC_wasm32_unknown_unknown="${CC_wasm32_unknown_unknown:-$(brew --prefix llvm)/bin/clang}"
 export AR_wasm32_unknown_unknown="${AR_wasm32_unknown_unknown:-$(brew --prefix llvm)/bin/llvm-ar}"
@@ -18,6 +18,8 @@ echo "== build wasm + bundle + native =="
 cargo build --quiet --bin riftpipe || exit 1
 
 echo "== serve dist on $PORT =="
+# Another checkout's preview on this port would silently serve ITS bundle.
+if curl -fsS "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then echo "port $PORT is already serving — rerun with PORT=<free port>"; exit 1; fi
 ( cd projects/kanban && deno run -A npm:vite preview --port $PORT --strictPort ) >/tmp/chr-preview.log 2>&1 &
 PREVIEW=$!
 NREAL="$(cd "$NDIR" && pwd -P)"
