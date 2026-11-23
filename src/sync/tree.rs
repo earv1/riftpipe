@@ -601,6 +601,10 @@ impl TreePeer {
     /// The wrap follows via maintenance — the request already taught the book the
     /// device's key.
     pub fn approve_request(&mut self, id: [u8; 32], dir: &Path) -> Vec<MeshMsg> {
+        if !self.device_id().is_some_and(|me| self.trust.role(&me) == Some(Role::Admin)) {
+            eprintln!("[auth] approve ignored: this device is not an Admin — run `riftpipe approve` on an Admin's dir");
+            return Vec::new();
+        }
         let Some(req) = self.requests.iter().find(|r| r.request.device_id == id).map(|r| &r.request) else {
             eprintln!(
                 "[auth] approve ignored: no pending request from {} — `riftpipe grant {} <device-id>` authorizes a device by id",
@@ -1198,6 +1202,31 @@ mod tests {
         assert!(founder.approve_request([9u8; 32], &df).is_empty());
         assert_eq!(founder.members().len(), 1, "only the founder");
         std::fs::remove_dir_all(&df).ok();
+    }
+
+    /// A Member keeps the request list too (and shows it), but can't approve:
+    /// approve refuses up front instead of announcing an approval that fails.
+    #[test]
+    fn approve_on_a_non_admin_peer_is_refused() {
+        let (df, dm) = (dir("approve-member-f"), dir("approve-member-m"));
+        let mut founder = founder_peer();
+        let mut member = restricted_peer(5);
+        let mid = member.device_id().unwrap();
+        founder.authorize_and_apply(member.read_request().unwrap(), &df);
+        for m in founder.auth_catchup().into_iter().chain(founder.approve_request(mid, &df)) {
+            member.authorize_and_apply(m, &dm);
+        }
+        assert_eq!(member.members().len(), 2, "the member knows both devices");
+
+        member.authorize_and_apply(request_from(&[8u8; 32], "Carol"), &dm);
+        assert_eq!(member.pending_requests().len(), 1, "a Member sees the request");
+        let carol = DeviceKey::from_seed(&[8u8; 32]).id();
+        assert!(member.approve_request(carol, &dm).is_empty());
+        assert_eq!(member.members().len(), 2, "nothing granted");
+        assert_eq!(member.pending_requests().len(), 1, "the request stays for an Admin");
+        for d in [&df, &dm] {
+            std::fs::remove_dir_all(d).ok();
+        }
     }
 
     #[test]

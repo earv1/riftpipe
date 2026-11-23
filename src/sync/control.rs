@@ -226,11 +226,19 @@ fn label_for(name: &str, safety: &str) -> String {
 /// requests. Returns the device id, plus a human label when a matching
 /// request's name/safety is known. Codes are refused once the peer's request
 /// list overflowed ([`inbox_overflowed`]): a dropped request isn't listed, so a
-/// listed one could have been ground to share its 32-bit code.
+/// listed one could have been ground to share its 32-bit code. A state whose
+/// `role` isn't `"admin"` is refused outright: that peer can't approve.
 pub fn resolve_approve_target(
     state: Option<&serde_json::Value>,
     arg: &str,
 ) -> Result<([u8; 32], Option<String>), String> {
+    if let Some(role) = state.and_then(|s| s.get("role")) {
+        if role.as_str() != Some("admin") {
+            return Err("the peer running on this dir is not an Admin of the board, so it can't approve — \
+                        run `riftpipe approve` on an Admin's dir"
+                .to_string());
+        }
+    }
     let t = normalize_code(arg);
     if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
         let id = hex32(&t).ok_or_else(|| "expected a 64-hex device id or an 8-hex safety code".to_string())?;
@@ -431,6 +439,22 @@ mod tests {
         ]});
         let err = resolve_approve_target(Some(&two), "a1b2c3d4").unwrap_err();
         assert!(err.contains("several"), "{err}");
+    }
+
+    #[test]
+    fn resolve_approve_target_refuses_a_non_admin_peer() {
+        let device = "ab".repeat(32);
+        for role in [json!("member"), json!(null)] {
+            let state = json!({"role": role,
+                "requests": [{"device": device, "name": "Bob", "safety": "a1b2 c3d4"}]});
+            for arg in ["a1b2c3d4", device.as_str()] {
+                let err = resolve_approve_target(Some(&state), arg).unwrap_err();
+                assert!(err.contains("not an Admin"), "{role} {arg}: {err}");
+            }
+        }
+        let admin = json!({"role": "admin",
+            "requests": [{"device": device, "name": "Bob", "safety": "a1b2 c3d4"}]});
+        assert!(resolve_approve_target(Some(&admin), "a1b2c3d4").is_ok());
     }
 
     #[test]
