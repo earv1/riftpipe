@@ -35,7 +35,8 @@ A working vertical slice over a board *directory* (no SQLite, no new sync engine
 - **Per-device append-only event log** (`events/<device-id>.jsonl`, one file
   per device → merges with zero conflicts) — a generic riftpipe-web primitive
   (`logEvent`/`readEvents`); `board.ts` logs card/comment events through
-  `src/events.ts`, the library adds `mesh.merge` + `auth.*`. Not rendered yet.
+  `src/events.ts`, the library adds `mesh.merge` + `auth.*`. Now rendered:
+  Activity panel + card History (see below).
 - **Realtime:** in-page — mutations go straight to the Solid store; remote
   merges fire `riftpipe:file-changed`, which `fs.ts`'s `watch` funnels (with
   local writes and sibling tabs) into a reconcile (only the changed card
@@ -105,8 +106,8 @@ Roughly priority order. Most of this is *wiring and UI*, not new sync code.
   their pushes through it over the BroadcastChannel.
 - **WebSocket-based presence** — "who's viewing/editing this card" (a separate
   channel; cursors/avatars are decorations, never part of the text/file model).
-- **History view** over `readEvents()` — render the merged `events/*.jsonl`
-  timeline (the log is already produced; this is the UI for it).
+- ~~**History view** over `readEvents()`~~ *(done — board-wide Activity panel
+  + per-card History; see Status)*.
 - **Attachments UI** — drop/upload into `attachments/`; rsync carries the bytes.
 - **Per-field `meta.toml` merge** — a future `lww-record` Syncer doing *per-key*
   LWW (each key carries a lamport+site; merge takes the max per key) so concurrent

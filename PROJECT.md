@@ -123,8 +123,11 @@ src/:
   `riftpipe:file-changed`), the kanban domain moved to TypeScript
   (`board.ts`/`fs.ts`) and `kanban-wasm`'s `format`/`handler` Rust was
   deleted; plus a generic synced **event log** (`logEvent`/`readEvents`,
-  `events/<device-id>.jsonl`, `riftpipe:event`). Details:
-  `docs/planned/roadmap.md` §Security and items 8/17.
+  `events/<device-id>.jsonl`, `riftpipe:event`), now rendered by the kanban
+  Activity panel (board-wide) and per-card History (branch `history-view`):
+  segment rotation at 16 KiB, a per-tab writer queue, coalesced
+  `mesh.merge`/`card.edit` logging, and reserved `ts`/`device`/`kind` fields.
+  Details: `docs/planned/roadmap.md` §Security and items 8/17.
 - **Epoch-key mesh seal** (branch `epoch-seal`, July 2026): restricted/claimed
   boards now seal content under a rotating epoch key (`core::epoch`,
   `PROTOCOL_VERSION` 4) — read revocation by rotation, not just write-revoke.
@@ -174,8 +177,10 @@ Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
    runs on epoch keys, read revocation by rotation, and
    `riftpipe revoke|grant <dir> <id>` on the native CLI (see `What's done`).
    Remaining: the WebAuthn browser ceremony.
-8. **History view** — render `readEvents()` (the event log is produced but
-   nothing displays it yet).
+8. ~~**History view**~~ — *done:* `readEvents()` is rendered by the kanban
+   board-wide Activity panel and per-card History (branch `history-view`),
+   verified end-to-end over the real sealed mesh by
+   `projects/kanban/e2e/run-history.sh`.
 Older/parallel: file-mirror reconnection;
 verify connect-anywhere on real networks (§14.1); domain + landing.
 
