@@ -21,6 +21,9 @@ import {
   requestAccess,
   pendingRequests,
   authState,
+  passkeySupported,
+  claimWithPasskey,
+  linkWithPasskey,
 } from "../wasm/pkg/kanban_wasm.js";
 import { ready, watch } from "./fs.ts";
 import { readEvents } from "./events.ts";
@@ -43,7 +46,10 @@ export { logEvent, readEvents, onEvent, type RiftEvent } from "./events.ts";
 //   riftpipe.grantDevice(id)     → author-only: approve a device to write
 //   riftpipe.revokeDevice(id)    → admin-only: remove a device (rotates the read key)
 //   riftpipe.boardMembers()      → authorized devices [{device,role,founder,me}]
-//   riftpipe.authState()         → { locked, device, authorized, isAuthor, author, requested, canRead, epoch }
+//   riftpipe.authState()         → { locked, device, authorized, isAuthor, author, requested, canRead, epoch, isAdmin, passkeys, passkeyHere }
+//   riftpipe.passkeySupported()  → can this page use passkey device-linking (secure domain origin)?
+//   riftpipe.claimWithPasskey()  → claim the board (if unclaimed) and register a passkey — no approve click for other devices
+//   riftpipe.linkWithPasskey()   → join a claimed board by asserting its registered passkey — no approve click
 export type AuthState = {
   locked: boolean;
   device: string;
@@ -53,6 +59,9 @@ export type AuthState = {
   requested: boolean;
   canRead: boolean;
   epoch: number;
+  isAdmin: boolean;
+  passkeys: number;
+  passkeyHere: boolean;
 };
 export type PendingRequest = { device: string; name: string; safety: string };
 export type Member = { device: string; role: "admin" | "member"; founder: boolean; me: boolean };
@@ -65,6 +74,9 @@ export const auth = {
   revokeDevice: (id: string): boolean => revokeDevice(id),
   members: (): Member[] => JSON.parse(boardMembers()),
   state: (): AuthState => JSON.parse(authState()),
+  passkeySupported: (): boolean => passkeySupported(),
+  claimWithPasskey: (): Promise<boolean> => claimWithPasskey(),
+  linkWithPasskey: (): Promise<boolean> => linkWithPasskey(),
 };
 (globalThis as any).riftpipe = {
   connectedPeers: () => JSON.parse(connectedPeers()),
@@ -78,6 +90,9 @@ export const auth = {
   boardMembers: () => JSON.parse(boardMembers()),
   authState: () => JSON.parse(authState()),
   readEvents: () => readEvents(),
+  passkeySupported: () => passkeySupported(),
+  claimWithPasskey: () => claimWithPasskey(),
+  linkWithPasskey: () => linkWithPasskey(),
 };
 
 // Build-time config (Vite env). Set these for a deployed/cross-network build:
