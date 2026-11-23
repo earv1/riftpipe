@@ -235,6 +235,44 @@ in *whole files*, so the app's TypeScript maps cards and comments onto paths
 engine decomposes each write into per-file CRDT/LWW sync underneath — the same
 layout a native `riftpipe connect` working copy shows as real files.
 
+## Mesh reconnection
+
+A board's peers (browser tabs and `riftpipe connect` CLIs) share one
+iroh-gossip topic. When one of them reloads or restarts, it comes back as the
+*same* peer on the *same* board: its key and board secret persist (localStorage,
+or `<dir>/.riftpipe-host`), and its per-path sync history persists in the
+never-synced `.riftpipe-sync/` dir and is restored before the mesh starts. A
+`Hello` on every `NeighborUp` makes a one-sided reconnect pull what the other
+side has and we lack; a neighbor that re-dials us after a same-key restart is
+re-Joined, because iroh-gossip would otherwise leave the restarted side without
+a NeighborUp (`core::reconnect::SwapRejoin` documents the hyparview cause).
+Policy (backoff, peer book, swap re-Join, link state) lives in
+`core::reconnect`; both drivers (`src/sync/mesh.rs`, `web/src/gossip.rs`) apply it.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant J as joiner J
+    participant H as host H
+
+    Note over J,H: synced on the board's topic · each side's PeerBook notes the other
+    Note over H: H reloads / restarts — J keeps editing (gap edits)
+    Note over H: restore the Syncer from .riftpipe-sync records<br/>(same CRDT history + LWW versions) · same key ⇒ same EndpointId · same secret ⇒ same topic
+    H->>J: subscribe with its PeerBook ⇒ dial J by id
+    Note over J: gossip silently swaps in H's new connection<br/>a stale hyparview pending entry<br/>suppresses J's reply to H's Join
+    Note over J: SwapRejoin: a new connection from<br/>a CURRENT neighbor ⇒ re-Join it
+    J->>H: Join ⇒ NeighborUp on H
+    H->>J: Hello (version vectors + LWW inventory) + full_state
+    J->>H: reply to the Hello — exactly the gap ops / newer LWW files H lacks
+    alt H never reaches J (J noticed the loss first)
+        Note over J: NeighborDown ⇒ status reconnecting<br/>backoff rejoin to bootstrap + PeerBook (1 s, ×2, capped 16 s)
+        J->>H: re-join ⇒ NeighborUp on both sides
+        J->>H: Hello + full_state (H sends its own too)
+        H->>J: each side replies with what the other lacks
+    end
+    Note over J,H: converged · status connected on both sides
+```
+
 ## Known seams & wrinkles
 
 Fixed in the July 2026 restructure + review series:

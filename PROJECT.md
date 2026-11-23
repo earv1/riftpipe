@@ -133,6 +133,14 @@ src/:
   `run-epoch-revoke.sh` (native), `run-browser-auth.sh` /
   `e2e/epoch-revoke.mjs` (browser). Details: `docs/planned/roadmap.md`
   §Security.
+- **Live reconnection** (branch `live-reconnect`): a reloaded/restarted host or
+  joiner rejoins the same board and both sides exchange their gap edits —
+  durable sync records (`.riftpipe-sync/`), one reused page `gossip::Node`,
+  backoff rejoin + per-board peer book, Hello on NeighborUp, a persisted CLI
+  host identity (`<dir>/.riftpipe-host`, `--new-board`), and a status pill
+  (`meshStatus()` / `riftpipe:mesh-status`). Details: `docs/planned/roadmap.md`
+  §Networking ("Live reconnection — done"); e2e `run-reconnect.sh`,
+  `run-cli-host-restart.sh`.
 
 ## Planned (design docs)
 - **P2P kanban — files as the database** — see [`docs/planned/`](docs/planned/).
@@ -177,7 +185,8 @@ Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
 8. **History view** — render `readEvents()` (the event log is produced but
    nothing displays it yet).
 Older/parallel: file-mirror reconnection;
-verify connect-anywhere on real networks (§14.1); domain + landing.
+verify connect-anywhere on real networks (§14.1); verify reconnection on real
+networks (see roadmap, "Live reconnection — done"); domain + landing.
 
 ## Key gotchas / decisions to remember
 - **Deltas must use ENCODE_PATCH**, not ENCODE_FULL (ENCODE_FULL embeds the whole

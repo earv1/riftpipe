@@ -174,6 +174,24 @@ rotates.
   safely is kept in `.legacy-root/` (never synced). See
   `docs/security/architecture.md`.
 
+## Local state
+
+Live reconnection keeps a little state next to a board so a restart resumes the
+same board. None of it ever syncs (dot-paths are machine-local):
+
+- **`<dir>/.riftpipe-host`** (CLI `connect --accept`) holds the host's iroh secret
+  key **and the board secret**. The board secret is ticket-equivalent: anyone who
+  reads this file can join, read and (on an open board) write the board. Guard it
+  like `<dir>/.device`; it is written mode `0600`. `--new-board` deletes it and
+  mints a new board/link.
+- **`<dir>/.riftpipe-peers`** and the browser's `riftpipe:peers:<topic>`
+  localStorage key hold a per-board list of recently seen peer EndpointIds —
+  public ids only, no secrets.
+- **`.riftpipe-sync/`** (natively under `<dir>`, in OPFS per board) holds each
+  path's CRDT history / LWW version in plaintext, next to the plaintext files it
+  materializes — no more sensitive than the tree itself (though history can retain
+  text since deleted from a file).
+
 ## How other local-first / P2P systems handle this
 
 Researched 2026-07-19 from primary sources. The recurring patterns below are what
