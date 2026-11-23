@@ -40,8 +40,11 @@ board to Anyone-with-link (Viewer or Editor), so no approval step is needed.
 
 ## Request to join (Restricted mode)
 
-*(Shipped: browser Ask/Approve — `e2e/lock-grant.mjs`; CLI `--grant <id>` at
-startup or live via `riftpipe grant <dir> <id>`.)*
+*(Shipped: browser Ask/Approve — `e2e/lock-grant.mjs`; CLI `connect --restricted
+--name <text>` → `riftpipe requests <dir>` → `riftpipe approve <dir>
+<safety-code>`, interoperable with the browser both ways —
+`e2e/request-approve.mjs`. `--grant <id>` at startup and `riftpipe grant <dir>
+<id>` still authorize a device by id.)*
 
 When the board is **Restricted**, the link gets a newcomer onto the mesh but
 grants no access. They broadcast a **signed join request** (with a name/note so

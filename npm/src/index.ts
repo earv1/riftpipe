@@ -8,3 +8,13 @@ export { PipeSession, applyEditOp, type EditOp, type PipeSessionOpts } from "./p
 export { TreeSession, type TreeSessionOpts, type ProtocolMismatch } from "./tree.js";
 export { Serve, type ChangeEvent, type ServeOpts } from "./serve.js";
 export { spawnRiftpipe, type SpawnHandle } from "./process.js";
+export {
+  requests,
+  members,
+  approve,
+  grant,
+  revoke,
+  deviceId,
+  type PendingRequest,
+  type Member,
+} from "./auth.js";

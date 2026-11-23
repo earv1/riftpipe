@@ -3,11 +3,20 @@
 // `SYNCED:{path}` breadcrumb on stdout — the programmatic surface.
 
 import { spawnRiftpipe } from "./process.js";
+import type { PendingRequest } from "./auth.js";
 
 export interface TreeSessionOpts {
   cwd?: string;
   /** Signaling server URL for connection-id fallback targets. */
   signal?: string;
+  /** Device-linking auth: sign writes and enforce authorization. On `host()`,
+   * also self-signs the genesis. On `join()`, a keyless device broadcasts a
+   * signed join request instead of reading/writing until an admin approves it. */
+  restricted?: boolean;
+  /** `host()` only: device ids to authorize (as Members) at startup. */
+  grant?: string[];
+  /** `join()` only: display name on the broadcast join request. */
+  name?: string;
 }
 
 /** A peer speaking a different riftpipe protocol version (0 = pre-versioning). */
@@ -17,6 +26,22 @@ export interface ProtocolMismatch {
   ours: number;
 }
 
+/** Parse a restricted peer's inbox line for a new or changed join request:
+ *   [auth] access-request device=<64 hex> safety=<xxxx xxxx> name="..."
+ * `null` for any other line, or one whose name isn't valid JSON (a garbled
+ * line must not throw inside the stderr handler and take the host down). */
+export function parseAccessRequestLine(line: string): PendingRequest | null {
+  const r = line.match(/access-request device=([0-9a-f]{64}) safety=([0-9a-f]{4} [0-9a-f]{4}) name=(.*)$/);
+  if (!r) return null;
+  let name: unknown;
+  try {
+    name = JSON.parse(r[3]);
+  } catch {
+    return null;
+  }
+  return typeof name === "string" ? { device: r[1], safety: r[2], name } : null;
+}
+
 /** A live tree-sync session over `dir`. */
 export class TreeSession {
   /**
@@ -24,7 +49,10 @@ export class TreeSession {
    * prints joins browser AND CLI peers to the same mesh.
    */
   static host(dir: string, opts: TreeSessionOpts = {}): TreeSession {
-    return new TreeSession(["connect", "--accept", dir], opts);
+    const args = ["connect", "--accept", dir];
+    if (opts.restricted) args.push("--restricted");
+    for (const id of opts.grant ?? []) args.push("--grant", id);
+    return new TreeSession(args, opts);
   }
 
   /**
@@ -34,12 +62,16 @@ export class TreeSession {
   static join(target: string, dir: string, opts: TreeSessionOpts = {}): TreeSession {
     const args = ["connect", target, dir];
     if (opts.signal) args.push("--signal", opts.signal);
+    if (opts.restricted) args.push("--restricted");
+    if (opts.name) args.push("--name", opts.name);
     return new TreeSession(args, opts);
   }
 
   #proc: ReturnType<typeof spawnRiftpipe>;
   #syncedCbs: Array<(path: string) => void> = [];
   #mismatchCbs: Array<(m: ProtocolMismatch) => void> = [];
+  #accessRequestCbs: Array<(r: PendingRequest) => void> = [];
+  #readKeyCbs: Array<(epoch: number) => void> = [];
 
   private constructor(args: string[], opts: TreeSessionOpts) {
     this.#proc = spawnRiftpipe(args, opts);
@@ -57,6 +89,15 @@ export class TreeSession {
         const ev = { peer: m[1], theirs: Number(m[2]), ours: Number(m[3]) };
         for (const cb of this.#mismatchCbs) cb(ev);
       }
+      const req = parseAccessRequestLine(line);
+      if (req) {
+        for (const cb of this.#accessRequestCbs) cb(req);
+      }
+      const k = line.match(/\[epoch\] read key acquired \(epoch (\d+)\)/);
+      if (k) {
+        const epoch = Number(k[1]);
+        for (const cb of this.#readKeyCbs) cb(epoch);
+      }
     });
   }
 
@@ -73,6 +114,19 @@ export class TreeSession {
   /** Fires once per peer whose riftpipe protocol version differs from ours. */
   onProtocolMismatch(cb: (m: ProtocolMismatch) => void): void {
     this.#mismatchCbs.push(cb);
+  }
+
+  /** Restricted mode: fires on a new or changed join request this peer sees
+   * (any restricted peer, not just an Admin — an Admin additionally gets an
+   * approve hint, logged but not parsed here). */
+  onAccessRequest(cb: (r: PendingRequest) => void): void {
+    this.#accessRequestCbs.push(cb);
+  }
+
+  /** Restricted mode: fires once this (joiner) device is wrapped into an
+   * epoch and can read sealed content. */
+  onReadKey(cb: (epoch: number) => void): void {
+    this.#readKeyCbs.push(cb);
   }
 
   /** Wait until `path` (relative to the dir) has been synced from a peer. */

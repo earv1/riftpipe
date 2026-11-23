@@ -88,3 +88,24 @@ export function spawnRiftpipe(
     },
   };
 }
+
+/** One-shot riftpipe invocation (e.g. `requests`/`approve`/`members`, `device-id`):
+ * spawn, collect both streams, resolve once the process exits. */
+export function runRiftpipe(
+  args: string[],
+  opts: { cwd?: string } = {},
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(riftpipeBinary(), args, { cwd: opts.cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout!.on("data", (d) => {
+      stdout += d;
+    });
+    child.stderr!.on("data", (d) => {
+      stderr += d;
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => resolve({ code, stdout, stderr }));
+  });
+}

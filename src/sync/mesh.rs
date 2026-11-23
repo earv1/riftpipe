@@ -135,6 +135,45 @@ pub async fn join_and_run(
     run(conn, dir, peer, rx, poll).await
 }
 
+/// The last `.riftpipe-auth.json` write: the unstamped snapshot text, and when.
+#[derive(Default)]
+struct StateWrite {
+    text: String,
+    at: Option<std::time::Instant>,
+}
+
+/// Removes `<dir>/.riftpipe-auth.json` when the mesh loop ends, however it ends.
+struct StateFileGuard(PathBuf);
+
+impl Drop for StateFileGuard {
+    fn drop(&mut self) {
+        crate::sync::control::remove_state(&self.0);
+    }
+}
+
+/// Resolves on Ctrl-C, or SIGTERM on unix (what `kill` and Node's `proc.kill()` send).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// Drive an already-joined [`MeshConn`] (joiner OR host role) over `dir`.
 pub async fn run(
     conn: MeshConn,
@@ -165,6 +204,13 @@ pub async fn run(
     let mut rescan = interval(Duration::from_secs(2));
     rescan.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut rx_open = true;
+    // Last-written `.riftpipe-auth.json` snapshot (unstamped text + when), so we
+    // rewrite the file only when it changed or the heartbeat is due.
+    let mut last_state = StateWrite::default();
+    // The snapshot describes THIS session: remove it however the loop ends
+    // (signal, gossip stream end, error), so `riftpipe requests|members|approve`
+    // don't read a dead peer's state.
+    let _state_guard = StateFileGuard(dir.to_path_buf());
 
     // Files that predate the session must be in the syncer BEFORE any
     // NeighborUp, or the full_state() catch-up broadcasts an empty tree
@@ -173,6 +219,14 @@ pub async fn run(
     // A restricted founder mints epoch 1 here. The announces stay in the book
     // and reach peers through the `NeighborUp` catch-up.
     let _ = peer.startup();
+    // Prime the auth state snapshot — or, when this session has no identity
+    // (not `--restricted`), clear a stale one an earlier restricted session on
+    // this dir left behind (e.g. after a crash).
+    if peer.auth_state_json().is_none() {
+        crate::sync::control::remove_state(dir);
+    } else {
+        sync_state(peer, dir, &mut last_state);
+    }
 
     // A failed send must not kill the session (convergence is repaired by the
     // next catch-up), but it must be VISIBLE — a silently dropped broadcast
@@ -233,8 +287,44 @@ pub async fn run(
     let mut control_tick = interval(Duration::from_secs(1));
     control_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // A keyless restricted peer re-announces its join request: an Admin who
+    // comes online later, or who isn't a direct neighbor, still sees it.
+    const REQUEST_REANNOUNCE: Duration = Duration::from_secs(15);
+    let mut request_tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + REQUEST_REANNOUNCE, REQUEST_REANNOUNCE);
+    request_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    /// Rewrite `.riftpipe-auth.json` when the snapshot changed, or every
+    /// `STATE_HEARTBEAT_SECS` so its `updatedAt` shows the peer is alive. Each
+    /// write is stamped with `pid` + `updatedAt` (unix seconds).
+    fn sync_state(peer: &TreePeer, dir: &Path, last: &mut StateWrite) {
+        use crate::sync::control::{write_state, STATE_HEARTBEAT_SECS};
+        let Some(mut json) = peer.auth_state_json() else { return };
+        let text = json.to_string();
+        let heartbeat_due =
+            last.at.is_none_or(|t| t.elapsed() >= Duration::from_secs(STATE_HEARTBEAT_SECS));
+        if text == last.text && !heartbeat_due {
+            return;
+        }
+        json["pid"] = std::process::id().into();
+        json["updatedAt"] = (now_ms() / 1000).into();
+        match write_state(dir, &serde_json::to_string_pretty(&json).unwrap_or_default()) {
+            Ok(()) => *last = StateWrite { text, at: Some(std::time::Instant::now()) },
+            Err(e) => eprintln!("[auth] writing .riftpipe-auth.json failed: {e}"),
+        }
+    }
+
+    // A clean stop on Ctrl-C / SIGTERM (not the default kill), so the state
+    // file guard runs.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
     loop {
         tokio::select! {
+            _ = &mut shutdown => {
+                eprintln!("[mesh] shutting down");
+                return Ok(());
+            }
             // Local edits → broadcast (the watcher feeds paths into `rx`).
             ev = rx.recv(), if rx_open => {
                 let Some(first) = ev else {
@@ -276,17 +366,26 @@ pub async fn run(
                     report_mismatch(&p);
                 }
             }
-            // Live admin commands from `riftpipe revoke|grant <dir> <id>`.
+            // A keyless restricted peer re-announces so an Admin who comes online
+            // later, or isn't a direct neighbor, still sees the request.
+            _ = request_tick.tick() => {
+                if let Some(r) = peer.read_request() {
+                    broadcast(&sender, &cipher, &r).await;
+                }
+            }
+            // Live admin commands from `riftpipe revoke|grant|approve <dir> <id>`.
             _ = control_tick.tick() => {
                 for cmd in control.poll() {
                     let out = match cmd {
                         crate::sync::control::Command::Revoke(id) => peer.revoke_device(id, dir),
                         crate::sync::control::Command::Grant(id) => peer.grant_device(id, dir),
+                        crate::sync::control::Command::Approve(id) => peer.approve_request(id, dir),
                     };
                     for m in out {
                         broadcast(&sender, &cipher, &m).await;
                     }
                 }
+                sync_state(peer, dir, &mut last_state);
             }
             // Mesh events: remote edits → disk, membership → catch-up + presence.
             ev = receiver.next() => {
