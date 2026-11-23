@@ -457,3 +457,129 @@ body {
   outline-offset: -2px;
   background: #e4ebf9;
 }
+
+/* ---- Activity / history ---- */
+.topbar-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.topbar .activity-toggle {
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.topbar .activity-toggle:hover,
+.topbar .activity-toggle.active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* z-index 40 keeps the panel under the card drawer (50/51). */
+.activity {
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 100vh;
+  width: 340px;
+  max-width: 100vw;
+  box-sizing: border-box;
+  background: var(--card);
+  border-left: 1px solid var(--border);
+  box-shadow: -2px 0 8px rgba(9, 30, 66, 0.12);
+  z-index: 40;
+  overflow-y: auto;
+  padding: 1rem 1rem 2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.activity-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.activity-head h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.activity-close {
+  background: transparent;
+  border: none;
+  font-size: 1.3rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.activity-sync {
+  font-size: 0.8rem;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.activity-list,
+.card-history {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.event-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.1rem 0.5rem;
+  padding: 0.4rem 0.5rem;
+  background: var(--bg);
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+.event-row.clickable {
+  cursor: pointer;
+}
+
+.event-row.clickable:hover {
+  outline: 1px solid var(--accent);
+}
+
+.event-who {
+  font-weight: 600;
+}
+
+.event-when {
+  font-size: 0.75rem;
+  color: var(--muted);
+  justify-self: end;
+}
+
+.event-what {
+  grid-column: 1 / -1;
+  word-break: break-word;
+}
+
+.event-empty {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.activity-more {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.columns.with-activity {
+  padding-right: 360px;
+}
