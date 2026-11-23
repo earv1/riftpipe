@@ -334,6 +334,8 @@ export function App() {
           id={openId()!}
           onClose={() => setOpenId(null)}
           refreshSignal={() => detailTick()}
+          viewer={viewer}
+          titleOf={titleOf}
         />
       </Show>
     </Show>

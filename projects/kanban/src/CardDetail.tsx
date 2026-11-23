@@ -3,8 +3,12 @@ import {
   getCardDetail,
   patchCard,
   addComment,
+  cardHistory,
+  historyEvents,
   type CardDetail as CardDetailT,
+  type Viewer,
 } from "./api.ts";
+import { EventRow } from "./ActivityPanel.tsx";
 
 function formatTs(ts: string): string {
   const d = new Date(ts);
@@ -21,6 +25,8 @@ export function CardDetail(props: {
   id: string;
   onClose: () => void;
   refreshSignal: () => number;
+  viewer: () => Viewer;
+  titleOf: (id: string) => string;
 }) {
   const [detail, setDetail] = createSignal<CardDetailT | null>(null);
   const [loading, setLoading] = createSignal(true);
@@ -199,6 +205,17 @@ export function CardDetail(props: {
               />
               <button type="submit">Comment</button>
             </form>
+
+            {/* Reads only the history store: live, independent of refreshSignal. */}
+            <h3 class="detail-label">History</h3>
+            <ol class="card-history">
+              <For
+                each={cardHistory(historyEvents(), props.id)}
+                fallback={<li class="event-empty">No history yet.</li>}
+              >
+                {(ev) => <EventRow event={ev} viewer={props.viewer()} titleOf={props.titleOf} inCard={true} />}
+              </For>
+            </ol>
           </Show>
         </Show>
       </aside>
