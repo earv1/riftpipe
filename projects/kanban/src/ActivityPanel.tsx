@@ -1,7 +1,7 @@
 // The board-wide Activity panel and the shared event row (also used by the
 // per-card History in the card drawer). Reads only the history store, so it
 // updates live as the merged event log changes and never re-renders the board.
-import { createSignal, For, onMount, Show } from "solid-js";
+import { createMemo, createSignal, For, onMount, Show } from "solid-js";
 import {
   absoluteTime,
   boardActivity,
@@ -58,7 +58,8 @@ export function ActivityPanel(props: {
   onClose: () => void;
 }) {
   const [showSync, setShowSync] = createSignal(false);
-  const view = () => boardActivity(historyEvents(), { showSync: showSync(), limit: ACTIVITY_LIMIT });
+  // Computed once per change (read 4× below), not once per read.
+  const view = createMemo(() => boardActivity(historyEvents(), { showSync: showSync(), limit: ACTIVITY_LIMIT }));
   let panel: HTMLElement | undefined;
   // Opening moves focus into the panel so keyboard users land on it.
   onMount(() => panel?.focus());

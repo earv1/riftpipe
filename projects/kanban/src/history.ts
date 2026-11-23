@@ -138,6 +138,21 @@ export function dedupe<T extends HistoryEvent>(evs: T[]): T[] {
   return out;
 }
 
+/** `evs` with each event replaced by its equal (same JSON) object from the
+ *  previous load, when there is one — so a keyed list (Solid's `<For>`) keeps
+ *  its existing rows and only builds rows for new events. Returns the list and
+ *  the key → object map to pass as `prev` next time. */
+export function keepIdentity<T>(prev: Map<string, T>, evs: T[]): { list: T[]; byKey: Map<string, T> } {
+  const byKey = new Map<string, T>();
+  const list = evs.map((e) => {
+    const key = JSON.stringify(e);
+    const kept = prev.get(key) ?? e;
+    byKey.set(key, kept);
+    return kept;
+  });
+  return { list, byKey };
+}
+
 /** A one-line English description of event `e`. `titleOf` resolves a card id
  *  to its (possibly historical) title; `inCard` drops the card's own name
  *  since it's already shown as the context (the card detail drawer). */

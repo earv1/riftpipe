@@ -10,6 +10,7 @@ import {
   deviceLabel,
   type HistoryEvent,
   isWellFormedEvent,
+  keepIdentity,
   knownTitles,
   relativeTime,
   type Viewer,
@@ -213,4 +214,27 @@ Deno.test("affectsEventLog — events/* and the board-switch nudge, nothing else
   assert.equal(affectsEventLog("tickets/tk_1/card.md"), false);
   assert.equal(affectsEventLog(undefined), false);
   assert.equal(affectsEventLog(1), false);
+});
+
+Deno.test("keepIdentity — unchanged events keep their objects across loads", () => {
+  const first = [
+    { ts: "t1", device: "d", kind: "a" },
+    { ts: "t2", device: "d", kind: "b" },
+  ];
+  const r1 = keepIdentity(new Map(), first);
+  assert.equal(r1.list[0], first[0]);
+  // A fresh load: equal-but-new objects, plus one new event.
+  const second = [
+    { ts: "t1", device: "d", kind: "a" },
+    { ts: "t2", device: "d", kind: "b" },
+    { ts: "t3", device: "d", kind: "c" },
+  ];
+  const r2 = keepIdentity(r1.byKey, second);
+  assert.equal(r2.list[0], first[0], "same object reused");
+  assert.equal(r2.list[1], first[1]);
+  assert.equal(r2.list[2], second[2], "new event is the new object");
+  assert.equal(r2.byKey.size, 3);
+  // Events that disappear (e.g. a board switch) drop out of the map.
+  const r3 = keepIdentity(r2.byKey, [second[2]]);
+  assert.deepEqual([...r3.byKey.values()], [second[2]]);
 });
