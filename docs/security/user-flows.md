@@ -61,18 +61,38 @@ provider-verified token (optional, for boards that want it).
 
 ## Link your own device
 
-*(Planned. Synchronous, high-assurance — for your own devices.)*
+*(Shipped via passkey — `e2e/passkey-link.mjs`; QR/short-code variant planned.)*
 
-Adding a device you control is co-present so the binding is strong: the new device
-generates its keypair and shows its pubkey out-of-band (QR / short code), the
-existing device (an Admin) confirms it's really yours and signs a **grant** +
-**wraps** the epoch key. This is the Signal/WhatsApp "scan to link" pattern.
+**With a passkey (shipped, browser).** Your passkey is your identity, and the
+platform already syncs it to your other devices (iCloud Keychain, Google
+Password Manager, 1Password…) — or it lives on a security key or your phone:
+
+1. **Claim with passkey.** On the first device, "🔑 Claim with passkey" claims
+   the board and registers the passkey on its trust log (an Admin-signed
+   `Passkey` entry; an owner who claimed without one gets "🔑 Add passkey").
+2. **Open the link** on the second device. It sees a claimed board with no
+   access, plus "🔑 Link with my passkey" when a registered passkey is usable
+   from this page's host.
+3. **Link with my passkey.** One platform prompt: the passkey signs a challenge
+   bound to this board and this device, broadcast as a `PasskeyLink` entry.
+4. **Peers verify, an Admin wraps it.** Every peer checks the assertion offline
+   against the registered public key and authorizes the device as an Admin — no
+   approve click. Once any online Admin holding the epoch key sees it, it wraps
+   the device in and it can read.
+
+**Co-present QR / short code (planned).** Adding a device you control is
+co-present so the binding is strong: the new device generates its keypair and
+shows its pubkey out-of-band (QR / short code), the existing device (an Admin)
+confirms it's really yours and signs a **grant** + **wraps** the epoch key. This
+is the Signal/WhatsApp "scan to link" pattern. The diagram below still shows
+this QR variant (it hasn't been regenerated for the passkey flow).
 
 ![Link a device](../diagrams/flow_link_device.png)
 
 The out-of-band QR/code is the security crux — it binds the new key to a physical
 action by someone who already holds an authorized device, so no one on the mesh
-can add themselves.
+can add themselves. In the passkey flow the passkey plays that role: only its
+holder can produce an assertion that verifies.
 
 ## Revoke a member
 
@@ -100,7 +120,7 @@ content the revoked party already decrypted can't be clawed back.
 | Start a board | Create | — | — |
 | Let everyone in | Open link (Viewer/Editor) | link possession | async |
 | Add a specific person | Request access | self-asserted → verified | async |
-| Add your own device | Link a device | co-present (QR) | sync |
+| Add your own device | Link a device | passkey (shipped) / co-present QR (planned) | async once an Admin is online / sync |
 | Remove someone | Revoke (+ rotate) | admin-signed | async |
 
 Everything funnels to the same primitives — a **signed trust-log entry** for

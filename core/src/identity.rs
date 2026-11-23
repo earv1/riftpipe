@@ -20,11 +20,15 @@
 //! *Not resolved in v1 (documented in the roadmap):* concurrent admin conflicts
 //! (A revokes B while B revokes A) merge by set-union, not a canonical order —
 //! deterministic conflict resolution is a follow-on.
+//!
+//! A registered passkey can vouch for further devices (`Passkey` + `PasskeyLink`, `core::passkey`).
 
 use std::collections::{HashMap, HashSet};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
+
+use crate::passkey::{PasskeyAssertion, PasskeyCredential};
 
 /// A device's public key — its stable identity on a board.
 pub type DeviceId = [u8; 32];
@@ -87,6 +91,15 @@ impl DeviceKey {
         let by = self.id();
         let sig = self.sign(&revoke_msg(&device, &by, &nonce)).to_vec();
         TrustEntry::Revoke { device, by, nonce, sig }
+    }
+
+    /// Register `cred` as a board passkey conferring `role` (an Admin action —
+    /// validated on apply): a device later presenting a fresh assertion from it
+    /// joins with no approve click.
+    pub fn register_passkey(&self, cred: PasskeyCredential, role: Role, nonce: [u8; 16]) -> TrustEntry {
+        let by = self.id();
+        let sig = self.sign(&passkey_msg(&cred, role, &by, &nonce)).to_vec();
+        TrustEntry::Passkey { cred, role, by, nonce, sig }
     }
 }
 
@@ -155,6 +168,16 @@ pub enum TrustEntry {
     Grant { device: DeviceId, role: Role, by: DeviceId, nonce: [u8; 16], sig: Vec<u8> },
     /// `by` (a current Admin, or `device` itself) removes `device`.
     Revoke { device: DeviceId, by: DeviceId, nonce: [u8; 16], sig: Vec<u8> },
+    /// `by` (a current Admin) registers a passkey: any device that later presents a
+    /// fresh assertion from it, bound to its own id ([`TrustEntry::PasskeyLink`]),
+    /// joins as `role` — linking your own devices with no approve click.
+    /// APPENDED (protocol v5).
+    Passkey { cred: PasskeyCredential, role: Role, by: DeviceId, nonce: [u8; 16], sig: Vec<u8> },
+    /// `device` joins vouched for by the registered passkey `cred_id`: `assertion`'s
+    /// challenge is [`passkey_link_challenge`]`(board, founder, device, nonce)`. Verified
+    /// offline against the registered public key; the passkey is the authority (no
+    /// device signature). APPENDED (protocol v5).
+    PasskeyLink { device: DeviceId, cred_id: Vec<u8>, nonce: [u8; 16], assertion: PasskeyAssertion },
 }
 
 // Domain-separated to-be-signed payloads (postcard, so field order is fixed).
@@ -168,17 +191,35 @@ fn revoke_msg(device: &DeviceId, by: &DeviceId, nonce: &[u8; 16]) -> Vec<u8> {
     postcard::to_allocvec(&("riftpipe-revoke-v1", device, by, nonce)).expect("encode")
 }
 
-fn sig_of(e: &TrustEntry) -> &[u8] {
+fn passkey_msg(cred: &PasskeyCredential, role: Role, by: &DeviceId, nonce: &[u8; 16]) -> Vec<u8> {
+    postcard::to_allocvec(&("riftpipe-passkey-v1", cred, role, by, nonce)).expect("encode")
+}
+/// The WebAuthn challenge a passkey signs to link `device` into `board` (its gossip
+/// topic, see [`TrustLog::set_board`]) founded by `founder`. The board scopes it to
+/// one board — even across boards with the same founder and passkey; `nonce` makes
+/// each link distinct.
+pub fn passkey_link_challenge(board: &[u8; 32], founder: &DeviceId, device: &DeviceId, nonce: &[u8; 16]) -> [u8; 32] {
+    let msg = postcard::to_allocvec(&("riftpipe-passkey-link-v1", board, founder, device, nonce)).expect("encode");
+    *blake3::hash(&msg).as_bytes()
+}
+
+/// A dedup id for an entry. Device-signed entries: the hash of their Ed25519
+/// signature (unique, and not malleable under `verify_strict`). A `PasskeyLink`:
+/// what it says — `(device, cred_id, nonce)` — never its signature bytes: an ES256
+/// signature is malleable (`(r, s)` and `(r, n−s)` both verify), so a
+/// signature-keyed id would let a removed device re-apply its own old link as a
+/// "new" entry.
+fn entry_id(e: &TrustEntry) -> [u8; 32] {
     match e {
         TrustEntry::Genesis { sig, .. }
         | TrustEntry::Grant { sig, .. }
-        | TrustEntry::Revoke { sig, .. } => sig,
+        | TrustEntry::Revoke { sig, .. }
+        | TrustEntry::Passkey { sig, .. } => *blake3::hash(sig).as_bytes(),
+        TrustEntry::PasskeyLink { device, cred_id, nonce, .. } => {
+            let msg = postcard::to_allocvec(&("riftpipe-passkey-link-id", device, cred_id, nonce)).expect("encode");
+            *blake3::hash(&msg).as_bytes()
+        }
     }
-}
-
-/// A dedup id for an entry — the hash of its (unique) signature.
-fn entry_id(e: &TrustEntry) -> [u8; 32] {
-    *blake3::hash(sig_of(e)).as_bytes()
 }
 
 enum Outcome {
@@ -191,9 +232,26 @@ enum Outcome {
     Rejected,
 }
 
+
+/// A passkey registered by an Admin — kept out of the public API; exposed via
+/// [`TrustLog::passkeys`].
+#[derive(Clone, Debug)]
+struct RegisteredPasskey {
+    cred: PasskeyCredential,
+    role: Role,
+    by: DeviceId,
+}
+/// How many not-yet-applicable `PasskeyLink`s a [`TrustLog`] buffers. They're free to
+/// forge (one naming an unknown credential defers unchecked), so the buffer is
+/// capped; a genuine link dropped here comes back in a neighbor's catch-up.
+const MAX_PENDING_PASSKEY_LINKS: usize = 64;
+
 /// The authorized device set for one board, built from [`TrustEntry`]s.
 #[derive(Default)]
 pub struct TrustLog {
+    /// The board this log belongs to (its gossip topic) — what passkey links are
+    /// bound to. `None` until [`TrustLog::set_board`].
+    board: Option<[u8; 32]>,
     founder: Option<DeviceId>,
     roles: HashMap<DeviceId, Role>,
     /// Entries whose signature checked out but that couldn't apply yet.
@@ -202,11 +260,22 @@ pub struct TrustLog {
     applied: HashSet<[u8; 32]>,
     /// Devices removed by an applied Revoke (cleared by a later re-grant).
     revoked: HashSet<DeviceId>,
+    /// Passkeys registered on this board, keyed by credential id.
+    passkeys: HashMap<Vec<u8>, RegisteredPasskey>,
 }
 
 impl TrustLog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bind this log to its board: the gossip topic `H(secret)`, which every peer of
+    /// the board derives identically. A passkey link's challenge includes it, so a
+    /// link made for one board never applies on another — even one with the same
+    /// founder and passkey. `PasskeyLink`s wait (deferred) until this is set.
+    pub fn set_board(&mut self, board: [u8; 32]) {
+        self.board = Some(board);
+        self.drain_pending();
     }
 
     /// Is `id` currently authorized (any role)?
@@ -237,6 +306,33 @@ impl TrustLog {
         self.revoked.contains(id)
     }
 
+    /// Passkeys registered on this board with the role each confers, sorted by credential id.
+    pub fn passkeys(&self) -> Vec<(PasskeyCredential, Role)> {
+        let mut v: Vec<_> = self.passkeys.values().map(|r| (r.cred.clone(), r.role)).collect();
+        v.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+        v
+    }
+
+    /// Has `entry` — or an equivalent re-encoding of it (a passkey link carrying
+    /// the other valid ECDSA signature) — already been applied? Callers that
+    /// store and re-send entries skip these.
+    pub fn holds(&self, entry: &TrustEntry) -> bool {
+        self.applied.contains(&entry_id(entry))
+    }
+
+    /// Registered passkeys that can link a device right now — their registrant is
+    /// still an Admin — sorted by credential id.
+    pub fn linking_passkeys(&self) -> Vec<PasskeyCredential> {
+        let mut v: Vec<_> = self
+            .passkeys
+            .values()
+            .filter(|r| self.role(&r.by) == Some(Role::Admin))
+            .map(|r| r.cred.clone())
+            .collect();
+        v.sort_by(|a, b| a.id.cmp(&b.id));
+        v
+    }
+
     /// Ingest one entry. Returns `true` if it is (now) applied. Invalid entries
     /// return `false`; validly-signed-but-not-yet-applicable ones are buffered
     /// and may apply later (also `false` for now). Idempotent on replays.
@@ -252,6 +348,10 @@ impl TrustLog {
                 true
             }
             Outcome::Deferred => {
+                let is_link = |e: &TrustEntry| matches!(e, TrustEntry::PasskeyLink { .. });
+                if is_link(&entry) && self.pending.iter().filter(|e| is_link(e)).count() >= MAX_PENDING_PASSKEY_LINKS {
+                    return false;
+                }
                 self.pending.push(entry);
                 false
             }
@@ -337,6 +437,43 @@ impl TrustLog {
                     // authorized to revoke). Defer; a Member's revoke never applies.
                     Outcome::Deferred
                 }
+            }
+            TrustEntry::Passkey { cred, role, by, nonce, sig } => {
+                if !verify(by, &passkey_msg(cred, *role, by, nonce), sig) || !cred.is_well_formed() {
+                    return Outcome::Rejected;
+                }
+                match self.role(by) {
+                    Some(Role::Admin) => {
+                        // First registration of a credential id wins; a re-registration is a no-op.
+                        self.passkeys
+                            .entry(cred.id.clone())
+                            .or_insert(RegisteredPasskey { cred: cred.clone(), role: *role, by: *by });
+                        Outcome::Applied
+                    }
+                    _ => Outcome::Deferred,
+                }
+            }
+            TrustEntry::PasskeyLink { device, cred_id, nonce, assertion } => {
+                // Needs the board and genesis (binding scope) and the registration — may arrive later.
+                let (Some(board), Some(founder), Some(reg)) = (self.board, self.founder, self.passkeys.get(cred_id)) else {
+                    return Outcome::Deferred;
+                };
+                // A passkey speaks only while its registrant is still an Admin. Checked
+                // before the (costlier) P-256 verify: a deferred link is retried on
+                // every drain.
+                if self.role(&reg.by) != Some(Role::Admin) {
+                    return Outcome::Deferred;
+                }
+                if !reg.cred.verify(assertion, &passkey_link_challenge(&board, &founder, device, nonce)) {
+                    return Outcome::Rejected;
+                }
+                let role = reg.role;
+                if self.founder == Some(*device) {
+                    return Outcome::Applied;
+                }
+                self.roles.insert(*device, role);
+                self.revoked.remove(device);
+                Outcome::Applied
             }
         }
     }
@@ -604,5 +741,339 @@ mod tests {
         assert!(!log.apply(member.revoke(target.id(), nonce(3))));
         assert!(!log.is_revoked(&target.id()));
         assert!(log.is_authorized(&target.id()));
+    }
+
+    fn soft_passkey(seed: u8, rp: &str) -> (p256::ecdsa::SigningKey, PasskeyCredential) {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+        let point = p256::ecdsa::VerifyingKey::from(&sk).to_encoded_point(false);
+        let cred = PasskeyCredential {
+            id: vec![seed; 16],
+            alg: crate::passkey::ALG_ES256,
+            public_key: point.as_bytes().to_vec(),
+            rp_id: rp.into(),
+        };
+        (sk, cred)
+    }
+    fn soft_assert(sk: &p256::ecdsa::SigningKey, rp: &str, challenge: &[u8]) -> PasskeyAssertion {
+        use p256::ecdsa::signature::Signer as _;
+        let mut ad = crate::passkey::rp_id_hash(rp).to_vec();
+        ad.extend_from_slice(&[0x05, 0, 0, 0, 0]);
+        let cdj = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"http://{rp}","crossOrigin":false}}"#,
+            crate::passkey::b64url(challenge)
+        )
+        .into_bytes();
+        let sig: p256::ecdsa::Signature = sk.sign(&crate::passkey::assertion_message(&ad, &cdj));
+        PasskeyAssertion { authenticator_data: ad, client_data_json: cdj, signature: sig.to_der().as_bytes().to_vec() }
+    }
+    /// The board (gossip topic) the passkey tests run on.
+    const BOARD: [u8; 32] = [0xb0; 32];
+    fn board_log() -> TrustLog {
+        let mut log = TrustLog::new();
+        log.set_board(BOARD);
+        log
+    }
+    fn link(
+        sk: &p256::ecdsa::SigningKey,
+        cred: &PasskeyCredential,
+        founder: &DeviceId,
+        device: DeviceId,
+        n: [u8; 16],
+    ) -> TrustEntry {
+        let ch = passkey_link_challenge(&BOARD, founder, &device, &n);
+        TrustEntry::PasskeyLink { device, cred_id: cred.id.clone(), nonce: n, assertion: soft_assert(sk, &cred.rp_id, &ch) }
+    }
+
+    /// The same assertion with the other valid ECDSA signature, `(r, n−s)`.
+    fn with_other_s(a: &PasskeyAssertion) -> PasskeyAssertion {
+        let sig = p256::ecdsa::Signature::from_der(&a.signature).unwrap();
+        let (r, s) = sig.split_scalars();
+        let flipped = p256::ecdsa::Signature::from_scalars(r, -s).unwrap();
+        PasskeyAssertion { signature: flipped.to_der().as_bytes().to_vec(), ..a.clone() }
+    }
+
+    #[test]
+    fn a_revoked_passkey_linked_device_cant_replay_its_link_with_the_other_s() {
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(1)));
+        let ln = link(&sk, &cred, &founder.id(), phone.id(), nonce(2));
+        assert!(log.apply(ln.clone()));
+        assert!(log.apply(founder.revoke(phone.id(), nonce(3))));
+
+        let TrustEntry::PasskeyLink { device, cred_id, nonce: n, assertion } = ln else { unreachable!() };
+        let replay = TrustEntry::PasskeyLink { device, cred_id, nonce: n, assertion: with_other_s(&assertion) };
+        let TrustEntry::PasskeyLink { assertion: flipped, .. } = &replay else { unreachable!() };
+        assert_ne!(flipped.signature, assertion.signature);
+        assert!(cred.verify(flipped, &passkey_link_challenge(&BOARD, &founder.id(), &phone.id(), &n)), "the flipped signature is valid");
+        assert!(log.holds(&replay), "it is the same link as the one already applied");
+        log.apply(replay);
+        assert!(!log.is_authorized(&phone.id()), "a revoked device can't re-add itself");
+        assert!(log.is_revoked(&phone.id()));
+    }
+
+    #[test]
+    fn passkey_link_authorizes_a_device_with_the_registered_role() {
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let third = DeviceKey::generate();
+        let mut log = board_log();
+        assert!(log.apply(founder.genesis()));
+        let (sk, cred) = soft_passkey(1, "localhost");
+        assert!(log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(1))));
+        assert!(log.apply(link(&sk, &cred, &founder.id(), phone.id(), nonce(2))));
+        assert_eq!(log.role(&phone.id()), Some(Role::Admin));
+        assert_eq!(log.passkeys().len(), 1);
+        // The phone can then grant a third device.
+        assert!(log.apply(phone.grant(third.id(), Role::Member, nonce(3))));
+        assert_eq!(log.role(&third.id()), Some(Role::Member));
+    }
+
+    #[test]
+    fn passkey_link_rejects_wrong_binding_key_or_rp() {
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let attacker = DeviceKey::generate();
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        let (sk, cred) = soft_passkey(1, "localhost");
+        log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(1)));
+
+        // Bound to the phone's assertion but claiming the attacker's device.
+        let mut wrong_device = link(&sk, &cred, &founder.id(), phone.id(), nonce(2));
+        if let TrustEntry::PasskeyLink { device, .. } = &mut wrong_device {
+            *device = attacker.id();
+        }
+        assert!(!log.apply(wrong_device));
+        assert!(!log.is_authorized(&attacker.id()));
+
+        // Signed by a different passkey, but with the registered cred id.
+        let (other_sk, _) = soft_passkey(2, "localhost");
+        assert!(!log.apply(link(&other_sk, &cred, &founder.id(), phone.id(), nonce(3))));
+        assert!(!log.is_authorized(&phone.id()));
+
+        // An assertion scoped to a different rp id.
+        let ch = passkey_link_challenge(&BOARD, &founder.id(), &phone.id(), &nonce(4));
+        let bad_rp = TrustEntry::PasskeyLink {
+            device: phone.id(),
+            cred_id: cred.id.clone(),
+            nonce: nonce(4),
+            assertion: soft_assert(&sk, "evil.example", &ch),
+        };
+        assert!(!log.apply(bad_rp));
+        assert!(!log.is_authorized(&phone.id()));
+    }
+
+    #[test]
+    fn passkey_registration_requires_an_admin() {
+        let founder = DeviceKey::generate();
+        let member = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        log.apply(founder.grant(member.id(), Role::Member, nonce(1)));
+
+        let (sk, cred) = soft_passkey(1, "localhost");
+        assert!(!log.apply(member.register_passkey(cred.clone(), Role::Admin, nonce(2))), "a Member can't register");
+
+        assert!(!log.apply(link(&sk, &cred, &founder.id(), phone.id(), nonce(3))));
+        assert!(!log.is_authorized(&phone.id()));
+    }
+
+    #[test]
+    fn passkey_entries_resolve_out_of_order() {
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+
+        let reg = founder.register_passkey(cred.clone(), Role::Admin, nonce(1));
+        let ln = link(&sk, &cred, &founder.id(), phone.id(), nonce(2));
+        let genesis = founder.genesis();
+
+        let mut log = board_log();
+        assert!(!log.apply(ln));
+        assert!(!log.apply(reg));
+        assert!(log.apply(genesis));
+        assert_eq!(log.role(&phone.id()), Some(Role::Admin));
+    }
+
+    #[test]
+    fn passkey_link_is_scoped_to_one_board() {
+        let founder_a = DeviceKey::generate();
+        let founder_b = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+
+        let mut log_a = board_log();
+        log_a.apply(founder_a.genesis());
+        log_a.apply(founder_a.register_passkey(cred.clone(), Role::Admin, nonce(1)));
+
+        let mut log_b = TrustLog::new();
+        log_b.set_board([0xb1; 32]);
+        log_b.apply(founder_b.genesis());
+        log_b.apply(founder_b.register_passkey(cred.clone(), Role::Admin, nonce(1)));
+
+        let ln = link(&sk, &cred, &founder_a.id(), phone.id(), nonce(2));
+        assert!(!log_b.apply(ln));
+        assert!(!log_b.is_authorized(&phone.id()));
+    }
+
+    #[test]
+    fn re_registering_a_credential_id_with_another_key_is_a_no_op() {
+        let founder = DeviceKey::generate();
+        let admin2 = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let (other_sk, other) = soft_passkey(2, "localhost");
+        let same_id_other_key = PasskeyCredential { id: cred.id.clone(), ..other };
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        log.apply(founder.grant(admin2.id(), Role::Admin, nonce(1)));
+        assert!(log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(2))));
+        assert!(log.apply(admin2.register_passkey(same_id_other_key, Role::Member, nonce(3))), "applies, as a no-op");
+        assert_eq!(log.passkeys(), vec![(cred.clone(), Role::Admin)], "the first registration stands");
+
+        assert!(!log.apply(link(&other_sk, &cred, &founder.id(), phone.id(), nonce(4))), "the later key can't link");
+        assert!(log.apply(link(&sk, &cred, &founder.id(), phone.id(), nonce(5))));
+        assert_eq!(log.role(&phone.id()), Some(Role::Admin));
+    }
+
+    #[test]
+    fn a_revoked_passkey_linked_device_stays_removed_on_replay() {
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(1)));
+        let ln = link(&sk, &cred, &founder.id(), phone.id(), nonce(2));
+        log.apply(ln.clone());
+        log.apply(founder.revoke(phone.id(), nonce(3)));
+        log.apply(ln);
+        assert!(!log.is_authorized(&phone.id()) && log.is_revoked(&phone.id()));
+        // A fresh assertion (a new nonce) from the passkey re-links it — by design.
+        assert!(log.apply(link(&sk, &cred, &founder.id(), phone.id(), nonce(4))));
+        assert_eq!(log.role(&phone.id()), Some(Role::Admin));
+    }
+
+    #[test]
+    fn a_passkey_link_for_the_founder_is_a_no_op() {
+        let founder = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        log.apply(founder.register_passkey(cred.clone(), Role::Member, nonce(1)));
+        assert!(log.apply(link(&sk, &cred, &founder.id(), founder.id(), nonce(2))));
+        assert_eq!(log.role(&founder.id()), Some(Role::Admin), "the founder stays Admin");
+        assert_eq!(log.devices().len(), 1);
+    }
+
+    #[test]
+    fn an_eddsa_passkey_links_through_the_trust_log() {
+        use ed25519_dalek::Signer as _;
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let cred = PasskeyCredential {
+            id: vec![9; 16],
+            alg: crate::passkey::ALG_EDDSA,
+            public_key: sk.verifying_key().to_bytes().to_vec(),
+            rp_id: "localhost".into(),
+        };
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        assert!(log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(1))));
+
+        let ch = passkey_link_challenge(&BOARD, &founder.id(), &phone.id(), &nonce(2));
+        let mut ad = crate::passkey::rp_id_hash("localhost").to_vec();
+        ad.extend_from_slice(&[0x05, 0, 0, 0, 0]);
+        let cdj = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"http://localhost","crossOrigin":false}}"#,
+            crate::passkey::b64url(&ch)
+        )
+        .into_bytes();
+        let signature = sk.sign(&crate::passkey::assertion_message(&ad, &cdj)).to_bytes().to_vec();
+        let assertion = PasskeyAssertion { authenticator_data: ad, client_data_json: cdj, signature };
+        let entry = TrustEntry::PasskeyLink { device: phone.id(), cred_id: cred.id.clone(), nonce: nonce(2), assertion };
+        assert!(log.apply(entry));
+        assert_eq!(log.role(&phone.id()), Some(Role::Admin));
+    }
+
+    #[test]
+    fn buffered_passkey_links_are_capped() {
+        let founder = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        // Links naming a credential nobody registered (yet): deferred, unchecked.
+        for i in 0..(MAX_PENDING_PASSKEY_LINKS as u32 + 10) {
+            let mut device = [0u8; 32];
+            device[..4].copy_from_slice(&i.to_le_bytes());
+            assert!(!log.apply(link(&sk, &cred, &founder.id(), device, nonce(2))));
+        }
+        assert_eq!(log.pending.len(), MAX_PENDING_PASSKEY_LINKS);
+        // Other deferred entries aren't crowded out.
+        let admin2 = DeviceKey::generate();
+        assert!(!log.apply(admin2.grant([7; 32], Role::Member, nonce(3))));
+        assert_eq!(log.pending.len(), MAX_PENDING_PASSKEY_LINKS + 1);
+        // The buffered links still resolve once the registration lands.
+        assert!(log.apply(founder.register_passkey(cred, Role::Admin, nonce(1))));
+        assert_eq!(log.devices().len(), 1 + MAX_PENDING_PASSKEY_LINKS);
+    }
+
+    #[test]
+    fn passkey_link_is_scoped_to_one_board_of_the_same_founder() {
+        // One browser founds two boards and registers its one passkey on both.
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let mut log_a = board_log();
+        let mut log_b = TrustLog::new();
+        log_b.set_board([0xb1; 32]);
+        for log in [&mut log_a, &mut log_b] {
+            log.apply(founder.genesis());
+            log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(1)));
+        }
+
+        let ln = link(&sk, &cred, &founder.id(), phone.id(), nonce(2));
+        assert!(log_a.apply(ln.clone()));
+        assert!(!log_b.apply(ln), "a link made for board A never applies on board B");
+        assert!(!log_b.is_authorized(&phone.id()));
+    }
+
+    #[test]
+    fn a_passkey_link_waits_for_the_board_binding() {
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let mut log = TrustLog::new();
+        log.apply(founder.genesis());
+        log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(1)));
+        assert!(!log.apply(link(&sk, &cred, &founder.id(), phone.id(), nonce(2))), "no board yet: deferred");
+        log.set_board(BOARD);
+        assert_eq!(log.role(&phone.id()), Some(Role::Admin), "applies once the board is known");
+    }
+
+    #[test]
+    fn a_revoked_registrants_passkey_stops_linking() {
+        let founder = DeviceKey::generate();
+        let admin2 = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        log.apply(founder.grant(admin2.id(), Role::Admin, nonce(1)));
+        log.apply(admin2.register_passkey(cred.clone(), Role::Admin, nonce(2)));
+        assert_eq!(log.linking_passkeys(), vec![cred.clone()]);
+        log.apply(founder.revoke(admin2.id(), nonce(3)));
+        assert_eq!(log.passkeys().len(), 1, "still registered");
+        assert!(log.linking_passkeys().is_empty(), "but it can't link anymore");
+
+        assert!(!log.apply(link(&sk, &cred, &founder.id(), phone.id(), nonce(4))));
+        assert!(!log.is_authorized(&phone.id()));
     }
 }

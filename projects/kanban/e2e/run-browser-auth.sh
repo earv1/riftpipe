@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Browser auth e2e over the real sealed mesh: claim/ask/approve with read gated
-# (lock-grant.mjs) and read revocation by epoch rotation (epoch-revoke.mjs).
+# (lock-grant.mjs), read revocation by epoch rotation (epoch-revoke.mjs), and
+# passkey claim + device-linking with no approve click (passkey-link.mjs, on
+# http://localhost — WebAuthn needs a domain RP ID).
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"; cd "$ROOT"
 PORT=8141
@@ -15,4 +17,5 @@ for _ in $(seq 1 50); do curl -fsS "http://127.0.0.1:$PORT/" >/dev/null 2>&1 && 
 fail=0
 ( cd projects/kanban/e2e && PORT=$PORT node lock-grant.mjs ) || fail=1
 ( cd projects/kanban/e2e && PORT=$PORT node epoch-revoke.mjs ) || fail=1
+( cd projects/kanban/e2e && PORT=$PORT node passkey-link.mjs ) || fail=1
 echo "== exit: $fail =="; exit $fail

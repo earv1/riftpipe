@@ -21,8 +21,6 @@ riftpipe.io/.sh available. "Open a rift, pipe through it.")
   claim/request-to-join flow, the generic file API, the synced event log,
   epoch-sealed content + read revocation, per-board OPFS, folder deletes —
   see `What's done`). New work goes on feature branches + PRs.
-- Current work: branch `cli-request-approve` — CLI request/approve parity
-  (`riftpipe requests|approve|members`, `connect … --restricted --name`).
 - **Guardrail:** a hook blocks committing/pushing to `main` (and any command
   containing the word "main") — the user pushes branches and merges PRs. Claude
   does not commit on `main`; current work is left in the working tree.
@@ -148,6 +146,11 @@ src/:
   `run-request-approve-native.sh`, `run-request-approve-browser.sh` /
   `e2e/request-approve.mjs`; npm `requests`/`approve`/`members`. Details:
   `docs/planned/roadmap.md` §Security ("CLI request/approve").
+- **Passkey ceremony** (branch `passkey-ceremony`): claim/add/link with a
+  passkey, verified offline (`core::passkey`, `TrustEntry::Passkey`/
+  `PasskeyLink`, `web/src/passkey.rs`); e2e `passkey-link.mjs` in
+  `run-browser-auth.sh`; `PROTOCOL_VERSION` 5. Details: `SECURITY.md`
+  §"Passkey device linking".
 
 ## Planned (design docs)
 - **P2P kanban — files as the database** — see [`docs/planned/`](docs/planned/).
@@ -188,7 +191,9 @@ Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
 7. ~~**Auth follow-through**~~ (roadmap §Security) — *done:* the mesh seal now
    runs on epoch keys, read revocation by rotation, and
    `riftpipe revoke|grant <dir> <id>` on the native CLI (see `What's done`).
-   Remaining: the WebAuthn browser ceremony.
+   The WebAuthn browser ceremony shipped too (passkey device-linking).
+   Remaining: passkey revocation; the QR / short-code link variant; the CLI
+   has no passkey ceremony (it only verifies).
 8. **History view** — render `readEvents()` (the event log is produced but
    nothing displays it yet).
 Older/parallel: file-mirror reconnection;

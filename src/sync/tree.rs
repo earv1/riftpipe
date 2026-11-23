@@ -193,6 +193,12 @@ impl TreePeer {
         self.epochs.as_ref()?.latest_held_seq()
     }
 
+    /// Bind the trust log to this board's topic (`H(secret)`) so passkey links
+    /// made for it verify ([`TrustLog::set_board`]).
+    pub fn set_board(&mut self, board: [u8; 32]) {
+        self.trust.set_board(board);
+    }
+
     /// This device's id, if an identity is set.
     pub fn device_id(&self) -> Option<[u8; 32]> {
         self.identity.as_ref().map(|k| k.id())
@@ -230,6 +236,11 @@ impl TreePeer {
     /// catch-up; a now-authorized device leaves the request list. Returns whether
     /// the log now holds it.
     pub fn add_trust(&mut self, entry: TrustEntry) -> bool {
+        // An equivalent of an entry already applied (a passkey link re-sent with the
+        // other valid ECDSA signature) is nothing new: don't store or re-send it.
+        if self.trust.holds(&entry) {
+            return true;
+        }
         let id = *blake3::hash(&postcard::to_allocvec(&entry).unwrap_or_default()).as_bytes();
         if self.trust_seen.insert(id) {
             self.trust_entries.push(entry.clone());
