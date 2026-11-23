@@ -1,6 +1,6 @@
 import { createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, connectPeer, newBoard, watch, storageSupported, auth, type AuthState, type PendingRequest, type Member, type Card } from "./api.ts";
+import { getBoard, addCard, patchCard, connectPeer, newBoard, watch, storageSupported, auth, meshStatus, onMeshStatus, type AuthState, type PendingRequest, type Member, type Card, type MeshStatus } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 
 export function App() {
@@ -25,6 +25,17 @@ export function App() {
   const [pending, setPending] = createSignal<PendingRequest[]>([]);
   // Every authorized device (restricted boards): lets the owner remove one.
   const [members, setMembers] = createSignal<Member[]>([]);
+  // Live peer-to-peer connection status (waiting/connected/reconnecting/offline),
+  // from the lib: a status pill in the header.
+  const [mesh, setMesh] = createSignal<MeshStatus>({ state: "idle", peers: 0 });
+  const meshLabel = (s: MeshStatus) =>
+    ({
+      waiting: "waiting for peers…",
+      connected: `● connected · ${s.peers}`,
+      reconnecting: "reconnecting…",
+      offline: "offline — edits are saved and sync when you're back",
+      idle: "",
+    })[s.state];
   const refreshAuth = () => {
     setAuthState(auth.state());
     setPending(auth.pending());
@@ -72,6 +83,9 @@ export function App() {
     // events/ and doesn't affect the board view, so skip those. No SSE, no server.
     watch((path) => { if (!path.startsWith("events/")) void refresh(); });
 
+    // Live connection status for the header pill.
+    onMeshStatus(setMesh);
+
     // Connect P2P when the URL carries a connection id / ticket. No id =>
     // single-player, no server. Merges arrive via `watch` above.
     let lastHash: string | null = null; // null => never connected (empty hash is valid)
@@ -89,6 +103,7 @@ export function App() {
     (async () => {
       await refresh();
       await connect();
+      setMesh(meshStatus());
       refreshAuth();
     })();
 
@@ -151,6 +166,11 @@ export function App() {
       </Show>
       <header class="topbar">
         <h1>{board.title}</h1>
+        <Show when={mesh().state !== "idle"}>
+          <span class={`mesh-status ${mesh().state}`} title="peer-to-peer connection">
+            {meshLabel(mesh())}
+          </span>
+        </Show>
         <button
           class="new-board"
           title="Start a fresh, empty board with a new share link"

@@ -21,8 +21,9 @@ import {
   requestAccess,
   pendingRequests,
   authState,
+  meshStatus as wasmMeshStatus,
 } from "../wasm/pkg/kanban_wasm.js";
-import { ready, watch } from "./fs.ts";
+import { ready, watch, read, write, list } from "./fs.ts";
 import { readEvents } from "./events.ts";
 
 // Domain model + types (Board, Card, Comment, CardDetail, getBoard, addCard,
@@ -33,6 +34,22 @@ export * from "./board.ts";
 export { watch, read as readFile, write as writeFile, list as listDir } from "./fs.ts";
 // The synced, cross-peer event log (history + debugging).
 export { logEvent, readEvents, onEvent, type RiftEvent } from "./events.ts";
+// Live peer-to-peer connection status, for a status pill or similar UI.
+export type MeshStatus = {
+  state: "idle" | "waiting" | "connected" | "reconnecting" | "offline";
+  peers: number;
+};
+export const meshStatus = (): MeshStatus => JSON.parse(wasmMeshStatus());
+/** The lib fires `riftpipe:mesh-status` whenever the connection state changes. */
+export function onMeshStatus(cb: (s: MeshStatus) => void): void {
+  window.addEventListener("riftpipe:mesh-status", (e) => {
+    try {
+      cb(JSON.parse((e as CustomEvent<string>).detail));
+    } catch {
+      /* ignore */
+    }
+  });
+}
 
 // The auth surface, backed entirely by the lib (wasm). Also on window.riftpipe
 // for console use:
@@ -78,6 +95,10 @@ export const auth = {
   boardMembers: () => JSON.parse(boardMembers()),
   authState: () => JSON.parse(authState()),
   readEvents: () => readEvents(),
+  meshStatus: () => meshStatus(),
+  readFile: (p: string) => read(p),
+  writeFile: (p: string, c: string) => write(p, c),
+  listDir: (p: string) => list(p),
 };
 
 // Build-time config (Vite env). Set these for a deployed/cross-network build:
