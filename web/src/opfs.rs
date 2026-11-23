@@ -349,19 +349,21 @@ pub(crate) async fn flush_records() {
 /// Rebuild board `topic`'s Syncer from its durable records + OPFS files, BEFORE the
 /// mesh starts: unchanged files resume their exact history (same CRDT origin, same LWW
 /// version); files changed while closed become local edits on top; files without a
-/// usable record are primed as new (the old `prime_all` behaviour). Nothing is broadcast
+/// usable record are primed as new (the old `prime_all` behaviour); records of files
+/// that are gone are deleted. Nothing is broadcast
 /// — the NeighborUp catch-up ships the whole state.
 pub async fn restore_syncer(topic: [u8; 32], agent: String) -> Syncer {
     let mut syncer = Syncer::new(agent);
     writes_settled(topic, None).await;
     let Ok(root) = board_root(&topic).await else { return syncer };
     let mut recs: std::collections::HashMap<String, DurablePath> = std::collections::HashMap::new();
-    if let Ok(dir) = subdir(&root, SYNC_DIR, false).await {
-        for name in list(&dir).await {
+    let records = subdir(&root, SYNC_DIR, false).await.ok();
+    if let Some(dir) = &records {
+        for name in list(dir).await {
             if !name.ends_with(".rec") {
                 continue;
             }
-            let Some(bytes) = read_bytes(&dir, &name).await else { continue };
+            let Some(bytes) = read_bytes(dir, &name).await else { continue };
             if let Ok(rec) = postcard::from_bytes::<DurablePath>(&bytes) {
                 recs.insert(rec.path.clone(), rec);
             }
@@ -386,6 +388,14 @@ pub async fn restore_syncer(topic: [u8; 32], agent: String) -> Syncer {
                     queue_record(topic, &r);
                 }
             }
+        }
+    }
+    // Records whose file is gone (deleted while closed): drop them, as the native
+    // `TreePeer::seed` does, so they don't pile up.
+    if let Some(dir) = &records {
+        for path in recs.into_keys() {
+            let name = format!("{}.rec", riftpipe_core::sync::record_name(&path));
+            let _ = JsFuture::from(dir.remove_entry(&name)).await;
         }
     }
     syncer
@@ -786,5 +796,24 @@ mod tests {
         flush_records().await;
         assert_eq!(read_in(&topic, "x.toml").await.as_deref(), Some("local"));
         assert_eq!(record_in(&topic, "x.toml").await, Some(rec));
+    }
+
+    /// A record whose file was deleted while the tab was closed is dropped on
+    /// restore (like the native `seed`), not kept forever.
+    #[wasm_bindgen_test]
+    async fn restore_drops_records_of_deleted_files() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        let mut s1 = Syncer::new("o1");
+        s1.local_text("gone.md", "# gone\n");
+        s1.local_text("kept.md", "# kept\n");
+        write_path_in(&topic, "kept.md", b"# kept\n").await.unwrap();
+        queue_record(topic, &s1.durable("gone.md").unwrap());
+        queue_record(topic, &s1.durable("kept.md").unwrap());
+        flush_records().await;
+        assert!(record_in(&topic, "gone.md").await.is_some());
+
+        let _ = restore_syncer(topic, "o2".into()).await;
+        assert!(record_in(&topic, "gone.md").await.is_none(), "orphan record dropped");
+        assert!(record_in(&topic, "kept.md").await.is_some(), "a live file's record stays");
     }
 }
