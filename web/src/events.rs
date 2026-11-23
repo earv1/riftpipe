@@ -21,22 +21,33 @@ fn log_path() -> String {
     format!("events/{}.jsonl", device_hex())
 }
 
+const RESERVED: [&str; 3] = ["ts", "device", "kind"];
+
+/// One JSON event line: `{ts, device, kind, …data}`. Data fields named like a
+/// reserved field are dropped — an event's author/time/kind can't be spoofed.
+pub(crate) fn event_line(ts: &str, device: &str, kind: &str, data: serde_json::Value) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("ts".into(), serde_json::json!(ts));
+    obj.insert("device".into(), serde_json::json!(device));
+    obj.insert("kind".into(), serde_json::json!(kind));
+    if let serde_json::Value::Object(m) = data {
+        for (k, v) in m {
+            if RESERVED.contains(&k.as_str()) {
+                continue;
+            }
+            obj.insert(k, v);
+        }
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
 /// Append one `{ts, device, kind, …data}` event to this device's log, persist to
 /// OPFS, and sync it to peers. Never fails loudly — logging is additive history.
 /// (Read-modify-write on the per-device file; concurrent appends from sibling
 /// tabs can rarely race, same as the retired server's log — acceptable here.)
 pub async fn append(kind: &str, data: serde_json::Value) {
     let ts = js_sys::Date::new_0().to_iso_string().as_string().unwrap_or_default();
-    let mut obj = serde_json::Map::new();
-    obj.insert("ts".into(), serde_json::json!(ts));
-    obj.insert("device".into(), serde_json::json!(device_hex()));
-    obj.insert("kind".into(), serde_json::json!(kind));
-    if let serde_json::Value::Object(m) = data {
-        for (k, v) in m {
-            obj.insert(k, v);
-        }
-    }
-    let line = serde_json::Value::Object(obj).to_string();
+    let line = event_line(&ts, &device_hex(), kind, data);
 
     let path = log_path();
     let mut log = crate::opfs::read_path(&path).await.unwrap_or_default();
@@ -96,4 +107,25 @@ pub async fn read_events() -> String {
         ka.cmp(kb)
     });
     serde_json::to_string(&events).unwrap_or_else(|_| "[]".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    #[wasm_bindgen_test]
+    fn event_line_keeps_reserved_fields() {
+        let line = event_line(
+            "T",
+            "me",
+            "card.move",
+            serde_json::json!({"ts":"x","device":"evil","kind":"y","id":"tk_1"}),
+        );
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["ts"], "T");
+        assert_eq!(v["device"], "me");
+        assert_eq!(v["kind"], "card.move");
+        assert_eq!(v["id"], "tk_1");
+    }
 }

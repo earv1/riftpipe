@@ -278,8 +278,7 @@ pub fn device_id() -> String {
 pub fn lock_board() -> bool {
     let ok = crate::gossip::active_lock();
     if ok {
-        let device = load_or_create_device().id().iter().map(|b| format!("{b:02x}")).collect::<String>();
-        crate::events::log("auth.claim", serde_json::json!({ "device": device }));
+        crate::events::log("auth.claim", serde_json::json!({}));
     }
     ok
 }
@@ -293,7 +292,7 @@ pub fn grant_device(hex_id: String) -> bool {
         Some(id) => {
             let ok = crate::gossip::active_grant(id);
             if ok {
-                crate::events::log("auth.grant", serde_json::json!({ "device": hex_id }));
+                crate::events::log("auth.grant", serde_json::json!({ "target": hex_id }));
             }
             ok
         }
@@ -310,7 +309,7 @@ pub fn revoke_device(hex_id: String) -> bool {
         Some(id) => {
             let ok = crate::gossip::active_revoke(id);
             if ok {
-                crate::events::log("auth.revoke", serde_json::json!({ "device": hex_id }));
+                crate::events::log("auth.revoke", serde_json::json!({ "target": hex_id }));
             }
             ok
         }
@@ -332,8 +331,7 @@ pub fn board_members() -> String {
 pub fn request_access() -> bool {
     let ok = crate::gossip::active_request_access();
     if ok {
-        let device = load_or_create_device().id().iter().map(|b| format!("{b:02x}")).collect::<String>();
-        crate::events::log("auth.request", serde_json::json!({ "device": device }));
+        crate::events::log("auth.request", serde_json::json!({}));
     }
     ok
 }
