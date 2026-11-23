@@ -547,12 +547,35 @@ body {
   font-size: 0.85rem;
 }
 
+/* A card event in the panel is a <button> filling the row. */
 .event-row.clickable {
+  display: block;
+  padding: 0;
+}
+
+.event-open {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.1rem 0.5rem;
+  width: 100%;
+  padding: 0.4rem 0.5rem;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  font: inherit;
+  color: inherit;
+  text-align: left;
   cursor: pointer;
 }
 
-.event-row.clickable:hover {
-  outline: 1px solid var(--accent);
+.event-open:hover,
+.event-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.activity:focus {
+  outline: none;
 }
 
 .event-who {
@@ -582,4 +605,10 @@ body {
 
 .columns.with-activity {
   padding-right: 360px;
+}
+
+/* Keep the topbar buttons and auth bar out from under the open panel. */
+.topbar.with-activity,
+.auth-bar.with-activity {
+  padding-right: calc(340px + 1.25rem);
 }

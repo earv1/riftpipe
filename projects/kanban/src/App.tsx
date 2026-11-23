@@ -124,7 +124,19 @@ export function App() {
         setVersionMismatch({ theirs: -1, ours: -1 });
       }
     });
+
+    // Escape closes the Activity panel (not while a card drawer is on top).
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && showActivity() && !openId()) closeActivity();
+    });
   });
+
+  // Closing the panel hands focus back to its toggle.
+  let activityToggle: HTMLButtonElement | undefined;
+  const closeActivity = () => {
+    setShowActivity(false);
+    activityToggle?.focus();
+  };
 
   // History: titles of cards that no longer exist (or were renamed) come from
   // the log itself; live cards use their current title.
@@ -171,12 +183,15 @@ export function App() {
           </div>
         )}
       </Show>
-      <header class="topbar">
+      <header classList={{ topbar: true, "with-activity": showActivity() }}>
         <h1>{board.title}</h1>
         <div class="topbar-actions">
           <button
+            ref={activityToggle}
             classList={{ "activity-toggle": true, active: showActivity() }}
             title="Board history"
+            aria-expanded={showActivity()}
+            aria-controls="activity-panel"
             onClick={() => setShowActivity((v) => !v)}
           >
             Activity
@@ -198,7 +213,7 @@ export function App() {
           </button>
         </div>
       </header>
-      <div class="auth-bar">
+      <div classList={{ "auth-bar": true, "with-activity": showActivity() }}>
         <Show when={!authState().locked}>
           <button
             class="lock-btn"
@@ -329,7 +344,7 @@ export function App() {
           viewer={viewer}
           titleOf={titleOf}
           onOpenCard={(id) => setOpenId(id)}
-          onClose={() => setShowActivity(false)}
+          onClose={closeActivity}
         />
       </Show>
       <Show when={openId()}>

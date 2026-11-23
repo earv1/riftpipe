@@ -82,6 +82,25 @@ try {
   }
   console.log(`A hosting (device ${aShort}…); B joined; Activity open on both`);
 
+  // 1b. The open panel: focus moved into it, the toggle reports it, and the
+  // topbar buttons stay visible beside it (not under it).
+  const panelUi = await a.evaluate(() => {
+    const t = document.querySelector(".activity-toggle").getBoundingClientRect();
+    const nb = document.querySelector(".new-board").getBoundingClientRect();
+    const p = document.querySelector(".activity").getBoundingClientRect();
+    return {
+      expanded: document.querySelector(".activity-toggle").getAttribute("aria-expanded"),
+      focusInPanel: !!document.activeElement?.closest(".activity"),
+      closeLabel: document.querySelector(".activity-close").getAttribute("aria-label"),
+      clear: t.right <= p.left && nb.right <= p.left,
+    };
+  });
+  if (panelUi.expanded !== "true") fail(`toggle should have aria-expanded=true, got ${panelUi.expanded}`);
+  if (!panelUi.focusInPanel) fail("opening Activity should move focus into the panel");
+  if (!panelUi.closeLabel) fail("the panel's × should have an aria-label");
+  if (!panelUi.clear) fail("the Activity/New board buttons should sit left of the open panel, not under it");
+  console.log("✓ panel a11y: focus moved in, aria-expanded, labelled close; topbar buttons not covered");
+
   // 2. Own event shows as "You".
   await addCard(a, "alpha");
   const own = await until(async () =>
@@ -153,6 +172,28 @@ try {
     if (Number.isNaN(Date.parse(r.dt))) fail(`row datetime should parse, got ${JSON.stringify(r)}`);
   }
   console.log(`✓ ${aRows.length} rows show relative times ("${aRows[0].when}")`);
+
+  // 8b. Keyboard: a card row is a focusable button (Enter opens the card);
+  // Escape closes the panel and returns focus to the toggle, Enter reopens it.
+  const rowBtn = a.locator('.activity .event-row[data-kind="card.create"] .event-open').first();
+  if ((await rowBtn.count()) !== 1) fail("card rows in the Activity panel should contain a .event-open button");
+  await rowBtn.focus();
+  await a.keyboard.press("Enter");
+  await a.waitForSelector(".drawer .detail-title", { timeout: 8000 });
+  const drawerTitle = await a.locator(".drawer .detail-title").inputValue();
+  if (drawerTitle !== "alpha-renamed") fail(`Enter on the alpha row should open alpha-renamed, got ${JSON.stringify(drawerTitle)}`);
+  await a.locator(".drawer-close").click();
+  await a.waitForSelector(".drawer", { state: "detached", timeout: 8000 });
+  await a.keyboard.press("Escape");
+  await a.waitForSelector(".activity", { state: "detached", timeout: 5000 });
+  const afterEsc = await a.evaluate(() => ({
+    focused: document.activeElement?.classList.contains("activity-toggle"),
+    expanded: document.querySelector(".activity-toggle").getAttribute("aria-expanded"),
+  }));
+  if (!afterEsc.focused || afterEsc.expanded !== "false") fail(`Escape should close the panel and refocus the toggle, got ${JSON.stringify(afterEsc)}`);
+  await a.keyboard.press("Enter");
+  await a.waitForSelector(".activity", { timeout: 5000 });
+  console.log("✓ keyboard: Enter on a row opens the card; Escape closes the panel; Enter on the toggle reopens it");
 
   // 9. An events/* change reaches B's Activity without re-rendering B's board.
   const n0 = await b.evaluate(() => window.riftpipe.boardRefreshes());
