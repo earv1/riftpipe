@@ -33,6 +33,9 @@ struct Opts {
     grant: Vec<String>,
     /// `--restricted` joiner only: display name on the broadcast join request.
     name: Option<String>,
+    /// `connect --accept` only: forget `<dir>/.riftpipe-host` and mint a new
+    /// identity + board secret (a new link), instead of resuming the old board.
+    new_board: bool,
 }
 
 /// Parse `args[2..]` into positionals + flags. `--metrics`/`--manifest`/
@@ -50,6 +53,7 @@ fn parse(args: &[String]) -> Opts {
         restricted: false,
         grant: Vec::new(),
         name: None,
+        new_board: false,
     };
     let mut i = 2;
     while i < args.len() {
@@ -58,6 +62,7 @@ fn parse(args: &[String]) -> Opts {
             "--memory" => o.memory = true,
             "--accept" => o.accept = true,
             "--restricted" => o.restricted = true,
+            "--new-board" => o.new_board = true,
             "--grant" => {
                 if let Some(v) = args.get(i + 1).cloned() {
                     o.grant.push(v);
@@ -255,7 +260,7 @@ async fn main() {
                 match opts.pos.first() {
                     Some(dir) => connect_accept(dir, &opts).await,
                     None => {
-                        eprintln!("usage: riftpipe connect --accept <dir> [--metrics <path>]");
+                        eprintln!("usage: riftpipe connect --accept <dir> [--new-board] [--metrics <path>]");
                         return;
                     }
                 }
@@ -264,7 +269,7 @@ async fn main() {
                     (Some(target), Some(dir)) => connect_dial(target, dir, &opts).await,
                     _ => {
                         eprintln!("usage: riftpipe connect <ticket|browser-link|connection-id> <dir> [--signal ws://…] [--metrics <path>]");
-                        eprintln!("       riftpipe connect --accept <dir> [--metrics <path>]");
+                        eprintln!("       riftpipe connect --accept <dir> [--new-board] [--metrics <path>]");
                         return;
                     }
                 }
@@ -327,9 +332,12 @@ async fn main() {
             eprintln!("                                      # else is a signaling connection-id — WebRTC via --signal (byte totals on exit)");
             eprintln!("                                      # --restricted [--name <text>]: joins a restricted board and asks for access");
             eprintln!("                                      # automatically — a signed request carrying <text> + a safety code to compare out-of-band");
-            eprintln!("  riftpipe connect --accept <dir> [--restricted [--grant <device-id>]...]");
+            eprintln!("  riftpipe connect --accept <dir> [--new-board] [--restricted [--grant <device-id>]...]");
             eprintln!("                                      # host a gossip-mesh swarm for <dir>: prints a mesh ticket a browser OR CLI");
             eprintln!("                                      # peer joins with `connect <ticket> <dir>` — one protocol, N peers, no signaling.");
+            eprintln!("                                      # <dir> is the same board across restarts (identity persists in <dir>/.riftpipe-host)");
+            eprintln!("                                      # --new-board: forget <dir>/.riftpipe-host and mint a new board/link");
+            eprintln!("                                      #   (a --restricted host can't resume yet: restart it with --new-board)");
             eprintln!("                                      # --restricted: only devices the founder grants can READ or write — content is sealed under a rotating epoch key");
             eprintln!("                                      # --grant <id> authorizes a device at startup (get one via `device-id <dir>`)");
             eprintln!("  riftpipe device-id <dir>            # print (creating if absent) this device's id for <dir> — share it to be --grant'ed");
@@ -586,26 +594,38 @@ fn decode_mesh_ticket(s: &str) -> Option<([u8; 32], iroh::EndpointAddr)> {
 /// speaks, so browsers and CLI peers join with the same `connect <ticket>` —
 /// one mesh, no signaling, no native-only transport. Edits on any peer
 /// converge. `_opts` (e.g. `--metrics`) is unused: the metrics side-car reports
-/// a single link's `connection_kind`, which a swarm doesn't have.
+/// a single link's `connection_kind`, which a swarm doesn't have. The same
+/// `dir` is the same board across restarts (identity + board secret persist
+/// in `<dir>/.riftpipe-host`); `--new-board` mints a new one.
 async fn connect_accept(dir: &str, opts: &Opts) -> riftpipe::net::Result<()> {
     use riftpipe::sync::{mesh, tree};
     use std::time::Duration;
 
     let dir = tree::prepare_dir(std::path::Path::new(dir))?;
+    mesh::check_restricted_resume(&dir, opts.restricted, opts.new_board)?;
     let (watcher, mut rx) = tree::watch(&dir);
     let mut peer = tree::TreePeer::new();
     apply_auth(&mut peer, &dir, opts, true); // founder: genesis + any --grant ids
 
-    // Host role: mint a fresh board secret (names the topic `H(secret)` + keys
-    // the frame cipher), bind an endpoint, and start the sealed swarm. Go online
-    // (best-effort relay home) so the ticket dials cross-network.
-    let secret = riftpipe_core::crypto::generate_secret();
-    let conn = mesh::MeshConn::join(secret, None).await?;
+    // Host role: load (or mint) a persisted identity + board secret, so a
+    // restart resumes the SAME board (same topic, same EndpointId) instead of
+    // a different one. Go online (best-effort relay home) so the ticket dials
+    // cross-network.
+    let (sk, secret) = mesh::load_or_create_host(&dir, opts.new_board)?;
+    let peers = mesh::load_peer_book(&dir, riftpipe_core::crypto::topic_from_secret(&secret));
+    let conn =
+        mesh::MeshConn::join_with(mesh::JoinOpts { secret, bootstrap: None, secret_key: Some(sk), peers }).await?;
     let _ = tokio::time::timeout(Duration::from_secs(5), conn.endpoint().online()).await;
     let addr = local_addr(conn.endpoint()).await;
     let ticket = encode_mesh_ticket(&secret, &addr);
     let _ = std::fs::write(format!("{}.ticket", dir.display()), &ticket); // sidecar for scripts
     eprintln!("share this ticket — a browser or CLI joins the same sealed board with `connect`:\n\n{ticket}\n");
+    eprintln!(
+        "[mesh] host id {} — identity + board secret persist in {}/{} (restart = same board; --new-board mints a new link)",
+        conn.endpoint().id(),
+        dir.display(),
+        mesh::HOST_FILE
+    );
     eprintln!("hosting {} on the gossip mesh (sealed); waiting for peers...", dir.display());
 
     mesh::run(conn, &dir, &mut peer, &mut rx, watcher.is_none()).await

@@ -65,6 +65,9 @@ trap 'kill $SIGNAL_PID 2>/dev/null' EXIT
 sleep 0.5
 
 # 5. Run, forcing OUR matching driver (wasm-pack would otherwise use its own).
+#    The runner's timeout bounds the WHOLE run (default 20 s); the real-relay
+#    network tests alone take longer than that, so give the run room.
+export WASM_BINDGEN_TEST_TIMEOUT="${WASM_BINDGEN_TEST_TIMEOUT:-180}"
 echo "running headless wasm tests (riftpipe-web)..."
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$RUNNER" \
 CHROMEDRIVER="$DRIVER" \

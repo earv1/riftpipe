@@ -28,7 +28,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use riftpipe_core::epoch::{AccessMode, EpochBook, Ingested, OpenError};
 use riftpipe_core::identity::{DeviceKey, Role, TrustEntry, TrustLog};
 use riftpipe_core::onboard::JoinRequest;
-use riftpipe_core::sync::{MeshMsg, SyncMsg, Syncer};
+use riftpipe_core::sync::{record_name, DurablePath, MeshMsg, Restored, SyncMsg, Syncer};
 
 use crate::net::{anyerr, Result, Sink, Source};
 use crate::sync::control::{clean_name, is_canonical_name, NAME_MAX_BYTES};
@@ -65,6 +65,35 @@ fn escapes(path: &str) -> bool {
 /// must never cross the wire, in EITHER direction.
 fn hidden(rel: &str) -> bool {
     rel.split('/').any(|c| c.starts_with('.'))
+}
+
+/// Never-synced dot-dir holding one durable record per path (`<record_name>.rec`):
+/// directly inside it for link sync, under `<hex topic>/` for a mesh board (see
+/// [`TreePeer::set_board`]).
+pub(crate) const SYNC_DIR: &str = ".riftpipe-sync";
+fn record_path(records: &Path, rel: &str) -> PathBuf {
+    records.join(format!("{}.rec", record_name(rel)))
+}
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+/// Every decodable record directly in `records`, by path.
+fn load_records(records: &Path) -> HashMap<String, DurablePath> {
+    let mut out = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(records) else { return out };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("rec") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&p) else { continue };
+        let Ok(rec) = postcard::from_bytes::<DurablePath>(&bytes) else { continue };
+        out.insert(rec.path.clone(), rec);
+    }
+    out
 }
 
 fn rel_of(full: &Path, dir: &Path) -> Option<String> {
@@ -141,6 +170,29 @@ pub struct TreePeer {
     inbox_overflow: bool,
     /// A join request with a non-canonical name was dropped once already (warned).
     warned_bad_name: bool,
+    /// The mesh board (topic) this tree syncs, scoping its durable records — so
+    /// a dir reused for another board never restores (and ships) the old
+    /// board's history. `None` = link sync.
+    board: Option<[u8; 32]>,
+}
+
+/// What an apply sends back out, by scope.
+#[derive(Default)]
+pub(crate) struct Outbound {
+    /// To the whole swarm (e.g. a Resync answer, epoch housekeeping).
+    pub(crate) swarm: Vec<MeshMsg>,
+    /// To direct neighbors only: replies to a (neighbors-only) `Hello`.
+    pub(crate) neighbors: Vec<MeshMsg>,
+}
+
+impl Outbound {
+    fn swarm(swarm: Vec<MeshMsg>) -> Self {
+        Outbound { swarm, neighbors: Vec::new() }
+    }
+    /// Every message, regardless of scope.
+    pub(crate) fn all(self) -> Vec<MeshMsg> {
+        self.swarm.into_iter().chain(self.neighbors).collect()
+    }
 }
 
 impl TreePeer {
@@ -164,6 +216,7 @@ impl TreePeer {
             warned_inbox_full: false,
             inbox_overflow: false,
             warned_bad_name: false,
+            board: None,
         }
     }
 
@@ -193,10 +246,13 @@ impl TreePeer {
         self.epochs.as_ref()?.latest_held_seq()
     }
 
-    /// Bind the trust log to this board's topic (`H(secret)`) so passkey links
-    /// made for it verify ([`TrustLog::set_board`]).
+    /// Bind this tree to mesh board `board` (`H(secret)`): the trust log, so
+    /// passkey links made for it verify ([`TrustLog::set_board`]), and the
+    /// durable records (`<dir>/.riftpipe-sync/<hex board>/`). Call before
+    /// [`seed`](Self::seed).
     pub fn set_board(&mut self, board: [u8; 32]) {
         self.trust.set_board(board);
+        self.board = Some(board);
     }
 
     /// This device's id, if an identity is set.
@@ -323,12 +379,12 @@ impl TreePeer {
     /// arrived sealed): enforce signing when the mode requires it, verify a signed
     /// write against the trust log, apply + persist, and return replies already
     /// wrapped for the wire.
-    fn apply_content(&mut self, msg: MeshMsg, dir: &Path) -> Vec<MeshMsg> {
+    fn apply_content(&mut self, msg: MeshMsg, dir: &Path) -> Outbound {
         let require_signed = self.mode.requires_signed_writes();
         let inner = match msg {
             MeshMsg::Sync(s) => {
                 if require_signed {
-                    return Vec::new(); // unsigned write rejected on a gated board
+                    return Outbound::default(); // unsigned write rejected on a gated board
                 }
                 s
             }
@@ -341,17 +397,25 @@ impl TreePeer {
                     sw.author_verified().is_some()
                 };
                 if !ok {
-                    return Vec::new();
+                    return Outbound::default();
                 }
                 match postcard::from_bytes::<SyncMsg>(&sw.payload) {
                     Ok(m) => m,
-                    Err(_) => return Vec::new(),
+                    Err(_) => return Outbound::default(),
                 }
             }
-            _ => return Vec::new(),
+            _ => return Outbound::default(),
         };
-        let replies = self.apply_and_persist(inner, dir);
-        replies.into_iter().filter_map(|r| self.sign_mesh(r)).collect()
+        // A Hello arrives neighbors-only, so its replies (up to our whole tree, for
+        // a fresh joiner) go back neighbors-only too — not flooded to the swarm.
+        let to_neighbors = inner.replies_go_to_neighbors();
+        let replies: Vec<MeshMsg> =
+            self.apply_and_persist(inner, dir).into_iter().filter_map(|r| self.sign_mesh(r)).collect();
+        if to_neighbors {
+            Outbound { swarm: Vec::new(), neighbors: replies }
+        } else {
+            Outbound { swarm: replies, neighbors: Vec::new() }
+        }
     }
 
     /// Auth-aware receive for every mesh message the driver doesn't handle itself
@@ -359,7 +423,7 @@ impl TreePeer {
     /// restricted board, reads are epoch-gated: only `Sealed` content is accepted,
     /// and only if we hold its epoch key. Returns messages to broadcast, already
     /// wrapped for the wire. `Presence`/`Version`/`Chunk` are handled by the driver.
-    pub(crate) fn authorize_and_apply(&mut self, msg: MeshMsg, dir: &Path) -> Vec<MeshMsg> {
+    pub(crate) fn authorize_and_apply(&mut self, msg: MeshMsg, dir: &Path) -> Outbound {
         match msg {
             MeshMsg::Trust(e) => {
                 let (was_authorized, was_held) = (self.me_authorized(), self.writes_held());
@@ -372,17 +436,17 @@ impl TreePeer {
                     eprintln!("[auth] this device is authorized ({role})");
                     out.extend(self.read_request());
                 }
-                out
+                Outbound::swarm(out)
             }
             MeshMsg::Epoch(a) => {
                 let was_held = self.writes_held();
-                let Some(book) = self.epochs.as_mut() else { return Vec::new() };
+                let Some(book) = self.epochs.as_mut() else { return Outbound::default() };
                 let ing = book.ingest(a, &self.trust);
-                self.epoch_followups(ing, dir, was_held)
+                Outbound::swarm(self.epoch_followups(ing, dir, was_held))
             }
             MeshMsg::Request(req) => {
                 self.ingest_request(req, dir);
-                self.maintenance()
+                Outbound::swarm(self.maintenance())
             }
             MeshMsg::Sealed(s) => {
                 if !self.mode.seals_content() {
@@ -390,24 +454,24 @@ impl TreePeer {
                         self.warned_restricted = true;
                         eprintln!("[epoch] this board is restricted — rejoin with --restricted to request access");
                     }
-                    return Vec::new();
+                    return Outbound::default();
                 }
-                let Some(book) = self.epochs.as_mut() else { return Vec::new() };
+                let Some(book) = self.epochs.as_mut() else { return Outbound::default() };
                 match book.open(s) {
                     Ok(inner) => self.apply_content(inner, dir),
                     Err(OpenError::NoKey { seq }) => {
                         if self.no_key_reported.insert(seq) {
                             eprintln!("[epoch] dropped content sealed under epoch {seq} (no key)");
                         }
-                        Vec::new()
+                        Outbound::default()
                     }
-                    Err(OpenError::Invalid) => Vec::new(),
+                    Err(OpenError::Invalid) => Outbound::default(),
                 }
             }
             // Restricted: content travels sealed only — an unsealed write is dropped.
-            MeshMsg::Sync(_) | MeshMsg::SignedSync(_) if self.mode.seals_content() => Vec::new(),
+            MeshMsg::Sync(_) | MeshMsg::SignedSync(_) if self.mode.seals_content() => Outbound::default(),
             MeshMsg::Sync(_) | MeshMsg::SignedSync(_) => self.apply_content(msg, dir),
-            _ => Vec::new(), // Presence/Version/Chunk not routed here
+            _ => Outbound::default(), // Presence/Version/Chunk not routed here
         }
     }
 
@@ -506,7 +570,7 @@ impl TreePeer {
             eprintln!("[epoch] holding epoch {seq} — new content is sealed under it");
         }
         for m in ing.released {
-            out.extend(self.apply_content(m, dir));
+            out.extend(self.apply_content(m, dir).all());
         }
         if ing.gained_first_key {
             let n = self.epoch_held().unwrap_or(0);
@@ -697,14 +761,33 @@ impl TreePeer {
         let msg = if riftpipe_core::sync::is_text_path(&rel) {
             self.syncer.local_text(&rel, &String::from_utf8_lossy(&bytes))
         } else {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            Some(self.syncer.local_lww(&rel, bytes, now))
+            Some(self.syncer.local_lww(&rel, bytes, now_ms()))
         };
-        self.seen.insert(rel, hash);
+        self.seen.insert(rel.clone(), hash);
+        self.save_record(dir, &rel);
         msg
+    }
+
+    /// Where this tree's durable records live under `dir`.
+    fn records_dir(&self, dir: &Path) -> PathBuf {
+        match &self.board {
+            Some(t) => dir.join(SYNC_DIR).join(t.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+            None => dir.join(SYNC_DIR),
+        }
+    }
+
+    /// Write `rel`'s durable sync record under [`records_dir`](Self::records_dir), replacing any
+    /// existing one for that path (tmp file + rename, so a crash never leaves a
+    /// half-written record). Call after every local change or persisted merge.
+    fn save_record(&self, dir: &Path, rel: &str) {
+        let Some(rec) = self.syncer.durable(rel) else { return };
+        let records = self.records_dir(dir);
+        let _ = std::fs::create_dir_all(&records);
+        let path = record_path(&records, rel);
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        if std::fs::write(&tmp, postcard::to_allocvec(&rec).unwrap_or_default()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
     /// Apply one remote message: merge, report any newly-parked paths, and
@@ -723,6 +806,7 @@ impl TreePeer {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let _ = std::fs::write(&full, &bytes);
+                self.save_record(dir, &path);
                 println!("SYNCED:{path}");
             }
         }
@@ -735,17 +819,46 @@ impl TreePeer {
         self.syncer.full_state()
     }
 
+    /// Version vectors + LWW inventory, no bodies — sent on `NeighborUp` so a
+    /// one-sided reconnect becomes bidirectional (the peer replies with
+    /// exactly what we lack).
+    pub(crate) fn hello(&self) -> SyncMsg {
+        self.syncer.hello()
+    }
+
     /// Load every file already on disk into the syncer — the native mirror of
-    /// the browser's `opfs::prime_all`. Without this, files that predate the
-    /// session are invisible: the watcher only reports NEW events, so `hello()`
-    /// would advertise nothing and a mesh `full_state()` would be empty. The
+    /// the browser's `opfs::prime_all`. Restores durable records first, so
+    /// history and LWW versions survive a restart; files changed while down
+    /// become local edits. Without this, files that predate the session are
+    /// invisible: the watcher only reports NEW events, so `hello()` would
+    /// advertise nothing and a mesh `full_state()` would be empty. The
     /// produced messages are discarded — the handshake (link) or the
     /// `NeighborUp` catch-up (mesh) does the actual transfer.
     pub(crate) fn seed(&mut self, dir: &Path) {
+        let records = self.records_dir(dir);
+        let mut recs = load_records(&records);
         let mut files = Vec::new();
         scan_files(dir, &mut files);
+        let now = now_ms();
         for p in files {
-            let _ = self.local_change(&p, dir);
+            let Some(rel) = rel_of(&p, dir) else { continue };
+            let Ok(bytes) = std::fs::read(&p) else { continue };
+            let hash = *blake3::hash(&bytes).as_bytes();
+            match recs.remove(&rel).map(|r| self.syncer.restore(r, Some(&bytes), now)) {
+                Some(Restored::Clean) => {
+                    self.seen.insert(rel, hash);
+                }
+                Some(Restored::Changed(_)) => {
+                    self.seen.insert(rel.clone(), hash);
+                    self.save_record(dir, &rel);
+                }
+                Some(Restored::Unusable) | None => {
+                    let _ = self.local_change(&p, dir);
+                }
+            }
+        }
+        for rel in recs.into_keys() {
+            let _ = std::fs::remove_file(record_path(&records, &rel));
         }
     }
 
@@ -959,6 +1072,26 @@ mod tests {
         std::fs::canonicalize(&d).unwrap()
     }
 
+    /// The origin carried by `path`'s `TextDelta` in `msgs`.
+    fn text_origin(msgs: &[SyncMsg], path: &str) -> Option<(String, usize)> {
+        msgs.iter()
+            .find_map(|m| match m {
+                SyncMsg::TextDelta { path: p, origin, .. } if p == path => Some(origin.clone()),
+                _ => None,
+            })
+            .expect("a TextDelta for the path")
+    }
+
+    /// The version carried by `path`'s `Lww` in `msgs`.
+    fn lww_version(msgs: &[SyncMsg], path: &str) -> u64 {
+        msgs.iter()
+            .find_map(|m| match m {
+                SyncMsg::Lww { path: p, version, .. } if p == path => Some(*version),
+                _ => None,
+            })
+            .expect("an Lww for the path")
+    }
+
     /// A restricted-mode peer (`--restricted`) with the device key from `seed`.
     fn restricted_peer(seed: u8) -> TreePeer {
         let mut p = TreePeer::new();
@@ -1085,7 +1218,7 @@ mod tests {
         assert!(member.sign_local(edit).is_none(), "epoch 1 still wraps the revoked device");
         let mut released = Vec::new();
         for m in epochs {
-            released.extend(member.authorize_and_apply(m, &dm));
+            released.extend(member.authorize_and_apply(m, &dm).all());
         }
         assert!(
             released.iter().any(|m| matches!(m, MeshMsg::Sealed(s) if s.seq == 2)),
@@ -1112,7 +1245,7 @@ mod tests {
         assert!(member.sign_local(edit).is_none(), "held: epoch 1 wraps the revoked device");
 
         let regrant = founder.grant_device(c_id, &df).into_iter().find(|m| matches!(m, MeshMsg::Trust(_))).unwrap();
-        let out = member.authorize_and_apply(regrant, &dm);
+        let out = member.authorize_and_apply(regrant, &dm).all();
         assert!(
             out.iter().any(|m| matches!(m, MeshMsg::Sealed(s) if s.seq == 1)),
             "the hold lifted (no new key): held state goes out sealed"
@@ -1324,7 +1457,7 @@ mod tests {
         let jid = joiner.device_id().unwrap();
         let trust = founder.grant_device(jid, &df).into_iter().find(|m| matches!(m, MeshMsg::Trust(_))).unwrap();
         let out = joiner.authorize_and_apply(trust, &dj);
-        assert!(out.iter().any(|m| matches!(m, MeshMsg::Request(_))), "the newly authorized device re-announces");
+        assert!(out.swarm.iter().any(|m| matches!(m, MeshMsg::Request(_))), "the newly authorized device re-announces");
         for d in [&df, &dj] {
             std::fs::remove_dir_all(d).ok();
         }
@@ -1432,13 +1565,33 @@ mod tests {
         std::fs::remove_dir_all(&df).ok();
     }
 
+    /// A Hello's replies (our whole tree, to a fresh joiner) go to direct
+    /// neighbors only; a Resync answer still goes swarm-wide.
+    #[test]
+    fn hello_replies_are_neighbors_only() {
+        let d = dir("hello-scope");
+        std::fs::write(d.join("a.md"), "# a\n").unwrap();
+        let mut peer = TreePeer::new();
+        peer.seed(&d);
+        let out = peer.authorize_and_apply(MeshMsg::Sync(SyncMsg::Hello { versions: vec![], lww_versions: vec![] }), &d);
+        assert!(out.swarm.is_empty(), "nothing flooded to the swarm");
+        assert!(
+            out.neighbors.iter().any(|m| matches!(m, MeshMsg::Sync(SyncMsg::TextDelta { path, .. }) if path == "a.md")),
+            "the joiner's missing doc goes to the neighbors"
+        );
+        let out = peer.authorize_and_apply(MeshMsg::Sync(SyncMsg::Resync { path: "a.md".into() }), &d);
+        assert!(out.neighbors.is_empty());
+        assert!(!out.swarm.is_empty(), "a Resync answer reaches whoever asked, anywhere in the swarm");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     #[test]
     fn open_peer_ignores_sealed_content() {
         use riftpipe_core::epoch::SealedMsg;
         let d = dir("open-sealed");
         let mut peer = TreePeer::new();
         let out = peer.authorize_and_apply(MeshMsg::Sealed(SealedMsg { seq: 1, id: [0; 8], body: vec![1] }), &d);
-        assert!(out.is_empty());
+        assert!(out.all().is_empty());
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "nothing persisted");
         std::fs::remove_dir_all(&d).ok();
     }
@@ -1594,5 +1747,162 @@ mod tests {
         assert!(!db.join("tickets/.hidden").exists(), "nested dotfile must never sync");
         std::fs::remove_dir_all(&da).ok();
         std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// A restarted peer's `seed` restores durable records before priming disk,
+    /// so history and LWW versions survive the restart instead of being
+    /// re-stamped as fresh (the bug step 2's `restore` fixes).
+    #[test]
+    fn restart_resumes_history_and_keeps_lww_versions() {
+        let d = dir("restart-resume");
+        std::fs::write(d.join("a.md"), "# one\n").unwrap();
+        std::fs::write(d.join("m.toml"), "x = 1\n").unwrap();
+
+        let mut p1 = TreePeer::new();
+        p1.seed(&d);
+        let rec_count = std::fs::read_dir(d.join(SYNC_DIR))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rec"))
+            .count();
+        assert_eq!(rec_count, 2, "one durable record per path");
+
+        let state1 = p1.full_state();
+        let origin1 = text_origin(&state1, "a.md");
+        let version1 = lww_version(&state1, "m.toml");
+
+        let mut p2 = TreePeer::new();
+        p2.seed(&d);
+        let state2 = p2.full_state();
+        assert_eq!(text_origin(&state2, "a.md"), origin1, "restart keeps the same CRDT origin");
+        assert_eq!(lww_version(&state2, "m.toml"), version1, "restart keeps the same LWW version");
+
+        assert!(
+            p2.local_change(&d.join("a.md"), &d).is_none(),
+            "unchanged file after seed is in `seen`, not re-pushed"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A file edited while its peer was down becomes a proper local edit on
+    /// top of the restored history — a clean merge, not an origin-conflict
+    /// adoption (the restarted peer's origin is unchanged).
+    #[test]
+    fn restart_turns_offline_edits_into_local_changes() {
+        let d = dir("restart-offline");
+        std::fs::write(d.join("a.md"), "# one\n").unwrap();
+
+        let mut p1 = TreePeer::new();
+        p1.seed(&d);
+        let state1 = p1.full_state();
+        let origin1 = text_origin(&state1, "a.md");
+
+        std::fs::write(d.join("a.md"), "# two\n").unwrap();
+        let mut p2 = TreePeer::new();
+        p2.seed(&d);
+        let state2 = p2.full_state();
+        let origin2 = text_origin(&state2, "a.md");
+
+        let mut c = Syncer::new("c");
+        for m in state1.into_iter().filter(|m| matches!(m, SyncMsg::TextDelta { path, .. } if path == "a.md")) {
+            c.apply(m);
+        }
+        let mut persisted = None;
+        for m in state2.into_iter().filter(|m| matches!(m, SyncMsg::TextDelta { path, .. } if path == "a.md")) {
+            let (persist, _) = c.apply(m);
+            if let Some((_, bytes)) = persist {
+                persisted = Some(bytes);
+            }
+        }
+        assert_eq!(persisted, Some(b"# two\n".to_vec()), "offline edit lands as a clean merge");
+        assert_eq!(origin2, origin1, "no origin-conflict adoption");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// `apply_and_persist` writes a durable record alongside the file, not
+    /// just on local edits — so a remote-only peer still resumes correctly.
+    #[test]
+    fn remote_merge_writes_a_record() {
+        let d = dir("remote-merge");
+        let mut s = Syncer::new("s");
+        let m = s.local_text("r.md", "# r\n").unwrap();
+        let mut peer = TreePeer::new();
+        peer.apply_and_persist(m, &d);
+        assert!(d.join("r.md").exists());
+        assert!(record_path(&d.join(SYNC_DIR), "r.md").exists());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A record for a path no longer on disk is dropped on the next seed,
+    /// instead of lingering forever in `.riftpipe-sync`.
+    #[test]
+    fn records_of_deleted_files_are_dropped() {
+        let d = dir("deleted-record");
+        std::fs::write(d.join("a.md"), "# one\n").unwrap();
+        let mut p1 = TreePeer::new();
+        p1.seed(&d);
+        assert!(record_path(&d.join(SYNC_DIR), "a.md").exists());
+
+        std::fs::remove_file(d.join("a.md")).unwrap();
+        let mut p2 = TreePeer::new();
+        p2.seed(&d);
+        assert!(!record_path(&d.join(SYNC_DIR), "a.md").exists(), "record for a deleted file is dropped");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A dir reused for ANOTHER mesh board never restores the first board's
+    /// history (which `full_state` would ship to the new board's peers, deleted
+    /// text included): records are scoped per board, and the old board's stay
+    /// for when it's opened again.
+    #[test]
+    fn records_are_scoped_per_board() {
+        let d = dir("board-scoped-records");
+        std::fs::write(d.join("a.md"), "# one\n").unwrap();
+        let mut on_a = TreePeer::new();
+        on_a.set_board([0xa; 32]);
+        on_a.seed(&d);
+        let origin_a = text_origin(&on_a.full_state(), "a.md");
+
+        let mut on_b = TreePeer::new();
+        on_b.set_board([0xb; 32]);
+        on_b.seed(&d);
+        assert_ne!(text_origin(&on_b.full_state(), "a.md"), origin_a, "board B starts fresh");
+
+        let mut a_again = TreePeer::new();
+        a_again.set_board([0xa; 32]);
+        a_again.seed(&d);
+        assert_eq!(text_origin(&a_again.full_state(), "a.md"), origin_a, "board A's history is intact");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// The NeighborUp Hello on a restricted board: it goes out sealed, a wrapped
+    /// member answers it (sealed, neighbors-only) with its gap edit, and the
+    /// founder persists it. An unsealed Hello is dropped, and a device revoked
+    /// since can't read the new-epoch Hello, so it answers nothing.
+    #[test]
+    fn restricted_hello_is_sealed_and_pulls_the_gap() {
+        let (mut founder, df, mut member, dm, mut revokee, dc) = restricted_board("hello");
+        std::fs::write(dm.join("gap.md"), "# made while apart\n").unwrap();
+        assert!(member.local_change(&dm.join("gap.md"), &dm).is_some(), "the gap edit (never delivered)");
+
+        let hello = founder.sign_mesh(founder.hello()).expect("a key holder can send its Hello");
+        assert!(matches!(hello, MeshMsg::Sealed(_)), "the Hello is sealed on a restricted board");
+        let out = member.authorize_and_apply(hello, &dm);
+        assert!(out.swarm.is_empty(), "Hello replies stay with the neighbors");
+        assert!(!out.neighbors.is_empty() && out.neighbors.iter().all(|m| matches!(m, MeshMsg::Sealed(_))));
+        for m in out.neighbors {
+            founder.authorize_and_apply(m, &df);
+        }
+        assert_eq!(std::fs::read(df.join("gap.md")).unwrap(), b"# made while apart\n");
+
+        let plain = MeshMsg::Sync(SyncMsg::Hello { versions: vec![], lww_versions: vec![] });
+        assert!(member.authorize_and_apply(plain, &dm).all().is_empty(), "an unsealed Hello is dropped");
+
+        founder.revoke_device(DeviceKey::from_seed(&[3u8; 32]).id(), &df);
+        let hello2 = founder.sign_mesh(founder.hello()).expect("sealed under the new epoch");
+        assert!(revokee.authorize_and_apply(hello2, &dc).all().is_empty(), "a revoked device can't answer it");
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
     }
 }
