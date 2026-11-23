@@ -75,8 +75,20 @@ fn dispatch_file_changed(path: &str) {
 }
 
 thread_local! {
-    /// Keeps the iroh endpoint alive for the page's lifetime.
-    static IROH_EP: RefCell<Option<iroh::Endpoint>> = const { RefCell::new(None) };
+    /// The page's one iroh endpoint (see `gossip::Node`).
+    static NODE: RefCell<Option<crate::gossip::Node>> = const { RefCell::new(None) };
+}
+
+/// The page's `Node` for `sk`: the bound one if it is `sk`'s, else bind and keep it.
+/// A different key only happens after "New board", which reloads the page anyway.
+async fn page_node(sk: iroh::SecretKey) -> Result<crate::gossip::Node, String> {
+    let bound = NODE.with(|c| c.borrow().clone());
+    if let Some(node) = bound.filter(|n| n.id() == sk.public()) {
+        return Ok(node);
+    }
+    let node = crate::gossip::Node::bind(sk).await?;
+    NODE.with(|c| *c.borrow_mut() = Some(node.clone()));
+    Ok(node)
 }
 
 /// Connect + sync a file tree over **iroh** — no signaling server, no host you run
@@ -86,14 +98,13 @@ thread_local! {
 /// or null (joiner). The app's pushes sync automatically thereafter.
 #[wasm_bindgen(js_name = irohConnect)]
 pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result<JsValue, JsValue> {
-    use crate::gossip::{GossipTreeSync, Mesh};
+    use crate::gossip::GossipTreeSync;
     use crate::iroh_link::{parse_ticket, ticket_of};
     let sk = load_or_create_secret_key();
     let my_id = sk.public();
 
-    // Tear down any prior mesh session (closes the old endpoint, awaited) before
-    // rebinding under the same persisted identity.
-    crate::gossip::clear_active().await;
+    // Tear down any prior mesh session. The endpoint is reused (never rebound).
+    crate::gossip::clear_active();
 
     // Parse an incoming link into (board secret, host address). We host when
     // there's no link, OR the link is our OWN (its address is us — a reloaded
@@ -119,14 +130,15 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
     // works solo on the right tree).
     let topic = enter_board(riftpipe_core::crypto::topic_from_secret(&secret)).await;
     let on_merged = opfs_on_merged(on_change, topic);
+    let node = page_node(sk).await.map_err(|e| JsValue::from_str(&e))?;
 
     let (mesh, my_ticket) = if is_host {
-        let mesh = Mesh::join(sk, secret, None).await.map_err(|e| JsValue::from_str(&e))?;
-        let addr = mesh.wait_for_addr().await;
+        let mesh = node.join(secret, None, &[]).await.map_err(|e| JsValue::from_str(&e))?;
+        let addr = node.wait_for_addr().await;
         (mesh, Some(ticket_of(&secret, &addr)))
     } else {
         let addr = parsed.unwrap().1;
-        let mesh = Mesh::join(sk, secret, Some(addr)).await.map_err(|e| JsValue::from_str(&e))?;
+        let mesh = node.join(secret, Some(addr), &[]).await.map_err(|e| JsValue::from_str(&e))?;
         (mesh, None)
     };
 

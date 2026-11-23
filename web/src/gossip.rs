@@ -11,7 +11,7 @@
 //! longer special. Every frame is AEAD-sealed with a key derived from the same
 //! secret, so the relay and non-holders see only ciphertext.
 
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use iroh::address_lookup::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -26,12 +26,103 @@ pub fn topic_of(secret: &[u8; 32]) -> TopicId {
     TopicId::from_bytes(riftpipe_core::crypto::topic_from_secret(secret))
 }
 
+/// A page-lifetime iroh endpoint with gossip mounted — bound ONCE per identity and
+/// reused across board switches: a reconnect re-subscribes a topic and never rebinds
+/// the persisted key (an immediate same-key rebind raced the relay's re-registration).
+#[derive(Clone)]
+pub struct Node {
+    endpoint: Endpoint,
+    _router: Router,
+    gossip: Gossip,
+    /// Shared by every board joined on this endpoint: a joiner seeds its host's
+    /// address here so it can dial it without waiting on discovery.
+    lookup: MemoryLookup,
+}
+
+impl Node {
+    /// Bind the endpoint under `sk` and mount gossip on it.
+    pub async fn bind(sk: SecretKey) -> Result<Node, String> {
+        let lookup = MemoryLookup::new();
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(sk)
+            .address_lookup(lookup.clone())
+            .bind()
+            .await
+            .map_err(|e| e.to_string())?;
+        // The library's 4 KiB frame limit stays at its default: big messages are
+        // chunked (`core::sync::encode_mesh_frames`) so no peer — however old —
+        // ever receives an over-limit frame.
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let router = Router::builder(endpoint.clone())
+            .accept(GOSSIP_ALPN, gossip.clone())
+            .spawn();
+        Ok(Node { endpoint, _router: router, gossip, lookup })
+    }
+
+    pub fn id(&self) -> EndpointId {
+        self.endpoint.id()
+    }
+
+    /// This endpoint's dialable address (share it as the bootstrap ticket).
+    pub fn addr(&self) -> EndpointAddr {
+        self.endpoint.addr()
+    }
+
+    /// Wait until this endpoint has a dialable (relay) address to share.
+    pub async fn wait_for_addr(&self) -> EndpointAddr {
+        for _ in 0..400 {
+            let a = self.endpoint.addr();
+            if !a.addrs.is_empty() {
+                return a;
+            }
+            gloo_timers::future::TimeoutFuture::new(50).await;
+        }
+        self.endpoint.addr()
+    }
+
+    /// Subscribe to board `secret`'s topic on this endpoint. `bootstrap` is the host's
+    /// address (joiner) or None (host); `known` = remembered peers to dial too.
+    /// The `secret` both names the topic (`H(secret)`) and keys the frame cipher, so
+    /// only link-holders find and can read the board.
+    pub async fn join(
+        &self,
+        secret: [u8; 32],
+        bootstrap: Option<EndpointAddr>,
+        known: &[EndpointId],
+    ) -> Result<Mesh, String> {
+        let my_id = self.id();
+        let bootstrap_id = bootstrap.as_ref().map(|a| a.id);
+        let mut boot = Vec::new();
+        if let Some(addr) = bootstrap {
+            boot.push(addr.id);
+            self.lookup.add_endpoint_info(addr);
+        }
+        for id in known {
+            if *id != my_id && !boot.contains(id) {
+                boot.push(*id);
+            }
+        }
+        let topic = self
+            .gossip
+            .subscribe(topic_of(&secret), boot)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (sender, receiver) = topic.split();
+        Ok(Mesh {
+            node: self.clone(),
+            sender,
+            receiver,
+            my_id,
+            bootstrap: bootstrap_id,
+            cipher: riftpipe_core::crypto::MeshCipher::from_secret(&secret),
+        })
+    }
+}
+
 /// A joined gossip mesh for one shared tree: broadcast bytes to everyone, receive a
 /// stream of events (messages + membership changes).
 pub struct Mesh {
-    endpoint: Endpoint,
-    _router: Router,
-    _gossip: Gossip,
+    node: Node,
     sender: GossipSender,
     receiver: GossipReceiver,
     my_id: EndpointId,
@@ -45,53 +136,15 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    /// Join the board identified by `secret`. `bootstrap` is the host's address
-    /// (from the ticket) for a joiner, or `None` for the host itself (it starts
-    /// the swarm). The `secret` both names the topic (`H(secret)`) and keys the
-    /// frame cipher, so only link-holders find and can read the board.
+    /// Join the board identified by `secret` on a freshly bound endpoint under `sk`.
+    /// `bootstrap` is the host's address (from the ticket) for a joiner, or `None`
+    /// for the host itself (it starts the swarm).
     pub async fn join(
         sk: SecretKey,
         secret: [u8; 32],
         bootstrap: Option<EndpointAddr>,
     ) -> Result<Mesh, String> {
-        let my_id = sk.public();
-        // Seed the bootstrap address so we can dial it without waiting on discovery.
-        let lookup = MemoryLookup::new();
-        let mut boot = Vec::new();
-        if let Some(addr) = bootstrap {
-            boot.push(addr.id);
-            lookup.add_endpoint_info(addr);
-        }
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(sk)
-            .address_lookup(lookup)
-            .bind()
-            .await
-            .map_err(|e| e.to_string())?;
-        // The library's 4 KiB frame limit stays at its default: big messages are
-        // chunked (`core::sync::encode_mesh_frames`) so no peer — however old —
-        // ever receives an over-limit frame.
-        let gossip = Gossip::builder().spawn(endpoint.clone());
-        let router = Router::builder(endpoint.clone())
-            .accept(GOSSIP_ALPN, gossip.clone())
-            .spawn();
-        let bootstrap = boot.first().copied();
-        let topic = gossip
-            .subscribe(topic_of(&secret), boot)
-            .await
-            .map_err(|e| e.to_string())?;
-        let (sender, receiver) = topic.split();
-        let cipher = riftpipe_core::crypto::MeshCipher::from_secret(&secret);
-        Ok(Mesh {
-            endpoint,
-            _router: router,
-            _gossip: gossip,
-            sender,
-            receiver,
-            my_id,
-            bootstrap,
-            cipher,
-        })
+        Node::bind(sk).await?.join(secret, bootstrap, &[]).await
     }
 
     pub fn my_id(&self) -> EndpointId {
@@ -100,19 +153,12 @@ impl Mesh {
 
     /// This peer's dialable address (share it as the bootstrap ticket).
     pub fn addr(&self) -> EndpointAddr {
-        self.endpoint.addr()
+        self.node.addr()
     }
 
     /// Wait until this peer has a dialable (relay) address to share.
     pub async fn wait_for_addr(&self) -> EndpointAddr {
-        for _ in 0..400 {
-            let a = self.endpoint.addr();
-            if !a.addrs.is_empty() {
-                return a;
-            }
-            gloo_timers::future::TimeoutFuture::new(50).await;
-        }
-        self.endpoint.addr()
+        self.node.wait_for_addr().await
     }
 
     /// Broadcast `bytes` to every peer in the mesh.
@@ -133,8 +179,8 @@ impl Mesh {
 
     /// Split into a broadcast sender, an event receiver, the bootstrap peer
     /// (for a re-join after total neighbor loss), the frame cipher (shared —
-    /// the recv task and the push path both seal/open with it), and a keep-alive
-    /// handle (the endpoint/router/gossip must outlive both).
+    /// the recv task and the push path both seal/open with it), and the `Node`
+    /// (the endpoint/router/gossip must outlive both).
     fn into_parts(
         self,
     ) -> (
@@ -142,30 +188,15 @@ impl Mesh {
         GossipReceiver,
         Option<EndpointId>,
         std::rc::Rc<riftpipe_core::crypto::MeshCipher>,
-        MeshKeepAlive,
+        Node,
     ) {
         (
             self.sender,
             self.receiver,
             self.bootstrap,
             std::rc::Rc::new(self.cipher),
-            MeshKeepAlive { _endpoint: self.endpoint, _router: self._router, _gossip: self._gossip },
+            self.node,
         )
-    }
-}
-
-/// Keeps the mesh's endpoint/router/gossip alive for the sync's lifetime.
-pub struct MeshKeepAlive {
-    _endpoint: Endpoint,
-    _router: Router,
-    _gossip: Gossip,
-}
-
-impl MeshKeepAlive {
-    /// Close the endpoint (and await it) so a reconnect can rebind the same key
-    /// cleanly — a plain drop is async and would race the relay re-registration.
-    async fn close(self) {
-        self._endpoint.close().await;
     }
 }
 
@@ -766,7 +797,10 @@ pub struct GossipTreeSync {
     auth: std::rc::Rc<std::cell::RefCell<Auth>>,
     /// Feeds sibling tabs' persisted trust/epoch changes into `auth`.
     _storage: Option<StorageListener>,
-    _keep: MeshKeepAlive,
+    /// The page's endpoint this sync's topic is subscribed on (kept bound past it).
+    _node: Node,
+    /// Dropped ⇒ the receive task ends ⇒ both gossip handles drop ⇒ the topic is left.
+    _stop: futures_channel::oneshot::Sender<()>,
 }
 
 /// A `storage` event listener on `window`, removed when dropped (the closure
@@ -882,7 +916,8 @@ impl GossipTreeSync {
         use std::cell::RefCell;
         use std::rc::Rc;
         let my_id = *mesh.my_id().as_bytes();
-        let (sender, mut receiver, bootstrap, cipher, keep) = mesh.into_parts();
+        let (sender, mut receiver, bootstrap, cipher, node) = mesh.into_parts();
+        let (stop_tx, stop_rx) = futures_channel::oneshot::channel::<()>();
         let agent = format!("g{:08x}", (js_sys::Math::random() * 4_294_967_296.0) as u32);
         let syncer = Rc::new(RefCell::new(riftpipe_core::sync::Syncer::new(agent)));
         let neighbors = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
@@ -935,7 +970,21 @@ impl GossipTreeSync {
             };
             // Reassembles incoming chunk frames into whole messages.
             let mut assembler = riftpipe_core::sync::MeshAssembler::new();
-            while let Some(Ok(ev)) = receiver.next().await {
+            enum Wake {
+                Stop,
+                Ev(Option<Result<Event, iroh_gossip::api::ApiError>>),
+            }
+            let mut stop = stop_rx.fuse();
+            loop {
+                let wake = futures_util::select! {
+                    _ = stop => Wake::Stop,
+                    ev = receiver.next().fuse() => Wake::Ev(ev),
+                };
+                let ev = match wake {
+                    Wake::Stop => break,
+                    Wake::Ev(Some(Ok(ev))) => ev,
+                    Wake::Ev(_) => break,
+                };
                 match ev {
                     Event::Received(m) => {
                         // Open the sealed frame (an outsider's or a corrupt frame
@@ -1086,7 +1135,18 @@ impl GossipTreeSync {
             })
         };
 
-        GossipTreeSync { syncer, sender, cipher, neighbors, routing, versions, auth, _storage: storage, _keep: keep }
+        GossipTreeSync {
+            syncer,
+            sender,
+            cipher,
+            neighbors,
+            routing,
+            versions,
+            auth,
+            _storage: storage,
+            _node: node,
+            _stop: stop_tx,
+        }
     }
 
     pub fn push_text(&self, path: &str, content: &str) {
@@ -1272,11 +1332,6 @@ impl GossipTreeSync {
             .map(|(k, v)| (hex32(k), v.iter().map(hex32).collect()))
             .collect()
     }
-
-    /// Leave the mesh, closing the endpoint (awaited) for a clean rebind.
-    async fn close(self) {
-        self._keep.close().await;
-    }
 }
 
 fn hex32(b: &[u8; 32]) -> String {
@@ -1293,12 +1348,10 @@ pub(crate) fn set_active(bs: GossipTreeSync) {
     GOSSIP.with(|c| *c.borrow_mut() = Some(bs));
 }
 
-/// Tear down any active gossip sync, closing the endpoint (awaited) so a reconnect
-/// under the same persisted identity rebinds cleanly.
-pub(crate) async fn clear_active() {
-    if let Some(bs) = GOSSIP.with(|c| c.borrow_mut().take()) {
-        bs.close().await;
-    }
+/// Tear down the active sync: its receive task stops and the topic is left. The
+/// page's `Node` (endpoint) stays bound for the next board.
+pub(crate) fn clear_active() {
+    drop(GOSSIP.with(|c| c.borrow_mut().take()));
 }
 
 /// Route a text push to the mesh if active; `true` if it was handled.
@@ -1711,6 +1764,58 @@ mod tests {
                 .iter()
                 .any(|(p, b)| p == "notes/x/doc.md" && b == b"# gossip doc\n"),
             "joiner received the file over the gossip mesh: {:?}",
+            got.borrow(),
+        );
+    }
+
+    /// One `Node` serves a board, is torn down, then serves another board — the
+    /// in-tab switch path: the endpoint is never rebound, and the second topic
+    /// syncs to a peer that joins it. Needs network.
+    #[wasm_bindgen_test]
+    async fn reused_node_switches_topics_without_rebinding() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let a = Node::bind(SecretKey::generate()).await.expect("bind a");
+        let s1 = riftpipe_core::crypto::generate_secret();
+        let m1 = a.join(s1, None, &[]).await.expect("a joins board 1");
+        let first = GossipTreeSync::new(
+            m1,
+            Rc::new(|_, _| {}),
+            Auth::load(DeviceKey::from_seed(&[81; 32]), riftpipe_core::crypto::topic_from_secret(&s1)),
+        );
+        drop(first);
+
+        let s2 = riftpipe_core::crypto::generate_secret();
+        let m2 = a.join(s2, None, &[]).await.expect("a joins board 2 on the same endpoint");
+        let host = GossipTreeSync::new(
+            m2,
+            Rc::new(|_, _| {}),
+            Auth::load(DeviceKey::from_seed(&[82; 32]), riftpipe_core::crypto::topic_from_secret(&s2)),
+        );
+        let addr = a.wait_for_addr().await;
+
+        let b = Node::bind(SecretKey::generate()).await.expect("bind b");
+        let mb = b.join(s2, Some(addr), &[]).await.expect("b joins board 2");
+        let got: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::new(RefCell::new(Vec::new()));
+        let g = got.clone();
+        let _joiner = GossipTreeSync::new(
+            mb,
+            Rc::new(move |p, b| g.borrow_mut().push((p, b))),
+            Auth::load(DeviceKey::from_seed(&[83; 32]), riftpipe_core::crypto::topic_from_secret(&s2)),
+        );
+
+        sleep_ms(2500).await;
+        host.push_text("switch.md", "# switched\n");
+        for _ in 0..300 {
+            if got.borrow().iter().any(|(p, _)| p == "switch.md") {
+                break;
+            }
+            sleep_ms(50).await;
+        }
+        assert!(
+            got.borrow().iter().any(|(p, b)| p == "switch.md" && b == b"# switched\n"),
+            "the peer on the re-used endpoint's second board got the file: {:?}",
             got.borrow(),
         );
     }
