@@ -244,10 +244,13 @@ click. Decisions:
    role, by, nonce, sig }` (an Admin registers a credential, Ed25519-signed) and
    `PasskeyLink { device, cred_id, nonce, assertion }` (a device joins, vouched
    for by a WebAuthn assertion whose challenge is
-   `blake3(postcard(("riftpipe-passkey-link-v1", founder, device, nonce)))`).
+   `blake3(postcard(("riftpipe-passkey-link-v1", board, founder, device, nonce)))`,
+   `board` = the gossip topic, bound via `TrustLog::set_board`).
    Every peer verifies offline (`core::passkey::PasskeyCredential::verify`):
    `rpIdHash`, the UP flag, `type == webauthn.get`, the challenge, and the
-   ES256/EdDSA signature. The founder in the challenge scopes it to one board.
+   ES256/EdDSA signature. The board in the challenge scopes it to one board, even
+   across boards one browser founded with the same passkey. Links dedupe by
+   `(device, cred_id, nonce)` — ES256 signatures are malleable.
 3. **No proof-of-possession at registration** — one prompt at claim, not two;
    only an Admin can register, and an Admin can already grant anyone.
 4. **A passkey-linked device is an Admin** (the role in the registration; the

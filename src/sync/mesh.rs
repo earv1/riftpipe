@@ -63,6 +63,8 @@ pub struct MeshConn {
     /// Seals/opens every gossip frame with the key derived from the board
     /// secret — the relay and non-holders see only ciphertext.
     cipher: MeshCipher,
+    /// The board's topic bytes (`H(secret)`) — what passkey links are bound to.
+    board: [u8; 32],
 }
 
 impl MeshConn {
@@ -100,6 +102,7 @@ impl MeshConn {
         let (sender, receiver) = topic.split();
         let cipher = MeshCipher::from_secret(&secret);
         Ok(MeshConn {
+            board: topic_from_secret(&secret),
             endpoint,
             _router: router,
             _gossip: gossip,
@@ -155,7 +158,9 @@ pub async fn run(
         my_id,
         bootstrap,
         cipher,
+        board,
     } = conn;
+    peer.set_board(board);
     let my_id_bytes = *my_id.as_bytes();
     // The gossiped routing map `id -> [neighbors]` (kept for parity with the
     // browser's debug map; phase 2 will surface it). Our own entry is sourced

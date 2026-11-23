@@ -392,7 +392,7 @@ over riftpipe's wasm file API). What remains:
   credential's public key on the trust log. Another of the owner's devices
   holding the same passkey (platform-synced, a security key, a phone) clicks
   "🔑 Link with my passkey": its assertion over
-  `blake3(founder, device, nonce)` rides a `TrustEntry::PasskeyLink`, every
+  `blake3(board, founder, device, nonce)` rides a `TrustEntry::PasskeyLink`, every
   peer verifies it offline (`core::passkey` — signature, `rpIdHash`, UP,
   type, challenge), and the device joins as an Admin with no approve click;
   an online Admin then wraps it into the epoch. The ceremony is generic

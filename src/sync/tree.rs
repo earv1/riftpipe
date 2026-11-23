@@ -156,6 +156,12 @@ impl TreePeer {
         self.epochs.as_ref()?.latest_held_seq()
     }
 
+    /// Bind the trust log to this board's topic (`H(secret)`) so passkey links
+    /// made for it verify ([`TrustLog::set_board`]).
+    pub fn set_board(&mut self, board: [u8; 32]) {
+        self.trust.set_board(board);
+    }
+
     /// This device's id, if an identity is set.
     pub fn device_id(&self) -> Option<[u8; 32]> {
         self.identity.as_ref().map(|k| k.id())

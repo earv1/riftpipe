@@ -170,9 +170,13 @@ check `core::passkey`.
   signature over `authenticatorData ‖ SHA-256(clientDataJSON)`,
   `rpIdHash == SHA-256(rp_id)`, the user-present flag set,
   `type == "webauthn.get"`, and the challenge equal to
-  `blake3("riftpipe-passkey-link-v1", founder, device, nonce)` — so an assertion
-  is scoped to **one board and one device** and can't be replayed onto another
-  board that registered the same passkey, or for another device.
+  `blake3("riftpipe-passkey-link-v1", board, founder, device, nonce)` (`board` =
+  the gossip topic `H(secret)`) — so an assertion is scoped to **one board and
+  one device** and can't be replayed onto another board that registered the
+  same passkey (even one founded by the same browser), or for another device.
+  A link is de-duplicated by `(device, cred_id, nonce)`, not its signature
+  bytes — ES256 signatures are malleable (`(r, n−s)` verifies too), so a
+  signature-keyed id would let a removed device re-apply its own old link.
 - **A linked device is an Admin** (the role stored in the registration; the UI
   always registers Admin — the passkey is the owner's identity). A passkey
   speaks only while its registrant is still an Admin.

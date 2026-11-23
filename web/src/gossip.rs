@@ -254,10 +254,12 @@ impl Auth {
     /// board stays claimed — and readable — across reloads.
     pub fn load(identity: DeviceKey, topic: [u8; 32]) -> Self {
         let epochs = EpochBook::new(&identity);
+        let mut trust = TrustLog::new();
+        trust.set_board(topic);
         let mut a = Auth {
             identity,
             topic,
-            trust: TrustLog::new(),
+            trust,
             entries: Vec::new(),
             seen: Default::default(),
             epochs,
@@ -445,7 +447,7 @@ impl Auth {
             return None;
         }
         let nonce = Self::fresh_nonce();
-        Some((passkey_link_challenge(&founder, &self.my_id(), &nonce), nonce, creds))
+        Some((passkey_link_challenge(&self.topic, &founder, &self.my_id(), &nonce), nonce, creds))
     }
 
     /// Join with a passkey assertion (from the ceremony `passkey_link_ask` set up). It
@@ -455,7 +457,7 @@ impl Auth {
     fn link_by_passkey(&mut self, cred_id: Vec<u8>, nonce: [u8; 16], assertion: PasskeyAssertion) -> Option<Accepted> {
         let founder = self.trust.founder()?;
         let (cred, _) = self.trust.passkeys().into_iter().find(|(c, _)| c.id == cred_id)?;
-        if !cred.verify(&assertion, &passkey_link_challenge(&founder, &self.my_id(), &nonce)) {
+        if !cred.verify(&assertion, &passkey_link_challenge(&self.topic, &founder, &self.my_id(), &nonce)) {
             return None;
         }
         let e = TrustEntry::PasskeyLink { device: self.my_id(), cred_id, nonce, assertion };
@@ -1874,8 +1876,12 @@ mod tests {
     /// the link offline and isn't authorized by it.
     #[wasm_bindgen_test]
     fn passkey_claim_then_link_a_second_device() {
-        let topic = riftpipe_core::crypto::generate_secret;
-        let mut a = Auth::load(DeviceKey::from_seed(&[81; 32]), topic());
+        // One board (one topic) for all three devices: load them before anything is
+        // persisted, so none starts from another's stored log.
+        let topic = riftpipe_core::crypto::generate_secret();
+        let mut a = Auth::load(DeviceKey::from_seed(&[81; 32]), topic);
+        let mut b = Auth::load(DeviceKey::from_seed(&[82; 32]), topic);
+        let mut c = Auth::load(DeviceKey::from_seed(&[83; 32]), topic);
         let (sk, cred) = soft_passkey(1, "localhost");
         let (ok, claim) = a.claim_with_passkey(cred.clone());
         assert!(ok && a.is_author(), "claimed and registered");
@@ -1883,7 +1889,6 @@ mod tests {
         assert!(a.passkeys_for("earv1.github.io").is_empty(), "a credential only asserts on its own RP id");
         let early = a.sign(SyncMsg::Lww { path: "early".into(), version: 1, bytes: b"0".to_vec() }).unwrap();
 
-        let mut b = Auth::load(DeviceKey::from_seed(&[82; 32]), topic());
         deliver(&claim, &mut b);
         assert!(b.locked() && !b.authorized());
         let (no, none) = b.claim_with_passkey(soft_passkey(3, "localhost").1);
@@ -1910,10 +1915,29 @@ mod tests {
         assert!(b.can_read(), "the owner wrapped the linked device into the epoch");
         assert_eq!(b.accept(dup(&early)).apply.len(), 1, "it opens content sealed before it linked");
 
-        let mut c = Auth::load(DeviceKey::from_seed(&[83; 32]), topic());
         deliver(&claim, &mut c);
         c.accept(dup(&link.send[0]));
         assert!(c.trust.is_authorized(&b.my_id()) && !c.authorized(), "c verifies b's link; it authorizes b, not c");
+    }
+
+    /// One browser founds two boards with its one passkey: a link made for board 1
+    /// doesn't authorize the device on board 2.
+    #[wasm_bindgen_test]
+    fn a_passkey_link_is_scoped_to_its_board() {
+        let (topic_1, topic_2) = (riftpipe_core::crypto::generate_secret(), riftpipe_core::crypto::generate_secret());
+        let mut owner_1 = Auth::load(DeviceKey::from_seed(&[86; 32]), topic_1);
+        let mut owner_2 = Auth::load(DeviceKey::from_seed(&[86; 32]), topic_2);
+        let mut phone = Auth::load(DeviceKey::from_seed(&[87; 32]), topic_1);
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let (_, claim_1) = owner_1.claim_with_passkey(cred.clone());
+        assert!(owner_2.claim_with_passkey(cred.clone()).0);
+        deliver(&claim_1, &mut phone);
+        let (challenge, nonce, _) = phone.passkey_link_ask("localhost").expect("a passkey to link with");
+        let link = phone.link_by_passkey(cred.id.clone(), nonce, soft_assert(&sk, "localhost", &challenge)).expect("linked");
+        owner_1.accept(dup(&link.send[0]));
+        owner_2.accept(dup(&link.send[0]));
+        assert!(owner_1.trust.is_authorized(&phone.my_id()), "linked on board 1");
+        assert!(!owner_2.trust.is_authorized(&phone.my_id()), "but not on board 2");
     }
 
     /// The same assertion with the other valid ECDSA signature, `(r, n−s)`.
