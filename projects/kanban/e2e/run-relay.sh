@@ -15,8 +15,11 @@ ROOM="relay-$(openssl rand -hex 4)"
 cargo build --quiet --bin riftpipe || exit 1
 
 echo "== starting coturn (TURN) + signaling =="
+# Newer coturn (4.18) dropped --no-dtls (DTLS is off unless --dtls) and
+# refuses to start when given it; pass it only to a turnserver that lists it.
+NO_DTLS=""; case "$(turnserver --help 2>&1)" in *--no-dtls*) NO_DTLS="--no-dtls";; esac
 turnserver -n --lt-cred-mech --user "$TURN_USER:$TURN_PASS" --realm riftpipe \
-  --listening-ip 127.0.0.1 --listening-port $TURNPORT --no-tls --no-dtls \
+  --listening-ip 127.0.0.1 --listening-port $TURNPORT --no-tls $NO_DTLS \
   --allow-loopback-peers \
   --min-port 49200 --max-port 49260 --log-file=/tmp/turn.log --simple-log --no-stdout-log >/dev/null 2>&1 &
 TURN=$!
