@@ -393,8 +393,9 @@ over riftpipe's wasm file API). What remains:
   or isn't a direct neighbor still sees it. Any restricted peer keeps a request
   list (verified, one per device, max 64, cleared on grant) and writes it, with
   the member list, to `.riftpipe-auth.json` (ids, names, roles, safety codes —
-  never keys; never synced). `riftpipe requests|members <dir> [--json]` read
-  it; `riftpipe approve <dir> <device-id|safety-code>` goes through
+  never keys; never synced; stamped with `pid`/`updatedAt` as a 5 s heartbeat
+  and removed when the peer stops — the CLI warns on a stale one).
+  `riftpipe requests|members <dir> [--json]` read it; `riftpipe approve <dir> <device-id|safety-code>` goes through
   `.riftpipe-control` — the running peer requires a waiting request from that
   device, then grants it (Member) and wraps it into the current epoch. No wire
   change (`MeshMsg::Request` was already pinned; `PROTOCOL_VERSION` stays 4).

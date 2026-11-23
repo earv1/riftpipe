@@ -11,9 +11,17 @@ pub const CONTROL_FILE: &str = ".riftpipe-control";
 
 /// Machine-local snapshot of a running restricted peer's auth state (device ids,
 /// names, roles and safety codes — never keys, never synced). Rewritten by the
-/// mesh loop about once a second when something changed; read by the
-/// `requests`/`members`/`approve` CLI verbs.
+/// mesh loop when something changed and at least every [`STATE_HEARTBEAT_SECS`],
+/// stamped with the writer's `pid` and `updatedAt` (unix seconds); removed when
+/// the loop ends. Read by the `requests`/`members`/`approve` CLI verbs.
 pub const STATE_FILE: &str = ".riftpipe-auth.json";
+
+/// The running peer rewrites [`STATE_FILE`] at least this often (a heartbeat).
+pub const STATE_HEARTBEAT_SECS: u64 = 5;
+
+/// A [`STATE_FILE`] whose `updatedAt` is older than this (three missed
+/// heartbeats) probably belongs to a peer that crashed or was killed.
+pub const STATE_STALE_SECS: u64 = 15;
 
 /// Display names are self-asserted and shown to an Admin before approving, so
 /// cap how much garbage one device can push.
@@ -186,6 +194,26 @@ pub fn read_state(dir: &Path) -> Option<serde_json::Value> {
 /// this device stops being restricted-and-unauthorized).
 pub fn remove_state(dir: &Path) {
     let _ = std::fs::remove_file(dir.join(STATE_FILE));
+}
+
+/// Seconds since the unix epoch (the clock `updatedAt` is stamped with).
+pub fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// A warning when `state` looks like a dead peer's: its `updatedAt` is more than
+/// [`STATE_STALE_SECS`] before `now_secs`. `None` when it's fresh or unstamped.
+pub fn stale_warning(state: &serde_json::Value, now_secs: u64) -> Option<String> {
+    let updated = state.get("updatedAt")?.as_u64()?;
+    let age = now_secs.saturating_sub(updated);
+    if age <= STATE_STALE_SECS {
+        return None;
+    }
+    let pid = state.get("pid").and_then(|v| v.as_u64()).map(|p| format!(" by pid {p}")).unwrap_or_default();
+    Some(format!(
+        "[riftpipe] warning: {STATE_FILE} was last updated {age}s ago{pid} — the peer may not be running, so this \
+         is out of date, and an `approve` queued now is only seen by a peer that is running on this dir"
+    ))
 }
 
 /// The `(name, safety)` of the request from `device_hex` in `state["requests"]`, if any.
@@ -480,6 +508,17 @@ mod tests {
         assert_eq!(read_state(&dir), None);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_warning_after_three_missed_heartbeats() {
+        let state = json!({"pid": 4242, "updatedAt": 1_000});
+        assert_eq!(stale_warning(&state, 1_000), None);
+        assert_eq!(stale_warning(&state, 1_000 + STATE_STALE_SECS), None);
+        let w = stale_warning(&state, 1_100).unwrap();
+        assert!(w.contains("100s ago") && w.contains("pid 4242"), "{w}");
+        assert_eq!(stale_warning(&json!({"requests": []}), 1_100), None, "unstamped: no claim either way");
+        assert_eq!(stale_warning(&state, 0), None, "a clock behind the writer's isn't stale");
     }
 
     #[test]

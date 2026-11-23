@@ -386,7 +386,14 @@ async fn restricted_mesh_request_then_approve_via_control_file() {
     assert_eq!(req.get("safety").and_then(|v| v.as_str()), Some(want_safety.as_str()));
 
     assert!(!dj.join("secret.bin").exists(), "an unapproved joiner must not read the founder's content");
+    let state = riftpipe::sync::control::read_state(&df).unwrap();
+    assert_eq!(state.get("pid").and_then(|v| v.as_u64()), Some(std::process::id() as u64), "stamped with the writer's pid");
+    assert!(state.get("updatedAt").and_then(|v| v.as_u64()).is_some(), "stamped with updatedAt");
 
+    // An approve for a device with no pending request is ignored (grant by id is
+    // the route for that); it's queued first, so it's handled before the real one.
+    let stranger = hex(&DeviceKey::from_seed(&[73u8; 32]).id());
+    riftpipe::sync::control::append(&df, "approve", &stranger).unwrap();
     riftpipe::sync::control::append(&df, "approve", &j_hex).unwrap();
     wait_for(&[dj.join("secret.bin")], "the approved joiner reads the founder's pre-existing content").await;
 
@@ -418,9 +425,20 @@ async fn restricted_mesh_request_then_approve_via_control_file() {
     })
     .await
     .expect("founder's auth state never settled to an empty inbox with the joiner as a member");
+    let members = riftpipe::sync::control::read_state(&df).unwrap()["members"].clone();
+    assert!(
+        !members.as_array().unwrap().iter().any(|m| m["device"] == stranger.as_str()),
+        "an approve with no pending request granted nothing: {members}"
+    );
 
+    // The snapshot belongs to the session: it's removed when the loop ends.
     a_task.abort();
     j_task.abort();
+    let _ = a_task.await;
+    let _ = j_task.await;
+    for d in [&df, &dj] {
+        assert!(riftpipe::sync::control::read_state(d).is_none(), "state file left behind in {}", d.display());
+    }
     std::fs::remove_dir_all(&df).ok();
     std::fs::remove_dir_all(&dj).ok();
 }

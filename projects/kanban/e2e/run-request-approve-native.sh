@@ -35,7 +35,8 @@ fail=0
 
 echo "== founder hosts a restricted board, granting no one up front =="
 "$BIN" connect --accept "$FOUNDER" --restricted >"$WORK/founder.log" 2>&1 &
-PIDS+=($!)
+FOUNDER_PID=$!
+PIDS+=($FOUNDER_PID)
 for _ in $(seq 1 30); do [ -f "$FOUNDER.ticket" ] && break; sleep 0.3; done
 TICKET="$(cat "$FOUNDER.ticket" 2>/dev/null || true)"
 [ -n "$TICKET" ] || { echo "FAIL: founder never printed a ticket"; cat "$WORK/founder.log"; exit 1; }
@@ -124,6 +125,21 @@ if ! "$BIN" members "$JOINER" 2>/dev/null | grep -q "^$J_ID  member  (this devic
 fi
 
 grep -q "protocol-mismatch" "$WORK"/*.log && { echo "FAIL: unexpected protocol mismatch"; fail=1; }
+
+# A SIGTERM'd peer stops cleanly and removes its auth snapshot, so `requests`
+# no longer reports a dead peer's state.
+kill "$FOUNDER_PID" 2>/dev/null
+ok=0
+for _ in $(seq 1 20); do
+  [ ! -f "$FOUNDER/.riftpipe-auth.json" ] && { ok=1; break; }
+  sleep 0.25
+done
+if [ "$ok" = 1 ] && ! "$BIN" requests "$FOUNDER" >/dev/null 2>&1; then
+  echo "OK: the stopped founder removed its auth state"
+else
+  echo "FAIL: the founder's .riftpipe-auth.json outlived it"
+  fail=1
+fi
 
 if [ "$fail" = 0 ]; then
   echo "PASS: request → approve (by safety code) works between CLI peers"

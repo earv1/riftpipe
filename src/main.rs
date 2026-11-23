@@ -164,6 +164,9 @@ async fn main() {
                 eprintln!("[riftpipe] no auth state in {dir} — run `riftpipe connect … --restricted` on it first");
                 std::process::exit(1);
             };
+            if let Some(w) = riftpipe::sync::control::stale_warning(&state, riftpipe::sync::control::unix_now_secs()) {
+                eprintln!("{w}");
+            }
             if json {
                 println!("{}", state.get(verb).cloned().unwrap_or(serde_json::json!([])));
             } else if verb == "requests" {
@@ -196,6 +199,12 @@ async fn main() {
             let dir = args[2].clone();
             let target = args[3..].concat();
             let state = riftpipe::sync::control::read_state(std::path::Path::new(&dir));
+            if let Some(w) = state
+                .as_ref()
+                .and_then(|s| riftpipe::sync::control::stale_warning(s, riftpipe::sync::control::unix_now_secs()))
+            {
+                eprintln!("{w}");
+            }
             match riftpipe::sync::control::resolve_approve_target(state.as_ref(), &target) {
                 Ok((id, label)) => {
                     let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
