@@ -46,7 +46,12 @@ pub fn is_text_path(path: &str) -> bool {
 /// `MeshMsg::Sealed` (content under the current epoch key); open boards are
 /// wire-identical. (b) Folder-mode deletes — `SyncMsg::StratDelete` (a v3
 /// folder peer skips it and keeps deleted files). The bump surfaces both.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5: passkey device-linking — two APPENDED `TrustEntry` variants (`Passkey`: an
+/// Admin registers a WebAuthn credential; `PasskeyLink`: a device joins vouched for
+/// by an assertion from it), carried in `MeshMsg::Trust`. A v4 peer fails to decode
+/// those frames and skips them, so it never authorizes a passkey-linked device (and
+/// drops its writes) — the bump surfaces that.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Per-chunk payload budget for [`encode_mesh_frames`]. iroh-gossip's message
 /// limit defaults to 4096 bytes and is enforced on SEND AND RECEIVE — so
@@ -147,7 +152,8 @@ pub enum MeshMsg {
     /// A signed trust-log entry (device-linking auth) — broadcast so every peer
     /// converges on the authorized device set. Fed to
     /// [`identity::TrustLog`](crate::identity::TrustLog). APPENDED: peers that
-    /// predate auth skip it cleanly.
+    /// predate auth skip it cleanly. `TrustEntry`'s own variants are append-only too
+    /// (pinned in `wire_compat`).
     Trust(crate::identity::TrustEntry),
     /// A **signed** tree write: the payload is a postcard-encoded [`SyncMsg`]
     /// signed by its author (device-linking auth). A driver enforcing signing
@@ -810,6 +816,80 @@ mod wire_compat {
                 "v3 peers must reject (and thus skip) epoch-sealed frames",
             );
         }
+    }
+
+    /// Protocol v5: two APPENDED `TrustEntry` variants (`Passkey`, `PasskeyLink`).
+    /// Pin their postcard discriminants, and prove a v4 peer — which doesn't know
+    /// about either — fails to decode (and thus skips) a `Trust` frame carrying one.
+    #[test]
+    fn trust_entry_indexes_pinned_and_v4_peers_skip_passkey_entries() {
+        use crate::identity::{DeviceKey, Role, TrustEntry};
+        use crate::passkey::{PasskeyAssertion, PasskeyCredential, ALG_ES256};
+        let k = DeviceKey::from_seed(&[7u8; 32]);
+        let cred =
+            PasskeyCredential { id: vec![1; 16], alg: ALG_ES256, public_key: vec![4; 65], rp_id: "localhost".into() };
+        let link = TrustEntry::PasskeyLink {
+            device: [2; 32],
+            cred_id: vec![1; 16],
+            nonce: [3; 16],
+            assertion: PasskeyAssertion {
+                authenticator_data: vec![0; 37],
+                client_data_json: b"{}".to_vec(),
+                signature: vec![1],
+            },
+        };
+
+        let cases: Vec<(TrustEntry, u8)> = vec![
+            (k.genesis(), 0),
+            (k.grant([1; 32], Role::Member, [0; 16]), 1),
+            (k.revoke([1; 32], [0; 16]), 2),
+            (k.register_passkey(cred.clone(), Role::Admin, [0; 16]), 3),
+            (link.clone(), 4),
+        ];
+        for (e, index) in cases {
+            assert_eq!(postcard::to_allocvec(&e).unwrap()[0], index, "TrustEntry variant index moved");
+            let bytes = postcard::to_allocvec(&MeshMsg::Trust(e)).unwrap();
+            assert_eq!(&bytes[..2], [4, index], "MeshMsg::Trust(..) wire prefix moved");
+        }
+
+        /// The `TrustEntry` enum exactly as v4 peers know it (no Passkey/PasskeyLink).
+        #[derive(serde::Deserialize)]
+        enum LegacyV4TrustEntry {
+            #[allow(dead_code)]
+            Genesis { founder: [u8; 32], sig: Vec<u8> },
+            #[allow(dead_code)]
+            Grant { device: [u8; 32], role: Role, by: [u8; 32], nonce: [u8; 16], sig: Vec<u8> },
+            #[allow(dead_code)]
+            Revoke { device: [u8; 32], by: [u8; 32], nonce: [u8; 16], sig: Vec<u8> },
+        }
+
+        /// The mesh wire enum exactly as v4 peers know it.
+        #[derive(serde::Deserialize)]
+        enum LegacyV4MeshMsg {
+            #[allow(dead_code)]
+            Sync(SyncMsg),
+            #[allow(dead_code)]
+            Presence { id: [u8; 32], neighbors: Vec<[u8; 32]> },
+            #[allow(dead_code)]
+            Chunk { id: u64, index: u32, total: u32, bytes: Vec<u8> },
+            #[allow(dead_code)]
+            Version { id: [u8; 32], proto: u32 },
+            #[allow(dead_code)]
+            Trust(LegacyV4TrustEntry),
+        }
+
+        let reg = k.register_passkey(cred, Role::Admin, [0; 16]);
+        for e in [reg, link] {
+            let bytes = postcard::to_allocvec(&MeshMsg::Trust(e)).unwrap();
+            assert!(
+                postcard::from_bytes::<LegacyV4MeshMsg>(&bytes).is_err(),
+                "v4 peers must reject (and thus skip) passkey entries",
+            );
+        }
+
+        // Sanity check: the legacy enum matches on an entry it does know.
+        let bytes = postcard::to_allocvec(&MeshMsg::Trust(k.genesis())).unwrap();
+        assert!(postcard::from_bytes::<LegacyV4MeshMsg>(&bytes).is_ok());
     }
 
     /// The mismatch detector: an announced different version flags once;
