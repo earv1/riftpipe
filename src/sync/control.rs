@@ -23,6 +23,7 @@ pub const NAME_MAX_CHARS: usize = 64;
 pub enum Command {
     Grant([u8; 32]),
     Revoke([u8; 32]),
+    Approve([u8; 32]),
 }
 
 /// Parse 64 hex chars into a 32-byte array.
@@ -37,7 +38,7 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// `revoke <64 hex>` | `grant <64 hex>` (surrounding whitespace ok).
+/// `revoke <64 hex>` | `grant <64 hex>` | `approve <64 hex>` (surrounding whitespace ok).
 pub fn parse_line(line: &str) -> Option<Command> {
     let line = line.trim();
     let mut parts = line.split_whitespace();
@@ -50,6 +51,7 @@ pub fn parse_line(line: &str) -> Option<Command> {
     match verb {
         "revoke" => Some(Command::Revoke(id)),
         "grant" => Some(Command::Grant(id)),
+        "approve" => Some(Command::Approve(id)),
         _ => None,
     }
 }
@@ -240,6 +242,7 @@ mod tests {
         let id = "a".repeat(64);
         assert_eq!(parse_line(&format!("revoke {id}")), Some(Command::Revoke(hex32(&id).unwrap())));
         assert_eq!(parse_line(&format!("  grant {id}  ")), Some(Command::Grant(hex32(&id).unwrap())));
+        assert_eq!(parse_line(&format!("approve {id}")), Some(Command::Approve(hex32(&id).unwrap())));
         assert_eq!(parse_line("revoke"), None);
         assert_eq!(parse_line("revoke nothex"), None);
         assert_eq!(parse_line(&format!("frobnicate {id}")), None);

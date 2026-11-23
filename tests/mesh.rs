@@ -328,3 +328,99 @@ async fn restricted_mesh_revoked_device_loses_read_after_rotation() {
         std::fs::remove_dir_all(d).ok();
     }
 }
+
+/// CLI request-to-join, END-TO-END over the real mesh: a keyless `--restricted`
+/// joiner broadcasts a signed [`riftpipe_core::onboard::JoinRequest`], the founder's
+/// inbox and `.riftpipe-auth.json` snapshot surface it, `riftpipe approve <dir>
+/// <id>` (the control-file path exercised by the CLI's `approve` verb) grants it,
+/// and the joiner reads the founder's content and gets wrapped into the epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restricted_mesh_request_then_approve_via_control_file() {
+    use riftpipe_core::identity::DeviceKey;
+    use riftpipe_core::onboard::JoinRequest;
+
+    let (df, dj) = (dir("rq-founder"), dir("rq-joiner"));
+    let secret = riftpipe_core::crypto::generate_secret();
+    let host = MeshConn::join(secret, None).await.expect("host join");
+    let host_addr = dialable_addr(&host).await;
+
+    let (_tx_a, mut rx_a) = push_file(&df, "secret.bin", b"members only");
+    let (tx_j, mut rx_j) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+
+    let df_task = df.clone();
+    let a_task = tokio::spawn(async move {
+        let founder = DeviceKey::from_seed(&[71u8; 32]);
+        let mut peer = TreePeer::new();
+        peer.set_identity(DeviceKey::from_seed(&[71u8; 32]), true);
+        peer.add_trust(founder.genesis()); // founder = Admin; no grants yet
+        let _ = riftpipe::sync::mesh::run(host, &df_task, &mut peer, &mut rx_a, false).await;
+    });
+    let (dj_task, addr) = (dj.clone(), host_addr.clone());
+    let j_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        peer.set_identity(DeviceKey::from_seed(&[72u8; 32]), true);
+        peer.set_request_name("Bob");
+        let _ = riftpipe::sync::mesh::join_and_run(secret, addr, &dj_task, &mut peer, &mut rx_j, false).await;
+    });
+
+    let j_id = DeviceKey::from_seed(&[72u8; 32]).id();
+    let j_hex = hex(&j_id);
+    let want_safety = JoinRequest::create(&DeviceKey::from_seed(&[72u8; 32]), "Bob").safety_code();
+
+    // The founder's inbox (via its `.riftpipe-auth.json` snapshot) learns the request.
+    let req = tokio::time::timeout(BUDGET, async {
+        loop {
+            if let Some(state) = riftpipe::sync::control::read_state(&df) {
+                if let Some(arr) = state.get("requests").and_then(|v| v.as_array()) {
+                    if let Some(r) = arr.iter().find(|r| r.get("device").and_then(|v| v.as_str()) == Some(j_hex.as_str())) {
+                        break r.clone();
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("founder's auth state never showed the joiner's request");
+    assert_eq!(req.get("name").and_then(|v| v.as_str()), Some("Bob"));
+    assert_eq!(req.get("safety").and_then(|v| v.as_str()), Some(want_safety.as_str()));
+
+    assert!(!dj.join("secret.bin").exists(), "an unapproved joiner must not read the founder's content");
+
+    riftpipe::sync::control::append(&df, "approve", &j_hex).unwrap();
+    wait_for(&[dj.join("secret.bin")], "the approved joiner reads the founder's pre-existing content").await;
+
+    std::fs::write(dj.join("reply.bin"), b"from the joiner").unwrap();
+    tx_j.send(dj.join("reply.bin")).unwrap();
+    wait_for(&[df.join("reply.bin")], "the newly-approved joiner's write reaches the founder").await;
+
+    // The founder's snapshot drops the request and lists the joiner as a member.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(state) = riftpipe::sync::control::read_state(&df) {
+                let empty = state.get("requests").and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(false);
+                let is_member = state
+                    .get("members")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter().any(|m| {
+                            m.get("device").and_then(|v| v.as_str()) == Some(j_hex.as_str())
+                                && m.get("role").and_then(|v| v.as_str()) == Some("member")
+                        })
+                    })
+                    .unwrap_or(false);
+                if empty && is_member {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("founder's auth state never settled to an empty inbox with the joiner as a member");
+
+    a_task.abort();
+    j_task.abort();
+    std::fs::remove_dir_all(&df).ok();
+    std::fs::remove_dir_all(&dj).ok();
+}

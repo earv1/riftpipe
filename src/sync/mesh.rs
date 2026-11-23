@@ -165,6 +165,9 @@ pub async fn run(
     let mut rescan = interval(Duration::from_secs(2));
     rescan.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut rx_open = true;
+    // Last-written `.riftpipe-auth.json` text, so we only rewrite the file
+    // (and churn an fsync) when the snapshot actually changed.
+    let mut last_state = String::new();
 
     // Files that predate the session must be in the syncer BEFORE any
     // NeighborUp, or the full_state() catch-up broadcasts an empty tree
@@ -173,6 +176,13 @@ pub async fn run(
     // A restricted founder mints epoch 1 here. The announces stay in the book
     // and reach peers through the `NeighborUp` catch-up.
     let _ = peer.startup();
+    // Prime the auth state snapshot (or clear a stale one left by a previous,
+    // now-authorized session on this dir).
+    if peer.auth_state_json().is_none() {
+        crate::sync::control::remove_state(dir);
+    } else {
+        sync_state(peer, dir, &mut last_state);
+    }
 
     // A failed send must not kill the session (convergence is repaired by the
     // next catch-up), but it must be VISIBLE — a silently dropped broadcast
@@ -233,6 +243,26 @@ pub async fn run(
     let mut control_tick = interval(Duration::from_secs(1));
     control_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // A keyless restricted peer re-announces its join request: an Admin who
+    // comes online later, or who isn't a direct neighbor, still sees it.
+    const REQUEST_REANNOUNCE: Duration = Duration::from_secs(15);
+    let mut request_tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + REQUEST_REANNOUNCE, REQUEST_REANNOUNCE);
+    request_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    /// Rewrite `.riftpipe-auth.json` only when the snapshot text actually changed.
+    fn sync_state(peer: &TreePeer, dir: &Path, last: &mut String) {
+        let Some(json) = peer.auth_state_json() else { return };
+        let text = serde_json::to_string_pretty(&json).unwrap_or_default();
+        if text == *last {
+            return;
+        }
+        match crate::sync::control::write_state(dir, &text) {
+            Ok(()) => *last = text,
+            Err(e) => eprintln!("[auth] writing .riftpipe-auth.json failed: {e}"),
+        }
+    }
+
     loop {
         tokio::select! {
             // Local edits → broadcast (the watcher feeds paths into `rx`).
@@ -276,17 +306,26 @@ pub async fn run(
                     report_mismatch(&p);
                 }
             }
-            // Live admin commands from `riftpipe revoke|grant <dir> <id>`.
+            // A keyless restricted peer re-announces so an Admin who comes online
+            // later, or isn't a direct neighbor, still sees the request.
+            _ = request_tick.tick() => {
+                if let Some(r) = peer.read_request() {
+                    broadcast(&sender, &cipher, &r).await;
+                }
+            }
+            // Live admin commands from `riftpipe revoke|grant|approve <dir> <id>`.
             _ = control_tick.tick() => {
                 for cmd in control.poll() {
                     let out = match cmd {
                         crate::sync::control::Command::Revoke(id) => peer.revoke_device(id, dir),
                         crate::sync::control::Command::Grant(id) => peer.grant_device(id, dir),
+                        crate::sync::control::Command::Approve(id) => peer.approve_request(id, dir),
                     };
                     for m in out {
                         broadcast(&sender, &cipher, &m).await;
                     }
                 }
+                sync_state(peer, dir, &mut last_state);
             }
             // Mesh events: remote edits → disk, membership → catch-up + presence.
             ev = receiver.next() => {
