@@ -29,6 +29,8 @@ pub mod gossip;
 pub mod iroh_link;
 /// OPFS file-tree helpers — local, serverless persistence.
 pub mod opfs;
+/// The browser WebAuthn ceremony for passkey device-linking (passkeySupported/claimWithPasskey/linkWithPasskey).
+pub mod passkey;
 /// Per-file sync of a shared file tree over an established WebRTC link.
 pub mod tree_sync;
 

@@ -85,7 +85,10 @@ body {
 }
 .auth-bar .lock-btn,
 .auth-bar .ask-btn,
-.auth-bar .approve-btn {
+.auth-bar .approve-btn,
+.auth-bar .passkey-claim-btn,
+.auth-bar .passkey-add-btn,
+.auth-bar .passkey-link-btn {
   padding: 0.3rem 0.7rem;
   border: 1px solid #c3c8ce;
   border-radius: 6px;
@@ -118,6 +121,7 @@ body {
 .auth-bar .auth-status.editor { color: #0b57d0; }
 .auth-bar .auth-status.no-access { color: #8a4d00; }
 .auth-bar .auth-status.pending-key { color: #8a9099; }
+.auth-bar .passkey-on { color: #0b6b3a; }
 .auth-bar .member {
   display: inline-flex;
   align-items: center;

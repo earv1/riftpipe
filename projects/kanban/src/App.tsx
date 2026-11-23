@@ -19,21 +19,39 @@ export function App() {
   // Auth/login state (from the lib): whether the board is locked (has an
   // author), and whether this device is the author / authorized to write.
   const [authState, setAuthState] = createSignal<AuthState>(
-    { locked: false, device: "", authorized: false, isAuthor: false, author: "", requested: false, canRead: true, epoch: 0 },
+    {
+      locked: false, device: "", authorized: false, isAuthor: false, author: "", requested: false, canRead: true,
+      epoch: 0, isAdmin: false, passkeys: 0, passkeyHere: false,
+    },
   );
   // The author's inbox: who has asked for write access (device id + safety code).
   const [pending, setPending] = createSignal<PendingRequest[]>([]);
   // Every authorized device (restricted boards): lets the owner remove one.
   const [members, setMembers] = createSignal<Member[]>([]);
+  // Whether this page can use passkey device-linking (secure domain origin;
+  // wasm is only initialized by the time refreshAuth first runs).
+  const [canPasskey, setCanPasskey] = createSignal(false);
+  const [passkeyMsg, setPasskeyMsg] = createSignal("");
   const refreshAuth = () => {
     setAuthState(auth.state());
     setPending(auth.pending());
     setMembers(auth.members());
+    setCanPasskey(auth.passkeySupported());
   };
   const lock = () => { auth.lockBoard(); refreshAuth(); };
   const askForAccess = () => { auth.requestAccess(); refreshAuth(); };
   const approve = (device: string) => { auth.grantDevice(device); refreshAuth(); };
   const revoke = (device: string) => { auth.revokeDevice(device); refreshAuth(); };
+  const claimPasskey = async () => {
+    setPasskeyMsg("");
+    if (!(await auth.claimWithPasskey())) setPasskeyMsg("passkey not set up (cancelled or unsupported)");
+    refreshAuth();
+  };
+  const linkPasskey = async () => {
+    setPasskeyMsg("");
+    if (!(await auth.linkWithPasskey())) setPasskeyMsg("couldn't link with a passkey (cancelled, or not this board's passkey)");
+    refreshAuth();
+  };
 
   // A mesh peer announced a different riftpipe protocol version (or predates
   // versioning). Detection lives in the library; we only render its event.
@@ -176,10 +194,16 @@ export function App() {
           >
             🔓 Claim board (you become the owner)
           </button>
+          <Show when={canPasskey()}>
+            <button class="passkey-claim-btn" title="Claim this board and register a passkey (Face ID / Touch ID / security key) — your other devices can then join with it, no approval needed" onClick={claimPasskey}>🔑 Claim with passkey</button>
+          </Show>
           <span class="auth-hint">anyone with the link can edit until you claim it</span>
         </Show>
-        <Show when={authState().locked && authState().isAuthor}>
-          <span class="auth-status owner">🔒 You own this board</span>
+        <Show when={authState().locked && authState().isAdmin && authState().canRead}>
+          <span class="auth-status owner">{authState().isAuthor ? "🔒 You own this board" : "🔒 Your device · board admin"}</span>
+          <Show when={authState().passkeys > 0} fallback={<Show when={canPasskey()}><button class="passkey-add-btn" title="Register a passkey so your other devices can join with it" onClick={claimPasskey}>🔑 Add passkey</button></Show>}>
+            <span class="auth-hint passkey-on">🔑 passkey on — your other devices can join with it</span>
+          </Show>
           <Show
             when={pending().length > 0}
             fallback={<span class="auth-hint">no access requests — people who ask will show up here</span>}
@@ -210,10 +234,10 @@ export function App() {
             </For>
           </Show>
         </Show>
-        <Show when={authState().locked && authState().authorized && !authState().isAuthor && authState().canRead}>
+        <Show when={authState().locked && authState().authorized && !authState().isAdmin && authState().canRead}>
           <span class="auth-status editor">🔒 Claimed · you can edit</span>
         </Show>
-        <Show when={authState().locked && authState().authorized && !authState().isAuthor && !authState().canRead}>
+        <Show when={authState().locked && authState().authorized && !authState().canRead}>
           <span class="auth-status pending-key">🔒 Claimed · approved — waiting for the board key</span>
         </Show>
         <Show when={authState().locked && !authState().authorized}>
@@ -224,7 +248,11 @@ export function App() {
           >
             <button class="ask-btn" onClick={askForAccess}>Ask to join</button>
           </Show>
+          <Show when={canPasskey() && authState().passkeyHere}>
+            <button class="passkey-link-btn" title="This is my board — join with my passkey (no approval needed)" onClick={linkPasskey}>🔑 Link with my passkey</button>
+          </Show>
         </Show>
+        <Show when={passkeyMsg()}><span class="auth-hint passkey-msg">{passkeyMsg()}</span></Show>
         <span class="device-id" title="this browser's device id">
           id: {authState().device.slice(0, 10)}…
         </span>

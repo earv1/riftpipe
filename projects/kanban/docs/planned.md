@@ -46,6 +46,11 @@ A working vertical slice over a board *directory* (no SQLite, no new sync engine
   "Ask to join"; the owner approves from an inbox and can **Remove** a member
   from the auth bar's members list, which rotates the read key — the removed
   device decrypts nothing new (`e2e/lock-grant.mjs`, `e2e/epoch-revoke.mjs`).
+  Passkey buttons (shown only on a secure domain origin, not an IP):
+  **🔑 Claim with passkey** next to "Claim board", **🔑 Add passkey** for an
+  owner without one, and **🔑 Link with my passkey** on a claimed board whose
+  passkey is usable here — the owner's other devices join as admins with no
+  approve click (`e2e/passkey-link.mjs`).
 - **Demos:** two/three-browser e2e flows over iroh + the gossip mesh
   (`e2e/run-iroh*.sh`).
 

@@ -70,3 +70,6 @@ features = [
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+# Same version core uses, so nothing new is downloaded — builds test-only helper
+# passkeys (soft authenticators) to exercise Auth's passkey ceremony offline.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "alloc"] }

@@ -365,11 +365,10 @@ over riftpipe's wasm file API). What remains:
   (`e2e/lock-grant.mjs`: unlocked sync → claim → view-only rejection → ask →
   inbox → approve → edit access; `shot-auth.mjs` screenshots it). Native
   peers keep the same request list (see "CLI request/approve").
-  *Remaining is interactive glue, not new crypto:* the WebAuthn browser
-  ceremony on top of these lib calls. (Driving the mesh seal from epoch keys
-  and approve delivering a wrapped epoch key are shipped — see "Epoch-key mesh
-  seal" below; request/approve on the native CLI is shipped — see "CLI
-  request/approve" below.)
+  (Driving the mesh seal from epoch keys and approve delivering a wrapped
+  epoch key are shipped — see "Epoch-key mesh seal" below; request/approve
+  on the native CLI is "CLI request/approve" below; the WebAuthn ceremony is
+  "Passkey device-linking" below.)
 - **Epoch-key mesh seal — done (`PROTOCOL_VERSION` 4, shared with folder deletes).** `core::epoch::EpochBook`
   wires the content key into the mesh for real: on a **Restricted** board,
   `Sync`/`SignedSync` is sealed a second time under the current epoch key
@@ -398,16 +397,32 @@ over riftpipe's wasm file API). What remains:
   `riftpipe requests|members <dir> [--json]` read it; `riftpipe approve <dir> <device-id|safety-code>` goes through
   `.riftpipe-control` — the running peer requires a waiting request from that
   device, then grants it (Member) and wraps it into the current epoch. No wire
-  change (`MeshMsg::Request` was already pinned; `PROTOCOL_VERSION` stays 4).
+  change of its own (`MeshMsg::Request` was already pinned).
   **Proven:** `tests/mesh.rs::restricted_mesh_request_then_approve_via_control_file`,
   `run-request-approve-native.sh` (CLI↔CLI), and
   `run-request-approve-browser.sh` / `request-approve.mjs` (browser owner ←
   CLI joiner and CLI owner ← browser joiner). The npm wrapper exposes
   `requests`/`approve`/`members` and `TreeSession.onAccessRequest`.
+- **Passkey device-linking — done (`PROTOCOL_VERSION` 5).** The owner claims
+  with a passkey ("🔑 Claim with passkey", or "🔑 Add passkey" after a plain
+  claim): an Admin-signed `TrustEntry::Passkey` registers the WebAuthn
+  credential's public key on the trust log. Another of the owner's devices
+  holding the same passkey (platform-synced, a security key, a phone) clicks
+  "🔑 Link with my passkey": its assertion over
+  `blake3(board, founder, device, nonce)` rides a `TrustEntry::PasskeyLink`, every
+  peer verifies it offline (`core::passkey` — signature, `rpIdHash`, UP,
+  type, challenge), and the device joins as an Admin with no approve click;
+  an online Admin then wraps it into the epoch. The ceremony is generic
+  (`web/src/passkey.rs`: `passkeySupported` / `claimWithPasskey` /
+  `linkWithPasskey`; RP ID = page hostname, IP origins unsupported). **Proven
+  in real browsers** with CDP virtual authenticators (`e2e/passkey-link.mjs`
+  in `run-browser-auth.sh`). Not built: passkey revocation, attestation, the
+  QR link variant, a CLI ceremony — see `SECURITY.md` §"Passkey device
+  linking".
 - **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md). Built so
   far (above): device keys + signed trust log, write signing, onboarding, the
-  claim/request-to-join flow, and the `core::passkey` verifier; *not* built:
-  Biscuit capabilities and the browser passkey ceremony. Two planes:
+  claim/request-to-join flow, the `core::passkey` verifier and passkey
+  device-linking; *not* built: Biscuit capabilities. Two planes:
   centralized *issuance* (an identity vouches for you, touched once) +
   decentralized *offline* verification (peers check a Biscuit capability
   against a root public key; data stays P2P). **Cemented identity: passkeys /

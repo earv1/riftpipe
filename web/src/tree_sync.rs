@@ -346,10 +346,13 @@ pub fn pending_requests() -> String {
 }
 
 /// Auth state of the active board as JSON:
-/// `{locked, device, authorized, isAuthor, author, requested, canRead, epoch}` —
-/// what the login UI renders. `canRead` is false on a claimed board until this
-/// device is wrapped into the latest epoch (or once it was removed); `epoch` is
-/// the latest epoch seq this device holds (0 = none).
+/// `{locked, device, authorized, isAuthor, author, requested, canRead, epoch,
+/// isAdmin, passkeys, passkeyHere}` — what the login UI renders. `canRead` is
+/// false on a claimed board until this device is wrapped into the latest epoch
+/// (or once it was removed); `epoch` is the latest epoch seq this device holds
+/// (0 = none); `passkeys` is how many registered passkeys can link a device
+/// from this page's relying party (hostname; their registrant still an
+/// Admin); `passkeyHere` is `passkeys > 0`.
 #[wasm_bindgen(js_name = authState)]
 pub fn auth_state() -> String {
     crate::gossip::active_auth_state()

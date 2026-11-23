@@ -174,6 +174,66 @@ rotates.
   epoch that still wraps a revoked device) and sends them once the new epoch
   arrives.
 
+## Passkey device linking (protocol v5)
+
+On a claimed browser board the owner can register a **passkey** ("🔑 Claim with
+passkey" / "🔑 Add passkey"); another of the owner's devices that has the same
+passkey (synced by iCloud Keychain / Google Password Manager / 1Password, a
+security key, or a phone) then joins with **"🔑 Link with my passkey"** — no
+approve click. Two trust-log entries carry it (`core::identity`,
+`PROTOCOL_VERSION` 5); the WebAuthn ceremony is `web/src/passkey.rs`, the
+check `core::passkey`.
+
+- **Registration is Admin-signed.** `TrustEntry::Passkey { cred, role, by, … }`
+  is signed by `by`'s Ed25519 device key and applies only while `by` is an
+  Admin. It stores public data only (credential id, COSE alg, public key, RP
+  ID). There's no proof-of-possession assertion at registration — an Admin can
+  already grant anyone, so a bogus registration only hurts its own board.
+- **Every link is verified offline on every peer**, native and browser.
+  `TrustEntry::PasskeyLink { device, cred_id, nonce, assertion }` applies only
+  if the assertion checks out against the registered key: ES256 or EdDSA
+  signature over `authenticatorData ‖ SHA-256(clientDataJSON)`,
+  `rpIdHash == SHA-256(rp_id)`, the user-present flag set,
+  `type == "webauthn.get"`, and the challenge equal to
+  `blake3("riftpipe-passkey-link-v1", board, founder, device, nonce)` (`board` =
+  the gossip topic `H(secret)`) — so an assertion is scoped to **one board and
+  one device** and can't be replayed onto another board that registered the
+  same passkey (even one founded by the same browser), or for another device.
+  A link is de-duplicated by `(device, cred_id, nonce)`, not its signature
+  bytes — ES256 signatures are malleable (`(r, n−s)` verifies too), so a
+  signature-keyed id would let a removed device re-apply its own old link.
+- **A linked device is an Admin** (the role stored in the registration; the UI
+  always registers Admin — the passkey is the owner's identity). A passkey
+  speaks only while its registrant is still an Admin.
+- **Reading starts once an online Admin wraps it in.** The linked device
+  broadcasts its `PasskeyLink` then its read request; any online Admin holding
+  the epoch key wraps it into the current epoch, same as after an approve.
+- **v4 peers don't understand it.** A v4 peer fails to decode the new `Trust`
+  frames and skips them, so it never authorizes a passkey-linked device and
+  drops its writes; the version bump surfaces the mismatch.
+
+Known limits:
+
+- **No attestation**: any authenticator is accepted (ES256 or EdDSA only —
+  e.g. Windows Hello's RS256 keys can't be registered).
+- **No passkey revocation yet.** A compromised passkey keeps linking devices
+  for as long as its registrant is an Admin — mint a new board.
+- **Revoking a passkey-linked device doesn't stick against the passkey
+  holder**, who can simply link again. By design: the passkey *is* the owner.
+- **The sign counter is ignored** (synced passkeys report 0), so a cloned
+  authenticator isn't detected.
+- **User verification isn't required.** The ceremony asks for it as
+  `"preferred"` and the check requires only user *presence*, so a security key
+  with no PIN or biometric links a device with just a touch — whoever holds
+  that key can add an Admin device.
+- **RP ID = the page hostname.** Every project page on `<user>.github.io`
+  shares the passkey (a page there could request an assertion from it), and a
+  board claimed on one host can't be passkey-linked from another.
+- **IP-address origins are unsupported** (WebAuthn rejects them); the passkey
+  buttons are hidden there — use `localhost`, not `127.0.0.1`.
+- **A still-open v4 tab** rewriting `riftpipe:trust:v2:<topic>` can drop the
+  v5 entries from localStorage; gossip restores them from peers.
+
 ## Still open
 
 - **Signing (insider authenticity) + read/write split** — described above; the
@@ -182,6 +242,9 @@ rotates.
   exists and both drivers route reads/writes through the one `mode()` switch,
   but it isn't reachable yet — it needs an Admin-signed access setting to pick
   it, with no content-wire change once that lands.
+- **Passkey revocation** (an Admin-signed entry retiring a registered passkey),
+  the QR / short-code device-link variant, and a CLI passkey ceremony (native
+  peers verify passkey entries but can't create or assert passkeys).
 
 ### Known limits
 
