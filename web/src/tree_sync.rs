@@ -350,9 +350,9 @@ pub fn pending_requests() -> String {
 /// isAdmin, passkeys, passkeyHere}` — what the login UI renders. `canRead` is
 /// false on a claimed board until this device is wrapped into the latest epoch
 /// (or once it was removed); `epoch` is the latest epoch seq this device holds
-/// (0 = none); `passkeys` is how many passkeys are registered on the board;
-/// `passkeyHere` is whether one of them is usable from this page's relying
-/// party (hostname).
+/// (0 = none); `passkeys` is how many registered passkeys can link a device
+/// from this page's relying party (hostname; their registrant still an
+/// Admin); `passkeyHere` is `passkeys > 0`.
 #[wasm_bindgen(js_name = authState)]
 pub fn auth_state() -> String {
     crate::gossip::active_auth_state()

@@ -320,6 +320,19 @@ impl TrustLog {
         self.applied.contains(&entry_id(entry))
     }
 
+    /// Registered passkeys that can link a device right now — their registrant is
+    /// still an Admin — sorted by credential id.
+    pub fn linking_passkeys(&self) -> Vec<PasskeyCredential> {
+        let mut v: Vec<_> = self
+            .passkeys
+            .values()
+            .filter(|r| self.role(&r.by) == Some(Role::Admin))
+            .map(|r| r.cred.clone())
+            .collect();
+        v.sort_by(|a, b| a.id.cmp(&b.id));
+        v
+    }
+
     /// Ingest one entry. Returns `true` if it is (now) applied. Invalid entries
     /// return `false`; validly-signed-but-not-yet-applicable ones are buffered
     /// and may apply later (also `false` for now). Idempotent on replays.
@@ -974,7 +987,10 @@ mod tests {
         log.apply(founder.genesis());
         log.apply(founder.grant(admin2.id(), Role::Admin, nonce(1)));
         log.apply(admin2.register_passkey(cred.clone(), Role::Admin, nonce(2)));
+        assert_eq!(log.linking_passkeys(), vec![cred.clone()]);
         log.apply(founder.revoke(admin2.id(), nonce(3)));
+        assert_eq!(log.passkeys().len(), 1, "still registered");
+        assert!(log.linking_passkeys().is_empty(), "but it can't link anymore");
 
         assert!(!log.apply(link(&sk, &cred, &founder.id(), phone.id(), nonce(4))));
         assert!(!log.is_authorized(&phone.id()));

@@ -429,9 +429,10 @@ impl Auth {
         (ok, acc)
     }
 
-    /// Registered passkeys usable from relying party `rp_id` (a credential asserts only on its own RP id).
+    /// Registered passkeys that can link a device from relying party `rp_id`: their
+    /// registrant is still an Admin, and a credential asserts only on its own RP id.
     fn passkeys_for(&self, rp_id: &str) -> Vec<PasskeyCredential> {
-        self.trust.passkeys().into_iter().map(|(c, _)| c).filter(|c| c.rp_id == rp_id).collect()
+        self.trust.linking_passkeys().into_iter().filter(|c| c.rp_id == rp_id).collect()
     }
 
     /// What a passkey-link ceremony needs: `(challenge, nonce, credentials to allow)`.
@@ -451,9 +452,12 @@ impl Auth {
     }
 
     /// Join with a passkey assertion (from the ceremony `passkey_link_ask` set up). It
-    /// is verified locally first, so a failed attempt is neither stored nor sent. On
-    /// success: the `PasskeyLink` entry, then our read request (so an online Admin
-    /// wraps us into the current epoch). `None` if it doesn't verify or authorize us.
+    /// is verified locally first, so an assertion that doesn't verify is neither
+    /// stored nor sent. One that verifies but doesn't authorize us yet (its
+    /// registrant isn't an Admin in our log) is kept in the log — it applies if that
+    /// changes — but not sent. On success: the `PasskeyLink` entry, then our read
+    /// request (so an online Admin wraps us into the current epoch). `None` unless
+    /// it authorized us.
     fn link_by_passkey(&mut self, cred_id: Vec<u8>, nonce: [u8; 16], assertion: PasskeyAssertion) -> Option<Accepted> {
         let founder = self.trust.founder()?;
         let (cred, _) = self.trust.passkeys().into_iter().find(|(c, _)| c.id == cred_id)?;
@@ -1317,8 +1321,9 @@ impl GossipTreeSync {
     /// true once we've asked and are still waiting; `canRead` is false on a claimed
     /// board until this device is wrapped into the latest epoch (or after it was
     /// removed); `epoch` is the latest epoch seq we hold (0 = none); `passkeys` is
-    /// how many passkeys are registered on the board; `passkeyHere` is whether one
-    /// of them is usable from this page's relying party (hostname).
+    /// how many registered passkeys can link a device from this page's relying
+    /// party (hostname; their registrant still an Admin); `passkeyHere` is
+    /// `passkeys > 0`.
     pub fn auth_state(&self) -> String {
         let a = self.auth.borrow();
         let host = web_sys::window().and_then(|w| w.location().hostname().ok()).unwrap_or_default();
@@ -1332,7 +1337,7 @@ impl GossipTreeSync {
             "canRead": a.can_read(),
             "epoch": a.epochs.latest_held_seq().unwrap_or(0),
             "isAdmin": a.is_admin(),
-            "passkeys": a.trust.passkeys().len(),
+            "passkeys": a.passkeys_for(&host).len(),
             "passkeyHere": !a.passkeys_for(&host).is_empty(),
         })
         .to_string()
@@ -1938,6 +1943,32 @@ mod tests {
         owner_2.accept(dup(&link.send[0]));
         assert!(owner_1.trust.is_authorized(&phone.my_id()), "linked on board 1");
         assert!(!owner_2.trust.is_authorized(&phone.my_id()), "but not on board 2");
+    }
+
+    /// A passkey whose registrant was removed can't link anyone, so it's no longer
+    /// offered (no "Link with my passkey" button, no ceremony).
+    #[wasm_bindgen_test]
+    fn a_removed_registrants_passkey_is_not_offered() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        let mut a = Auth::load(DeviceKey::from_seed(&[88; 32]), topic);
+        let mut b = Auth::load(DeviceKey::from_seed(&[89; 32]), topic);
+        let mut c = Auth::load(DeviceKey::from_seed(&[90; 32]), topic);
+        let claim = a.lock_as_author().expect("unclaimed board locks");
+        deliver(&claim, &mut b);
+        deliver(&claim, &mut c);
+        let admin_b = a.identity.grant(b.my_id(), Role::Admin, Auth::fresh_nonce());
+        a.add_trust(admin_b.clone());
+        b.add_trust(admin_b.clone());
+        c.add_trust(admin_b);
+        let (registered, reg) = b.claim_with_passkey(soft_passkey(1, "localhost").1);
+        assert!(registered, "an Admin registers its passkey");
+        deliver(&reg, &mut c);
+        assert!(c.passkey_link_ask("localhost").is_some(), "offered while b is an Admin");
+
+        let removed = a.make_revoke(b.my_id()).expect("owner removes b");
+        deliver(&removed, &mut c);
+        assert!(c.passkeys_for("localhost").is_empty(), "b's passkey can't link anymore");
+        assert!(c.passkey_link_ask("localhost").is_none(), "so it isn't offered");
     }
 
     /// The same assertion with the other valid ECDSA signature, `(r, n−s)`.
