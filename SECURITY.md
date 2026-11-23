@@ -131,6 +131,16 @@ rotates.
   "Remove"); any online Admin also wraps a newly-granted device into the
   current epoch without a rotation, which is what makes `--grant`/"Approve"
   deliver read access, not just write access.
+- **Joining.** A restricted joiner (CLI `connect … --restricted [--name]`,
+  browser "Ask to join") broadcasts a self-signed request — device id,
+  encryption key, name — under the outer seal. Admins see it with a safety
+  code (a hash of those three fields) to compare out-of-band before approving
+  (`riftpipe approve <dir> <safety-code>` or the browser's "Approve"). On the
+  CLI, `.riftpipe-auth.json` is a machine-local dotfile (never synced) holding
+  device ids, names, roles and safety codes only, never keys. Each peer keeps
+  at most 64 pending requests per session, so a link-holder can fill the list
+  with junk requests — a known insider-DoS limit; `riftpipe grant <dir> <id>`
+  still works by id when that happens.
 - **Older epochs keep working for the session.** Keys are kept as long as the
   process runs, so content sealed under any epoch you hold still opens; a
   message for an epoch you don't hold yet is parked (bounded) and replayed

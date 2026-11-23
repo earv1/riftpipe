@@ -364,12 +364,12 @@ over riftpipe's wasm file API). What remains:
   access). **Proven in real browsers** over the sealed mesh
   (`e2e/lock-grant.mjs`: unlocked sync → claim → view-only rejection → ask →
   inbox → approve → edit access; `shot-auth.mjs` screenshots it). Native
-  peers skip `MeshMsg::Request` (their catch-all) — the CLI still grants via
-  `--grant <device-id>`.
+  peers keep the same request list (see "CLI request/approve").
   *Remaining is interactive glue, not new crypto:* the WebAuthn browser
-  ceremony on top of these lib calls. (Driving the mesh seal from epoch keys,
-  approve delivering a wrapped epoch key, and request/approve on the native
-  CLI are now shipped — see "Epoch-key mesh seal" below.)
+  ceremony on top of these lib calls. (Driving the mesh seal from epoch keys
+  and approve delivering a wrapped epoch key are shipped — see "Epoch-key mesh
+  seal" below; request/approve on the native CLI is shipped — see "CLI
+  request/approve" below.)
 - **Epoch-key mesh seal — done (`PROTOCOL_VERSION` 4, shared with folder deletes).** `core::epoch::EpochBook`
   wires the content key into the mesh for real: on a **Restricted** board,
   `Sync`/`SignedSync` is sealed a second time under the current epoch key
@@ -387,6 +387,22 @@ over riftpipe's wasm file API). What remains:
   `run-epoch-revoke.sh`) and browser (`epoch-revoke.mjs`,
   `run-browser-auth.sh`); live via `riftpipe revoke|grant <dir> <id>` and the
   kanban owner's members-list "Remove" button.
+- **CLI request/approve — done.** `connect … --restricted [--name <text>]`
+  auto-broadcasts a signed `JoinRequest` (name defaults to `cli`) and
+  re-announces it every 15 s while keyless, so an Admin who comes online later
+  or isn't a direct neighbor still sees it. Any restricted peer keeps a request
+  list (verified, one per device, max 64, cleared on grant) and writes it, with
+  the member list, to `.riftpipe-auth.json` (ids, names, roles, safety codes —
+  never keys; never synced). `riftpipe requests|members <dir> [--json]` read
+  it; `riftpipe approve <dir> <device-id|safety-code>` goes through
+  `.riftpipe-control` — the running peer requires a waiting request from that
+  device, then grants it (Member) and wraps it into the current epoch. No wire
+  change (`MeshMsg::Request` was already pinned; `PROTOCOL_VERSION` stays 4).
+  **Proven:** `tests/mesh.rs::restricted_mesh_request_then_approve_via_control_file`,
+  `run-request-approve-native.sh` (CLI↔CLI), and
+  `run-request-approve-browser.sh` / `request-approve.mjs` (browser owner ←
+  CLI joiner and CLI owner ← browser joiner). The npm wrapper exposes
+  `requests`/`approve`/`members` and `TreeSession.onAccessRequest`.
 - **Auth & identity** — designed in [`docs/planned/auth.md`](auth.md). Built so
   far (above): device keys + signed trust log, write signing, onboarding, the
   claim/request-to-join flow, and the `core::passkey` verifier; *not* built:
