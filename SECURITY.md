@@ -137,10 +137,25 @@ rotates.
   code (a hash of those three fields) to compare out-of-band before approving
   (`riftpipe approve <dir> <safety-code>` or the browser's "Approve"). On the
   CLI, `.riftpipe-auth.json` is a machine-local dotfile (never synced) holding
-  device ids, names, roles and safety codes only, never keys. Each peer keeps
-  at most 64 pending requests per session, so a link-holder can fill the list
-  with junk requests — a known insider-DoS limit; `riftpipe grant <dir> <id>`
-  still works by id when that happens.
+  device ids, names, roles and safety codes only, never keys.
+  - *The safety code is only 32 bits*, so a link-holder can grind a request
+    (a fresh key, or a name variation) whose code matches someone else's in
+    minutes. Two defenses keep that from picking the wrong device on the CLI:
+    a native peer accepts a request only if its signed name is already
+    canonical (at most 256 bytes, trimmed, no control or Unicode format
+    characters such as bidi overrides or zero-width spaces), so what an Admin
+    sees is exactly what was hashed; and when two listed requests share a
+    code, `riftpipe approve <dir> <code>` refuses and asks for the device id.
+  - *The list is capped at 64 requests per session*, so a link-holder can fill
+    it with junk — a known insider-DoS limit. A request dropped by a full list
+    is invisible, so a listed one could have been ground to share its code:
+    a full list also refuses re-signed (renamed) entries, and once anything
+    was dropped the state file reports `inboxOverflow` and `approve` refuses
+    safety codes for the rest of the session — confirm the device id
+    out-of-band and approve by id (`riftpipe grant <dir> <id>` also works).
+  - The browser inbox does not apply the name rule or the cap yet; it lists
+    every request, so a colliding code shows up as a second row with the same
+    code.
 - **Older epochs keep working for the session.** Keys are kept as long as the
   process runs, so content sealed under any epoch you hold still opens; a
   message for an epoch you don't hold yet is parked (bounded) and replayed

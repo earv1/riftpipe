@@ -212,6 +212,11 @@ fn requests_by_safety(state: &serde_json::Value, code: &str) -> Vec<(String, Str
         .collect()
 }
 
+/// Did the running peer drop a request because its list was full (`inboxOverflow`)?
+pub fn inbox_overflowed(state: &serde_json::Value) -> bool {
+    state.get("inboxOverflow").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 fn label_for(name: &str, safety: &str) -> String {
     format!("{} (safety {safety})", serde_json::to_string(name).unwrap_or_default())
 }
@@ -219,7 +224,9 @@ fn label_for(name: &str, safety: &str) -> String {
 /// Resolve what `riftpipe approve <dir> <arg>` means: `arg` is either a 64-hex
 /// device id, or an 8-hex safety code looked up against `state`'s pending
 /// requests. Returns the device id, plus a human label when a matching
-/// request's name/safety is known.
+/// request's name/safety is known. Codes are refused once the peer's request
+/// list overflowed ([`inbox_overflowed`]): a dropped request isn't listed, so a
+/// listed one could have been ground to share its 32-bit code.
 pub fn resolve_approve_target(
     state: Option<&serde_json::Value>,
     arg: &str,
@@ -234,6 +241,12 @@ pub fn resolve_approve_target(
         let Some(state) = state else {
             return Err("no auth state file — is `riftpipe connect … --restricted` running on this dir?".to_string());
         };
+        if inbox_overflowed(state) {
+            return Err(format!(
+                "the request list overflowed this session, so a dropped request could share safety code {t} \
+                 with a listed one — confirm the device id out-of-band and approve by id (see `riftpipe requests <dir>`)"
+            ));
+        }
         let matches = requests_by_safety(state, &t);
         return match matches.len() {
             1 => {
@@ -418,6 +431,16 @@ mod tests {
         ]});
         let err = resolve_approve_target(Some(&two), "a1b2c3d4").unwrap_err();
         assert!(err.contains("several"), "{err}");
+    }
+
+    #[test]
+    fn resolve_approve_target_refuses_codes_after_an_overflow() {
+        let device = "ab".repeat(32);
+        let state = json!({"inboxOverflow": true,
+            "requests": [{"device": device, "name": "Bob", "safety": "a1b2 c3d4"}]});
+        let err = resolve_approve_target(Some(&state), "a1b2 c3d4").unwrap_err();
+        assert!(err.contains("overflowed") && err.contains("approve by id"), "{err}");
+        assert_eq!(resolve_approve_target(Some(&state), &device).unwrap().0, hex32(&device).unwrap());
     }
 
     #[test]

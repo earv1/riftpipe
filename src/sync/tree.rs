@@ -126,6 +126,11 @@ pub struct TreePeer {
     requests: Vec<JoinRequest>,
     /// The request list hit [`REQUEST_INBOX_CAP`] once already (warned).
     warned_inbox_full: bool,
+    /// A new device's request was dropped because the list was full (sticky for
+    /// the session). The dropped request is invisible here, so its safety code
+    /// could be matched by one ground for an entry that IS listed: the state file
+    /// reports it as `inboxOverflow` and `riftpipe approve` then refuses codes.
+    inbox_overflow: bool,
     /// A join request with a non-canonical name was dropped once already (warned).
     warned_bad_name: bool,
 }
@@ -149,6 +154,7 @@ impl TreePeer {
             stale_epoch_reported: HashSet::new(),
             requests: Vec::new(),
             warned_inbox_full: false,
+            inbox_overflow: false,
             warned_bad_name: false,
         }
     }
@@ -411,18 +417,26 @@ impl TreePeer {
         if self.trust.is_authorized(&req.device_id) || Some(req.device_id) == self.device_id() {
             return;
         }
+        let full = self.requests.len() >= REQUEST_INBOX_CAP;
         if let Some(i) = self.requests.iter().position(|r| r.device_id == req.device_id) {
             let old = &self.requests[i];
-            if old.name != req.name || old.enc_pub != req.enc_pub {
+            // While full, an entry can't be re-signed either: that would let a
+            // device already in a full list re-grind its safety code to match a
+            // request that was dropped.
+            if (old.name != req.name || old.enc_pub != req.enc_pub) && !full {
                 self.report_request(&req, dir);
                 self.requests[i] = req;
             }
             return;
         }
-        if self.requests.len() >= REQUEST_INBOX_CAP {
+        if full {
+            self.inbox_overflow = true;
             if !self.warned_inbox_full {
                 self.warned_inbox_full = true;
-                eprintln!("[auth] request inbox full ({REQUEST_INBOX_CAP}) — ignoring new requests");
+                eprintln!(
+                    "[auth] request inbox full ({REQUEST_INBOX_CAP}) — ignoring new requests; \
+                     approve by device id from now on (safety codes can't be trusted to pick one)"
+                );
             }
             return;
         }
@@ -635,6 +649,7 @@ impl TreePeer {
             "canRead": !self.mode.seals_content() || book.holds_latest(),
             "members": members,
             "requests": requests,
+            "inboxOverflow": self.inbox_overflow,
             "myRequest": my_request,
         }))
     }
@@ -1190,6 +1205,49 @@ mod tests {
         std::fs::remove_dir_all(&df).ok();
     }
 
+    /// The safety-code hijack: fill the list, let the victim's request drop, then
+    /// re-sign a listed entry so its code matches the victim's. A full list refuses
+    /// the re-sign, and once anything was dropped the state reports
+    /// `inboxOverflow`, which makes approve-by-code refuse (approve by id still works).
+    #[test]
+    fn a_full_inbox_refuses_renames_and_disables_approve_by_code() {
+        use crate::sync::control::resolve_approve_target;
+        let df = dir("inbox-overflow");
+        let mut founder = founder_peer();
+        let seed = |i: usize| {
+            let mut s = [0u8; 32];
+            s[0] = i as u8;
+            s[1] = 0xBB;
+            s
+        };
+        for i in 0..REQUEST_INBOX_CAP {
+            founder.authorize_and_apply(request_from(&seed(i), "junk"), &df);
+        }
+        assert_eq!(founder.pending_requests().len(), REQUEST_INBOX_CAP);
+        assert_eq!(founder.auth_state_json().unwrap()["inboxOverflow"], false, "full, but nothing dropped yet");
+
+        founder.authorize_and_apply(request_from(&seed(0), "renamed"), &df);
+        assert_eq!(founder.pending_requests()[0].name, "junk", "a full list refuses re-signs");
+
+        founder.authorize_and_apply(request_from(&[0xEEu8; 32], "victim"), &df);
+        assert_eq!(founder.pending_requests().len(), REQUEST_INBOX_CAP, "the new request is dropped");
+        let state = founder.auth_state_json().unwrap();
+        assert_eq!(state["inboxOverflow"], true);
+
+        let listed = &founder.pending_requests()[3];
+        let code = listed.safety_code();
+        let err = resolve_approve_target(Some(&state), &code).unwrap_err();
+        assert!(err.contains("overflowed"), "{err}");
+        let by_id = resolve_approve_target(Some(&state), &hex32(&listed.device_id)).unwrap();
+        assert_eq!(by_id.0, listed.device_id, "approve by device id still works");
+
+        // Sticky: freeing a slot doesn't make codes trustworthy again.
+        let first = founder.pending_requests()[0].device_id;
+        founder.approve_request(first, &df);
+        assert_eq!(founder.auth_state_json().unwrap()["inboxOverflow"], true);
+        std::fs::remove_dir_all(&df).ok();
+    }
+
     #[test]
     fn a_renamed_request_replaces_the_old_one() {
         let df = dir("inbox-rename");
@@ -1246,6 +1304,47 @@ mod tests {
         assert_eq!(j["canRead"], false);
 
         assert!(TreePeer::new().auth_state_json().is_none());
+        std::fs::remove_dir_all(&df).ok();
+    }
+
+    /// Pins `.riftpipe-auth.json`'s exact keys (top level, members, requests,
+    /// myRequest), so no key material — `enc_pub`, a seed, a wrapped key — can
+    /// slip into the machine-local snapshot unnoticed.
+    #[test]
+    fn auth_state_json_has_exactly_the_documented_keys() {
+        fn keys(v: &serde_json::Value) -> Vec<&str> {
+            let mut k: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+            k.sort_unstable();
+            k
+        }
+        let df = dir("state-keys");
+        let mut founder = founder_peer();
+        let mut joiner = restricted_peer(5);
+        joiner.set_request_name("Bob");
+        founder.authorize_and_apply(joiner.read_request().unwrap(), &df);
+
+        let f = founder.auth_state_json().unwrap();
+        assert_eq!(
+            keys(&f),
+            [
+                "canRead",
+                "device",
+                "epoch",
+                "founder",
+                "inboxOverflow",
+                "members",
+                "myRequest",
+                "requests",
+                "restricted",
+                "role",
+                "version"
+            ]
+        );
+        assert_eq!(keys(&f["members"][0]), ["device", "founder", "me", "role"]);
+        assert_eq!(keys(&f["requests"][0]), ["device", "name", "safety"]);
+        let j = joiner.auth_state_json().unwrap();
+        assert_eq!(keys(&j), keys(&f));
+        assert_eq!(keys(&j["myRequest"]), ["name", "safety"]);
         std::fs::remove_dir_all(&df).ok();
     }
 

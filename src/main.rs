@@ -171,6 +171,12 @@ async fn main() {
                 if lines.is_empty() {
                     eprintln!("no pending requests");
                 }
+                if riftpipe::sync::control::inbox_overflowed(&state) {
+                    eprintln!(
+                        "[riftpipe] warning: the request list overflowed this session — some requests were dropped; \
+                         approve by device id, not safety code"
+                    );
+                }
                 for line in lines {
                     println!("{line}");
                 }
