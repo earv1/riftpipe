@@ -11,6 +11,7 @@ import {
   historyNow,
   isCardEvent,
   relativeTime,
+  startHistory,
   type HistoryEvent,
   type Viewer,
 } from "./api.ts";
@@ -61,8 +62,12 @@ export function ActivityPanel(props: {
   // Computed once per change (read 4× below), not once per read.
   const view = createMemo(() => boardActivity(historyEvents(), { showSync: showSync(), limit: ACTIVITY_LIMIT }));
   let panel: HTMLElement | undefined;
-  // Opening moves focus into the panel so keyboard users land on it.
-  onMount(() => panel?.focus());
+  // Opening moves focus into the panel so keyboard users land on it, and
+  // starts the history store (it isn't read until something shows it).
+  onMount(() => {
+    startHistory();
+    panel?.focus();
+  });
   return (
     <aside class="activity" id="activity-panel" aria-labelledby="activity-title" tabindex="-1" ref={panel}>
       <div class="activity-head">

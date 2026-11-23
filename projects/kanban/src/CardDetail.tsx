@@ -1,10 +1,11 @@
-import { createSignal, createEffect, For, Show } from "solid-js";
+import { createSignal, createEffect, For, onMount, Show } from "solid-js";
 import {
   getCardDetail,
   patchCard,
   addComment,
   cardHistory,
   historyEvents,
+  startHistory,
   type CardDetail as CardDetailT,
   type Viewer,
 } from "./api.ts";
@@ -42,6 +43,8 @@ export function CardDetail(props: {
   let descFocused = false;
 
   const [comment, setComment] = createSignal("");
+  // The History section reads the shared history store; start it on first use.
+  onMount(() => startHistory());
 
   const load = async () => {
     const d = await getCardDetail(props.id);

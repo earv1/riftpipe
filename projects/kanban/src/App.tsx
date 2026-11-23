@@ -1,6 +1,6 @@
 import { createMemo, createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, flushPendingEdits, connectPeer, newBoard, watch, storageSupported, auth, startHistory, historyEvents, knownTitles, type AuthState, type PendingRequest, type Member, type Card, type Viewer } from "./api.ts";
+import { getBoard, addCard, patchCard, flushPendingEdits, connectPeer, newBoard, watch, storageSupported, auth, historyEvents, knownTitles, type AuthState, type PendingRequest, type Member, type Card, type Viewer } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 import { ActivityPanel } from "./ActivityPanel.tsx";
 
@@ -103,7 +103,6 @@ export function App() {
     (async () => {
       await refresh();
       setMyId(auth.deviceId());
-      startHistory();
       await connect();
       refreshAuth();
     })();

@@ -35,7 +35,10 @@ function schedule(): void {
   }, REFRESH_DEBOUNCE_MS);
 }
 
-/** Start once: load the merged log and re-read (debounced) whenever it changes. */
+/** Start once, on first display (Activity panel or a card drawer): load the
+ *  merged log and re-read (debounced) whenever it changes. Not started at app
+ *  load — a peer nobody is looking at shouldn't re-read every log on every
+ *  merge. */
 export function startHistory(): void {
   if (started) return;
   started = true;
