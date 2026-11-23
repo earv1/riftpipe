@@ -280,6 +280,11 @@ impl Auth {
     /// Ingest a trust entry (idempotent), remember it for neighbor catch-up, and
     /// persist. The wire/load is the source; we persist our own converged view.
     pub fn add_trust(&mut self, e: TrustEntry) {
+        // An equivalent of an entry already applied (a passkey link re-sent with the
+        // other valid ECDSA signature) is nothing new: don't store or re-send it.
+        if self.trust.holds(&e) {
+            return;
+        }
         let fresh = self.seen.insert(trust_entry_id(&e));
         if fresh {
             self.entries.push(e.clone());
@@ -1909,5 +1914,41 @@ mod tests {
         deliver(&claim, &mut c);
         c.accept(dup(&link.send[0]));
         assert!(c.trust.is_authorized(&b.my_id()) && !c.authorized(), "c verifies b's link; it authorizes b, not c");
+    }
+
+    /// The same assertion with the other valid ECDSA signature, `(r, n−s)`.
+    fn with_other_s(a: &PasskeyAssertion) -> PasskeyAssertion {
+        let sig = p256::ecdsa::Signature::from_der(&a.signature).unwrap();
+        let (r, s) = sig.split_scalars();
+        let flipped = p256::ecdsa::Signature::from_scalars(r, -s).unwrap();
+        PasskeyAssertion { signature: flipped.to_der().as_bytes().to_vec(), ..a.clone() }
+    }
+
+    /// A removed passkey-linked device re-sending its old link with the other valid
+    /// ECDSA signature neither re-adds itself nor gets the copy stored (or re-sent
+    /// to neighbors) as a new entry.
+    #[wasm_bindgen_test]
+    fn a_removed_devices_passkey_link_resent_with_the_other_s_is_ignored() {
+        // One board (one topic) for both devices: load both before anything is
+        // persisted, so neither starts from the other's stored log.
+        let topic = riftpipe_core::crypto::generate_secret();
+        let mut a = Auth::load(DeviceKey::from_seed(&[84; 32]), topic);
+        let mut b = Auth::load(DeviceKey::from_seed(&[85; 32]), topic);
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let (_, claim) = a.claim_with_passkey(cred.clone());
+        deliver(&claim, &mut b);
+        let (challenge, nonce, _) = b.passkey_link_ask("localhost").expect("a passkey to link with");
+        let link = b.link_by_passkey(cred.id.clone(), nonce, soft_assert(&sk, "localhost", &challenge)).expect("linked");
+        let MeshMsg::Trust(entry) = dup(&link.send[0]) else { panic!("the link goes first") };
+        a.accept(MeshMsg::Trust(entry.clone()));
+        assert!(a.trust.is_authorized(&b.my_id()));
+        a.make_revoke(b.my_id()).expect("owner removes b");
+        let stored = a.entries.len();
+
+        let TrustEntry::PasskeyLink { device, cred_id, nonce, assertion } = entry else { panic!("a passkey link") };
+        let resent = TrustEntry::PasskeyLink { device, cred_id, nonce, assertion: with_other_s(&assertion) };
+        a.accept(MeshMsg::Trust(resent));
+        assert!(!a.trust.is_authorized(&b.my_id()), "the removed device stays removed");
+        assert_eq!(a.entries.len(), stored, "the re-signed copy isn't stored or re-sent");
     }
 }

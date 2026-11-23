@@ -201,19 +201,23 @@ pub fn passkey_link_challenge(founder: &DeviceId, device: &DeviceId, nonce: &[u8
     *blake3::hash(&msg).as_bytes()
 }
 
-fn sig_of(e: &TrustEntry) -> &[u8] {
+/// A dedup id for an entry. Device-signed entries: the hash of their Ed25519
+/// signature (unique, and not malleable under `verify_strict`). A `PasskeyLink`:
+/// what it says — `(device, cred_id, nonce)` — never its signature bytes: an ES256
+/// signature is malleable (`(r, s)` and `(r, n−s)` both verify), so a
+/// signature-keyed id would let a removed device re-apply its own old link as a
+/// "new" entry.
+fn entry_id(e: &TrustEntry) -> [u8; 32] {
     match e {
         TrustEntry::Genesis { sig, .. }
         | TrustEntry::Grant { sig, .. }
         | TrustEntry::Revoke { sig, .. }
-        | TrustEntry::Passkey { sig, .. } => sig,
-        TrustEntry::PasskeyLink { assertion, .. } => &assertion.signature,
+        | TrustEntry::Passkey { sig, .. } => *blake3::hash(sig).as_bytes(),
+        TrustEntry::PasskeyLink { device, cred_id, nonce, .. } => {
+            let msg = postcard::to_allocvec(&("riftpipe-passkey-link-id", device, cred_id, nonce)).expect("encode");
+            *blake3::hash(&msg).as_bytes()
+        }
     }
-}
-
-/// A dedup id for an entry — the hash of its (unique) signature.
-fn entry_id(e: &TrustEntry) -> [u8; 32] {
-    *blake3::hash(sig_of(e)).as_bytes()
 }
 
 enum Outcome {
@@ -288,6 +292,13 @@ impl TrustLog {
         let mut v: Vec<_> = self.passkeys.values().map(|r| (r.cred.clone(), r.role)).collect();
         v.sort_by(|a, b| a.0.id.cmp(&b.0.id));
         v
+    }
+
+    /// Has `entry` — or an equivalent re-encoding of it (a passkey link carrying
+    /// the other valid ECDSA signature) — already been applied? Callers that
+    /// store and re-send entries skip these.
+    pub fn holds(&self, entry: &TrustEntry) -> bool {
+        self.applied.contains(&entry_id(entry))
     }
 
     /// Ingest one entry. Returns `true` if it is (now) applied. Invalid entries
@@ -727,6 +738,37 @@ mod tests {
     ) -> TrustEntry {
         let ch = passkey_link_challenge(founder, &device, &n);
         TrustEntry::PasskeyLink { device, cred_id: cred.id.clone(), nonce: n, assertion: soft_assert(sk, &cred.rp_id, &ch) }
+    }
+
+    /// The same assertion with the other valid ECDSA signature, `(r, n−s)`.
+    fn with_other_s(a: &PasskeyAssertion) -> PasskeyAssertion {
+        let sig = p256::ecdsa::Signature::from_der(&a.signature).unwrap();
+        let (r, s) = sig.split_scalars();
+        let flipped = p256::ecdsa::Signature::from_scalars(r, -s).unwrap();
+        PasskeyAssertion { signature: flipped.to_der().as_bytes().to_vec(), ..a.clone() }
+    }
+
+    #[test]
+    fn a_revoked_passkey_linked_device_cant_replay_its_link_with_the_other_s() {
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let mut log = TrustLog::new();
+        log.apply(founder.genesis());
+        log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(1)));
+        let ln = link(&sk, &cred, &founder.id(), phone.id(), nonce(2));
+        assert!(log.apply(ln.clone()));
+        assert!(log.apply(founder.revoke(phone.id(), nonce(3))));
+
+        let TrustEntry::PasskeyLink { device, cred_id, nonce: n, assertion } = ln else { unreachable!() };
+        let replay = TrustEntry::PasskeyLink { device, cred_id, nonce: n, assertion: with_other_s(&assertion) };
+        let TrustEntry::PasskeyLink { assertion: flipped, .. } = &replay else { unreachable!() };
+        assert_ne!(flipped.signature, assertion.signature);
+        assert!(cred.verify(flipped, &passkey_link_challenge(&founder.id(), &phone.id(), &n)), "the flipped signature is valid");
+        assert!(log.holds(&replay), "it is the same link as the one already applied");
+        log.apply(replay);
+        assert!(!log.is_authorized(&phone.id()), "a revoked device can't re-add itself");
+        assert!(log.is_revoked(&phone.id()));
     }
 
     #[test]

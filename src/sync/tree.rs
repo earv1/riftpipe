@@ -164,6 +164,11 @@ impl TreePeer {
     /// Ingest a trust-log entry (idempotent) and remember it for neighbor
     /// catch-up. Returns whether the log now holds it.
     pub fn add_trust(&mut self, entry: TrustEntry) -> bool {
+        // An equivalent of an entry already applied (a passkey link re-sent with the
+        // other valid ECDSA signature) is nothing new: don't store or re-send it.
+        if self.trust.holds(&entry) {
+            return true;
+        }
         let id = *blake3::hash(&postcard::to_allocvec(&entry).unwrap_or_default()).as_bytes();
         if self.trust_seen.insert(id) {
             self.trust_entries.push(entry.clone());
