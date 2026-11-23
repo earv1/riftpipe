@@ -65,10 +65,12 @@ pub fn parse_line(line: &str) -> Option<Command> {
 }
 
 /// Append `"{verb} {hex_id}\n"` to `<dir>/.riftpipe-control` (create if absent).
+/// The line goes out in one `write` on an O_APPEND file, so concurrent appenders
+/// (the CLI and the npm wrapper, say) can't interleave inside a line.
 pub fn append(dir: &Path, verb: &str, hex_id: &str) -> std::io::Result<()> {
     let path = dir.join(CONTROL_FILE);
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{verb} {hex_id}")
+    f.write_all(format!("{verb} {hex_id}\n").as_bytes())
 }
 
 /// Tails the control file from its length at open (old lines ignored).
@@ -388,6 +390,31 @@ mod tests {
         }
         assert_eq!(control.poll(), vec![Command::Grant(hex32(&grant_id).unwrap())]);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_appends_never_interleave_inside_a_line() {
+        let dir = std::env::temp_dir().join(format!("riftpipe-control-race-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let threads: Vec<_> = (0..8u8)
+            .map(|t| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let id = format!("{t:02x}").repeat(32);
+                    for _ in 0..200 {
+                        append(&dir, "grant", &id).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let text = std::fs::read_to_string(dir.join(CONTROL_FILE)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 8 * 200);
+        assert!(lines.iter().all(|l| parse_line(l).is_some()), "every line is whole");
         std::fs::remove_dir_all(&dir).ok();
     }
 
