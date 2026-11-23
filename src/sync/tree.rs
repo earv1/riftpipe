@@ -137,6 +137,25 @@ pub struct TreePeer {
     stale_epoch_reported: HashSet<u64>,
 }
 
+/// What an apply sends back out, by scope.
+#[derive(Default)]
+pub(crate) struct Outbound {
+    /// To the whole swarm (e.g. a Resync answer, epoch housekeeping).
+    pub(crate) swarm: Vec<MeshMsg>,
+    /// To direct neighbors only: replies to a (neighbors-only) `Hello`.
+    pub(crate) neighbors: Vec<MeshMsg>,
+}
+
+impl Outbound {
+    fn swarm(swarm: Vec<MeshMsg>) -> Self {
+        Outbound { swarm, neighbors: Vec::new() }
+    }
+    /// Every message, regardless of scope.
+    pub(crate) fn all(self) -> Vec<MeshMsg> {
+        self.swarm.into_iter().chain(self.neighbors).collect()
+    }
+}
+
 impl TreePeer {
     pub fn new() -> Self {
         TreePeer {
@@ -270,12 +289,12 @@ impl TreePeer {
     /// arrived sealed): enforce signing when the mode requires it, verify a signed
     /// write against the trust log, apply + persist, and return replies already
     /// wrapped for the wire.
-    fn apply_content(&mut self, msg: MeshMsg, dir: &Path) -> Vec<MeshMsg> {
+    fn apply_content(&mut self, msg: MeshMsg, dir: &Path) -> Outbound {
         let require_signed = self.mode.requires_signed_writes();
         let inner = match msg {
             MeshMsg::Sync(s) => {
                 if require_signed {
-                    return Vec::new(); // unsigned write rejected on a gated board
+                    return Outbound::default(); // unsigned write rejected on a gated board
                 }
                 s
             }
@@ -288,17 +307,25 @@ impl TreePeer {
                     sw.author_verified().is_some()
                 };
                 if !ok {
-                    return Vec::new();
+                    return Outbound::default();
                 }
                 match postcard::from_bytes::<SyncMsg>(&sw.payload) {
                     Ok(m) => m,
-                    Err(_) => return Vec::new(),
+                    Err(_) => return Outbound::default(),
                 }
             }
-            _ => return Vec::new(),
+            _ => return Outbound::default(),
         };
-        let replies = self.apply_and_persist(inner, dir);
-        replies.into_iter().filter_map(|r| self.sign_mesh(r)).collect()
+        // A Hello arrives neighbors-only, so its replies (up to our whole tree, for
+        // a fresh joiner) go back neighbors-only too — not flooded to the swarm.
+        let to_neighbors = inner.replies_go_to_neighbors();
+        let replies: Vec<MeshMsg> =
+            self.apply_and_persist(inner, dir).into_iter().filter_map(|r| self.sign_mesh(r)).collect();
+        if to_neighbors {
+            Outbound { swarm: Vec::new(), neighbors: replies }
+        } else {
+            Outbound { swarm: replies, neighbors: Vec::new() }
+        }
     }
 
     /// Auth-aware receive for every mesh message the driver doesn't handle itself
@@ -306,24 +333,24 @@ impl TreePeer {
     /// restricted board, reads are epoch-gated: only `Sealed` content is accepted,
     /// and only if we hold its epoch key. Returns messages to broadcast, already
     /// wrapped for the wire. `Presence`/`Version`/`Chunk` are handled by the driver.
-    pub(crate) fn authorize_and_apply(&mut self, msg: MeshMsg, dir: &Path) -> Vec<MeshMsg> {
+    pub(crate) fn authorize_and_apply(&mut self, msg: MeshMsg, dir: &Path) -> Outbound {
         match msg {
             MeshMsg::Trust(e) => {
                 let was_held = self.writes_held();
                 self.add_trust(e);
-                self.after_trust_change(dir, was_held)
+                Outbound::swarm(self.after_trust_change(dir, was_held))
             }
             MeshMsg::Epoch(a) => {
                 let was_held = self.writes_held();
-                let Some(book) = self.epochs.as_mut() else { return Vec::new() };
+                let Some(book) = self.epochs.as_mut() else { return Outbound::default() };
                 let ing = book.ingest(a, &self.trust);
-                self.epoch_followups(ing, dir, was_held)
+                Outbound::swarm(self.epoch_followups(ing, dir, was_held))
             }
             MeshMsg::Request(req) => {
                 if let Some(b) = self.epochs.as_mut() {
                     b.learn_request(&req);
                 }
-                self.maintenance()
+                Outbound::swarm(self.maintenance())
             }
             MeshMsg::Sealed(s) => {
                 if !self.mode.seals_content() {
@@ -331,24 +358,24 @@ impl TreePeer {
                         self.warned_restricted = true;
                         eprintln!("[epoch] this board is restricted — rejoin with --restricted to request access");
                     }
-                    return Vec::new();
+                    return Outbound::default();
                 }
-                let Some(book) = self.epochs.as_mut() else { return Vec::new() };
+                let Some(book) = self.epochs.as_mut() else { return Outbound::default() };
                 match book.open(s) {
                     Ok(inner) => self.apply_content(inner, dir),
                     Err(OpenError::NoKey { seq }) => {
                         if self.no_key_reported.insert(seq) {
                             eprintln!("[epoch] dropped content sealed under epoch {seq} (no key)");
                         }
-                        Vec::new()
+                        Outbound::default()
                     }
-                    Err(OpenError::Invalid) => Vec::new(),
+                    Err(OpenError::Invalid) => Outbound::default(),
                 }
             }
             // Restricted: content travels sealed only — an unsealed write is dropped.
-            MeshMsg::Sync(_) | MeshMsg::SignedSync(_) if self.mode.seals_content() => Vec::new(),
+            MeshMsg::Sync(_) | MeshMsg::SignedSync(_) if self.mode.seals_content() => Outbound::default(),
             MeshMsg::Sync(_) | MeshMsg::SignedSync(_) => self.apply_content(msg, dir),
-            _ => Vec::new(), // Presence/Version/Chunk not routed here
+            _ => Outbound::default(), // Presence/Version/Chunk not routed here
         }
     }
 
@@ -382,7 +409,7 @@ impl TreePeer {
             eprintln!("[epoch] holding epoch {seq} — new content is sealed under it");
         }
         for m in ing.released {
-            out.extend(self.apply_content(m, dir));
+            out.extend(self.apply_content(m, dir).all());
         }
         if ing.gained_first_key {
             let n = self.epoch_held().unwrap_or(0);
@@ -947,7 +974,7 @@ mod tests {
         assert!(member.sign_local(edit).is_none(), "epoch 1 still wraps the revoked device");
         let mut released = Vec::new();
         for m in epochs {
-            released.extend(member.authorize_and_apply(m, &dm));
+            released.extend(member.authorize_and_apply(m, &dm).all());
         }
         assert!(
             released.iter().any(|m| matches!(m, MeshMsg::Sealed(s) if s.seq == 2)),
@@ -974,7 +1001,7 @@ mod tests {
         assert!(member.sign_local(edit).is_none(), "held: epoch 1 wraps the revoked device");
 
         let regrant = founder.grant_device(c_id, &df).into_iter().find(|m| matches!(m, MeshMsg::Trust(_))).unwrap();
-        let out = member.authorize_and_apply(regrant, &dm);
+        let out = member.authorize_and_apply(regrant, &dm).all();
         assert!(
             out.iter().any(|m| matches!(m, MeshMsg::Sealed(s) if s.seq == 1)),
             "the hold lifted (no new key): held state goes out sealed"
@@ -994,13 +1021,33 @@ mod tests {
         assert!(keyless.sign_local(lww("b.bin", b"2")).is_none());
     }
 
+    /// A Hello's replies (our whole tree, to a fresh joiner) go to direct
+    /// neighbors only; a Resync answer still goes swarm-wide.
+    #[test]
+    fn hello_replies_are_neighbors_only() {
+        let d = dir("hello-scope");
+        std::fs::write(d.join("a.md"), "# a\n").unwrap();
+        let mut peer = TreePeer::new();
+        peer.seed(&d);
+        let out = peer.authorize_and_apply(MeshMsg::Sync(SyncMsg::Hello { versions: vec![], lww_versions: vec![] }), &d);
+        assert!(out.swarm.is_empty(), "nothing flooded to the swarm");
+        assert!(
+            out.neighbors.iter().any(|m| matches!(m, MeshMsg::Sync(SyncMsg::TextDelta { path, .. }) if path == "a.md")),
+            "the joiner's missing doc goes to the neighbors"
+        );
+        let out = peer.authorize_and_apply(MeshMsg::Sync(SyncMsg::Resync { path: "a.md".into() }), &d);
+        assert!(out.neighbors.is_empty());
+        assert!(!out.swarm.is_empty(), "a Resync answer reaches whoever asked, anywhere in the swarm");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     #[test]
     fn open_peer_ignores_sealed_content() {
         use riftpipe_core::epoch::SealedMsg;
         let d = dir("open-sealed");
         let mut peer = TreePeer::new();
         let out = peer.authorize_and_apply(MeshMsg::Sealed(SealedMsg { seq: 1, id: [0; 8], body: vec![1] }), &d);
-        assert!(out.is_empty());
+        assert!(out.all().is_empty());
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "nothing persisted");
         std::fs::remove_dir_all(&d).ok();
     }

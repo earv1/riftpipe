@@ -157,6 +157,16 @@ pub enum SyncMsg {
     StratDelete { path: String, ids: Vec<u64>, seen: Vec<[u8; 32]> },
 }
 
+impl SyncMsg {
+    /// Replies to this message only matter to its sender's neighborhood: a `Hello`
+    /// is sent to direct neighbors only, so drivers send its replies (up to the
+    /// whole tree, for a fresh joiner) neighbors-only too instead of flooding the
+    /// swarm on every join. Everything else replies swarm-wide.
+    pub fn replies_go_to_neighbors(&self) -> bool {
+        matches!(self, SyncMsg::Hello { .. })
+    }
+}
+
 /// What travels over a gossip-mesh topic: tree [`SyncMsg`]s plus periodic
 /// presence, so peers can build a routing map for debugging.
 ///
@@ -1106,6 +1116,16 @@ mod chunking {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a Hello's replies stay with the neighborhood it came from.
+    #[test]
+    fn only_hello_replies_go_to_neighbors() {
+        assert!(SyncMsg::Hello { versions: vec![], lww_versions: vec![] }.replies_go_to_neighbors());
+        assert!(!SyncMsg::Resync { path: "a.md".into() }.replies_go_to_neighbors());
+        assert!(!SyncMsg::Lww { path: "m.toml".into(), version: 1, bytes: vec![] }.replies_go_to_neighbors());
+        let mut s = Syncer::new("r");
+        assert!(!s.local_text("a.md", "x").unwrap().replies_go_to_neighbors());
+    }
 
     /// Drive a message into `dst`, persisting + forwarding replies until quiescent.
     /// Returns the last persisted bytes for `path`, if any.

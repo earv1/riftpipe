@@ -1294,6 +1294,9 @@ impl GossipTreeSync {
                                     send(&snd, &cph, m, false).await;
                                 }
                                 for msg in acc.apply {
+                                    // A Hello's replies (up to our whole tree, for a
+                                    // fresh joiner) go back neighbors-only, like it came.
+                                    let to_neighbors = msg.replies_go_to_neighbors();
                                     let (persist, replies) = sy.borrow_mut().apply(msg);
                                     if let Some((path, bytes)) = persist {
                                         on_merged(path.clone(), bytes);
@@ -1302,7 +1305,7 @@ impl GossipTreeSync {
                                     for r in replies {
                                         let mm = au.borrow().sign(r);
                                         if let Some(mm) = mm {
-                                            send(&snd, &cph, &mm, false).await;
+                                            send(&snd, &cph, &mm, to_neighbors).await;
                                         }
                                     }
                                 }

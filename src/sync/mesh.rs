@@ -548,8 +548,12 @@ pub async fn run(
                             // SYNCED:{path}, and runs epoch housekeeping). Replies
                             // come back already wrapped for the wire.
                             other => {
-                                for reply in peer.authorize_and_apply(other, dir) {
+                                let out = peer.authorize_and_apply(other, dir);
+                                for reply in out.swarm {
                                     broadcast(&sender, &cipher, &reply).await;
+                                }
+                                for reply in out.neighbors {
+                                    broadcast_neighbors(&sender, &cipher, &reply).await;
                                 }
                             }
                         }
