@@ -130,6 +130,7 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
     // works solo on the right tree).
     let topic = enter_board(riftpipe_core::crypto::topic_from_secret(&secret)).await;
     let on_merged = opfs_on_merged(on_change, topic);
+    let syncer = crate::opfs::restore_syncer(topic, crate::gossip::gossip_agent()).await;
     let node = page_node(sk).await.map_err(|e| JsValue::from_str(&e))?;
 
     let (mesh, my_ticket) = if is_host {
@@ -150,8 +151,7 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
     if crate::opfs::board_claimed(&topic).await {
         auth.set_claimed_hint();
     }
-    crate::gossip::set_active(GossipTreeSync::new(mesh, on_merged, auth));
-    wasm_bindgen_futures::spawn_local(crate::opfs::prime_all(topic));
+    crate::gossip::set_active(GossipTreeSync::new(mesh, syncer, on_merged, auth));
 
     Ok(my_ticket.map(|t| JsValue::from_str(&t)).unwrap_or(JsValue::NULL))
 }

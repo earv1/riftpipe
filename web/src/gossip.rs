@@ -787,6 +787,8 @@ fn load_epochs(topic: &[u8; 32]) -> Vec<EpochAnnounce> {
 /// re-broadcasting our full tree. Tracks direct neighbors + a gossiped routing map.
 pub struct GossipTreeSync {
     syncer: std::rc::Rc<std::cell::RefCell<riftpipe_core::sync::Syncer>>,
+    /// The board this sync's durable records save under (see `opfs::queue_record`).
+    topic: [u8; 32],
     sender: GossipSender,
     cipher: std::rc::Rc<riftpipe_core::crypto::MeshCipher>,
     neighbors: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<[u8; 32]>>>,
@@ -829,10 +831,19 @@ impl Drop for StorageListener {
     }
 }
 
+/// Persist `path`'s durable record for board `topic` after it changed — call
+/// after `on_merged` (file write spawned first) / before a local broadcast.
+fn save_record(topic: [u8; 32], sy: &std::cell::RefCell<riftpipe_core::sync::Syncer>, path: &str) {
+    if let Some(rec) = sy.borrow().durable(path) {
+        crate::opfs::queue_record(topic, &rec);
+    }
+}
+
 /// Act on auth output produced outside the receive loop: apply its content
 /// (firing `on_merged`), then broadcast its messages, the replies, and (if
 /// asked) our full state — all signed/sealed, in order, from one task.
 fn apply_and_broadcast(
+    topic: [u8; 32],
     acc: Accepted,
     sy: &std::cell::RefCell<riftpipe_core::sync::Syncer>,
     au: &std::cell::RefCell<Auth>,
@@ -844,7 +855,8 @@ fn apply_and_broadcast(
     for msg in acc.apply {
         let (persist, replies) = sy.borrow_mut().apply(msg);
         if let Some((path, bytes)) = persist {
-            on_merged(path, bytes);
+            on_merged(path.clone(), bytes);
+            save_record(topic, sy, &path);
         }
         let a = au.borrow();
         msgs.extend(replies.into_iter().filter_map(|r| a.sign(r)));
@@ -911,15 +923,26 @@ fn report_mismatch(p: &riftpipe_core::sync::PeerVersion) {
     }
 }
 
+/// A fresh per-session agent id for the eg-walker text CRDTs — unique per tab
+/// session so concurrent edits from the same device (e.g. two tabs) still get
+/// distinct origins. Used both for a fresh `Syncer` and when restoring one.
+pub(crate) fn gossip_agent() -> String {
+    format!("g{:08x}", (js_sys::Math::random() * 4_294_967_296.0) as u32)
+}
+
 impl GossipTreeSync {
-    pub fn new(mesh: Mesh, on_merged: std::rc::Rc<dyn Fn(String, Vec<u8>)>, auth: Auth) -> GossipTreeSync {
+    pub fn new(
+        mesh: Mesh,
+        syncer: riftpipe_core::sync::Syncer,
+        on_merged: std::rc::Rc<dyn Fn(String, Vec<u8>)>,
+        auth: Auth,
+    ) -> GossipTreeSync {
         use std::cell::RefCell;
         use std::rc::Rc;
         let my_id = *mesh.my_id().as_bytes();
         let (sender, mut receiver, bootstrap, cipher, node) = mesh.into_parts();
         let (stop_tx, stop_rx) = futures_channel::oneshot::channel::<()>();
-        let agent = format!("g{:08x}", (js_sys::Math::random() * 4_294_967_296.0) as u32);
-        let syncer = Rc::new(RefCell::new(riftpipe_core::sync::Syncer::new(agent)));
+        let syncer = Rc::new(RefCell::new(syncer));
         let neighbors = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
         let routing = Rc::new(RefCell::new(std::collections::BTreeMap::new()));
         let versions = Rc::new(RefCell::new(riftpipe_core::sync::VersionMonitor::new()));
@@ -1027,7 +1050,8 @@ impl GossipTreeSync {
                                 for msg in acc.apply {
                                     let (persist, replies) = sy.borrow_mut().apply(msg);
                                     if let Some((path, bytes)) = persist {
-                                        on_merged(path, bytes);
+                                        on_merged(path.clone(), bytes);
+                                        save_record(topic, &sy, &path);
                                     }
                                     for r in replies {
                                         let mm = au.borrow().sign(r);
@@ -1131,12 +1155,13 @@ impl GossipTreeSync {
                 let (Some(sy), Some(au)) = (wsy.upgrade(), wau.upgrade()) else { return };
                 let acc = au.borrow_mut().sync_from_storage(&key, &value);
                 mark_claimed_if_due(&au, topic);
-                apply_and_broadcast(acc, &sy, &au, &*on_merged, &snd, &cph);
+                apply_and_broadcast(topic, acc, &sy, &au, &*on_merged, &snd, &cph);
             })
         };
 
         GossipTreeSync {
             syncer,
+            topic,
             sender,
             cipher,
             neighbors,
@@ -1152,6 +1177,7 @@ impl GossipTreeSync {
     pub fn push_text(&self, path: &str, content: &str) {
         let msg = self.syncer.borrow_mut().local_text(path, content);
         if let Some(msg) = msg {
+            save_record(self.topic, &self.syncer, path);
             let mm = self.auth.borrow().sign(msg);
             if let Some(mm) = mm {
                 self.broadcast(mm);
@@ -1162,6 +1188,7 @@ impl GossipTreeSync {
     pub fn push_lww(&self, path: &str, bytes: &[u8]) {
         let now = js_sys::Date::now() as u64;
         let msg = self.syncer.borrow_mut().local_lww(path, bytes.to_vec(), now);
+        save_record(self.topic, &self.syncer, path);
         let mm = self.auth.borrow().sign(msg);
         if let Some(mm) = mm {
             self.broadcast(mm);
@@ -1740,14 +1767,14 @@ mod tests {
             sleep_ms(50).await;
         }
         let host_addr = host_mesh.addr();
-        let host_bs = GossipTreeSync::new(host_mesh, Rc::new(|_, _| {}), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32]), riftpipe_core::crypto::topic_from_secret(&secret)));
+        let host_bs = GossipTreeSync::new(host_mesh, riftpipe_core::sync::Syncer::new(gossip_agent()), Rc::new(|_, _| {}), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32]), riftpipe_core::crypto::topic_from_secret(&secret)));
 
         let join_sk = SecretKey::generate();
         let joiner_mesh = Mesh::join(join_sk, secret, Some(host_addr)).await.expect("joiner");
         let got: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::new(RefCell::new(Vec::new()));
         let g = got.clone();
         let _joiner_bs =
-            GossipTreeSync::new(joiner_mesh, Rc::new(move |p, b| g.borrow_mut().push((p, b))), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32]), riftpipe_core::crypto::topic_from_secret(&secret)));
+            GossipTreeSync::new(joiner_mesh, riftpipe_core::sync::Syncer::new(gossip_agent()), Rc::new(move |p, b| g.borrow_mut().push((p, b))), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32]), riftpipe_core::crypto::topic_from_secret(&secret)));
 
         // Let the swarm form, then the host pushes a file.
         sleep_ms(2500).await;
@@ -1781,6 +1808,7 @@ mod tests {
         let m1 = a.join(s1, None, &[]).await.expect("a joins board 1");
         let first = GossipTreeSync::new(
             m1,
+            riftpipe_core::sync::Syncer::new(gossip_agent()),
             Rc::new(|_, _| {}),
             Auth::load(DeviceKey::from_seed(&[81; 32]), riftpipe_core::crypto::topic_from_secret(&s1)),
         );
@@ -1790,6 +1818,7 @@ mod tests {
         let m2 = a.join(s2, None, &[]).await.expect("a joins board 2 on the same endpoint");
         let host = GossipTreeSync::new(
             m2,
+            riftpipe_core::sync::Syncer::new(gossip_agent()),
             Rc::new(|_, _| {}),
             Auth::load(DeviceKey::from_seed(&[82; 32]), riftpipe_core::crypto::topic_from_secret(&s2)),
         );
@@ -1801,6 +1830,7 @@ mod tests {
         let g = got.clone();
         let _joiner = GossipTreeSync::new(
             mb,
+            riftpipe_core::sync::Syncer::new(gossip_agent()),
             Rc::new(move |p, b| g.borrow_mut().push((p, b))),
             Auth::load(DeviceKey::from_seed(&[83; 32]), riftpipe_core::crypto::topic_from_secret(&s2)),
         );

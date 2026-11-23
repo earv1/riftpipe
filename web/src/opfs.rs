@@ -12,6 +12,8 @@
 
 use std::cell::RefCell;
 
+use riftpipe_core::sync::{is_text_path, DurablePath, Restored, Syncer};
+
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -22,6 +24,10 @@ use web_sys::{
 
 /// Parent of every board's tree: `.boards/<hex topic>/`.
 const BOARDS_DIR: &str = ".boards";
+/// Never-synced dot-dir holding one durable sync record per path (see
+/// [`queue_record`] / [`restore_syncer`]) — a dot-dir, so `tree_files` already
+/// skips it.
+const SYNC_DIR: &str = ".riftpipe-sync";
 
 thread_local! {
     /// The board (topic) the path API is scoped to — set on connect. Unset before
@@ -71,6 +77,15 @@ pub async fn read_text(dir: &FileSystemDirectoryHandle, name: &str) -> Option<St
     let file: File = JsFuture::from(handle.get_file()).await.ok()?.unchecked_into();
     let buf = JsFuture::from(file.array_buffer()).await.ok()?;
     String::from_utf8(js_sys::Uint8Array::new(&buf).to_vec()).ok()
+}
+
+/// Read a file in `dir` as raw bytes, or `None` if it doesn't exist.
+pub async fn read_bytes(dir: &FileSystemDirectoryHandle, name: &str) -> Option<Vec<u8>> {
+    let handle: FileSystemFileHandle =
+        JsFuture::from(dir.get_file_handle(name)).await.ok()?.unchecked_into();
+    let file: File = JsFuture::from(handle.get_file()).await.ok()?.unchecked_into();
+    let buf = JsFuture::from(file.array_buffer()).await.ok()?;
+    Some(js_sys::Uint8Array::new(&buf).to_vec())
 }
 
 /// Write text to a file in `dir` (created if absent).
@@ -182,6 +197,8 @@ pub async fn board_claimed(topic: &[u8; 32]) -> bool {
 /// is **folder-generic**: `.md` files sync as text CRDTs, everything else as LWW,
 /// with no knowledge of any app's layout. Only that board's own tree is read, so
 /// another board's files (claimed or not) never reach this board's swarm.
+/// Kept only for the legacy WebRTC `connect_and_sync` path — `iroh_connect` uses
+/// [`restore_syncer`] instead, which resumes durable history/LWW versions.
 pub async fn prime_all(topic: [u8; 32]) {
     let Ok(root) = board_root(&topic).await else { return };
     for (path, text) in tree_files(root).await {
@@ -189,6 +206,118 @@ pub async fn prime_all(topic: [u8; 32]) {
         // classification rule, inside `push`.
         crate::tree_sync::push(&path, text.as_bytes());
     }
+}
+
+/// A pending durable-record write: serialized per path so two overlapping
+/// `createWritable`s can't land out of order — the latest queued record for a
+/// path always wins.
+#[derive(Default)]
+struct RecordQueue {
+    pending: std::collections::BTreeMap<([u8; 32], String), Vec<u8>>,
+    draining: bool,
+}
+thread_local! {
+    static RECORDS: RefCell<RecordQueue> = RefCell::new(RecordQueue::default());
+}
+
+/// Queue `rec` for board `topic` (replacing any not-yet-written record for that path).
+pub(crate) fn queue_record(topic: [u8; 32], rec: &DurablePath) {
+    let bytes = postcard::to_allocvec(rec).unwrap_or_default();
+    let spawn = RECORDS.with(|q| {
+        let mut q = q.borrow_mut();
+        q.pending.insert((topic, rec.path.clone()), bytes);
+        if q.draining {
+            false
+        } else {
+            q.draining = true;
+            true
+        }
+    });
+    if spawn {
+        wasm_bindgen_futures::spawn_local(drain_records());
+    }
+}
+
+/// Drain [`RECORDS`] one write at a time until it's empty.
+async fn drain_records() {
+    loop {
+        let next = RECORDS.with(|q| {
+            let mut q = q.borrow_mut();
+            match q.pending.pop_first() {
+                Some(x) => Some(x),
+                None => {
+                    q.draining = false;
+                    None
+                }
+            }
+        });
+        let Some(((topic, path), bytes)) = next else { break };
+        if let Ok(root) = board_root(&topic).await {
+            if let Ok(dir) = subdir(&root, SYNC_DIR, true).await {
+                let _ = write_bytes(&dir, &format!("{}.rec", riftpipe_core::sync::record_name(&path)), &bytes).await;
+            }
+        }
+    }
+}
+
+/// Wait for every queued record write to land — tests only (production code
+/// never waits on the write queue).
+#[cfg(test)]
+pub(crate) async fn flush_records() {
+    for _ in 0..500 {
+        let idle = RECORDS.with(|q| {
+            let q = q.borrow();
+            !q.draining && q.pending.is_empty()
+        });
+        if idle {
+            return;
+        }
+        gloo_timers::future::TimeoutFuture::new(10).await;
+    }
+}
+
+/// Rebuild board `topic`'s Syncer from its durable records + OPFS files, BEFORE the
+/// mesh starts: unchanged files resume their exact history (same CRDT origin, same LWW
+/// version); files changed while closed become local edits on top; files without a
+/// usable record are primed as new (the old `prime_all` behaviour). Nothing is broadcast
+/// — the NeighborUp catch-up ships the whole state.
+pub async fn restore_syncer(topic: [u8; 32], agent: String) -> Syncer {
+    let mut syncer = Syncer::new(agent);
+    let Ok(root) = board_root(&topic).await else { return syncer };
+    let mut recs: std::collections::HashMap<String, DurablePath> = std::collections::HashMap::new();
+    if let Ok(dir) = subdir(&root, SYNC_DIR, false).await {
+        for name in list(&dir).await {
+            if !name.ends_with(".rec") {
+                continue;
+            }
+            let Some(bytes) = read_bytes(&dir, &name).await else { continue };
+            if let Ok(rec) = postcard::from_bytes::<DurablePath>(&bytes) {
+                recs.insert(rec.path.clone(), rec);
+            }
+        }
+    }
+    let now = js_sys::Date::now() as u64;
+    for (path, text) in tree_files(root).await {
+        match recs.remove(&path).map(|rec| syncer.restore(rec, Some(text.as_bytes()), now)) {
+            Some(Restored::Clean) => {}
+            Some(Restored::Changed(_)) => {
+                if let Some(r) = syncer.durable(&path) {
+                    queue_record(topic, &r);
+                }
+            }
+            Some(Restored::Unusable) | None => {
+                if is_text_path(&path) {
+                    let _ = syncer.local_text(&path, &text);
+                } else {
+                    let _ = syncer.local_lww(&path, text.into_bytes(), now);
+                }
+                if let Some(r) = syncer.durable(&path) {
+                    queue_record(topic, &r);
+                }
+            }
+        }
+    }
+    syncer
 }
 
 /// Every syncable file under `root` as `(path, text)`. Iterative DFS (a name is
@@ -432,5 +561,85 @@ mod tests {
         assert!(subdir(&root, "legacytickets", false).await.is_err(), "gone from the root");
         set_active_board(c);
         assert_eq!(read_path("legacytickets/card.md").await.as_deref(), Some("old card"));
+    }
+
+    /// The `TextDelta` origin carried for `path` in `msgs`.
+    fn text_origin(msgs: &[riftpipe_core::sync::SyncMsg], path: &str) -> Option<(String, usize)> {
+        msgs.iter()
+            .find_map(|m| match m {
+                riftpipe_core::sync::SyncMsg::TextDelta { path: p, origin, .. } if p == path => {
+                    Some(origin.clone())
+                }
+                _ => None,
+            })
+            .expect("a TextDelta for the path")
+    }
+
+    /// The `Lww` version carried for `path` in `msgs`.
+    fn lww_version(msgs: &[riftpipe_core::sync::SyncMsg], path: &str) -> u64 {
+        msgs.iter()
+            .find_map(|m| match m {
+                riftpipe_core::sync::SyncMsg::Lww { path: p, version, .. } if p == path => {
+                    Some(*version)
+                }
+                _ => None,
+            })
+            .expect("an Lww for the path")
+    }
+
+    /// A restart resumes the SAME CRDT history (not a fresh re-prime): the text
+    /// origin and LWW version survive, and a file changed while closed becomes a
+    /// local edit that still merges cleanly with the pre-restart history.
+    #[wasm_bindgen_test]
+    async fn restore_syncer_resumes_history_and_lww_versions() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        write_path_in(&topic, "a.md", b"# one\n").await.unwrap();
+        write_path_in(&topic, "m.toml", b"x = 1\n").await.unwrap();
+
+        let mut s1 = Syncer::new("t1");
+        s1.local_text("a.md", "# one\n");
+        s1.local_lww("m.toml", b"x = 1\n".to_vec(), 100);
+        queue_record(topic, &s1.durable("a.md").unwrap());
+        queue_record(topic, &s1.durable("m.toml").unwrap());
+        flush_records().await;
+
+        let s2 = restore_syncer(topic, "t2".into()).await;
+        let s1_full = s1.full_state();
+        assert_eq!(text_origin(&s2.full_state(), "a.md"), text_origin(&s1_full, "a.md"));
+        assert_eq!(lww_version(&s2.full_state(), "m.toml"), 100);
+
+        write_path_in(&topic, "a.md", b"# two\n").await.unwrap();
+        let s3 = restore_syncer(topic, "t3".into()).await;
+
+        let mut c = Syncer::new("c");
+        let mut persisted = None;
+        for m in s1.full_state().into_iter().chain(s3.full_state()) {
+            if let (Some((p, bytes)), _) = c.apply(m) {
+                if p == "a.md" {
+                    persisted = Some(bytes);
+                }
+            }
+        }
+        assert_eq!(persisted.as_deref(), Some(&b"# two\n"[..]));
+        assert_eq!(text_origin(&c.full_state(), "a.md"), text_origin(&s1_full, "a.md"));
+    }
+
+    /// Two records queued for the same path before either write lands: only the
+    /// latest survives on disk.
+    #[wasm_bindgen_test]
+    async fn record_queue_keeps_the_latest_per_path() {
+        use riftpipe_core::sync::DurableKind;
+        let topic = riftpipe_core::crypto::generate_secret();
+        let rec_v1 = DurablePath { path: "p.md".into(), kind: DurableKind::Lww { version: 1 }, disk: [0; 32] };
+        let rec_v2 = DurablePath { path: "p.md".into(), kind: DurableKind::Lww { version: 2 }, disk: [1; 32] };
+        queue_record(topic, &rec_v1);
+        queue_record(topic, &rec_v2);
+        flush_records().await;
+
+        let dir = subdir(&board_root(&topic).await.unwrap(), SYNC_DIR, false).await.unwrap();
+        let name = format!("{}.rec", riftpipe_core::sync::record_name("p.md"));
+        let bytes = read_bytes(&dir, &name).await.expect("record written");
+        let decoded: DurablePath = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, rec_v2);
     }
 }
