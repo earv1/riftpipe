@@ -37,6 +37,14 @@ use crate::sync::control::{clean_name, is_canonical_name, NAME_MAX_BYTES};
 /// are ignored with a one-time warning, so a link-holder can't grow it unbounded.
 pub const REQUEST_INBOX_CAP: usize = 64;
 
+/// A verified join request waiting in the list, with its safety code computed
+/// once on arrival (the state snapshot is rebuilt every second).
+#[derive(Clone, Debug)]
+pub struct PendingRequest {
+    pub request: JoinRequest,
+    pub safety: String,
+}
+
 fn hex32(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -123,7 +131,7 @@ pub struct TreePeer {
     stale_epoch_reported: HashSet<u64>,
     /// Verified requests from devices that aren't authorized, one per device —
     /// the `riftpipe requests` list. Cleared per device when it's granted.
-    requests: Vec<JoinRequest>,
+    requests: Vec<PendingRequest>,
     /// The request list hit [`REQUEST_INBOX_CAP`] once already (warned).
     warned_inbox_full: bool,
     /// A new device's request was dropped because the list was full (sticky for
@@ -204,7 +212,7 @@ impl TreePeer {
     }
 
     /// Verified requests waiting for approval (one per not-yet-authorized device).
-    pub fn pending_requests(&self) -> &[JoinRequest] {
+    pub fn pending_requests(&self) -> &[PendingRequest] {
         &self.requests
     }
 
@@ -228,7 +236,7 @@ impl TreePeer {
         }
         let ok = self.trust.apply(entry);
         let trust = &self.trust;
-        self.requests.retain(|r| !trust.is_authorized(&r.device_id));
+        self.requests.retain(|r| !trust.is_authorized(&r.request.device_id));
         ok
     }
 
@@ -418,14 +426,15 @@ impl TreePeer {
             return;
         }
         let full = self.requests.len() >= REQUEST_INBOX_CAP;
-        if let Some(i) = self.requests.iter().position(|r| r.device_id == req.device_id) {
-            let old = &self.requests[i];
+        if let Some(i) = self.requests.iter().position(|r| r.request.device_id == req.device_id) {
+            let old = &self.requests[i].request;
             // While full, an entry can't be re-signed either: that would let a
             // device already in a full list re-grind its safety code to match a
             // request that was dropped.
             if (old.name != req.name || old.enc_pub != req.enc_pub) && !full {
-                self.report_request(&req, dir);
-                self.requests[i] = req;
+                let pending = PendingRequest { safety: req.safety_code(), request: req };
+                self.report_request(&pending, dir);
+                self.requests[i] = pending;
             }
             return;
         }
@@ -440,14 +449,15 @@ impl TreePeer {
             }
             return;
         }
-        self.report_request(&req, dir);
-        self.requests.push(req);
+        let pending = PendingRequest { safety: req.safety_code(), request: req };
+        self.report_request(&pending, dir);
+        self.requests.push(pending);
     }
 
     /// The `access-request` breadcrumb, plus how to approve it when we're an Admin.
-    fn report_request(&self, req: &JoinRequest, dir: &Path) {
+    fn report_request(&self, pending: &PendingRequest, dir: &Path) {
+        let (req, safety) = (&pending.request, &pending.safety);
         let name = serde_json::to_string(&clean_name(&req.name)).unwrap_or_default();
-        let safety = req.safety_code();
         eprintln!("[auth] access-request device={} safety={safety} name={name}", hex32(&req.device_id));
         let admin = self.device_id().is_some_and(|me| self.trust.role(&me) == Some(Role::Admin));
         if admin {
@@ -591,7 +601,7 @@ impl TreePeer {
     /// The wrap follows via maintenance — the request already taught the book the
     /// device's key.
     pub fn approve_request(&mut self, id: [u8; 32], dir: &Path) -> Vec<MeshMsg> {
-        let Some(req) = self.requests.iter().find(|r| r.device_id == id) else {
+        let Some(req) = self.requests.iter().find(|r| r.request.device_id == id).map(|r| &r.request) else {
             eprintln!(
                 "[auth] approve ignored: no pending request from {} — `riftpipe grant {} <device-id>` authorizes a device by id",
                 hex32(&id),
@@ -628,9 +638,9 @@ impl TreePeer {
             .iter()
             .map(|r| {
                 serde_json::json!({
-                    "device": hex32(&r.device_id),
-                    "name": clean_name(&r.name),
-                    "safety": r.safety_code(),
+                    "device": hex32(&r.request.device_id),
+                    "name": clean_name(&r.request.name),
+                    "safety": r.safety,
                 })
             })
             .collect();
@@ -1132,7 +1142,7 @@ mod tests {
 
         founder.authorize_and_apply(joiner.read_request().expect("a keyless joiner asks"), &df);
         assert_eq!(founder.pending_requests().len(), 1);
-        assert_eq!(founder.pending_requests()[0].name, "Bob");
+        assert_eq!(founder.pending_requests()[0].request.name, "Bob");
         founder.authorize_and_apply(joiner.read_request().unwrap(), &df);
         assert_eq!(founder.pending_requests().len(), 1, "a repeated request keeps one entry");
 
@@ -1227,7 +1237,7 @@ mod tests {
         assert_eq!(founder.auth_state_json().unwrap()["inboxOverflow"], false, "full, but nothing dropped yet");
 
         founder.authorize_and_apply(request_from(&seed(0), "renamed"), &df);
-        assert_eq!(founder.pending_requests()[0].name, "junk", "a full list refuses re-signs");
+        assert_eq!(founder.pending_requests()[0].request.name, "junk", "a full list refuses re-signs");
 
         founder.authorize_and_apply(request_from(&[0xEEu8; 32], "victim"), &df);
         assert_eq!(founder.pending_requests().len(), REQUEST_INBOX_CAP, "the new request is dropped");
@@ -1235,14 +1245,16 @@ mod tests {
         assert_eq!(state["inboxOverflow"], true);
 
         let listed = &founder.pending_requests()[3];
-        let code = listed.safety_code();
+        let code = listed.safety.clone();
+        assert_eq!(code, listed.request.safety_code(), "the cached code is the real one");
+        let listed = &listed.request;
         let err = resolve_approve_target(Some(&state), &code).unwrap_err();
         assert!(err.contains("overflowed"), "{err}");
         let by_id = resolve_approve_target(Some(&state), &hex32(&listed.device_id)).unwrap();
         assert_eq!(by_id.0, listed.device_id, "approve by device id still works");
 
         // Sticky: freeing a slot doesn't make codes trustworthy again.
-        let first = founder.pending_requests()[0].device_id;
+        let first = founder.pending_requests()[0].request.device_id;
         founder.approve_request(first, &df);
         assert_eq!(founder.auth_state_json().unwrap()["inboxOverflow"], true);
         std::fs::remove_dir_all(&df).ok();
@@ -1255,7 +1267,7 @@ mod tests {
         founder.authorize_and_apply(request_from(&[5u8; 32], "A"), &df);
         founder.authorize_and_apply(request_from(&[5u8; 32], "B"), &df);
         assert_eq!(founder.pending_requests().len(), 1);
-        assert_eq!(founder.pending_requests()[0].name, "B");
+        assert_eq!(founder.pending_requests()[0].request.name, "B");
         std::fs::remove_dir_all(&df).ok();
     }
 
