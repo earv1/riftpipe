@@ -183,7 +183,9 @@ same board. None of it ever syncs (dot-paths are machine-local):
   key **and the board secret**. The board secret is ticket-equivalent: anyone who
   reads this file can join, read and (on an open board) write the board. Guard it
   like `<dir>/.device`; it is written mode `0600`. `--new-board` deletes it and
-  mints a new board/link.
+  mints a new board/link. A `--restricted` host refuses to resume it (its trust
+  log and epochs aren't persisted, so replaying `--grant`s could re-authorize a
+  device revoked live) — restart a restricted board with `--new-board`.
 - **`<dir>/.riftpipe-peers`** and the browser's `riftpipe:peers:<topic>`
   localStorage key hold a per-board list of recently seen peer EndpointIds —
   public ids only, no secrets.

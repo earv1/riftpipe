@@ -111,8 +111,11 @@ sense to do it, not strict priority.
     its record landing can duplicate that one merged edit on the next start (fails
     toward duplication, never loss); no app-level heartbeat or `pagehide` →
     Disconnect, so a joiner notices a vanished host only via QUIC idle (~15–30 s)
-    and the pill can read "connected" that long; a restarted `--restricted` CLI
-    host doesn't persist its trust log/epochs (re-mints epoch 1; untested); the
+    and the pill can read "connected" that long; a `--restricted` CLI host doesn't
+    persist its trust log/epochs, and a restart would replay its `--grant`s under
+    fresh nonces (re-authorizing a device revoked live, on peers that saw the
+    revoke first) and re-mint epoch 1 — so `connect --accept --restricted` refuses
+    to resume a dir that already hosts a board; restart it with `--new-board`; the
     legacy WebRTC/signaling `connectAndSync` path has no records or reconnection;
     the npm wrapper doesn't parse `[mesh] status=` lines. Pre-existing and
     separate: tree/mesh deletes, out-of-order OPFS writes of rapid merges to one

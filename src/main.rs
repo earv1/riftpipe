@@ -252,6 +252,7 @@ async fn main() {
             eprintln!("                                      # peer joins with `connect <ticket> <dir>` — one protocol, N peers, no signaling.");
             eprintln!("                                      # <dir> is the same board across restarts (identity persists in <dir>/.riftpipe-host)");
             eprintln!("                                      # --new-board: forget <dir>/.riftpipe-host and mint a new board/link");
+            eprintln!("                                      #   (a --restricted host can't resume yet: restart it with --new-board)");
             eprintln!("                                      # --restricted: only devices the founder grants can READ or write — content is sealed under a rotating epoch key");
             eprintln!("                                      # --grant <id> authorizes a device at startup (get one via `device-id <dir>`)");
             eprintln!("  riftpipe device-id <dir>            # print (creating if absent) this device's id for <dir> — share it to be --grant'ed");
@@ -500,6 +501,7 @@ async fn connect_accept(dir: &str, opts: &Opts) -> riftpipe::net::Result<()> {
     use std::time::Duration;
 
     let dir = tree::prepare_dir(std::path::Path::new(dir))?;
+    mesh::check_restricted_resume(&dir, opts.restricted, opts.new_board)?;
     let (watcher, mut rx) = tree::watch(&dir);
     let mut peer = tree::TreePeer::new();
     apply_auth(&mut peer, &dir, opts, true); // founder: genesis + any --grant ids

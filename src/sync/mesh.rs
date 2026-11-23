@@ -99,6 +99,23 @@ pub fn load_or_create_host(dir: &Path, fresh: bool) -> Result<(SecretKey, [u8; 3
     Ok((sk, secret))
 }
 
+/// Refuse to resume a board `dir` already hosted when `restricted`, unless
+/// `fresh` (`--new-board`). `TreePeer` doesn't persist the trust log or epochs,
+/// so a restarted restricted founder would replay its `--grant`s under fresh
+/// nonces — on peers that already hold `[grant, revoke]` the new grant lands
+/// after the revoke and re-authorizes a device revoked live — and re-mint
+/// epoch 1. Until trust + epochs persist, a restricted host starts a new board.
+pub fn check_restricted_resume(dir: &Path, restricted: bool, fresh: bool) -> Result<()> {
+    if restricted && !fresh && dir.join(HOST_FILE).exists() {
+        return Err(anyerr(format!(
+            "{} already hosts a board; a --restricted host can't resume it yet (its trust log and epochs \
+             aren't persisted, so a restart could re-authorize a revoked device) — rerun with --new-board",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
 /// This board's remembered peers (`<dir>/.riftpipe-peers`), or an empty book
 /// if the file is absent, corrupt, or for a different topic.
 pub fn load_peer_book(dir: &Path, topic: [u8; 32]) -> PeerBook {
@@ -638,6 +655,21 @@ mod tests {
         assert_ne!(sk3.to_bytes(), sk1.to_bytes(), "--new-board mints a fresh key");
         assert_ne!(secret3, secret1, "--new-board mints a fresh board secret");
 
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A restricted host refuses to resume a board its dir already hosted
+    /// (`--grant` replay could re-authorize a live-revoked device); a first run,
+    /// `--new-board`, or an open board are fine.
+    #[test]
+    fn restricted_host_refuses_to_resume_without_new_board() {
+        let d = dir("restricted-resume");
+        assert!(check_restricted_resume(&d, true, false).is_ok(), "first run: nothing to resume");
+        load_or_create_host(&d, false).unwrap();
+        let err = check_restricted_resume(&d, true, false).expect_err("restricted resume refused");
+        assert!(err.to_string().contains("--new-board"), "the error says how to proceed: {err}");
+        assert!(check_restricted_resume(&d, true, true).is_ok(), "--new-board starts over");
+        assert!(check_restricted_resume(&d, false, false).is_ok(), "an open board resumes");
         std::fs::remove_dir_all(&d).ok();
     }
 

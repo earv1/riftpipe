@@ -550,3 +550,24 @@ async fn mesh_host_crash_restart_resyncs_gap_edits() {
     std::fs::remove_dir_all(&dh).ok();
     std::fs::remove_dir_all(&dj).ok();
 }
+
+/// `connect --accept --restricted` on a dir that already hosted a board stops
+/// before going online and keeps the old identity file untouched: resuming would
+/// replay `--grant`s and could re-authorize a live-revoked device.
+#[test]
+fn restricted_cli_host_restart_requires_new_board() {
+    let d = dir("restricted-restart");
+    let (sk, _) = load_or_create_host(&d, false).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riftpipe"))
+        .args(["connect", "--accept"])
+        .arg(&d)
+        .arg("--restricted")
+        .output()
+        .expect("run connect --accept --restricted");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("rerun with --new-board"), "refused with a hint, got: {stderr}");
+    assert!(!stderr.contains("[mesh] host id"), "never went online: {stderr}");
+    let (sk2, _) = load_or_create_host(&d, false).unwrap();
+    assert_eq!(sk2.to_bytes(), sk.to_bytes(), "the persisted identity is untouched");
+    std::fs::remove_dir_all(&d).ok();
+}
