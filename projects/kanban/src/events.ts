@@ -4,7 +4,8 @@
 // transitions). Apps add their own semantic events via `logEvent`. This feeds
 // the Activity panel and per-card History (`historyStore.ts`), plus debugging.
 import { logEvent as wasmLogEvent, readEvents as wasmReadEvents } from "../wasm/pkg/kanban_wasm.js";
-import { ready } from "./fs.ts";
+import { ready, watchSiblings } from "./fs.ts";
+import { affectsEventLog } from "./history.ts";
 
 export type RiftEvent = {
   ts: string;
@@ -38,14 +39,13 @@ export function onEvent(cb: (e: RiftEvent) => void): void {
 }
 
 // "The log changed" subscription for `historyStore.ts`: a single hook that
-// fires on any of the four ways the merged log can change in this tab — a
-// local append, a remote merge landing via the lib's `riftpipe:file-changed`,
-// or either relayed from a sibling tab over BroadcastChannel. Callers don't
-// care which path fired; they just re-read with `readEvents()`.
+// fires on any of the ways the merged log can change in this tab — a local
+// append, a remote merge landing via the lib's `riftpipe:file-changed`, an
+// in-tab board switch (path ""), or an append/merge relayed from a sibling tab.
+// Callers don't care which path fired; they just re-read with `readEvents()`.
 const subscribers = new Set<() => void>();
 let installed = false;
 const eventsBc = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("riftpipe:events") : null;
-const fsBc = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("riftpipe:fs") : null;
 
 function notifyAll(): void {
   for (const s of subscribers) s();
@@ -64,11 +64,12 @@ function install(): void {
   });
   window.addEventListener("riftpipe:file-changed", (e) => {
     const path = (e as CustomEvent).detail as string;
-    if (typeof path === "string" && path.startsWith("events/")) notifyAll();
+    if (affectsEventLog(path)) notifyAll();
   });
   eventsBc?.addEventListener("message", () => notifyAll());
-  fsBc?.addEventListener("message", (e) => {
-    if (typeof e.data === "string" && e.data.startsWith("events/")) notifyAll();
+  // A sibling's board switch isn't ours, so only its events/* relays count.
+  watchSiblings((path) => {
+    if (typeof path === "string" && path.startsWith("events/")) notifyAll();
   });
 }
 

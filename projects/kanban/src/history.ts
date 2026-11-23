@@ -58,6 +58,13 @@ export function relativeTime(ts: string, nowMs: number): string {
   return new Date(t).toISOString().slice(0, 10);
 }
 
+/** Whether a `riftpipe:file-changed` path can change the merged event log: any
+ *  `events/*` file, or `""` — the library's "the page switched boards" nudge
+ *  (the whole tree, events included, is now another board's). */
+export function affectsEventLog(path: unknown): boolean {
+  return typeof path === "string" && (path === "" || path.startsWith("events/"));
+}
+
 /** A full local date-time for an event's tooltip; the raw string when `ts`
  *  doesn't parse (instead of "Invalid Date"). */
 export function absoluteTime(ts: string): string {

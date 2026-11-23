@@ -56,6 +56,16 @@ function fireChanged(path: string): void {
 }
 
 /**
+ * Sibling-tab changes only: `cb(path)` for each path another tab in this
+ * profile relayed. Listens on this module's own channel object, which never
+ * receives its own posts — so this tab's relays don't echo back (a second
+ * `BroadcastChannel("riftpipe:fs")` in the same tab would hear them).
+ */
+export function watchSiblings(cb: (path: string) => void): void {
+  bc?.addEventListener("message", (e) => cb(e.data as string));
+}
+
+/**
  * Watch the tree: `cb(path)` fires on every change — a local `write`, a remote
  * merge (the lib's `riftpipe:file-changed` event), or a sibling tab's write
  * (BroadcastChannel). Local/remote changes are relayed to siblings here; a

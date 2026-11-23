@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   absoluteTime,
+  affectsEventLog,
   boardActivity,
   cardHistory,
   dedupe,
@@ -202,4 +203,14 @@ Deno.test("absoluteTime — local date-time, raw string when unparseable", () =>
   const ts = "2026-07-20T12:00:00Z";
   assert.equal(absoluteTime(ts), new Date(ts).toLocaleString());
   assert.notEqual(absoluteTime(ts), "Invalid Date");
+});
+
+Deno.test("affectsEventLog — events/* and the board-switch nudge, nothing else", () => {
+  assert.equal(affectsEventLog("events/abc.jsonl"), true);
+  assert.equal(affectsEventLog("events/abc.000001.jsonl"), true);
+  assert.equal(affectsEventLog(""), true, "an in-tab board switch reloads history");
+  assert.equal(affectsEventLog("board.md"), false);
+  assert.equal(affectsEventLog("tickets/tk_1/card.md"), false);
+  assert.equal(affectsEventLog(undefined), false);
+  assert.equal(affectsEventLog(1), false);
 });
