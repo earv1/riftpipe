@@ -197,6 +197,10 @@ Known limits:
   holder**, who can simply link again. By design: the passkey *is* the owner.
 - **The sign counter is ignored** (synced passkeys report 0), so a cloned
   authenticator isn't detected.
+- **User verification isn't required.** The ceremony asks for it as
+  `"preferred"` and the check requires only user *presence*, so a security key
+  with no PIN or biometric links a device with just a touch — whoever holds
+  that key can add an Admin device.
 - **RP ID = the page hostname.** Every project page on `<user>.github.io`
   shares the passkey (a page there could request an assertion from it), and a
   board claimed on one host can't be passkey-linked from another.

@@ -106,7 +106,10 @@ impl PasskeyCredential {
     ///
     /// The sign counter is deliberately ignored (synced passkeys report 0);
     /// there's no origin check because `rpIdHash` already scopes to the host
-    /// and the browser enforces that the RP ID is within the origin.
+    /// and the browser enforces that the RP ID is within the origin. User
+    /// *verification* (the UV flag, `0x04`) is deliberately not required: the
+    /// ceremony asks for it as `"preferred"`, so a security key without a PIN or
+    /// biometric still works with just a touch (user presence).
     pub fn verify(&self, a: &PasskeyAssertion, expected_challenge: &[u8]) -> bool {
         let ad = &a.authenticator_data;
         if ad.len() < 37 || ad[..32] != rp_id_hash(&self.rp_id)[..] || ad[32] & FLAG_UP == 0 {
@@ -347,6 +350,17 @@ mod tests {
         no_up_ad[32] = 0x04;
         let no_up_a = PasskeyAssertion { authenticator_data: no_up_ad, ..a.clone() };
         assert!(!cred.verify(&no_up_a, &[3u8; 32]), "UP cleared");
+
+        // Presence without verification (a touch-only security key) is accepted.
+        let mut up_only_ad = ad.clone();
+        up_only_ad[32] = 0x01;
+        let up_only_sig: P256Signature = sk.sign(&assertion_message(&up_only_ad, &cdj));
+        let up_only_a = PasskeyAssertion {
+            authenticator_data: up_only_ad,
+            signature: up_only_sig.to_der().as_bytes().to_vec(),
+            ..a.clone()
+        };
+        assert!(cred.verify(&up_only_a, &[3u8; 32]), "UV isn't required");
 
         let create_cdj = String::from_utf8(cdj).unwrap().replace("webauthn.get", "webauthn.create").into_bytes();
         let create_a = PasskeyAssertion { client_data_json: create_cdj, ..a.clone() };
