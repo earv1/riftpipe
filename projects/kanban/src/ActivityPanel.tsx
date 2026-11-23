@@ -3,6 +3,7 @@
 // updates live as the merged event log changes and never re-renders the board.
 import { createSignal, For, onMount, Show } from "solid-js";
 import {
+  absoluteTime,
   boardActivity,
   describe,
   deviceLabel,
@@ -31,7 +32,7 @@ export function EventRow(props: {
   const body = () => (
     <>
       <span class="event-who" title={`device ${e.device}`}>{deviceLabel(e.device, props.viewer)}</span>
-      <time class="event-when" datetime={e.ts} title={new Date(e.ts).toLocaleString()}>
+      <time class="event-when" datetime={e.ts} title={absoluteTime(e.ts)}>
         {relativeTime(e.ts, historyNow())}
       </time>
       <span class="event-what">{describe(e, props.titleOf, props.viewer, props.inCard)}</span>

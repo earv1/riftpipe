@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  absoluteTime,
   boardActivity,
   cardHistory,
   dedupe,
@@ -193,4 +194,12 @@ Deno.test("wellFormed — drops lines without string ts/device/kind, keeps order
   const shown = boardActivity(wellFormed(raw), { showSync: true, limit: 10 }).items;
   assert.deepEqual(shown.map((e) => deviceLabel(e.device, v)), ["unknown d2", "You"]);
   assert.equal(knownTitles(wellFormed(raw)).size, 0);
+});
+
+Deno.test("absoluteTime — local date-time, raw string when unparseable", () => {
+  assert.equal(absoluteTime("bogus"), "bogus");
+  assert.equal(absoluteTime(""), "");
+  const ts = "2026-07-20T12:00:00Z";
+  assert.equal(absoluteTime(ts), new Date(ts).toLocaleString());
+  assert.notEqual(absoluteTime(ts), "Invalid Date");
 });

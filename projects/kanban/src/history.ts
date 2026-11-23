@@ -58,6 +58,13 @@ export function relativeTime(ts: string, nowMs: number): string {
   return new Date(t).toISOString().slice(0, 10);
 }
 
+/** A full local date-time for an event's tooltip; the raw string when `ts`
+ *  doesn't parse (instead of "Invalid Date"). */
+export function absoluteTime(ts: string): string {
+  const t = Date.parse(ts);
+  return Number.isNaN(t) ? ts : new Date(t).toLocaleString();
+}
+
 /** Whether `e` is one of the per-card event kinds (has a string `id`). */
 export function isCardEvent(e: HistoryEvent): boolean {
   return typeof e.id === "string" && CARD_KINDS.includes(e.kind);
