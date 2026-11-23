@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use riftpipe::sync::mesh::MeshConn;
+use riftpipe::sync::mesh::{load_or_create_host, load_peer_book, JoinOpts, MeshConn};
 use riftpipe::sync::tree::TreePeer;
 
 const BUDGET: Duration = Duration::from_secs(60);
@@ -327,4 +327,122 @@ async fn restricted_mesh_revoked_device_loses_read_after_rotation() {
     for d in [&df, &db, &dc] {
         std::fs::remove_dir_all(d).ok();
     }
+}
+
+/// RESTART end-to-end over the real mesh: a native host's persisted identity +
+/// board secret (`load_or_create_host`) make a restart the SAME board; durable
+/// sync records (`TreePeer::seed`) resume its history instead of re-priming;
+/// and the restarted host's `NeighborUp` Hello pulls back the joiner's gap
+/// edits — made to existing AND brand-new files while the host was down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mesh_host_restart_resyncs_gap_edits() {
+    const RESTART_BUDGET: Duration = Duration::from_secs(90);
+
+    let dh = dir("rs-host");
+    let dj = dir("rs-joiner");
+    std::fs::write(dh.join("a.md"), "# v1\n").unwrap();
+    std::fs::write(dh.join("m.toml"), "col = 1\n").unwrap();
+
+    let (sk, secret) = load_or_create_host(&dh, false).unwrap();
+    let topic = riftpipe_core::crypto::topic_from_secret(&secret);
+
+    let host = MeshConn::join_with(JoinOpts {
+        secret,
+        bootstrap: None,
+        secret_key: Some(sk.clone()),
+        peers: load_peer_book(&dh, topic),
+    })
+    .await
+    .expect("host join");
+    let addr = dialable_addr(&host).await;
+    let ep1 = host.endpoint().clone();
+
+    let (_tx_h, mut rx_h) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let (stop1, stop1_rx) = tokio::sync::oneshot::channel::<()>();
+    let dh_task1 = dh.clone();
+    let host_task1 = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        tokio::select! {
+            _ = riftpipe::sync::mesh::run(host, &dh_task1, &mut peer, &mut rx_h, false) => {}
+            _ = stop1_rx => {}
+        }
+    });
+
+    let (tx_j, mut rx_j) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let (dj_task, addr_j) = (dj.clone(), addr.clone());
+    let joiner_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        let _ = riftpipe::sync::mesh::join_and_run(secret, addr_j, &dj_task, &mut peer, &mut rx_j, false).await;
+    });
+
+    wait_for(&[dj.join("a.md"), dj.join("m.toml")], "joiner gets the host's tree").await;
+    let peers_file = dh.join(".riftpipe-peers");
+    tokio::time::timeout(BUDGET, async {
+        while !peers_file.is_file() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("host never noted the joiner in its PeerBook");
+
+    // Stop host 1 WITHOUT tearing down the joiner — a real restart, not a
+    // clean shutdown the joiner also sees.
+    let _ = stop1.send(());
+    ep1.close().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Gap edits on the joiner while the host is down: one existing text file,
+    // one existing LWW file, and one brand-new file.
+    std::fs::write(dj.join("a.md"), "# v1\ngap line\n").unwrap();
+    tx_j.send(dj.join("a.md")).unwrap();
+    std::fs::write(dj.join("gap.md"), "# gap\n").unwrap();
+    tx_j.send(dj.join("gap.md")).unwrap();
+    std::fs::write(dj.join("m.toml"), "col = 2\n").unwrap();
+    tx_j.send(dj.join("m.toml")).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Restart: same dir ⇒ same persisted identity ⇒ same board.
+    let (sk2, secret2) = load_or_create_host(&dh, false).unwrap();
+    assert_eq!(sk2.to_bytes(), sk.to_bytes(), "restart keeps the same identity");
+    assert_eq!(secret2, secret, "restart keeps the same board secret");
+    let host2 = MeshConn::join_with(JoinOpts {
+        secret: secret2,
+        bootstrap: None,
+        secret_key: Some(sk2),
+        peers: load_peer_book(&dh, topic),
+    })
+    .await
+    .expect("host restart join");
+    assert_eq!(host2.endpoint().id(), addr.id, "restart keeps the same EndpointId");
+
+    let (_tx_h2, mut rx_h2) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let dh_task2 = dh.clone();
+    let host_task2 = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        let _ = riftpipe::sync::mesh::run(host2, &dh_task2, &mut peer, &mut rx_h2, false).await;
+    });
+
+    let (gap, a_path, m_path) = (dh.join("gap.md"), dh.join("a.md"), dh.join("m.toml"));
+    tokio::time::timeout(RESTART_BUDGET, async {
+        loop {
+            if gap.is_file()
+                && std::fs::read(&a_path).ok() == Some(b"# v1\ngap line\n".to_vec())
+                && std::fs::read(&m_path).ok() == Some(b"col = 2\n".to_vec())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("restarted host never pulled the joiner's gap edits");
+
+    assert_eq!(std::fs::read(dj.join("a.md")).unwrap(), b"# v1\ngap line\n", "joiner not regressed");
+    assert_eq!(std::fs::read(dj.join("m.toml")).unwrap(), b"col = 2\n", "joiner not regressed");
+
+    host_task1.abort();
+    host_task2.abort();
+    joiner_task.abort();
+    std::fs::remove_dir_all(&dh).ok();
+    std::fs::remove_dir_all(&dj).ok();
 }
