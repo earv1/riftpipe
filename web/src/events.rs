@@ -281,6 +281,16 @@ pub async fn log_event(kind: String, data_json: String) {
     append(&kind, data).await;
 }
 
+/// The JSON-object lines of one log file. Anyone with the link can write
+/// `events/*` on an open board, so non-JSON lines and non-object values
+/// (`null`, `7`, `[…]`) are skipped; apps still validate field types.
+pub(crate) fn parse_event_lines(text: &str) -> Vec<serde_json::Value> {
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|v| v.is_object())
+        .collect()
+}
+
 /// The merged, time-sorted history across all peers, as a JSON array string —
 /// every `events/*.jsonl`, oldest first.
 #[wasm_bindgen(js_name = readEvents)]
@@ -291,11 +301,7 @@ pub async fn read_events() -> String {
             continue;
         }
         let text = crate::opfs::read_path(&format!("events/{fname}")).await.unwrap_or_default();
-        for line in text.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                events.push(v);
-            }
-        }
+        events.extend(parse_event_lines(&text));
     }
     events.sort_by(|a, b| {
         let ka = a.get("ts").and_then(|v| v.as_str()).unwrap_or("");
@@ -383,6 +389,15 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert!(due_repushes(&mut recent, 31_000.0, 30_000.0, 5_000.0).is_empty());
         assert!(recent.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn parse_event_lines_keeps_only_objects() {
+        let text = "null\n7\n[1]\n\"s\"\nnot json\n{}\n{\"ts\":\"T\",\"device\":\"d\",\"kind\":\"k\"}\n";
+        let v = parse_event_lines(text);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0], serde_json::json!({}));
+        assert_eq!(v[1]["kind"], "k");
     }
 
     #[wasm_bindgen_test]

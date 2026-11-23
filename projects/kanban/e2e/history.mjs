@@ -48,7 +48,9 @@ async function waitState(page, pred, ms = 10000) {
   while (Date.now() < end) { const s = await authState(page); if (pred(s)) return s; await wait(250); }
   return authState(page);
 }
-const ev = (page) => page.evaluate(() => window.riftpipe.readEvents());
+// The raw merged log; step 9b deliberately syncs malformed lines, so keep objects.
+const ev = (page) => page.evaluate(async () =>
+  (await window.riftpipe.readEvents()).filter((e) => e !== null && typeof e === "object"));
 // The rendered event rows under `scope` (".activity" or ".drawer .card-history").
 const rows = (page, scope) =>
   page.$$eval(`${scope} .event-row`, (els) =>
