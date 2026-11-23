@@ -241,6 +241,11 @@ struct RegisteredPasskey {
     role: Role,
     by: DeviceId,
 }
+/// How many not-yet-applicable `PasskeyLink`s a [`TrustLog`] buffers. They're free to
+/// forge (one naming an unknown credential defers unchecked), so the buffer is
+/// capped; a genuine link dropped here comes back in a neighbor's catch-up.
+const MAX_PENDING_PASSKEY_LINKS: usize = 64;
+
 /// The authorized device set for one board, built from [`TrustEntry`]s.
 #[derive(Default)]
 pub struct TrustLog {
@@ -330,6 +335,10 @@ impl TrustLog {
                 true
             }
             Outcome::Deferred => {
+                let is_link = |e: &TrustEntry| matches!(e, TrustEntry::PasskeyLink { .. });
+                if is_link(&entry) && self.pending.iter().filter(|e| is_link(e)).count() >= MAX_PENDING_PASSKEY_LINKS {
+                    return false;
+                }
                 self.pending.push(entry);
                 false
             }
@@ -436,15 +445,16 @@ impl TrustLog {
                 let (Some(board), Some(founder), Some(reg)) = (self.board, self.founder, self.passkeys.get(cred_id)) else {
                     return Outcome::Deferred;
                 };
-                let ok = reg.cred.verify(assertion, &passkey_link_challenge(&board, &founder, device, nonce));
-                let (by, role) = (reg.by, reg.role);
-                if !ok {
-                    return Outcome::Rejected;
-                }
-                // A passkey speaks only while its registrant is still an Admin.
-                if self.role(&by) != Some(Role::Admin) {
+                // A passkey speaks only while its registrant is still an Admin. Checked
+                // before the (costlier) P-256 verify: a deferred link is retried on
+                // every drain.
+                if self.role(&reg.by) != Some(Role::Admin) {
                     return Outcome::Deferred;
                 }
+                if !reg.cred.verify(assertion, &passkey_link_challenge(&board, &founder, device, nonce)) {
+                    return Outcome::Rejected;
+                }
+                let role = reg.role;
                 if self.founder == Some(*device) {
                     return Outcome::Applied;
                 }
@@ -896,6 +906,28 @@ mod tests {
         let ln = link(&sk, &cred, &founder_a.id(), phone.id(), nonce(2));
         assert!(!log_b.apply(ln));
         assert!(!log_b.is_authorized(&phone.id()));
+    }
+
+    #[test]
+    fn buffered_passkey_links_are_capped() {
+        let founder = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+        let mut log = board_log();
+        log.apply(founder.genesis());
+        // Links naming a credential nobody registered (yet): deferred, unchecked.
+        for i in 0..(MAX_PENDING_PASSKEY_LINKS as u32 + 10) {
+            let mut device = [0u8; 32];
+            device[..4].copy_from_slice(&i.to_le_bytes());
+            assert!(!log.apply(link(&sk, &cred, &founder.id(), device, nonce(2))));
+        }
+        assert_eq!(log.pending.len(), MAX_PENDING_PASSKEY_LINKS);
+        // Other deferred entries aren't crowded out.
+        let admin2 = DeviceKey::generate();
+        assert!(!log.apply(admin2.grant([7; 32], Role::Member, nonce(3))));
+        assert_eq!(log.pending.len(), MAX_PENDING_PASSKEY_LINKS + 1);
+        // The buffered links still resolve once the registration lands.
+        assert!(log.apply(founder.register_passkey(cred, Role::Admin, nonce(1))));
+        assert_eq!(log.devices().len(), 1 + MAX_PENDING_PASSKEY_LINKS);
     }
 
     #[test]
