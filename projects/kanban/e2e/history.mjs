@@ -10,7 +10,8 @@
 //     drops under a burst are only repaired by the next push or a neighbour
 //     join; appends re-push recently rotated segments for 30 s);
 //   - on a claimed board the log is sealed like content: a late joiner and an
-//     unapproved peer can't read the owner's post-claim events.
+//     unapproved peer (both provably connected) can't read the owner's
+//     post-claim events — until the owner approves the joiner.
 //
 // Run: node e2e/history.mjs   (needs `vite preview` on PORT, default 8142)
 import { chromium } from "playwright";
@@ -233,7 +234,16 @@ try {
   await addCard(a, "after-claim");
   await a.evaluate(() => window.riftpipe.logEvent("test.secret", {}));
   const c = await join(browser, ticket);
-  await wait(5000);
+  const cId = (await authState(c)).device;
+  // Positive connectivity first, so the absence checks below can't pass just
+  // because nothing synced: C must have received A's claim over the mesh.
+  const cState = await waitState(c, (s) => s.locked && !s.authorized && !s.canRead, 15000);
+  if (!(cState.locked && !cState.authorized && !cState.canRead)) {
+    fail(`late joiner C should see the board claimed (no access) — proves it reached the mesh; got ${JSON.stringify(cState)}`);
+  }
+  const bState = await waitState(b, (s) => s.locked && !s.canRead);
+  if (!(bState.locked && !bState.canRead)) fail(`unapproved B should see the board claimed with no read key, got ${JSON.stringify(bState)}`);
+  await wait(3000);
   const cEvents = await ev(c);
   if (cEvents.some((e) => e.device === aId)) fail(`late joiner C must read none of A's events, got ${JSON.stringify(cEvents.filter((e) => e.device === aId).slice(0, 3))}`);
   if (cEvents.some((e) => e.title === "after-claim")) fail("late joiner C must not read the after-claim card.create");
@@ -244,7 +254,24 @@ try {
   const bEvents = await ev(b);
   if (bEvents.some((e) => e.kind === "test.secret")) fail("unapproved B must not read A's post-claim test.secret");
   if (bEvents.some((e) => e.title === "after-claim")) fail("unapproved B must not read A's post-claim card.create");
-  console.log(`✓ sealed: late joiner C sees 0 of A's events (${cEvents.length} total); unapproved B sees nothing post-claim`);
+  if (!bEvents.some((e) => e.device === aId && e.title === "alpha")) fail("B should still hold A's pre-claim events (it synced before the claim)");
+  console.log(`✓ sealed: claimed board reached C and B, yet C sees 0 of A's events (${cEvents.length} total); unapproved B sees nothing post-claim`);
+
+  // Control: once A approves C, the same sealed log opens for C — the absence
+  // above was the seal, not a missing connection.
+  await c.locator(".ask-btn").click();
+  const approveC = a.locator(".req", { hasText: cId.slice(0, 8) }).locator(".approve-btn");
+  await approveC.waitFor({ timeout: 15000 });
+  await approveC.click();
+  const cOpen = await until(async () => {
+    const evs = await ev(c);
+    return evs.some((e) => e.device === aId && e.kind === "test.secret") && evs.some((e) => e.title === "after-claim");
+  }, 20000);
+  if (!cOpen) fail(`approved C should read A's sealed post-claim events, got kinds ${JSON.stringify([...new Set((await ev(c)).map((e) => e.kind))])}`);
+  if (!(await until(async () => (await rows(c, ".activity")).some((r) => r.who.includes(aShort) && r.what === "created “after-claim” in Todo"), 10000))) {
+    fail("approved C's Activity should show A's after-claim card");
+  }
+  console.log("✓ control: approved C reads A's sealed events and sees them in its Activity");
 
   console.log("\nPASS — history view: live per-card + board activity, coalesced edits, segment rotation, no board re-render, sealed on claimed boards");
 } finally {
