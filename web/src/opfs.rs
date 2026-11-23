@@ -107,9 +107,12 @@ pub async fn write_bytes(dir: &FileSystemDirectoryHandle, name: &str, bytes: &[u
 }
 
 /// Write bytes to a path like `notes/<id>/doc.md` on the active board's tree,
-/// creating dirs as needed.
+/// creating dirs as needed. An app (local) write: it first lets any queued merged
+/// write of the same path land, so the older merge can't overwrite it afterwards.
 pub async fn write_path(path: &str, bytes: &[u8]) -> Result<(), JsValue> {
-    write_path_in(&active_board(), path, bytes).await
+    let topic = active_board();
+    writes_settled(topic, Some(path)).await;
+    write_path_in(&topic, path, bytes).await
 }
 
 /// Write bytes to `path` on board `topic`'s tree — the sync layer lands a peer's
@@ -208,64 +211,131 @@ pub async fn prime_all(topic: [u8; 32]) {
     }
 }
 
-/// A pending durable-record write: serialized per path so two overlapping
-/// `createWritable`s can't land out of order — the latest queued record for a
-/// path always wins.
+/// One path's not-yet-written durable state: the merged file bytes and/or its
+/// record, plus what to run once the file has landed.
 #[derive(Default)]
-struct RecordQueue {
-    pending: std::collections::BTreeMap<([u8; 32], String), Vec<u8>>,
+struct PendingWrite {
+    file: Option<Vec<u8>>,
+    record: Option<Vec<u8>>,
+    after: Vec<Box<dyn FnOnce()>>,
+}
+
+/// Every durable write of the mesh path — merged files AND their records — goes
+/// through ONE serialized queue, latest-wins per `(board, path)`, and each entry
+/// writes its file BEFORE its record. So a record never lands ahead of the file it
+/// describes: a reload mid-write can only see the new file with the old record
+/// (restore treats it as a local edit = the merge again: duplication, never loss),
+/// never the new record with the old file (restore would author a revert of the
+/// merge and broadcast it mesh-wide). Rapid merges to one file can't land out of
+/// order either.
+#[derive(Default)]
+struct WriteQueue {
+    pending: std::collections::BTreeMap<([u8; 32], String), PendingWrite>,
+    /// The entry being written right now (already popped from `pending`).
+    in_flight: Option<([u8; 32], String)>,
     draining: bool,
 }
 thread_local! {
-    static RECORDS: RefCell<RecordQueue> = RefCell::new(RecordQueue::default());
+    static WRITES: RefCell<WriteQueue> = RefCell::new(WriteQueue::default());
 }
 
-/// Queue `rec` for board `topic` (replacing any not-yet-written record for that path).
-pub(crate) fn queue_record(topic: [u8; 32], rec: &DurablePath) {
-    let bytes = postcard::to_allocvec(rec).unwrap_or_default();
-    let spawn = RECORDS.with(|q| {
+/// Add to `key`'s pending entry via `f` and make sure the drain runs.
+fn enqueue(key: ([u8; 32], String), f: impl FnOnce(&mut PendingWrite, bool)) {
+    let spawn = WRITES.with(|q| {
         let mut q = q.borrow_mut();
-        q.pending.insert((topic, rec.path.clone()), bytes);
-        if q.draining {
-            false
-        } else {
-            q.draining = true;
-            true
-        }
+        let in_flight = q.in_flight.as_ref() == Some(&key);
+        f(q.pending.entry(key).or_default(), in_flight);
+        !std::mem::replace(&mut q.draining, true)
     });
     if spawn {
-        wasm_bindgen_futures::spawn_local(drain_records());
+        wasm_bindgen_futures::spawn_local(drain_writes());
     }
 }
 
-/// Drain [`RECORDS`] one write at a time until it's empty.
-async fn drain_records() {
+/// Queue a merged file for board `topic` (replacing any not-yet-written bytes for
+/// that path); `after` runs once it has landed (change events, UI nudges). Queue
+/// its record with [`queue_record`] right after, so the pair is written in order.
+pub(crate) fn queue_merged_file(topic: [u8; 32], path: String, bytes: Vec<u8>, after: impl FnOnce() + 'static) {
+    enqueue((topic, path), |e, _| {
+        e.file = Some(bytes);
+        e.after.push(Box::new(after));
+    });
+}
+
+/// Queue `rec` for board `topic`: the record of a merged file queued just before
+/// it, or of a file restore found on disk.
+pub(crate) fn queue_record(topic: [u8; 32], rec: &DurablePath) {
+    let bytes = postcard::to_allocvec(rec).unwrap_or_default();
+    enqueue((topic, rec.path.clone()), |e, _| e.record = Some(bytes));
+}
+
+/// Queue `rec` after a LOCAL write of `written` to its path (the app wrote the
+/// file itself, then pushed). If a merged file for that path is still queued or
+/// being written, it is older than this write — re-queue `written` so the file
+/// ends as what the record describes.
+pub(crate) fn queue_local_record(topic: [u8; 32], rec: &DurablePath, written: &[u8]) {
+    let bytes = postcard::to_allocvec(rec).unwrap_or_default();
+    enqueue((topic, rec.path.clone()), |e, in_flight| {
+        if in_flight || e.file.is_some() {
+            e.file = Some(written.to_vec());
+        }
+        e.record = Some(bytes);
+    });
+}
+
+/// Drain [`WRITES`] one entry at a time until it's empty: file, then record.
+async fn drain_writes() {
     loop {
-        let next = RECORDS.with(|q| {
+        let next = WRITES.with(|q| {
             let mut q = q.borrow_mut();
-            match q.pending.pop_first() {
-                Some(x) => Some(x),
-                None => {
-                    q.draining = false;
-                    None
-                }
+            let next = q.pending.pop_first();
+            q.in_flight = next.as_ref().map(|(k, _)| k.clone());
+            if next.is_none() {
+                q.draining = false;
             }
+            next
         });
-        let Some(((topic, path), bytes)) = next else { break };
-        if let Ok(root) = board_root(&topic).await {
-            if let Ok(dir) = subdir(&root, SYNC_DIR, true).await {
-                let _ = write_bytes(&dir, &format!("{}.rec", riftpipe_core::sync::record_name(&path)), &bytes).await;
+        let Some(((topic, path), w)) = next else { break };
+        if let Some(bytes) = &w.file {
+            let _ = write_path_in(&topic, &path, bytes).await;
+        }
+        for f in w.after {
+            f();
+        }
+        if let Some(rec) = &w.record {
+            if let Ok(root) = board_root(&topic).await {
+                if let Ok(dir) = subdir(&root, SYNC_DIR, true).await {
+                    let _ = write_bytes(&dir, &format!("{}.rec", riftpipe_core::sync::record_name(&path)), rec).await;
+                }
             }
         }
     }
 }
 
-/// Wait for every queued record write to land — tests only (production code
-/// never waits on the write queue).
+/// Wait until no write for board `topic` (only for `path`, if given) is queued or
+/// in flight — so a restore (e.g. a fast in-tab switch back to this board) reads
+/// settled file/record pairs, and a local write lands after any older merge.
+/// Bounded: a wedged OPFS write can't hang the caller forever.
+async fn writes_settled(topic: [u8; 32], path: Option<&str>) {
+    let hit = |k: &([u8; 32], String)| k.0 == topic && path.is_none_or(|p| k.1 == p);
+    for _ in 0..1_000 {
+        let busy = WRITES.with(|q| {
+            let q = q.borrow();
+            q.in_flight.as_ref().is_some_and(hit) || q.pending.keys().any(hit)
+        });
+        if !busy {
+            return;
+        }
+        gloo_timers::future::TimeoutFuture::new(10).await;
+    }
+}
+
+/// Wait for every queued write to land — tests only (production code never waits
+/// on the write queue except [`restore_syncer`]'s per-board settle).
 #[cfg(test)]
 pub(crate) async fn flush_records() {
     for _ in 0..500 {
-        let idle = RECORDS.with(|q| {
+        let idle = WRITES.with(|q| {
             let q = q.borrow();
             !q.draining && q.pending.is_empty()
         });
@@ -283,6 +353,7 @@ pub(crate) async fn flush_records() {
 /// — the NeighborUp catch-up ships the whole state.
 pub async fn restore_syncer(topic: [u8; 32], agent: String) -> Syncer {
     let mut syncer = Syncer::new(agent);
+    writes_settled(topic, None).await;
     let Ok(root) = board_root(&topic).await else { return syncer };
     let mut recs: std::collections::HashMap<String, DurablePath> = std::collections::HashMap::new();
     if let Ok(dir) = subdir(&root, SYNC_DIR, false).await {
@@ -641,5 +712,79 @@ mod tests {
         let bytes = read_bytes(&dir, &name).await.expect("record written");
         let decoded: DurablePath = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, rec_v2);
+    }
+
+    /// `path`'s text on board `topic`'s tree (`None` if absent).
+    async fn read_in(topic: &[u8; 32], path: &str) -> Option<String> {
+        let parts: Vec<&str> = path.split('/').collect();
+        let (file, dirs) = parts.split_last()?;
+        let mut dir = board_root(topic).await.ok()?;
+        for d in dirs {
+            dir = subdir(&dir, d, false).await.ok()?;
+        }
+        read_text(&dir, file).await
+    }
+
+    /// `path`'s durable record on board `topic`, if written.
+    async fn record_in(topic: &[u8; 32], path: &str) -> Option<DurablePath> {
+        let dir = subdir(&board_root(topic).await.ok()?, SYNC_DIR, false).await.ok()?;
+        let bytes = read_bytes(&dir, &format!("{}.rec", riftpipe_core::sync::record_name(path))).await?;
+        postcard::from_bytes(&bytes).ok()
+    }
+
+    /// A merged file and its record: whenever the record is on disk, the file it
+    /// describes already is too (a reload in between would otherwise restore the
+    /// OLD file against the NEW record and author a revert of the merge).
+    #[wasm_bindgen_test]
+    async fn record_never_lands_before_its_merged_file() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        let path = "tickets/deep/nested/card.md";
+        write_path_in(&topic, path, b"# old\n").await.unwrap();
+        let mut s = Syncer::new("m1");
+        s.local_text(path, "# old\n# merged\n");
+        let rec = s.durable(path).unwrap();
+        queue_merged_file(topic, path.into(), b"# old\n# merged\n".to_vec(), || {});
+        queue_record(topic, &rec);
+        for _ in 0..500 {
+            if record_in(&topic, path).await.is_some() {
+                assert_eq!(read_in(&topic, path).await.as_deref(), Some("# old\n# merged\n"), "record landed before its file");
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(1).await;
+        }
+        flush_records().await;
+        assert_eq!(record_in(&topic, path).await, Some(rec));
+    }
+
+    /// A restore that starts while the board's merged file + record are still being
+    /// written (a fast in-tab switch back) waits for them: it resumes the merged
+    /// history cleanly instead of reading a half-written pair.
+    #[wasm_bindgen_test]
+    async fn restore_waits_for_in_flight_writes() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        let mut s1 = Syncer::new("w1");
+        s1.local_text("a.md", "# merged\n");
+        queue_merged_file(topic, "a.md".into(), b"# merged\n".to_vec(), || {});
+        queue_record(topic, &s1.durable("a.md").unwrap());
+        let s2 = restore_syncer(topic, "w2".into()).await;
+        assert_eq!(text_origin(&s2.full_state(), "a.md"), text_origin(&s1.full_state(), "a.md"));
+        assert_eq!(s2.durable("a.md"), s1.durable("a.md"), "restored Clean: same history, no new local edit");
+    }
+
+    /// A local write made while an older merged file for the same path is queued
+    /// or mid-write wins on disk — the file ends as what its record says.
+    #[wasm_bindgen_test]
+    async fn local_write_wins_over_a_pending_merged_file() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        set_active_board(topic);
+        queue_merged_file(topic, "x.toml".into(), b"merged".to_vec(), || {});
+        write_path("x.toml", b"local").await.unwrap();
+        let mut s = Syncer::new("l1");
+        s.local_lww("x.toml", b"local".to_vec(), 5);
+        let rec = s.durable("x.toml").unwrap();
+        queue_local_record(topic, &rec, b"local");
+        flush_records().await;
+        assert_eq!(read_in(&topic, "x.toml").await.as_deref(), Some("local"));
+        assert_eq!(record_in(&topic, "x.toml").await, Some(rec));
     }
 }

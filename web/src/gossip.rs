@@ -933,11 +933,24 @@ impl Drop for WindowListener {
     }
 }
 
-/// Persist `path`'s durable record for board `topic` after it changed — call
-/// after `on_merged` (file write spawned first) / before a local broadcast.
+/// Persist `path`'s durable record for board `topic` after a merge — call right
+/// after `on_merged` (which queues the file), so the record is written after it.
 fn save_record(topic: [u8; 32], sy: &std::cell::RefCell<riftpipe_core::sync::Syncer>, path: &str) {
     if let Some(rec) = sy.borrow().durable(path) {
         crate::opfs::queue_record(topic, &rec);
+    }
+}
+
+/// Persist `path`'s durable record after a LOCAL write of `written` (the app wrote
+/// the file, then pushed) — before the broadcast.
+fn save_local_record(
+    topic: [u8; 32],
+    sy: &std::cell::RefCell<riftpipe_core::sync::Syncer>,
+    path: &str,
+    written: &[u8],
+) {
+    if let Some(rec) = sy.borrow().durable(path) {
+        crate::opfs::queue_local_record(topic, &rec, written);
     }
 }
 
@@ -1409,7 +1422,7 @@ impl GossipTreeSync {
     pub fn push_text(&self, path: &str, content: &str) {
         let msg = self.syncer.borrow_mut().local_text(path, content);
         if let Some(msg) = msg {
-            save_record(self.topic, &self.syncer, path);
+            save_local_record(self.topic, &self.syncer, path, content.as_bytes());
             let mm = self.auth.borrow().sign(msg);
             if let Some(mm) = mm {
                 self.broadcast(mm);
@@ -1420,7 +1433,7 @@ impl GossipTreeSync {
     pub fn push_lww(&self, path: &str, bytes: &[u8]) {
         let now = js_sys::Date::now() as u64;
         let msg = self.syncer.borrow_mut().local_lww(path, bytes.to_vec(), now);
-        save_record(self.topic, &self.syncer, path);
+        save_local_record(self.topic, &self.syncer, path, bytes);
         let mm = self.auth.borrow().sign(msg);
         if let Some(mm) = mm {
             self.broadcast(mm);

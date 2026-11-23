@@ -49,14 +49,16 @@ fn opfs_on_merged(on_change: js_sys::Function, board: [u8; 32]) -> Rc<dyn Fn(Str
     let on_change = Rc::new(on_change);
     Rc::new(move |path: String, bytes: Vec<u8>| {
         let cb = on_change.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let _ = crate::opfs::write_path_in(&board, &path, &bytes).await;
+        let p = path.clone();
+        // Queued (not spawned) so the path's record, queued right after by the
+        // mesh driver, is written AFTER this file — see `opfs::queue_merged_file`.
+        crate::opfs::queue_merged_file(board, path, bytes, move || {
             // Record the merge for history/debugging — but NOT for the event
             // files themselves, or logging a merged log would recurse forever.
-            if !path.starts_with("events/") {
-                crate::events::log("mesh.merge", serde_json::json!({ "path": path }));
+            if !p.starts_with("events/") {
+                crate::events::log("mesh.merge", serde_json::json!({ "path": p }));
             }
-            dispatch_file_changed(&path);
+            dispatch_file_changed(&p);
             let _ = cb.call0(&JsValue::NULL);
         });
     })
