@@ -23,7 +23,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
-use riftpipe_core::reconnect::{rejoin_targets, PeerBook, Rejoin};
+use riftpipe_core::reconnect::{link_state, rejoin_targets, LinkState, PeerBook, Rejoin};
 
 /// The gossip topic for a board secret — `H(secret)`, underivable without the
 /// share link. Identical to the native `sync::mesh::topic_of`.
@@ -826,6 +826,11 @@ pub struct GossipTreeSync {
     _node: Node,
     /// Dropped ⇒ the receive task ends ⇒ both gossip handles drop ⇒ the topic is left.
     _stop: futures_channel::oneshot::Sender<()>,
+    /// Last emitted connection status (state, peer count) — see [`Self::status`].
+    status: std::rc::Rc<std::cell::RefCell<(LinkState, usize)>>,
+    /// `window` "online"/"offline" listeners, removed when dropped.
+    _online: Option<WindowListener>,
+    _offline: Option<WindowListener>,
 }
 
 /// A `storage` event listener on `window`, removed when dropped (the closure
@@ -850,6 +855,33 @@ impl Drop for StorageListener {
         use wasm_bindgen::JsCast;
         if let Some(w) = web_sys::window() {
             let _ = w.remove_event_listener_with_callback("storage", self.closure.as_ref().unchecked_ref());
+        }
+    }
+}
+
+/// A `window` event listener (`"online"` / `"offline"`), removed when dropped
+/// (the closure must not outlive its registration).
+struct WindowListener {
+    event: &'static str,
+    closure: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::Event)>,
+}
+
+impl WindowListener {
+    fn add(event: &'static str, f: impl FnMut(web_sys::Event) + 'static) -> Option<WindowListener> {
+        use wasm_bindgen::JsCast;
+        let closure = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(f);
+        web_sys::window()?
+            .add_event_listener_with_callback(event, closure.as_ref().unchecked_ref())
+            .ok()?;
+        Some(WindowListener { event, closure })
+    }
+}
+
+impl Drop for WindowListener {
+    fn drop(&mut self) {
+        use wasm_bindgen::JsCast;
+        if let Some(w) = web_sys::window() {
+            let _ = w.remove_event_listener_with_callback(self.event, self.closure.as_ref().unchecked_ref());
         }
     }
 }
@@ -946,6 +978,35 @@ fn report_mismatch(p: &riftpipe_core::sync::PeerVersion) {
     }
 }
 
+/// Whether the browser believes it has a network connection.
+fn navigator_online() -> bool {
+    web_sys::window().map(|w| w.navigator().on_line()).unwrap_or(true)
+}
+
+/// JSON shape of the live connection status: [`GossipTreeSync::status`] /
+/// `meshStatus()`, and the `riftpipe:mesh-status` event detail.
+fn status_json(state: LinkState, peers: usize) -> String {
+    format!(r#"{{"state":"{}","peers":{peers}}}"#, state.as_str())
+}
+
+/// If `(state, peers)` differs from what's in `cell`, store it and fire
+/// `riftpipe:mesh-status` on `window` with its JSON (see [`status_json`]) so
+/// any app on the library can render a status pill.
+fn emit_status(cell: &std::cell::RefCell<(LinkState, usize)>, state: LinkState, peers: usize) {
+    if *cell.borrow() == (state, peers) {
+        return;
+    }
+    *cell.borrow_mut() = (state, peers);
+    if let Some(w) = web_sys::window() {
+        let detail = status_json(state, peers);
+        let init = web_sys::CustomEventInit::new();
+        init.set_detail(&wasm_bindgen::JsValue::from_str(&detail));
+        if let Ok(ev) = web_sys::CustomEvent::new_with_event_init_dict("riftpipe:mesh-status", &init) {
+            let _ = w.dispatch_event(&ev);
+        }
+    }
+}
+
 /// A fresh per-session agent id for the eg-walker text CRDTs — unique per tab
 /// session so concurrent edits from the same device (e.g. two tabs) still get
 /// distinct origins. Used both for a fresh `Syncer` and when restoring one.
@@ -973,8 +1034,22 @@ impl GossipTreeSync {
         let on_merged_storage = on_merged.clone();
         let auth = Rc::new(RefCell::new(auth));
         mark_claimed_if_due(&auth, topic);
+        let status = Rc::new(RefCell::new((LinkState::Waiting, 0usize)));
+        let (net_tx, mut net_rx) = futures_channel::mpsc::unbounded::<bool>();
+        let _online = {
+            let tx = net_tx.clone();
+            WindowListener::add("online", move |_| {
+                let _ = tx.unbounded_send(true);
+            })
+        };
+        let _offline = {
+            let tx = net_tx.clone();
+            WindowListener::add("offline", move |_| {
+                let _ = tx.unbounded_send(false);
+            })
+        };
 
-        let (sy, nb, rt, vs, snd, cph, au) = (
+        let (sy, nb, rt, vs, snd, cph, au, st) = (
             syncer.clone(),
             neighbors.clone(),
             routing.clone(),
@@ -982,6 +1057,7 @@ impl GossipTreeSync {
             sender.clone(),
             cipher.clone(),
             auth.clone(),
+            status.clone(),
         );
         wasm_bindgen_futures::spawn_local(async move {
             // A failed send must not kill the session, but it must be VISIBLE —
@@ -1022,9 +1098,17 @@ impl GossipTreeSync {
             let mut rejoin = Rejoin::new();
             rejoin.on_neighbors(0, js_sys::Date::now() as u64);
             let mut ticks = gloo_timers::future::IntervalStream::new(1_000).fuse();
+            // Connection status for `status()` / `meshStatus()`: `ever` turns a
+            // total neighbor loss into "reconnecting" rather than "waiting";
+            // `online` (navigator.onLine, kept live by the online/offline
+            // listeners) gates the backoff rejoin and distinguishes "offline".
+            let mut ever = false;
+            let mut online = navigator_online();
+            emit_status(&st, link_state(0, false, online), 0);
             enum Wake {
                 Stop,
                 Tick,
+                Net(Option<bool>),
                 Ev(Option<Result<Event, iroh_gossip::api::ApiError>>),
             }
             let mut stop = stop_rx.fuse();
@@ -1032,13 +1116,14 @@ impl GossipTreeSync {
                 let wake = futures_util::select! {
                     _ = stop => Wake::Stop,
                     _ = ticks.next() => Wake::Tick,
+                    n = net_rx.next() => Wake::Net(n),
                     ev = receiver.next().fuse() => Wake::Ev(ev),
                 };
                 let ev = match wake {
                     Wake::Stop => break,
                     Wake::Tick => {
                         let now = js_sys::Date::now() as u64;
-                        if rejoin.due(now) {
+                        if online && rejoin.due(now) {
                             let targets: Vec<EndpointId> =
                                 rejoin_targets(bootstrap.map(|b| *b.as_bytes()), &book, my_id)
                                     .iter()
@@ -1054,6 +1139,16 @@ impl GossipTreeSync {
                         }
                         continue;
                     }
+                    Wake::Net(Some(on)) => {
+                        online = on;
+                        if on {
+                            rejoin.on_online(js_sys::Date::now() as u64);
+                        }
+                        let n = snapshot(&receiver).len();
+                        emit_status(&st, link_state(n, ever, online), n);
+                        continue;
+                    }
+                    Wake::Net(None) => continue,
                     Wake::Ev(Some(Ok(ev))) => ev,
                     Wake::Ev(_) => break,
                 };
@@ -1169,6 +1264,8 @@ impl GossipTreeSync {
                             persist_peer_book(&book);
                         }
                         rejoin.on_neighbors(n, js_sys::Date::now() as u64);
+                        ever = true;
+                        emit_status(&st, link_state(n, ever, online), n);
                     }
                     Event::NeighborDown(_) => {
                         let ours = riftpipe_core::sync::PROTOCOL_VERSION;
@@ -1179,6 +1276,7 @@ impl GossipTreeSync {
                         // passive view — it never re-dials the bootstrap or the
                         // peers we remember. The tick arm retries with backoff.
                         rejoin.on_neighbors(list.len(), js_sys::Date::now() as u64);
+                        emit_status(&st, link_state(list.len(), ever, online), list.len());
                         rt.borrow_mut().insert(my_id, list.clone());
                         send(&snd, &cph, &MeshMsg::Presence { id: my_id, neighbors: list }, false).await;
                     }
@@ -1228,6 +1326,9 @@ impl GossipTreeSync {
             _storage: storage,
             _node: node,
             _stop: stop_tx,
+            status,
+            _online,
+            _offline,
         }
     }
 
@@ -1416,6 +1517,12 @@ impl GossipTreeSync {
             .map(|(k, v)| (hex32(k), v.iter().map(hex32).collect()))
             .collect()
     }
+
+    /// Live connection status, as JSON `{"state":…,"peers":n}` (see [`status_json`]).
+    pub fn status(&self) -> String {
+        let (s, n) = *self.status.borrow();
+        status_json(s, n)
+    }
 }
 
 fn hex32(b: &[u8; 32]) -> String {
@@ -1506,6 +1613,14 @@ pub fn connected_peers() -> String {
         let peers = c.borrow().as_ref().map(|bs| bs.peers()).unwrap_or_default();
         serde_json::to_string(&peers).unwrap_or_else(|_| "[]".into())
     })
+}
+
+/// Live connection status for the active mesh, as JSON `{"state":…,"peers":n}`; state is
+/// `idle` (no session) | `waiting` (never had a peer) | `connected` | `reconnecting` |
+/// `offline`. Also fired as `riftpipe:mesh-status` on `window` whenever it changes.
+#[wasm_bindgen::prelude::wasm_bindgen(js_name = meshStatus)]
+pub fn mesh_status() -> String {
+    GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.status()).unwrap_or_else(|| r#"{"state":"idle","peers":0}"#.into()))
 }
 
 /// Protocol-version status for the active mesh, as JSON:
@@ -1923,5 +2038,19 @@ mod tests {
             "the peer on the re-used endpoint's second board got the file: {:?}",
             got.borrow(),
         );
+    }
+
+    /// With no active session, `meshStatus()` reports a safe idle default —
+    /// not whatever the last session's status happened to be.
+    #[wasm_bindgen_test]
+    fn mesh_status_is_idle_without_a_session() {
+        clear_active();
+        assert_eq!(mesh_status(), r#"{"state":"idle","peers":0}"#);
+    }
+
+    #[wasm_bindgen_test]
+    fn status_json_shape() {
+        assert_eq!(status_json(LinkState::Connected, 3), r#"{"state":"connected","peers":3}"#);
+        assert_eq!(status_json(LinkState::Offline, 0), r#"{"state":"offline","peers":0}"#);
     }
 }
