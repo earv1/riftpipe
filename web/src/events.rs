@@ -19,6 +19,7 @@
 //! also fires a `riftpipe:event` CustomEvent on `window` for live debugging.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use futures_util::StreamExt;
 use wasm_bindgen::prelude::*;
@@ -94,6 +95,47 @@ pub(crate) fn event_line(ts: &str, device: &str, kind: &str, data: serde_json::V
         }
     }
     serde_json::Value::Object(obj).to_string()
+}
+
+/// `mesh.merge` is logged at most once per path within this window, so a burst
+/// of merges for the same file (e.g. racing writers) doesn't flood the log.
+pub const MERGE_LOG_COALESCE_MS: f64 = 10_000.0;
+
+thread_local! {
+    /// Last `mesh.merge` log time (ms) per path, for [`should_log_merge`].
+    static LAST_MERGE: RefCell<HashMap<String, f64>> = RefCell::new(HashMap::new());
+}
+
+/// Whether a `mesh.merge` for `path` at `now_ms` should be logged: never for
+/// `events/` paths (would recurse), never again within `window_ms` of the last
+/// log for that path. Prunes stale entries once `last` grows past 1024 paths.
+pub(crate) fn should_log_merge(
+    last: &mut HashMap<String, f64>,
+    path: &str,
+    now_ms: f64,
+    window_ms: f64,
+) -> bool {
+    if path.starts_with("events/") {
+        return false;
+    }
+    if let Some(t) = last.get(path) {
+        if now_ms - t < window_ms {
+            return false;
+        }
+    }
+    if last.len() >= 1024 {
+        last.retain(|_, t| now_ms - *t < window_ms);
+    }
+    last.insert(path.to_string(), now_ms);
+    true
+}
+
+/// Log a `mesh.merge` event for `path`, coalesced per [`MERGE_LOG_COALESCE_MS`].
+pub fn log_merge(path: &str) {
+    let now = js_sys::Date::now();
+    if LAST_MERGE.with(|m| should_log_merge(&mut m.borrow_mut(), path, now, MERGE_LOG_COALESCE_MS)) {
+        log("mesh.merge", serde_json::json!({ "path": path }));
+    }
 }
 
 /// One queued append; `done` fires once its line is written (or dropped).
@@ -271,5 +313,15 @@ mod tests {
         assert_eq!(next_segment_seq(&names, "dev"), 4);
         assert_eq!(next_segment_seq(&[], "dev"), 1);
         assert_eq!(segment_path("dev", 4), "events/dev.000004.jsonl");
+    }
+
+    #[wasm_bindgen_test]
+    fn should_log_merge_coalesces() {
+        let mut last = HashMap::new();
+        assert!(!should_log_merge(&mut last, "events/a.jsonl", 0.0, 10_000.0));
+        assert!(should_log_merge(&mut last, "x.md", 0.0, 10_000.0));
+        assert!(!should_log_merge(&mut last, "x.md", 5000.0, 10_000.0));
+        assert!(should_log_merge(&mut last, "x.md", 10_001.0, 10_000.0));
+        assert!(should_log_merge(&mut last, "y.md", 5000.0, 10_000.0));
     }
 }

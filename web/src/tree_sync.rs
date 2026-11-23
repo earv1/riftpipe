@@ -51,11 +51,10 @@ fn opfs_on_merged(on_change: js_sys::Function, board: [u8; 32]) -> Rc<dyn Fn(Str
         let cb = on_change.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let _ = crate::opfs::write_path_in(&board, &path, &bytes).await;
-            // Record the merge for history/debugging — but NOT for the event
-            // files themselves, or logging a merged log would recurse forever.
-            if !path.starts_with("events/") {
-                crate::events::log("mesh.merge", serde_json::json!({ "path": path }));
-            }
+            // Record the merge for history/debugging (coalesced) — but events/
+            // paths are skipped inside log_merge, or logging a merged log
+            // would recurse forever.
+            crate::events::log_merge(&path);
             dispatch_file_changed(&path);
             let _ = cb.call0(&JsValue::NULL);
         });
