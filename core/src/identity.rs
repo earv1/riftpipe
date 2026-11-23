@@ -20,11 +20,15 @@
 //! *Not resolved in v1 (documented in the roadmap):* concurrent admin conflicts
 //! (A revokes B while B revokes A) merge by set-union, not a canonical order —
 //! deterministic conflict resolution is a follow-on.
+//!
+//! A registered passkey can vouch for further devices (`Passkey` + `PasskeyLink`, `core::passkey`).
 
 use std::collections::{HashMap, HashSet};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
+
+use crate::passkey::{PasskeyAssertion, PasskeyCredential};
 
 /// A device's public key — its stable identity on a board.
 pub type DeviceId = [u8; 32];
@@ -87,6 +91,15 @@ impl DeviceKey {
         let by = self.id();
         let sig = self.sign(&revoke_msg(&device, &by, &nonce)).to_vec();
         TrustEntry::Revoke { device, by, nonce, sig }
+    }
+
+    /// Register `cred` as a board passkey conferring `role` (an Admin action —
+    /// validated on apply): a device later presenting a fresh assertion from it
+    /// joins with no approve click.
+    pub fn register_passkey(&self, cred: PasskeyCredential, role: Role, nonce: [u8; 16]) -> TrustEntry {
+        let by = self.id();
+        let sig = self.sign(&passkey_msg(&cred, role, &by, &nonce)).to_vec();
+        TrustEntry::Passkey { cred, role, by, nonce, sig }
     }
 }
 
@@ -155,6 +168,16 @@ pub enum TrustEntry {
     Grant { device: DeviceId, role: Role, by: DeviceId, nonce: [u8; 16], sig: Vec<u8> },
     /// `by` (a current Admin, or `device` itself) removes `device`.
     Revoke { device: DeviceId, by: DeviceId, nonce: [u8; 16], sig: Vec<u8> },
+    /// `by` (a current Admin) registers a passkey: any device that later presents a
+    /// fresh assertion from it, bound to its own id ([`TrustEntry::PasskeyLink`]),
+    /// joins as `role` — linking your own devices with no approve click.
+    /// APPENDED (protocol v5).
+    Passkey { cred: PasskeyCredential, role: Role, by: DeviceId, nonce: [u8; 16], sig: Vec<u8> },
+    /// `device` joins vouched for by the registered passkey `cred_id`: `assertion`'s
+    /// challenge is [`passkey_link_challenge`]`(founder, device, nonce)`. Verified
+    /// offline against the registered public key; the passkey is the authority (no
+    /// device signature). APPENDED (protocol v5).
+    PasskeyLink { device: DeviceId, cred_id: Vec<u8>, nonce: [u8; 16], assertion: PasskeyAssertion },
 }
 
 // Domain-separated to-be-signed payloads (postcard, so field order is fixed).
@@ -168,11 +191,23 @@ fn revoke_msg(device: &DeviceId, by: &DeviceId, nonce: &[u8; 16]) -> Vec<u8> {
     postcard::to_allocvec(&("riftpipe-revoke-v1", device, by, nonce)).expect("encode")
 }
 
+fn passkey_msg(cred: &PasskeyCredential, role: Role, by: &DeviceId, nonce: &[u8; 16]) -> Vec<u8> {
+    postcard::to_allocvec(&("riftpipe-passkey-v1", cred, role, by, nonce)).expect("encode")
+}
+/// The WebAuthn challenge a passkey signs to link `device` into the board founded by
+/// `founder`. The founder scopes it to one board; `nonce` makes each link distinct.
+pub fn passkey_link_challenge(founder: &DeviceId, device: &DeviceId, nonce: &[u8; 16]) -> [u8; 32] {
+    let msg = postcard::to_allocvec(&("riftpipe-passkey-link-v1", founder, device, nonce)).expect("encode");
+    *blake3::hash(&msg).as_bytes()
+}
+
 fn sig_of(e: &TrustEntry) -> &[u8] {
     match e {
         TrustEntry::Genesis { sig, .. }
         | TrustEntry::Grant { sig, .. }
-        | TrustEntry::Revoke { sig, .. } => sig,
+        | TrustEntry::Revoke { sig, .. }
+        | TrustEntry::Passkey { sig, .. } => sig,
+        TrustEntry::PasskeyLink { assertion, .. } => &assertion.signature,
     }
 }
 
@@ -191,6 +226,15 @@ enum Outcome {
     Rejected,
 }
 
+
+/// A passkey registered by an Admin — kept out of the public API; exposed via
+/// [`TrustLog::passkeys`].
+#[derive(Clone, Debug)]
+struct RegisteredPasskey {
+    cred: PasskeyCredential,
+    role: Role,
+    by: DeviceId,
+}
 /// The authorized device set for one board, built from [`TrustEntry`]s.
 #[derive(Default)]
 pub struct TrustLog {
@@ -202,6 +246,8 @@ pub struct TrustLog {
     applied: HashSet<[u8; 32]>,
     /// Devices removed by an applied Revoke (cleared by a later re-grant).
     revoked: HashSet<DeviceId>,
+    /// Passkeys registered on this board, keyed by credential id.
+    passkeys: HashMap<Vec<u8>, RegisteredPasskey>,
 }
 
 impl TrustLog {
@@ -235,6 +281,13 @@ impl TrustLog {
     /// "not authorized": a device whose grant simply hasn't arrived yet is NOT revoked.
     pub fn is_revoked(&self, id: &DeviceId) -> bool {
         self.revoked.contains(id)
+    }
+
+    /// Passkeys registered on this board with the role each confers, sorted by credential id.
+    pub fn passkeys(&self) -> Vec<(PasskeyCredential, Role)> {
+        let mut v: Vec<_> = self.passkeys.values().map(|r| (r.cred.clone(), r.role)).collect();
+        v.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+        v
     }
 
     /// Ingest one entry. Returns `true` if it is (now) applied. Invalid entries
@@ -337,6 +390,42 @@ impl TrustLog {
                     // authorized to revoke). Defer; a Member's revoke never applies.
                     Outcome::Deferred
                 }
+            }
+            TrustEntry::Passkey { cred, role, by, nonce, sig } => {
+                if !verify(by, &passkey_msg(cred, *role, by, nonce), sig) || !cred.is_well_formed() {
+                    return Outcome::Rejected;
+                }
+                match self.role(by) {
+                    Some(Role::Admin) => {
+                        // First registration of a credential id wins; a re-registration is a no-op.
+                        self.passkeys
+                            .entry(cred.id.clone())
+                            .or_insert(RegisteredPasskey { cred: cred.clone(), role: *role, by: *by });
+                        Outcome::Applied
+                    }
+                    _ => Outcome::Deferred,
+                }
+            }
+            TrustEntry::PasskeyLink { device, cred_id, nonce, assertion } => {
+                // Needs the genesis (binding scope) and the registration — may arrive later.
+                let (Some(founder), Some(reg)) = (self.founder, self.passkeys.get(cred_id)) else {
+                    return Outcome::Deferred;
+                };
+                let ok = reg.cred.verify(assertion, &passkey_link_challenge(&founder, device, nonce));
+                let (by, role) = (reg.by, reg.role);
+                if !ok {
+                    return Outcome::Rejected;
+                }
+                // A passkey speaks only while its registrant is still an Admin.
+                if self.role(&by) != Some(Role::Admin) {
+                    return Outcome::Deferred;
+                }
+                if self.founder == Some(*device) {
+                    return Outcome::Applied;
+                }
+                self.roles.insert(*device, role);
+                self.revoked.remove(device);
+                Outcome::Applied
             }
         }
     }
@@ -604,5 +693,161 @@ mod tests {
         assert!(!log.apply(member.revoke(target.id(), nonce(3))));
         assert!(!log.is_revoked(&target.id()));
         assert!(log.is_authorized(&target.id()));
+    }
+
+    fn soft_passkey(seed: u8, rp: &str) -> (p256::ecdsa::SigningKey, PasskeyCredential) {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+        let point = p256::ecdsa::VerifyingKey::from(&sk).to_encoded_point(false);
+        let cred = PasskeyCredential {
+            id: vec![seed; 16],
+            alg: crate::passkey::ALG_ES256,
+            public_key: point.as_bytes().to_vec(),
+            rp_id: rp.into(),
+        };
+        (sk, cred)
+    }
+    fn soft_assert(sk: &p256::ecdsa::SigningKey, rp: &str, challenge: &[u8]) -> PasskeyAssertion {
+        use p256::ecdsa::signature::Signer as _;
+        let mut ad = crate::passkey::rp_id_hash(rp).to_vec();
+        ad.extend_from_slice(&[0x05, 0, 0, 0, 0]);
+        let cdj = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"http://{rp}","crossOrigin":false}}"#,
+            crate::passkey::b64url(challenge)
+        )
+        .into_bytes();
+        let sig: p256::ecdsa::Signature = sk.sign(&crate::passkey::assertion_message(&ad, &cdj));
+        PasskeyAssertion { authenticator_data: ad, client_data_json: cdj, signature: sig.to_der().as_bytes().to_vec() }
+    }
+    fn link(
+        sk: &p256::ecdsa::SigningKey,
+        cred: &PasskeyCredential,
+        founder: &DeviceId,
+        device: DeviceId,
+        n: [u8; 16],
+    ) -> TrustEntry {
+        let ch = passkey_link_challenge(founder, &device, &n);
+        TrustEntry::PasskeyLink { device, cred_id: cred.id.clone(), nonce: n, assertion: soft_assert(sk, &cred.rp_id, &ch) }
+    }
+
+    #[test]
+    fn passkey_link_authorizes_a_device_with_the_registered_role() {
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let third = DeviceKey::generate();
+        let mut log = TrustLog::new();
+        assert!(log.apply(founder.genesis()));
+        let (sk, cred) = soft_passkey(1, "localhost");
+        assert!(log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(1))));
+        assert!(log.apply(link(&sk, &cred, &founder.id(), phone.id(), nonce(2))));
+        assert_eq!(log.role(&phone.id()), Some(Role::Admin));
+        assert_eq!(log.passkeys().len(), 1);
+        // The phone can then grant a third device.
+        assert!(log.apply(phone.grant(third.id(), Role::Member, nonce(3))));
+        assert_eq!(log.role(&third.id()), Some(Role::Member));
+    }
+
+    #[test]
+    fn passkey_link_rejects_wrong_binding_key_or_rp() {
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let attacker = DeviceKey::generate();
+        let mut log = TrustLog::new();
+        log.apply(founder.genesis());
+        let (sk, cred) = soft_passkey(1, "localhost");
+        log.apply(founder.register_passkey(cred.clone(), Role::Admin, nonce(1)));
+
+        // Bound to the phone's assertion but claiming the attacker's device.
+        let mut wrong_device = link(&sk, &cred, &founder.id(), phone.id(), nonce(2));
+        if let TrustEntry::PasskeyLink { device, .. } = &mut wrong_device {
+            *device = attacker.id();
+        }
+        assert!(!log.apply(wrong_device));
+        assert!(!log.is_authorized(&attacker.id()));
+
+        // Signed by a different passkey, but with the registered cred id.
+        let (other_sk, _) = soft_passkey(2, "localhost");
+        assert!(!log.apply(link(&other_sk, &cred, &founder.id(), phone.id(), nonce(3))));
+        assert!(!log.is_authorized(&phone.id()));
+
+        // An assertion scoped to a different rp id.
+        let ch = passkey_link_challenge(&founder.id(), &phone.id(), &nonce(4));
+        let bad_rp = TrustEntry::PasskeyLink {
+            device: phone.id(),
+            cred_id: cred.id.clone(),
+            nonce: nonce(4),
+            assertion: soft_assert(&sk, "evil.example", &ch),
+        };
+        assert!(!log.apply(bad_rp));
+        assert!(!log.is_authorized(&phone.id()));
+    }
+
+    #[test]
+    fn passkey_registration_requires_an_admin() {
+        let founder = DeviceKey::generate();
+        let member = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let mut log = TrustLog::new();
+        log.apply(founder.genesis());
+        log.apply(founder.grant(member.id(), Role::Member, nonce(1)));
+
+        let (sk, cred) = soft_passkey(1, "localhost");
+        assert!(!log.apply(member.register_passkey(cred.clone(), Role::Admin, nonce(2))), "a Member can't register");
+
+        assert!(!log.apply(link(&sk, &cred, &founder.id(), phone.id(), nonce(3))));
+        assert!(!log.is_authorized(&phone.id()));
+    }
+
+    #[test]
+    fn passkey_entries_resolve_out_of_order() {
+        let founder = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+
+        let reg = founder.register_passkey(cred.clone(), Role::Admin, nonce(1));
+        let ln = link(&sk, &cred, &founder.id(), phone.id(), nonce(2));
+        let genesis = founder.genesis();
+
+        let mut log = TrustLog::new();
+        assert!(!log.apply(ln));
+        assert!(!log.apply(reg));
+        assert!(log.apply(genesis));
+        assert_eq!(log.role(&phone.id()), Some(Role::Admin));
+    }
+
+    #[test]
+    fn passkey_link_is_scoped_to_one_board() {
+        let founder_a = DeviceKey::generate();
+        let founder_b = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+
+        let mut log_a = TrustLog::new();
+        log_a.apply(founder_a.genesis());
+        log_a.apply(founder_a.register_passkey(cred.clone(), Role::Admin, nonce(1)));
+
+        let mut log_b = TrustLog::new();
+        log_b.apply(founder_b.genesis());
+        log_b.apply(founder_b.register_passkey(cred.clone(), Role::Admin, nonce(1)));
+
+        let ln = link(&sk, &cred, &founder_a.id(), phone.id(), nonce(2));
+        assert!(!log_b.apply(ln));
+        assert!(!log_b.is_authorized(&phone.id()));
+    }
+
+    #[test]
+    fn a_revoked_registrants_passkey_stops_linking() {
+        let founder = DeviceKey::generate();
+        let admin2 = DeviceKey::generate();
+        let phone = DeviceKey::generate();
+        let (sk, cred) = soft_passkey(1, "localhost");
+
+        let mut log = TrustLog::new();
+        log.apply(founder.genesis());
+        log.apply(founder.grant(admin2.id(), Role::Admin, nonce(1)));
+        log.apply(admin2.register_passkey(cred.clone(), Role::Admin, nonce(2)));
+        log.apply(founder.revoke(admin2.id(), nonce(3)));
+
+        assert!(!log.apply(link(&sk, &cred, &founder.id(), phone.id(), nonce(4))));
+        assert!(!log.is_authorized(&phone.id()));
     }
 }
