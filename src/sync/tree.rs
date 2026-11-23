@@ -47,10 +47,12 @@ fn hidden(rel: &str) -> bool {
     rel.split('/').any(|c| c.starts_with('.'))
 }
 
-/// Never-synced dot-dir holding one durable record per path (`<record_name>.rec`).
+/// Never-synced dot-dir holding one durable record per path (`<record_name>.rec`):
+/// directly inside it for link sync, under `<hex topic>/` for a mesh board (see
+/// [`TreePeer::set_board`]).
 pub(crate) const SYNC_DIR: &str = ".riftpipe-sync";
-fn record_path(dir: &Path, rel: &str) -> PathBuf {
-    dir.join(SYNC_DIR).join(format!("{}.rec", record_name(rel)))
+fn record_path(records: &Path, rel: &str) -> PathBuf {
+    records.join(format!("{}.rec", record_name(rel)))
 }
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -58,10 +60,10 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-/// Every decodable record under `<dir>/.riftpipe-sync/`, by path.
-fn load_records(dir: &Path) -> HashMap<String, DurablePath> {
+/// Every decodable record directly in `records`, by path.
+fn load_records(records: &Path) -> HashMap<String, DurablePath> {
     let mut out = HashMap::new();
-    let Ok(entries) = std::fs::read_dir(dir.join(SYNC_DIR)) else { return out };
+    let Ok(entries) = std::fs::read_dir(records) else { return out };
     for e in entries.flatten() {
         let p = e.path();
         if p.extension().and_then(|e| e.to_str()) != Some("rec") {
@@ -135,6 +137,10 @@ pub struct TreePeer {
     warned_keyless: bool,
     /// Epochs already reported as "not the current sealable epoch — writes held".
     stale_epoch_reported: HashSet<u64>,
+    /// The mesh board (topic) this tree syncs, scoping its durable records — so
+    /// a dir reused for another board never restores (and ships) the old
+    /// board's history. `None` = link sync.
+    board: Option<[u8; 32]>,
 }
 
 /// What an apply sends back out, by scope.
@@ -173,6 +179,7 @@ impl TreePeer {
             warned_restricted: false,
             warned_keyless: false,
             stale_epoch_reported: HashSet::new(),
+            board: None,
         }
     }
 
@@ -534,13 +541,28 @@ impl TreePeer {
         msg
     }
 
-    /// Write `rel`'s durable sync record under `<dir>/.riftpipe-sync/`, replacing any
+    /// Scope this tree's durable records to mesh board `topic`
+    /// (`<dir>/.riftpipe-sync/<hex topic>/`). Call before [`seed`](Self::seed).
+    pub(crate) fn set_board(&mut self, topic: [u8; 32]) {
+        self.board = Some(topic);
+    }
+
+    /// Where this tree's durable records live under `dir`.
+    fn records_dir(&self, dir: &Path) -> PathBuf {
+        match &self.board {
+            Some(t) => dir.join(SYNC_DIR).join(t.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+            None => dir.join(SYNC_DIR),
+        }
+    }
+
+    /// Write `rel`'s durable sync record under [`records_dir`](Self::records_dir), replacing any
     /// existing one for that path (tmp file + rename, so a crash never leaves a
     /// half-written record). Call after every local change or persisted merge.
     fn save_record(&self, dir: &Path, rel: &str) {
         let Some(rec) = self.syncer.durable(rel) else { return };
-        let _ = std::fs::create_dir_all(dir.join(SYNC_DIR));
-        let path = record_path(dir, rel);
+        let records = self.records_dir(dir);
+        let _ = std::fs::create_dir_all(&records);
+        let path = record_path(&records, rel);
         let tmp = PathBuf::from(format!("{}.tmp", path.display()));
         if std::fs::write(&tmp, postcard::to_allocvec(&rec).unwrap_or_default()).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
@@ -592,7 +614,8 @@ impl TreePeer {
     /// produced messages are discarded — the handshake (link) or the
     /// `NeighborUp` catch-up (mesh) does the actual transfer.
     pub(crate) fn seed(&mut self, dir: &Path) {
-        let mut recs = load_records(dir);
+        let records = self.records_dir(dir);
+        let mut recs = load_records(&records);
         let mut files = Vec::new();
         scan_files(dir, &mut files);
         let now = now_ms();
@@ -614,7 +637,7 @@ impl TreePeer {
             }
         }
         for rel in recs.into_keys() {
-            let _ = std::fs::remove_file(record_path(dir, &rel));
+            let _ = std::fs::remove_file(record_path(&records, &rel));
         }
     }
 
@@ -1285,7 +1308,7 @@ mod tests {
         let mut peer = TreePeer::new();
         peer.apply_and_persist(m, &d);
         assert!(d.join("r.md").exists());
-        assert!(record_path(&d, "r.md").exists());
+        assert!(record_path(&d.join(SYNC_DIR), "r.md").exists());
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -1297,12 +1320,37 @@ mod tests {
         std::fs::write(d.join("a.md"), "# one\n").unwrap();
         let mut p1 = TreePeer::new();
         p1.seed(&d);
-        assert!(record_path(&d, "a.md").exists());
+        assert!(record_path(&d.join(SYNC_DIR), "a.md").exists());
 
         std::fs::remove_file(d.join("a.md")).unwrap();
         let mut p2 = TreePeer::new();
         p2.seed(&d);
-        assert!(!record_path(&d, "a.md").exists(), "record for a deleted file is dropped");
+        assert!(!record_path(&d.join(SYNC_DIR), "a.md").exists(), "record for a deleted file is dropped");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A dir reused for ANOTHER mesh board never restores the first board's
+    /// history (which `full_state` would ship to the new board's peers, deleted
+    /// text included): records are scoped per board, and the old board's stay
+    /// for when it's opened again.
+    #[test]
+    fn records_are_scoped_per_board() {
+        let d = dir("board-scoped-records");
+        std::fs::write(d.join("a.md"), "# one\n").unwrap();
+        let mut on_a = TreePeer::new();
+        on_a.set_board([0xa; 32]);
+        on_a.seed(&d);
+        let origin_a = text_origin(&on_a.full_state(), "a.md");
+
+        let mut on_b = TreePeer::new();
+        on_b.set_board([0xb; 32]);
+        on_b.seed(&d);
+        assert_ne!(text_origin(&on_b.full_state(), "a.md"), origin_a, "board B starts fresh");
+
+        let mut a_again = TreePeer::new();
+        a_again.set_board([0xa; 32]);
+        a_again.seed(&d);
+        assert_eq!(text_origin(&a_again.full_state(), "a.md"), origin_a, "board A's history is intact");
         std::fs::remove_dir_all(&d).ok();
     }
 }

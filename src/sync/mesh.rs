@@ -181,6 +181,8 @@ pub struct MeshConn {
     peers: PeerBook,
     /// Remote ids of accepted gossip connections (from [`GossipAccept`]).
     incoming: UnboundedReceiver<EndpointId>,
+    /// The board (`H(secret)`): scopes the tree's durable records.
+    topic: [u8; 32],
 }
 
 /// Inputs to [`MeshConn::join_with`].
@@ -250,6 +252,7 @@ impl MeshConn {
             cipher,
             peers,
             incoming,
+            topic: topic_from_secret(&secret),
         })
     }
 
@@ -319,6 +322,7 @@ pub async fn run(
         cipher,
         peers: mut book,
         mut incoming,
+        topic,
     } = conn;
     let my_id_bytes = *my_id.as_bytes();
     // The gossiped routing map `id -> [neighbors]` (kept for parity with the
@@ -333,6 +337,7 @@ pub async fn run(
     // Files that predate the session must be in the syncer BEFORE any
     // NeighborUp, or the full_state() catch-up broadcasts an empty tree
     // (the browser host primes OPFS the same way).
+    peer.set_board(topic);
     peer.seed(dir);
     // A restricted founder mints epoch 1 here. The announces stay in the book
     // and reach peers through the `NeighborUp` catch-up.

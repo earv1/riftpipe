@@ -189,7 +189,7 @@ same board. None of it ever syncs (dot-paths are machine-local):
 - **`<dir>/.riftpipe-peers`** and the browser's `riftpipe:peers:<topic>`
   localStorage key hold a per-board list of recently seen peer EndpointIds —
   public ids only, no secrets.
-- **`.riftpipe-sync/`** (natively under `<dir>`, in OPFS per board) holds each
+- **`.riftpipe-sync/`** (natively `<dir>/.riftpipe-sync/<hex topic>/`, in OPFS per board) holds each
   path's CRDT history / LWW version in plaintext, next to the plaintext files it
   materializes — no more sensitive than the tree itself (though history can retain
   text since deleted from a file).

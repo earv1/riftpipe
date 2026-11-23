@@ -88,9 +88,13 @@ sense to do it, not strict priority.
     SIGKILLed CLI host; fails without the fix) and `run-reconnect.sh` /
     `run-cli-host-restart.sh`. An upstream iroh-gossip fix would make it moot.
   - *Durable sync records (D4):* `Syncer::durable/restore` + one `DurablePath` per
-    path in the never-synced `.riftpipe-sync/` (OPFS per board, natively under
-    `<dir>`), restored before the mesh starts — history, CRDT origins and LWW
-    versions survive a restart; files edited while down become local edits on top.
+    path in the never-synced `.riftpipe-sync/` (OPFS per board, natively
+    `<dir>/.riftpipe-sync/<hex topic>/` — also per board, so a reused dir never
+    ships another board's history), restored before the mesh starts — history,
+    CRDT origins and LWW versions survive a restart; files edited while down
+    become local edits on top. In the browser a merged file and its record go
+    through one serialized queue, file first, so a reload can't pair a new record
+    with the old file (which would author a revert of the merge).
   - *CLI host identity (D5):* `connect --accept <dir>` persists its iroh key + board
     secret in `<dir>/.riftpipe-host` (restart = same board); `--new-board` mints a
     new link.
