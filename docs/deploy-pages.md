@@ -12,9 +12,7 @@ Already enabled (Source: **GitHub Actions**, set via `gh api … -f
 build_type=workflow` — the UI equivalent is Settings → Pages → Source).
 The workflow `.github/workflows/pages.yml` builds the app's wasm crate
 (`projects/kanban/wasm`, iroh included) + the SolidJS bundle and deploys on
-every push to `main` **or `serverless-browser-kanban`** (the active branch —
-drop it from the trigger list after merging), plus manual runs via
-workflow_dispatch. The board lives at `https://earv1.github.io/riftpipe/`.
+every push to `main`, plus manual runs via workflow_dispatch. The board lives at `https://earv1.github.io/riftpipe/`.
 
 (The build compiles iroh to WebAssembly, which needs a wasm-capable clang — the
 workflow installs it. Nothing for you to configure.)

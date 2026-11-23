@@ -596,7 +596,7 @@ mod tests {
         a.edit_to("shared base.\n");
         let seed = a.encode_full();
         let mut b = EgWalkerText::new("bob");
-        b.merge(&seed);
+        assert!(b.merge(&seed));
         assert_eq!(b.content(), "shared base.\n");
 
         let base = a.version(); // both replicas are here
@@ -610,8 +610,8 @@ mod tests {
         link_b.send(&b.encode_delta(&base)).expect("B sends delta");
         let from_b = link_a.recv().await.expect("A receives B's delta");
         let from_a = link_b.recv().await.expect("B receives A's delta");
-        a.merge(&from_b);
-        b.merge(&from_a);
+        assert!(a.merge(&from_b));
+        assert!(b.merge(&from_a));
 
         // Converged: identical content on both ends, both edits preserved.
         assert_eq!(a.content(), b.content(), "replicas converge over webrtc");
@@ -668,15 +668,15 @@ mod tests {
         a.edit_to("base.\n");
         let seed = a.encode_full();
         let mut b = EgWalkerText::new("bob");
-        b.merge(&seed);
+        assert!(b.merge(&seed));
         let base = a.version();
 
         a.edit_to("alice line\nbase.\n");
         b.edit_to("base.\nbob line\n");
         link_a.send(&a.encode_delta(&base)).expect("A sends");
         link_b.send(&b.encode_delta(&base)).expect("B sends");
-        a.merge(&link_a.recv().await.expect("A recv"));
-        b.merge(&link_b.recv().await.expect("B recv"));
+        assert!(a.merge(&link_a.recv().await.expect("A recv")));
+        assert!(b.merge(&link_b.recv().await.expect("B recv")));
 
         assert_eq!(a.content(), b.content(), "converged via signaling-brokered webrtc");
         assert!(a.content().contains("alice line") && a.content().contains("bob line"));
