@@ -2146,6 +2146,46 @@ mod tests {
         );
     }
 
+    /// Dropping a session leaves its topic: a peer on that board sees the
+    /// re-used endpoint go (NeighborDown) instead of keeping a zombie neighbor
+    /// that would never answer again.
+    #[wasm_bindgen_test]
+    async fn dropped_session_leaves_its_topic() {
+        use std::rc::Rc;
+        let a = Node::bind(SecretKey::generate()).await.expect("bind a");
+        let s1 = riftpipe_core::crypto::generate_secret();
+        let m1 = a.join(s1, None, &[]).await.expect("a joins board 1");
+        let first = GossipTreeSync::new(
+            m1,
+            riftpipe_core::sync::Syncer::new(gossip_agent()),
+            Rc::new(|_, _| {}),
+            Auth::load(DeviceKey::from_seed(&[85; 32]), riftpipe_core::crypto::topic_from_secret(&s1)),
+        );
+        let addr = a.wait_for_addr().await;
+        let b = Node::bind(SecretKey::generate()).await.expect("bind b");
+        let mut mb = b.join(s1, Some(addr), &[]).await.expect("b joins board 1");
+
+        async fn next_event(m: &mut Mesh, want_up: bool, secs: u32) -> bool {
+            let deadline = js_sys::Date::now() + f64::from(secs) * 1000.0;
+            while js_sys::Date::now() < deadline {
+                let ev = futures_util::select! {
+                    ev = m.next().fuse() => ev,
+                    _ = gloo_timers::future::TimeoutFuture::new(500).fuse() => continue,
+                };
+                match ev {
+                    Some(Event::NeighborUp(_)) if want_up => return true,
+                    Some(Event::NeighborDown(_)) if !want_up => return true,
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+            false
+        }
+        assert!(next_event(&mut mb, true, 20).await, "b meets a on board 1");
+        drop(first);
+        assert!(next_event(&mut mb, false, 20).await, "a left board 1: b sees it go");
+    }
+
     /// With no active session, `meshStatus()` reports a safe idle default —
     /// not whatever the last session's status happened to be.
     #[wasm_bindgen_test]

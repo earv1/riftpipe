@@ -1353,4 +1353,35 @@ mod tests {
         assert_eq!(text_origin(&a_again.full_state(), "a.md"), origin_a, "board A's history is intact");
         std::fs::remove_dir_all(&d).ok();
     }
+
+    /// The NeighborUp Hello on a restricted board: it goes out sealed, a wrapped
+    /// member answers it (sealed, neighbors-only) with its gap edit, and the
+    /// founder persists it. An unsealed Hello is dropped, and a device revoked
+    /// since can't read the new-epoch Hello, so it answers nothing.
+    #[test]
+    fn restricted_hello_is_sealed_and_pulls_the_gap() {
+        let (mut founder, df, mut member, dm, mut revokee, dc) = restricted_board("hello");
+        std::fs::write(dm.join("gap.md"), "# made while apart\n").unwrap();
+        assert!(member.local_change(&dm.join("gap.md"), &dm).is_some(), "the gap edit (never delivered)");
+
+        let hello = founder.sign_mesh(founder.hello()).expect("a key holder can send its Hello");
+        assert!(matches!(hello, MeshMsg::Sealed(_)), "the Hello is sealed on a restricted board");
+        let out = member.authorize_and_apply(hello, &dm);
+        assert!(out.swarm.is_empty(), "Hello replies stay with the neighbors");
+        assert!(!out.neighbors.is_empty() && out.neighbors.iter().all(|m| matches!(m, MeshMsg::Sealed(_))));
+        for m in out.neighbors {
+            founder.authorize_and_apply(m, &df);
+        }
+        assert_eq!(std::fs::read(df.join("gap.md")).unwrap(), b"# made while apart\n");
+
+        let plain = MeshMsg::Sync(SyncMsg::Hello { versions: vec![], lww_versions: vec![] });
+        assert!(member.authorize_and_apply(plain, &dm).all().is_empty(), "an unsealed Hello is dropped");
+
+        founder.revoke_device(DeviceKey::from_seed(&[3u8; 32]).id(), &df);
+        let hello2 = founder.sign_mesh(founder.hello()).expect("sealed under the new epoch");
+        assert!(revokee.authorize_and_apply(hello2, &dc).all().is_empty(), "a revoked device can't answer it");
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
 }
