@@ -276,6 +276,27 @@ export async function addCard(column: string, title: string): Promise<Card> {
   return { id, title: finalTitle, column: col, position: maxPos + 1, done: false };
 }
 
+/** Live saves fire per keystroke; history records ONE card.edit per field once
+*  typing settles (final value), and nothing if it ended where it started. */
+export const EDIT_SETTLE_MS = 1500;
+type PendingEdit = { timer: ReturnType<typeof setTimeout>; from: string; to: string };
+const pendingEdits = new Map<string, PendingEdit>();
+function logEditSettled(id: string, field: "title" | "description", from: string, to: string): void {
+  const key = `${id}\u0000${field}`;
+  const prev = pendingEdits.get(key);
+  if (prev) clearTimeout(prev.timer);
+  const entry: PendingEdit = {
+    from: prev?.from ?? from,
+    to,
+    timer: setTimeout(() => {
+      pendingEdits.delete(key);
+      if (entry.to === entry.from) return;
+      void logEvent("card.edit", field === "title" ? { id, field, value: entry.to } : { id, field });
+    }, EDIT_SETTLE_MS),
+  };
+  pendingEdits.set(key, entry);
+}
+
 export async function patchCard(
   id: string,
   patch: Partial<Card> & { description?: string },
@@ -302,9 +323,9 @@ export async function patchCard(
   // Record semantic history — the same events the old server logged.
   if (card.column !== before.column) await logEvent("card.move", { id, from: before.column, to: card.column });
   if (card.done !== before.done) await logEvent("card.check", { id, done: card.done });
-  if (card.title !== before.title) await logEvent("card.edit", { id, field: "title", value: card.title });
+  if (card.title !== before.title) logEditSettled(id, "title", before.title, card.title);
   if (patch.description !== undefined && description !== oldDescription) {
-    await logEvent("card.edit", { id, field: "description" });
+    logEditSettled(id, "description", oldDescription, description);
   }
   return card;
 }
