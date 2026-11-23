@@ -28,7 +28,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use riftpipe_core::epoch::{AccessMode, EpochBook, Ingested, OpenError};
 use riftpipe_core::identity::{DeviceKey, Role, TrustEntry, TrustLog};
 use riftpipe_core::onboard::JoinRequest;
-use riftpipe_core::sync::{MeshMsg, SyncMsg, Syncer};
+use riftpipe_core::sync::{record_name, DurablePath, MeshMsg, Restored, SyncMsg, Syncer};
 
 use crate::net::{anyerr, Result, Sink, Source};
 
@@ -45,6 +45,33 @@ fn escapes(path: &str) -> bool {
 /// must never cross the wire, in EITHER direction.
 fn hidden(rel: &str) -> bool {
     rel.split('/').any(|c| c.starts_with('.'))
+}
+
+/// Never-synced dot-dir holding one durable record per path (`<record_name>.rec`).
+pub(crate) const SYNC_DIR: &str = ".riftpipe-sync";
+fn record_path(dir: &Path, rel: &str) -> PathBuf {
+    dir.join(SYNC_DIR).join(format!("{}.rec", record_name(rel)))
+}
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+/// Every decodable record under `<dir>/.riftpipe-sync/`, by path.
+fn load_records(dir: &Path) -> HashMap<String, DurablePath> {
+    let mut out = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(dir.join(SYNC_DIR)) else { return out };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("rec") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&p) else { continue };
+        let Ok(rec) = postcard::from_bytes::<DurablePath>(&bytes) else { continue };
+        out.insert(rec.path.clone(), rec);
+    }
+    out
 }
 
 fn rel_of(full: &Path, dir: &Path) -> Option<String> {
@@ -473,14 +500,24 @@ impl TreePeer {
         let msg = if riftpipe_core::sync::is_text_path(&rel) {
             self.syncer.local_text(&rel, &String::from_utf8_lossy(&bytes))
         } else {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            Some(self.syncer.local_lww(&rel, bytes, now))
+            Some(self.syncer.local_lww(&rel, bytes, now_ms()))
         };
-        self.seen.insert(rel, hash);
+        self.seen.insert(rel.clone(), hash);
+        self.save_record(dir, &rel);
         msg
+    }
+
+    /// Write `rel`'s durable sync record under `<dir>/.riftpipe-sync/`, replacing any
+    /// existing one for that path (tmp file + rename, so a crash never leaves a
+    /// half-written record). Call after every local change or persisted merge.
+    fn save_record(&self, dir: &Path, rel: &str) {
+        let Some(rec) = self.syncer.durable(rel) else { return };
+        let _ = std::fs::create_dir_all(dir.join(SYNC_DIR));
+        let path = record_path(dir, rel);
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        if std::fs::write(&tmp, postcard::to_allocvec(&rec).unwrap_or_default()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
     /// Apply one remote message: merge, report any newly-parked paths, and
@@ -499,6 +536,7 @@ impl TreePeer {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let _ = std::fs::write(&full, &bytes);
+                self.save_record(dir, &path);
                 println!("SYNCED:{path}");
             }
         }
@@ -512,16 +550,37 @@ impl TreePeer {
     }
 
     /// Load every file already on disk into the syncer — the native mirror of
-    /// the browser's `opfs::prime_all`. Without this, files that predate the
-    /// session are invisible: the watcher only reports NEW events, so `hello()`
-    /// would advertise nothing and a mesh `full_state()` would be empty. The
+    /// the browser's `opfs::prime_all`. Restores durable records first, so
+    /// history and LWW versions survive a restart; files changed while down
+    /// become local edits. Without this, files that predate the session are
+    /// invisible: the watcher only reports NEW events, so `hello()` would
+    /// advertise nothing and a mesh `full_state()` would be empty. The
     /// produced messages are discarded — the handshake (link) or the
     /// `NeighborUp` catch-up (mesh) does the actual transfer.
     pub(crate) fn seed(&mut self, dir: &Path) {
+        let mut recs = load_records(dir);
         let mut files = Vec::new();
         scan_files(dir, &mut files);
+        let now = now_ms();
         for p in files {
-            let _ = self.local_change(&p, dir);
+            let Some(rel) = rel_of(&p, dir) else { continue };
+            let Ok(bytes) = std::fs::read(&p) else { continue };
+            let hash = *blake3::hash(&bytes).as_bytes();
+            match recs.remove(&rel).map(|r| self.syncer.restore(r, Some(&bytes), now)) {
+                Some(Restored::Clean) => {
+                    self.seen.insert(rel, hash);
+                }
+                Some(Restored::Changed(_)) => {
+                    self.seen.insert(rel.clone(), hash);
+                    self.save_record(dir, &rel);
+                }
+                Some(Restored::Unusable) | None => {
+                    let _ = self.local_change(&p, dir);
+                }
+            }
+        }
+        for rel in recs.into_keys() {
+            let _ = std::fs::remove_file(record_path(dir, &rel));
         }
     }
 
@@ -733,6 +792,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::canonicalize(&d).unwrap()
+    }
+
+    /// The origin carried by `path`'s `TextDelta` in `msgs`.
+    fn text_origin(msgs: &[SyncMsg], path: &str) -> Option<(String, usize)> {
+        msgs.iter()
+            .find_map(|m| match m {
+                SyncMsg::TextDelta { path: p, origin, .. } if p == path => Some(origin.clone()),
+                _ => None,
+            })
+            .expect("a TextDelta for the path")
+    }
+
+    /// The version carried by `path`'s `Lww` in `msgs`.
+    fn lww_version(msgs: &[SyncMsg], path: &str) -> u64 {
+        msgs.iter()
+            .find_map(|m| match m {
+                SyncMsg::Lww { path: p, version, .. } if p == path => Some(*version),
+                _ => None,
+            })
+            .expect("an Lww for the path")
     }
 
     /// A restricted-mode peer (`--restricted`) with the device key from `seed`.
@@ -1070,5 +1149,106 @@ mod tests {
         assert!(!db.join("tickets/.hidden").exists(), "nested dotfile must never sync");
         std::fs::remove_dir_all(&da).ok();
         std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// A restarted peer's `seed` restores durable records before priming disk,
+    /// so history and LWW versions survive the restart instead of being
+    /// re-stamped as fresh (the bug step 2's `restore` fixes).
+    #[test]
+    fn restart_resumes_history_and_keeps_lww_versions() {
+        let d = dir("restart-resume");
+        std::fs::write(d.join("a.md"), "# one\n").unwrap();
+        std::fs::write(d.join("m.toml"), "x = 1\n").unwrap();
+
+        let mut p1 = TreePeer::new();
+        p1.seed(&d);
+        let rec_count = std::fs::read_dir(d.join(SYNC_DIR))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rec"))
+            .count();
+        assert_eq!(rec_count, 2, "one durable record per path");
+
+        let state1 = p1.full_state();
+        let origin1 = text_origin(&state1, "a.md");
+        let version1 = lww_version(&state1, "m.toml");
+
+        let mut p2 = TreePeer::new();
+        p2.seed(&d);
+        let state2 = p2.full_state();
+        assert_eq!(text_origin(&state2, "a.md"), origin1, "restart keeps the same CRDT origin");
+        assert_eq!(lww_version(&state2, "m.toml"), version1, "restart keeps the same LWW version");
+
+        assert!(
+            p2.local_change(&d.join("a.md"), &d).is_none(),
+            "unchanged file after seed is in `seen`, not re-pushed"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A file edited while its peer was down becomes a proper local edit on
+    /// top of the restored history — a clean merge, not an origin-conflict
+    /// adoption (the restarted peer's origin is unchanged).
+    #[test]
+    fn restart_turns_offline_edits_into_local_changes() {
+        let d = dir("restart-offline");
+        std::fs::write(d.join("a.md"), "# one\n").unwrap();
+
+        let mut p1 = TreePeer::new();
+        p1.seed(&d);
+        let state1 = p1.full_state();
+        let origin1 = text_origin(&state1, "a.md");
+
+        std::fs::write(d.join("a.md"), "# two\n").unwrap();
+        let mut p2 = TreePeer::new();
+        p2.seed(&d);
+        let state2 = p2.full_state();
+        let origin2 = text_origin(&state2, "a.md");
+
+        let mut c = Syncer::new("c");
+        for m in state1.into_iter().filter(|m| matches!(m, SyncMsg::TextDelta { path, .. } if path == "a.md")) {
+            c.apply(m);
+        }
+        let mut persisted = None;
+        for m in state2.into_iter().filter(|m| matches!(m, SyncMsg::TextDelta { path, .. } if path == "a.md")) {
+            let (persist, _) = c.apply(m);
+            if let Some((_, bytes)) = persist {
+                persisted = Some(bytes);
+            }
+        }
+        assert_eq!(persisted, Some(b"# two\n".to_vec()), "offline edit lands as a clean merge");
+        assert_eq!(origin2, origin1, "no origin-conflict adoption");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// `apply_and_persist` writes a durable record alongside the file, not
+    /// just on local edits — so a remote-only peer still resumes correctly.
+    #[test]
+    fn remote_merge_writes_a_record() {
+        let d = dir("remote-merge");
+        let mut s = Syncer::new("s");
+        let m = s.local_text("r.md", "# r\n").unwrap();
+        let mut peer = TreePeer::new();
+        peer.apply_and_persist(m, &d);
+        assert!(d.join("r.md").exists());
+        assert!(record_path(&d, "r.md").exists());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A record for a path no longer on disk is dropped on the next seed,
+    /// instead of lingering forever in `.riftpipe-sync`.
+    #[test]
+    fn records_of_deleted_files_are_dropped() {
+        let d = dir("deleted-record");
+        std::fs::write(d.join("a.md"), "# one\n").unwrap();
+        let mut p1 = TreePeer::new();
+        p1.seed(&d);
+        assert!(record_path(&d, "a.md").exists());
+
+        std::fs::remove_file(d.join("a.md")).unwrap();
+        let mut p2 = TreePeer::new();
+        p2.seed(&d);
+        assert!(!record_path(&d, "a.md").exists(), "record for a deleted file is dropped");
+        std::fs::remove_dir_all(&d).ok();
     }
 }
