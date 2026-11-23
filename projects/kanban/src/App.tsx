@@ -1,7 +1,8 @@
-import { createSignal, onMount, For, Show } from "solid-js";
+import { createMemo, createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, connectPeer, newBoard, watch, storageSupported, auth, meshStatus, onMeshStatus, type AuthState, type PendingRequest, type Member, type Card, type MeshStatus } from "./api.ts";
+import { getBoard, addCard, patchCard, flushPendingEdits, connectPeer, newBoard, watch, storageSupported, auth, meshStatus, onMeshStatus, historyEvents, knownTitles, type AuthState, type PendingRequest, type Member, type Card, type MeshStatus, type Viewer } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
+import { ActivityPanel } from "./ActivityPanel.tsx";
 
 export function App() {
   const [board, setBoard] = createStore<{
@@ -70,10 +71,18 @@ export function App() {
   // Drag-and-drop: which card is being dragged, and which column is hovered.
   const [draggedId, setDraggedId] = createSignal<string | null>(null);
   const [dragOverCol, setDragOverCol] = createSignal<string | null>(null);
+  // The board-wide Activity panel, and this device's id (for "You" labels).
+  const [showActivity, setShowActivity] = createSignal(false);
+  const [myId, setMyId] = createSignal("");
+
+  // Board reloads so far — exposed for e2e to prove events/* changes don't
+  // trigger them.
+  let refreshCount = 0;
 
   // Reload the whole board (cheap — it's local OPFS) and nudge an open card.
   const refresh = async () => {
     try {
+      refreshCount++;
       const b = await getBoard();
       setBoard("title", b.title);
       setBoard("columns", reconcile(b.columns));
@@ -95,6 +104,8 @@ export function App() {
   };
 
   onMount(() => {
+    (globalThis as any).riftpipe.boardRefreshes = () => refreshCount;
+
     // One subscription for every change to the synced tree — our own edits, a
     // peer's merged edit, or another tab in this profile. All funnel through the
     // file API's `watch`; each re-reads the board. The event log lives under
@@ -110,6 +121,9 @@ export function App() {
     const connect = async () => {
       if (location.hash === lastHash) return; // e.g. the host writing its own ticket
       lastHash = location.hash;
+      // A board switch is coming: settle pending card.edit events on the board
+      // they were typed on (they're dropped if it has already switched).
+      await flushPendingEdits();
       try {
         await connectPeer();
       } catch (_e) {
@@ -120,6 +134,7 @@ export function App() {
 
     (async () => {
       await refresh();
+      setMyId(auth.deviceId());
       await connect();
       setMesh(meshStatus());
       refreshAuth();
@@ -142,7 +157,25 @@ export function App() {
         setVersionMismatch({ theirs: -1, ours: -1 });
       }
     });
+
+    // Escape closes the Activity panel (not while a card drawer is on top).
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && showActivity() && !openId()) closeActivity();
+    });
   });
+
+  // Closing the panel hands focus back to its toggle.
+  let activityToggle: HTMLButtonElement | undefined;
+  const closeActivity = () => {
+    setShowActivity(false);
+    activityToggle?.focus();
+  };
+
+  // History: titles of cards that no longer exist (or were renamed) come from
+  // the log itself; live cards use their current title.
+  const pastTitles = createMemo(() => knownTitles(historyEvents()));
+  const titleOf = (id: string) => board.cards.find((c) => c.id === id)?.title ?? pastTitles().get(id) ?? id;
+  const viewer = (): Viewer => ({ me: myId(), owner: authState().author });
 
   const cardsIn = (col: string): Card[] =>
     board.cards
@@ -183,30 +216,42 @@ export function App() {
           </div>
         )}
       </Show>
-      <header class="topbar">
+      <header classList={{ topbar: true, "with-activity": showActivity() }}>
         <h1>{board.title}</h1>
         <Show when={mesh().state !== "idle"}>
           <span class={`mesh-status ${mesh().state}`} title="peer-to-peer connection">
             {meshLabel(mesh())}
           </span>
         </Show>
-        <button
-          class="new-board"
-          title="Start a fresh, empty board with a new share link"
-          onClick={() => {
-            if (
-              confirm(
-                "Start a fresh board? This clears the local board and its share link.",
-              )
-            ) {
-              void newBoard();
-            }
-          }}
-        >
-          New board
-        </button>
+        <div class="topbar-actions">
+          <button
+            ref={activityToggle}
+            classList={{ "activity-toggle": true, active: showActivity() }}
+            title="Board history"
+            aria-expanded={showActivity()}
+            aria-controls="activity-panel"
+            onClick={() => setShowActivity((v) => !v)}
+          >
+            Activity
+          </button>
+          <button
+            class="new-board"
+            title="Start a fresh, empty board with a new share link"
+            onClick={() => {
+              if (
+                confirm(
+                  "Start a fresh board? This clears the local board and its share link.",
+                )
+              ) {
+                void newBoard();
+              }
+            }}
+          >
+            New board
+          </button>
+        </div>
       </header>
-      <div class="auth-bar">
+      <div classList={{ "auth-bar": true, "with-activity": showActivity() }}>
         <Show when={!authState().locked}>
           <button
             class="lock-btn"
@@ -278,7 +323,7 @@ export function App() {
           id: {authState().device.slice(0, 10)}…
         </span>
       </div>
-      <main class="columns">
+      <main classList={{ columns: true, "with-activity": showActivity() }}>
         <For each={board.columns}>
           {(col) => (
             <section
@@ -342,11 +387,21 @@ export function App() {
           )}
         </For>
       </main>
+      <Show when={showActivity()}>
+        <ActivityPanel
+          viewer={viewer}
+          titleOf={titleOf}
+          onOpenCard={(id) => setOpenId(id)}
+          onClose={closeActivity}
+        />
+      </Show>
       <Show when={openId()}>
         <CardDetail
           id={openId()!}
           onClose={() => setOpenId(null)}
           refreshSignal={() => detailTick()}
+          viewer={viewer}
+          titleOf={titleOf}
         />
       </Show>
     </Show>
