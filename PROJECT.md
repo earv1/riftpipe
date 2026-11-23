@@ -21,6 +21,8 @@ riftpipe.io/.sh available. "Open a rift, pipe through it.")
   claim/request-to-join flow, the generic file API, the synced event log,
   epoch-sealed content + read revocation, per-board OPFS, folder deletes —
   see `What's done`). New work goes on feature branches + PRs.
+- Current work: branch `cli-request-approve` — CLI request/approve parity
+  (`riftpipe requests|approve|members`, `connect … --restricted --name`).
 - **Guardrail:** a hook blocks committing/pushing to `main` (and any command
   containing the word "main") — the user pushes branches and merges PRs. Claude
   does not commit on `main`; current work is left in the working tree.
@@ -37,6 +39,10 @@ CLI (all generic — no app verbs, see `agent.md`):
 `riftpipe join <ticket> <file|dir> [--pipe]` ·
 `riftpipe connect <connection-id> <dir> [--signal ws://…]` (tree sync with a
 core-protocol peer, e.g. a browser board) ·
+`riftpipe connect … <dir> --restricted [--name <text>]` (a restricted board;
+a keyless joiner auto-asks for access) ·
+`riftpipe requests|approve|members <dir>` (the running restricted peer's
+pending requests / approve by safety code or id / member list) ·
 `riftpipe serve <dir> [--port]` (generic static host + SSE change events) ·
 `riftpipe signal [--port]`. The kanban app has **no server** — its board
 domain is TypeScript in the page over riftpipe's wasm file API;
@@ -133,6 +139,15 @@ src/:
   `run-epoch-revoke.sh` (native), `run-browser-auth.sh` /
   `e2e/epoch-revoke.mjs` (browser). Details: `docs/planned/roadmap.md`
   §Security.
+- **CLI request/approve parity** (branch `cli-request-approve`): a keyless
+  `connect … --restricted [--name]` joiner auto-broadcasts a signed join
+  request (re-announced every 15 s); any restricted peer keeps a request list
+  and writes `.riftpipe-auth.json`; `riftpipe requests|members <dir> [--json]`
+  read it and `riftpipe approve <dir> <safety-code|device-id>` grants + wraps
+  through `.riftpipe-control`. Interoperates with the browser both ways. E2E:
+  `run-request-approve-native.sh`, `run-request-approve-browser.sh` /
+  `e2e/request-approve.mjs`; npm `requests`/`approve`/`members`. Details:
+  `docs/planned/roadmap.md` §Security ("CLI request/approve").
 
 ## Planned (design docs)
 - **P2P kanban — files as the database** — see [`docs/planned/`](docs/planned/).

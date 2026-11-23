@@ -31,6 +31,8 @@ struct Opts {
     restricted: bool,
     /// Founder only: hex device ids to authorize (as Members) at startup.
     grant: Vec<String>,
+    /// `--restricted` joiner only: display name on the broadcast join request.
+    name: Option<String>,
 }
 
 /// Parse `args[2..]` into positionals + flags. `--metrics`/`--manifest`/
@@ -47,6 +49,7 @@ fn parse(args: &[String]) -> Opts {
         signal: None,
         restricted: false,
         grant: Vec::new(),
+        name: None,
     };
     let mut i = 2;
     while i < args.len() {
@@ -59,6 +62,10 @@ fn parse(args: &[String]) -> Opts {
                 if let Some(v) = args.get(i + 1).cloned() {
                     o.grant.push(v);
                 }
+                i += 1;
+            }
+            "--name" => {
+                o.name = args.get(i + 1).cloned();
                 i += 1;
             }
             "--metrics" => {
@@ -142,6 +149,82 @@ async fn main() {
                     }
                 }
                 _ => eprintln!("usage: riftpipe {verb} <dir> <device-id>   # applied by the running `connect … --restricted` admin peer on <dir>"),
+            }
+        }
+        // Read-only views of a running restricted peer's auth state, written to
+        // <dir>/.riftpipe-auth.json by the mesh loop (`riftpipe::sync::control`).
+        "requests" | "members" => {
+            let verb = args[1].as_str();
+            let Some(dir) = args.get(2) else {
+                eprintln!("usage: riftpipe requests|members <dir> [--json]");
+                std::process::exit(2);
+            };
+            let json = args.iter().any(|a| a == "--json");
+            let Some(state) = riftpipe::sync::control::read_state(std::path::Path::new(dir)) else {
+                eprintln!("[riftpipe] no auth state in {dir} — run `riftpipe connect … --restricted` on it first");
+                std::process::exit(1);
+            };
+            if let Some(w) = riftpipe::sync::control::stale_warning(&state, riftpipe::sync::control::unix_now_secs()) {
+                eprintln!("{w}");
+            }
+            if json {
+                println!("{}", state.get(verb).cloned().unwrap_or(serde_json::json!([])));
+            } else if verb == "requests" {
+                let lines = riftpipe::sync::control::format_requests(&state);
+                if lines.is_empty() {
+                    eprintln!("no pending requests");
+                }
+                if riftpipe::sync::control::inbox_overflowed(&state) {
+                    eprintln!(
+                        "[riftpipe] warning: the request list overflowed this session — some requests were dropped; \
+                         approve by device id, not safety code"
+                    );
+                }
+                for line in lines {
+                    println!("{line}");
+                }
+            } else {
+                for line in riftpipe::sync::control::format_members(&state) {
+                    println!("{line}");
+                }
+            }
+        }
+        // Resolve a device id or safety code against the running peer's auth
+        // state, then queue it through the same control file `grant`/`revoke` use.
+        "approve" => {
+            if args.get(2).is_none() || args.len() <= 3 {
+                eprintln!("usage: riftpipe approve <dir> <device-id|safety-code>");
+                std::process::exit(2);
+            }
+            let dir = args[2].clone();
+            let target = args[3..].concat();
+            let state = riftpipe::sync::control::read_state(std::path::Path::new(&dir));
+            if let Some(w) = state
+                .as_ref()
+                .and_then(|s| riftpipe::sync::control::stale_warning(s, riftpipe::sync::control::unix_now_secs()))
+            {
+                eprintln!("{w}");
+            }
+            match riftpipe::sync::control::resolve_approve_target(state.as_ref(), &target) {
+                Ok((id, label)) => {
+                    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+                    match riftpipe::sync::control::append(std::path::Path::new(&dir), "approve", &hex) {
+                        Ok(()) => {
+                            let suffix = label.map(|l| format!(" {l}")).unwrap_or_default();
+                            println!(
+                                "queued `approve` for device {hex}{suffix} — the running restricted admin peer on {dir} grants it and wraps the read key"
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("[riftpipe] approve failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(m) => {
+                    eprintln!("[riftpipe] approve: {m}");
+                    std::process::exit(1);
+                }
             }
         }
         "share" => {
@@ -242,6 +325,8 @@ async fn main() {
             eprintln!("                                      # browser share link's hex ticket after '#') joins that folder's iroh-gossip");
             eprintln!("                                      # mesh natively — same protocol browsers speak, no signaling server. anything");
             eprintln!("                                      # else is a signaling connection-id — WebRTC via --signal (byte totals on exit)");
+            eprintln!("                                      # --restricted [--name <text>]: joins a restricted board and asks for access");
+            eprintln!("                                      # automatically — a signed request carrying <text> + a safety code to compare out-of-band");
             eprintln!("  riftpipe connect --accept <dir> [--restricted [--grant <device-id>]...]");
             eprintln!("                                      # host a gossip-mesh swarm for <dir>: prints a mesh ticket a browser OR CLI");
             eprintln!("                                      # peer joins with `connect <ticket> <dir>` — one protocol, N peers, no signaling.");
@@ -250,6 +335,9 @@ async fn main() {
             eprintln!("  riftpipe device-id <dir>            # print (creating if absent) this device's id for <dir> — share it to be --grant'ed");
             eprintln!("  riftpipe revoke <dir> <device-id>    # remove a device from a running restricted board (rotates the read key)");
             eprintln!("  riftpipe grant <dir> <device-id>     # authorize a device on a running restricted board");
+            eprintln!("  riftpipe requests <dir> [--json]     # list a running restricted board's pending join requests");
+            eprintln!("  riftpipe approve <dir> <device-id|safety-code>  # grant a pending join request, by id or safety code");
+            eprintln!("  riftpipe members <dir> [--json]      # list a running restricted board's authorized devices");
             eprintln!("  riftpipe serve <dir> [--port 8080]  # static-host a folder + SSE change events at /events");
             eprintln!("                                      # (share/join a folder + serve = live-updating static site)");
             eprintln!("  riftpipe signal [--port 9000]       # WebRTC signaling relay for browser peers");
@@ -429,6 +517,9 @@ fn hex_to_32(s: &str) -> Option<[u8; 32]> {
 fn apply_auth(peer: &mut riftpipe::sync::tree::TreePeer, dir: &std::path::Path, opts: &Opts, founder: bool) {
     use riftpipe_core::identity::Role;
     if !opts.restricted {
+        if opts.name.is_some() {
+            eprintln!("[auth] --name only applies with --restricted (ignored)");
+        }
         return;
     }
     let key = load_or_create_device(dir);
@@ -447,9 +538,19 @@ fn apply_auth(peer: &mut riftpipe::sync::tree::TreePeer, dir: &std::path::Path, 
         }
     }
     peer.set_identity(key, true);
+    if let Some(n) = &opts.name {
+        peer.set_request_name(n);
+    }
     eprintln!("[auth] restricted mode — this device id: {id_hex}");
     if !founder {
-        eprintln!("[auth] ask the founder to grant {id_hex} (`--grant` at startup or `riftpipe grant <dir> {id_hex}`) — once granted, its peer wraps the read key to you");
+        if let Some(req) = peer.my_request() {
+            let name_json = serde_json::to_string(&req.name).unwrap_or_default();
+            let safety = req.safety_code();
+            let safety_nospace = safety.replace(' ', "");
+            eprintln!(
+                "[auth] join request name={name_json} safety={safety} — the board owner approves it with: riftpipe approve <their-dir> {safety_nospace}"
+            );
+        }
     }
 }
 

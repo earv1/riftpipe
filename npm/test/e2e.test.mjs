@@ -8,7 +8,16 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { PipeSession, TreeSession, Serve, applyEditOp, riftpipeBinary } from "../dist/index.js";
+import {
+  PipeSession,
+  TreeSession,
+  Serve,
+  applyEditOp,
+  riftpipeBinary,
+  requests,
+  approve,
+  members,
+} from "../dist/index.js";
 
 const within = (ms, p, what) =>
   Promise.race([
@@ -111,4 +120,43 @@ test("tree: mesh host + joiner converge, SYNCED breadcrumbs fire", async (t) => 
   writeFileSync(join(dirB, "reply.md"), "# from the joiner\n");
   await within(90_000, hostSaw, "reply.md syncing back to host");
   assert.equal(readFileSync(join(dirA, "reply.md"), "utf8"), "# from the joiner\n");
+});
+
+test("tree: restricted request → approve by safety code → joiner reads", async (t) => {
+  const dirA = mkdtempSync(join(tmpdir(), "riftpipe-npm-restr-a-"));
+  const dirB = mkdtempSync(join(tmpdir(), "riftpipe-npm-restr-b-"));
+  writeFileSync(join(dirA, "secret.md"), "# members only\n");
+
+  const host = TreeSession.host(dirA, { restricted: true });
+  t.after(() => host.close());
+  const ticket = await within(30_000, host.ticket(), "mesh ticket");
+
+  const asked = new Promise((r) => host.onAccessRequest(r));
+  const joiner = TreeSession.join(ticket, dirB, { restricted: true, name: "npm joiner" });
+  t.after(() => joiner.close());
+
+  const req = await within(90_000, asked, "founder sees the joiner's access request");
+  assert.equal(req.name, "npm joiner");
+  assert.match(req.safety, /^[0-9a-f]{4} [0-9a-f]{4}$/);
+
+  const sawRequest = (async () => {
+    for (let i = 0; i < 40; i++) {
+      const list = await requests(dirA);
+      if (list.some((r) => r.device === req.device)) return true;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return false;
+  })();
+  assert.equal(await within(15_000, sawRequest, "founder's requests() lists the joiner"), true);
+
+  const got = joiner.synced("secret.md");
+  await approve(dirA, req.safety);
+  await within(90_000, got, "secret.md syncing to the approved joiner");
+  assert.equal(readFileSync(join(dirB, "secret.md"), "utf8"), "# members only\n");
+
+  const list = await members(dirA);
+  assert.ok(
+    list.some((m) => m.device === req.device && m.role === "member"),
+    `expected ${req.device} as a member, got ${JSON.stringify(list)}`,
+  );
 });

@@ -31,9 +31,29 @@ use riftpipe_core::onboard::JoinRequest;
 use riftpipe_core::sync::{MeshMsg, SyncMsg, Syncer};
 
 use crate::net::{anyerr, Result, Sink, Source};
+use crate::sync::control::{clean_name, is_canonical_name, NAME_MAX_BYTES};
+
+/// Most verified join requests a peer keeps waiting (one per device); later ones
+/// are ignored with a one-time warning, so a link-holder can't grow it unbounded.
+pub const REQUEST_INBOX_CAP: usize = 64;
+
+/// A verified join request waiting in the list, with its safety code computed
+/// once on arrival (the state snapshot is rebuilt every second).
+#[derive(Clone, Debug)]
+pub struct PendingRequest {
+    pub request: JoinRequest,
+    pub safety: String,
+}
 
 fn hex32(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn role_str(r: Role) -> &'static str {
+    match r {
+        Role::Admin => "admin",
+        Role::Member => "member",
+    }
 }
 
 fn escapes(path: &str) -> bool {
@@ -97,7 +117,8 @@ pub struct TreePeer {
     /// Epoch keys, announces, and wrap targets. `Some` iff an identity is set.
     epochs: Option<EpochBook>,
     /// Our signed join request — the binding from device id to wrap-target key that
-    /// an Admin needs to wrap us into the current epoch. `Some` iff an identity is set.
+    /// an Admin needs to wrap us into the current epoch, plus our display name
+    /// (`--name`, default `"cli"`). `Some` iff an identity is set.
     my_request: Option<JoinRequest>,
     /// Epochs already reported as "dropped content (no key)", so the breadcrumb
     /// fires once per epoch.
@@ -108,6 +129,18 @@ pub struct TreePeer {
     warned_keyless: bool,
     /// Epochs already reported as "not the current sealable epoch — writes held".
     stale_epoch_reported: HashSet<u64>,
+    /// Verified requests from devices that aren't authorized, one per device —
+    /// the `riftpipe requests` list. Cleared per device when it's granted.
+    requests: Vec<PendingRequest>,
+    /// The request list hit [`REQUEST_INBOX_CAP`] once already (warned).
+    warned_inbox_full: bool,
+    /// A new device's request was dropped because the list was full (sticky for
+    /// the session). The dropped request is invisible here, so its safety code
+    /// could be matched by one ground for an entry that IS listed: the state file
+    /// reports it as `inboxOverflow` and `riftpipe approve` then refuses codes.
+    inbox_overflow: bool,
+    /// A join request with a non-canonical name was dropped once already (warned).
+    warned_bad_name: bool,
 }
 
 impl TreePeer {
@@ -127,6 +160,10 @@ impl TreePeer {
             warned_restricted: false,
             warned_keyless: false,
             stale_epoch_reported: HashSet::new(),
+            requests: Vec::new(),
+            warned_inbox_full: false,
+            inbox_overflow: false,
+            warned_bad_name: false,
         }
     }
 
@@ -161,14 +198,46 @@ impl TreePeer {
         self.identity.as_ref().map(|k| k.id())
     }
 
+    /// Re-sign our join request with display name `name` (`--name`; cleaned of
+    /// control characters and capped). No-op without an identity.
+    pub fn set_request_name(&mut self, name: &str) {
+        if let Some(key) = &self.identity {
+            self.my_request = Some(JoinRequest::create(key, clean_name(name)));
+        }
+    }
+
+    /// Our signed join request (`Some` iff an identity is set).
+    pub fn my_request(&self) -> Option<&JoinRequest> {
+        self.my_request.as_ref()
+    }
+
+    /// Verified requests waiting for approval (one per not-yet-authorized device).
+    pub fn pending_requests(&self) -> &[PendingRequest] {
+        &self.requests
+    }
+
+    /// The board's authorized devices and their roles, sorted by id.
+    pub fn members(&self) -> Vec<([u8; 32], Role)> {
+        self.trust.devices()
+    }
+
+    /// Is this device in the trust log?
+    fn me_authorized(&self) -> bool {
+        self.device_id().is_some_and(|id| self.trust.is_authorized(&id))
+    }
+
     /// Ingest a trust-log entry (idempotent) and remember it for neighbor
-    /// catch-up. Returns whether the log now holds it.
+    /// catch-up; a now-authorized device leaves the request list. Returns whether
+    /// the log now holds it.
     pub fn add_trust(&mut self, entry: TrustEntry) -> bool {
         let id = *blake3::hash(&postcard::to_allocvec(&entry).unwrap_or_default()).as_bytes();
         if self.trust_seen.insert(id) {
             self.trust_entries.push(entry.clone());
         }
-        self.trust.apply(entry)
+        let ok = self.trust.apply(entry);
+        let trust = &self.trust;
+        self.requests.retain(|r| !trust.is_authorized(&r.request.device_id));
+        ok
     }
 
     /// The auth state to catch a new neighbor up (gossip is ephemeral, so a late
@@ -282,9 +351,17 @@ impl TreePeer {
     pub(crate) fn authorize_and_apply(&mut self, msg: MeshMsg, dir: &Path) -> Vec<MeshMsg> {
         match msg {
             MeshMsg::Trust(e) => {
-                let was_held = self.writes_held();
+                let (was_authorized, was_held) = (self.me_authorized(), self.writes_held());
                 self.add_trust(e);
-                self.after_trust_change(dir, was_held)
+                let mut out = self.after_trust_change(dir, was_held);
+                // Just approved but keyless: announce ourselves so an Admin wraps us in
+                // (mirrors the browser's `accept(Trust)`).
+                if !was_authorized && self.me_authorized() {
+                    let role = self.device_id().and_then(|id| self.trust.role(&id)).map_or("member", role_str);
+                    eprintln!("[auth] this device is authorized ({role})");
+                    out.extend(self.read_request());
+                }
+                out
             }
             MeshMsg::Epoch(a) => {
                 let was_held = self.writes_held();
@@ -293,9 +370,7 @@ impl TreePeer {
                 self.epoch_followups(ing, dir, was_held)
             }
             MeshMsg::Request(req) => {
-                if let Some(b) = self.epochs.as_mut() {
-                    b.learn_request(&req);
-                }
+                self.ingest_request(req, dir);
                 self.maintenance()
             }
             MeshMsg::Sealed(s) => {
@@ -322,6 +397,71 @@ impl TreePeer {
             MeshMsg::Sync(_) | MeshMsg::SignedSync(_) if self.mode.seals_content() => Vec::new(),
             MeshMsg::Sync(_) | MeshMsg::SignedSync(_) => self.apply_content(msg, dir),
             _ => Vec::new(), // Presence/Version/Chunk not routed here
+        }
+    }
+
+    /// A signed join request arrived: teach the epoch book the device's wrap key
+    /// (an already-granted device gets wrapped in by `maintenance`), and — if the
+    /// device isn't authorized yet — keep it in the request list (one entry per
+    /// device, capped at [`REQUEST_INBOX_CAP`]) and report it.
+    fn ingest_request(&mut self, req: JoinRequest, dir: &Path) {
+        let Some(book) = self.epochs.as_mut() else { return };
+        // Byte cap + canonical form first: an oversized name costs nothing, and
+        // the displayed name is exactly the signed one (see `is_canonical_name`).
+        if !is_canonical_name(&req.name) {
+            if !self.warned_bad_name {
+                self.warned_bad_name = true;
+                eprintln!(
+                    "[auth] ignoring a join request whose name isn't canonical (over {NAME_MAX_BYTES} bytes, \
+                     untrimmed, or with control/format characters) — device {}",
+                    hex32(&req.device_id)
+                );
+            }
+            return;
+        }
+        if !book.learn_request(&req) {
+            return;
+        }
+        if self.trust.is_authorized(&req.device_id) || Some(req.device_id) == self.device_id() {
+            return;
+        }
+        let full = self.requests.len() >= REQUEST_INBOX_CAP;
+        if let Some(i) = self.requests.iter().position(|r| r.request.device_id == req.device_id) {
+            let old = &self.requests[i].request;
+            // While full, an entry can't be re-signed either: that would let a
+            // device already in a full list re-grind its safety code to match a
+            // request that was dropped.
+            if (old.name != req.name || old.enc_pub != req.enc_pub) && !full {
+                let pending = PendingRequest { safety: req.safety_code(), request: req };
+                self.report_request(&pending, dir);
+                self.requests[i] = pending;
+            }
+            return;
+        }
+        if full {
+            self.inbox_overflow = true;
+            if !self.warned_inbox_full {
+                self.warned_inbox_full = true;
+                eprintln!(
+                    "[auth] request inbox full ({REQUEST_INBOX_CAP}) — ignoring new requests; \
+                     approve by device id from now on (safety codes can't be trusted to pick one)"
+                );
+            }
+            return;
+        }
+        let pending = PendingRequest { safety: req.safety_code(), request: req };
+        self.report_request(&pending, dir);
+        self.requests.push(pending);
+    }
+
+    /// The `access-request` breadcrumb, plus how to approve it when we're an Admin.
+    fn report_request(&self, pending: &PendingRequest, dir: &Path) {
+        let (req, safety) = (&pending.request, &pending.safety);
+        let name = serde_json::to_string(&clean_name(&req.name)).unwrap_or_default();
+        eprintln!("[auth] access-request device={} safety={safety} name={name}", hex32(&req.device_id));
+        let admin = self.device_id().is_some_and(|me| self.trust.role(&me) == Some(Role::Admin));
+        if admin {
+            eprintln!("[auth]   approve with: riftpipe approve {} {}", dir.display(), safety.replace(' ', ""));
         }
     }
 
@@ -453,6 +593,79 @@ impl TreePeer {
         let mut out = vec![MeshMsg::Trust(entry)];
         out.extend(self.after_trust_change(dir, was_held));
         out
+    }
+
+    /// Admin action (`riftpipe approve`): grant a device that has a request waiting.
+    /// Unlike [`grant_device`](Self::grant_device) it refuses an id with no pending
+    /// request, so a stale or mistyped approve can't authorize an arbitrary device.
+    /// The wrap follows via maintenance — the request already taught the book the
+    /// device's key.
+    pub fn approve_request(&mut self, id: [u8; 32], dir: &Path) -> Vec<MeshMsg> {
+        if !self.device_id().is_some_and(|me| self.trust.role(&me) == Some(Role::Admin)) {
+            eprintln!("[auth] approve ignored: this device is not an Admin — run `riftpipe approve` on an Admin's dir");
+            return Vec::new();
+        }
+        let Some(req) = self.requests.iter().find(|r| r.request.device_id == id).map(|r| &r.request) else {
+            eprintln!(
+                "[auth] approve ignored: no pending request from {} — `riftpipe grant {} <device-id>` authorizes a device by id",
+                hex32(&id),
+                dir.display()
+            );
+            return Vec::new();
+        };
+        let name = serde_json::to_string(&clean_name(&req.name)).unwrap_or_default();
+        eprintln!("[auth] approving request from {name} device={}", hex32(&id));
+        self.grant_device(id, dir)
+    }
+
+    /// Machine-local snapshot of this peer's auth state for `.riftpipe-auth.json`
+    /// (ids, names, roles, safety codes — never keys). `None` without an identity.
+    pub fn auth_state_json(&self) -> Option<serde_json::Value> {
+        let me = self.device_id()?;
+        let book = self.epochs.as_ref()?;
+        let founder = self.trust.founder();
+        let members: Vec<serde_json::Value> = self
+            .trust
+            .devices()
+            .into_iter()
+            .map(|(device, role)| {
+                serde_json::json!({
+                    "device": hex32(&device),
+                    "role": role_str(role),
+                    "founder": founder == Some(device),
+                    "me": device == me,
+                })
+            })
+            .collect();
+        let requests: Vec<serde_json::Value> = self
+            .requests
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "device": hex32(&r.request.device_id),
+                    "name": clean_name(&r.request.name),
+                    "safety": r.safety,
+                })
+            })
+            .collect();
+        let my_request = self
+            .my_request
+            .as_ref()
+            .filter(|_| self.mode.seals_content() && !self.me_authorized())
+            .map(|r| serde_json::json!({ "name": r.name, "safety": r.safety_code() }));
+        Some(serde_json::json!({
+            "version": 1,
+            "device": hex32(&me),
+            "restricted": self.mode.seals_content(),
+            "role": self.trust.role(&me).map(role_str),
+            "founder": founder.map(|f| hex32(&f)),
+            "epoch": self.epoch_held().unwrap_or(0),
+            "canRead": !self.mode.seals_content() || book.holds_latest(),
+            "members": members,
+            "requests": requests,
+            "inboxOverflow": self.inbox_overflow,
+            "myRequest": my_request,
+        }))
     }
 
     /// The push decision for one local file, shared by every driver (link +
@@ -906,6 +1119,306 @@ mod tests {
         assert!(keyless.sign_local(lww("a.bin", b"1")).is_none(), "no key: nothing goes out");
         assert!(keyless.warned_keyless, "the held edit is reported");
         assert!(keyless.sign_local(lww("b.bin", b"2")).is_none());
+    }
+
+    /// The founder (seed 1) of a restricted board, holding epoch 1, no other members.
+    fn founder_peer() -> TreePeer {
+        let mut f = restricted_peer(1);
+        f.add_trust(DeviceKey::from_seed(&[1u8; 32]).genesis());
+        f.startup();
+        f
+    }
+
+    fn request_from(seed: &[u8; 32], name: &str) -> MeshMsg {
+        MeshMsg::Request(JoinRequest::create(&DeviceKey::from_seed(seed), name))
+    }
+
+    /// Request-to-join on the native peer: the joiner's signed request lands in the
+    /// founder's list (once per device), and `approve_request` grants it AND wraps
+    /// the current epoch to it, so the joiner can read.
+    #[test]
+    fn a_join_request_lands_in_the_inbox_and_approve_wraps_it_in() {
+        let (df, dj) = (dir("inbox-f"), dir("inbox-j"));
+        let mut founder = founder_peer();
+        let mut joiner = restricted_peer(5);
+        joiner.set_request_name("Bob");
+        let jid = joiner.device_id().unwrap();
+
+        founder.authorize_and_apply(joiner.read_request().expect("a keyless joiner asks"), &df);
+        assert_eq!(founder.pending_requests().len(), 1);
+        assert_eq!(founder.pending_requests()[0].request.name, "Bob");
+        founder.authorize_and_apply(joiner.read_request().unwrap(), &df);
+        assert_eq!(founder.pending_requests().len(), 1, "a repeated request keeps one entry");
+
+        for m in founder.auth_catchup() {
+            joiner.authorize_and_apply(m, &dj);
+        }
+        assert_eq!(joiner.epoch_held(), None, "not approved yet: no read key");
+
+        let out = founder.approve_request(jid, &df);
+        assert!(out.iter().any(|m| matches!(m, MeshMsg::Trust(_))), "approve grants");
+        assert!(out.iter().any(|m| matches!(m, MeshMsg::Epoch(_))), "approve wraps the current epoch");
+        assert!(founder.pending_requests().is_empty(), "a granted device leaves the list");
+        assert!(founder.members().contains(&(jid, Role::Member)));
+
+        for m in out {
+            joiner.authorize_and_apply(m, &dj);
+        }
+        assert_eq!(joiner.epoch_held(), Some(1), "the approved joiner holds the read key");
+        for d in [&df, &dj] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// Forged requests, our own request, and requests from already-authorized
+    /// devices never enter the list; a grant by id clears a waiting entry.
+    #[test]
+    fn bad_or_already_authorized_requests_stay_out() {
+        let df = dir("inbox-bad");
+        let mut founder = founder_peer();
+
+        let mut forged = JoinRequest::create(&DeviceKey::from_seed(&[5u8; 32]), "Mallory");
+        forged.sig[0] ^= 1;
+        founder.authorize_and_apply(MeshMsg::Request(forged), &df);
+
+        let own = founder.my_request().unwrap().clone();
+        founder.authorize_and_apply(MeshMsg::Request(own), &df);
+
+        founder.grant_device(DeviceKey::from_seed(&[6u8; 32]).id(), &df);
+        founder.authorize_and_apply(request_from(&[6u8; 32], "granted"), &df);
+        assert!(founder.pending_requests().is_empty());
+
+        founder.authorize_and_apply(request_from(&[7u8; 32], "later granted"), &df);
+        assert_eq!(founder.pending_requests().len(), 1);
+        founder.grant_device(DeviceKey::from_seed(&[7u8; 32]).id(), &df);
+        assert!(founder.pending_requests().is_empty(), "grant by id clears the waiting entry");
+        std::fs::remove_dir_all(&df).ok();
+    }
+
+    #[test]
+    fn approve_without_a_pending_request_is_ignored() {
+        let df = dir("approve-none");
+        let mut founder = founder_peer();
+        assert!(founder.approve_request([9u8; 32], &df).is_empty());
+        assert_eq!(founder.members().len(), 1, "only the founder");
+        std::fs::remove_dir_all(&df).ok();
+    }
+
+    /// A Member keeps the request list too (and shows it), but can't approve:
+    /// approve refuses up front instead of announcing an approval that fails.
+    #[test]
+    fn approve_on_a_non_admin_peer_is_refused() {
+        let (df, dm) = (dir("approve-member-f"), dir("approve-member-m"));
+        let mut founder = founder_peer();
+        let mut member = restricted_peer(5);
+        let mid = member.device_id().unwrap();
+        founder.authorize_and_apply(member.read_request().unwrap(), &df);
+        for m in founder.auth_catchup().into_iter().chain(founder.approve_request(mid, &df)) {
+            member.authorize_and_apply(m, &dm);
+        }
+        assert_eq!(member.members().len(), 2, "the member knows both devices");
+
+        member.authorize_and_apply(request_from(&[8u8; 32], "Carol"), &dm);
+        assert_eq!(member.pending_requests().len(), 1, "a Member sees the request");
+        let carol = DeviceKey::from_seed(&[8u8; 32]).id();
+        assert!(member.approve_request(carol, &dm).is_empty());
+        assert_eq!(member.members().len(), 2, "nothing granted");
+        assert_eq!(member.pending_requests().len(), 1, "the request stays for an Admin");
+        for d in [&df, &dm] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    #[test]
+    fn inbox_is_capped() {
+        let df = dir("inbox-cap");
+        let mut founder = founder_peer();
+        for i in 0..REQUEST_INBOX_CAP + 5 {
+            let mut s = [0u8; 32];
+            s[0] = i as u8;
+            s[1] = 0xAA;
+            founder.authorize_and_apply(request_from(&s, "x"), &df);
+        }
+        assert_eq!(founder.pending_requests().len(), REQUEST_INBOX_CAP);
+        assert!(founder.warned_inbox_full);
+        std::fs::remove_dir_all(&df).ok();
+    }
+
+    /// The safety-code hijack: fill the list, let the victim's request drop, then
+    /// re-sign a listed entry so its code matches the victim's. A full list refuses
+    /// the re-sign, and once anything was dropped the state reports
+    /// `inboxOverflow`, which makes approve-by-code refuse (approve by id still works).
+    #[test]
+    fn a_full_inbox_refuses_renames_and_disables_approve_by_code() {
+        use crate::sync::control::resolve_approve_target;
+        let df = dir("inbox-overflow");
+        let mut founder = founder_peer();
+        let seed = |i: usize| {
+            let mut s = [0u8; 32];
+            s[0] = i as u8;
+            s[1] = 0xBB;
+            s
+        };
+        for i in 0..REQUEST_INBOX_CAP {
+            founder.authorize_and_apply(request_from(&seed(i), "junk"), &df);
+        }
+        assert_eq!(founder.pending_requests().len(), REQUEST_INBOX_CAP);
+        assert_eq!(founder.auth_state_json().unwrap()["inboxOverflow"], false, "full, but nothing dropped yet");
+
+        founder.authorize_and_apply(request_from(&seed(0), "renamed"), &df);
+        assert_eq!(founder.pending_requests()[0].request.name, "junk", "a full list refuses re-signs");
+
+        founder.authorize_and_apply(request_from(&[0xEEu8; 32], "victim"), &df);
+        assert_eq!(founder.pending_requests().len(), REQUEST_INBOX_CAP, "the new request is dropped");
+        let state = founder.auth_state_json().unwrap();
+        assert_eq!(state["inboxOverflow"], true);
+
+        let listed = &founder.pending_requests()[3];
+        let code = listed.safety.clone();
+        assert_eq!(code, listed.request.safety_code(), "the cached code is the real one");
+        let listed = &listed.request;
+        let err = resolve_approve_target(Some(&state), &code).unwrap_err();
+        assert!(err.contains("overflowed"), "{err}");
+        let by_id = resolve_approve_target(Some(&state), &hex32(&listed.device_id)).unwrap();
+        assert_eq!(by_id.0, listed.device_id, "approve by device id still works");
+
+        // Sticky: freeing a slot doesn't make codes trustworthy again.
+        let first = founder.pending_requests()[0].request.device_id;
+        founder.approve_request(first, &df);
+        assert_eq!(founder.auth_state_json().unwrap()["inboxOverflow"], true);
+        std::fs::remove_dir_all(&df).ok();
+    }
+
+    #[test]
+    fn a_renamed_request_replaces_the_old_one() {
+        let df = dir("inbox-rename");
+        let mut founder = founder_peer();
+        founder.authorize_and_apply(request_from(&[5u8; 32], "A"), &df);
+        founder.authorize_and_apply(request_from(&[5u8; 32], "B"), &df);
+        assert_eq!(founder.pending_requests().len(), 1);
+        assert_eq!(founder.pending_requests()[0].request.name, "B");
+        std::fs::remove_dir_all(&df).ok();
+    }
+
+    /// Granted by id before an Admin knew our wrap key: the Trust entry that
+    /// authorizes us makes us re-announce our request, so the Admin can wrap us in.
+    #[test]
+    fn being_granted_prompts_a_keyless_device_to_re_announce() {
+        let (df, dj) = (dir("regrant-f"), dir("regrant-j"));
+        let mut founder = founder_peer();
+        let mut joiner = restricted_peer(5);
+        for m in founder.auth_catchup() {
+            joiner.authorize_and_apply(m, &dj);
+        }
+        let jid = joiner.device_id().unwrap();
+        let trust = founder.grant_device(jid, &df).into_iter().find(|m| matches!(m, MeshMsg::Trust(_))).unwrap();
+        let out = joiner.authorize_and_apply(trust, &dj);
+        assert!(out.iter().any(|m| matches!(m, MeshMsg::Request(_))), "the newly authorized device re-announces");
+        for d in [&df, &dj] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    #[test]
+    fn auth_state_json_reports_members_requests_and_my_request() {
+        let df = dir("state-json");
+        let mut founder = founder_peer();
+        let mut joiner = restricted_peer(5);
+        joiner.set_request_name("Bob");
+        let req = joiner.my_request().unwrap().clone();
+        founder.authorize_and_apply(MeshMsg::Request(req.clone()), &df);
+
+        let f = founder.auth_state_json().unwrap();
+        assert_eq!(f["role"], "admin");
+        assert_eq!(f["epoch"], 1);
+        assert_eq!(f["canRead"], true);
+        assert_eq!(f["requests"][0]["safety"], req.safety_code());
+        assert_eq!(f["requests"][0]["name"], "Bob");
+        assert_eq!(f["members"][0]["founder"], true);
+        assert_eq!(f["members"][0]["me"], true);
+        assert!(f["myRequest"].is_null(), "an authorized device isn't asking");
+
+        let j = joiner.auth_state_json().unwrap();
+        assert!(j["role"].is_null());
+        assert_eq!(j["myRequest"]["name"], "Bob");
+        assert_eq!(j["myRequest"]["safety"], req.safety_code());
+        assert_eq!(j["canRead"], false);
+
+        assert!(TreePeer::new().auth_state_json().is_none());
+        std::fs::remove_dir_all(&df).ok();
+    }
+
+    /// Pins `.riftpipe-auth.json`'s exact keys (top level, members, requests,
+    /// myRequest), so no key material — `enc_pub`, a seed, a wrapped key — can
+    /// slip into the machine-local snapshot unnoticed.
+    #[test]
+    fn auth_state_json_has_exactly_the_documented_keys() {
+        fn keys(v: &serde_json::Value) -> Vec<&str> {
+            let mut k: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+            k.sort_unstable();
+            k
+        }
+        let df = dir("state-keys");
+        let mut founder = founder_peer();
+        let mut joiner = restricted_peer(5);
+        joiner.set_request_name("Bob");
+        founder.authorize_and_apply(joiner.read_request().unwrap(), &df);
+
+        let f = founder.auth_state_json().unwrap();
+        assert_eq!(
+            keys(&f),
+            [
+                "canRead",
+                "device",
+                "epoch",
+                "founder",
+                "inboxOverflow",
+                "members",
+                "myRequest",
+                "requests",
+                "restricted",
+                "role",
+                "version"
+            ]
+        );
+        assert_eq!(keys(&f["members"][0]), ["device", "founder", "me", "role"]);
+        assert_eq!(keys(&f["requests"][0]), ["device", "name", "safety"]);
+        let j = joiner.auth_state_json().unwrap();
+        assert_eq!(keys(&j), keys(&f));
+        assert_eq!(keys(&j["myRequest"]), ["name", "safety"]);
+        std::fs::remove_dir_all(&df).ok();
+    }
+
+    #[test]
+    fn request_name_is_cleaned() {
+        let mut p = restricted_peer(5);
+        p.set_request_name("  Bob\u{7} ");
+        let req = p.my_request().unwrap();
+        assert_eq!(req.name, "Bob?");
+        assert!(req.verify(), "re-signed over the cleaned name");
+    }
+
+    /// The safety code hashes the signed name while Admins see the cleaned one,
+    /// so only requests whose signed name is already canonical (and small) get in:
+    /// no invisible suffix to grind a chosen code with, no megabyte names held.
+    #[test]
+    fn requests_with_non_canonical_names_stay_out() {
+        let df = dir("inbox-canon");
+        let mut founder = founder_peer();
+        let huge = "x".repeat(1_000_000);
+        for (i, name) in ["Bob ", "Bob\u{3000}", "Bob\u{200B}", "Bob\u{202E}", "\u{7}Bob", huge.as_str()]
+            .into_iter()
+            .enumerate()
+        {
+            founder.authorize_and_apply(request_from(&[20 + i as u8; 32], name), &df);
+        }
+        assert!(founder.pending_requests().is_empty());
+        assert!(founder.warned_bad_name);
+
+        founder.authorize_and_apply(request_from(&[30u8; 32], ""), &df);
+        founder.authorize_and_apply(request_from(&[31u8; 32], "Bob"), &df);
+        assert_eq!(founder.pending_requests().len(), 2, "browser (\"\") and cleaned CLI names get in");
+        std::fs::remove_dir_all(&df).ok();
     }
 
     #[test]
