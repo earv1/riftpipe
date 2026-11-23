@@ -22,7 +22,7 @@ import {
   pendingRequests,
   authState,
 } from "../wasm/pkg/kanban_wasm.js";
-import { list, ready, watch } from "./fs.ts";
+import { list, read, ready, watch } from "./fs.ts";
 import { logEvent, readEvents } from "./events.ts";
 
 // Domain model + types (Board, Card, Comment, CardDetail, getBoard, addCard,
@@ -50,6 +50,7 @@ export * from "./history.ts";
 //   riftpipe.authState()         → { locked, device, authorized, isAuthor, author, requested, canRead, epoch }
 //   riftpipe.logEvent(kind, data)    → append a debug event to this device's log
 //   riftpipe.listDir(path)           → entry names under a synced tree path
+//   riftpipe.readFile(path)          → a synced file's text (null if absent)
 export type AuthState = {
   locked: boolean;
   device: string;
@@ -86,6 +87,7 @@ export const auth = {
   readEvents: () => readEvents(),
   logEvent: (kind: string, data: Record<string, unknown> = {}) => logEvent(kind, data),
   listDir: (p: string) => list(p),
+  readFile: (p: string) => read(p),
 };
 
 // Build-time config (Vite env). Set these for a deployed/cross-network build:

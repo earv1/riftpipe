@@ -8,6 +8,12 @@
 //! segment `events/<device-id>.NNNNNN.jsonl` and the active file restarts. So an
 //! append re-sends at most one small file, never the whole history.
 //!
+//! Event files are whole-file LWW over best-effort gossip. If a segment's one
+//! push is dropped but the restarted (short) active file lands, a live peer
+//! would lose those lines until it reconnects — so for
+//! [`SEGMENT_REPUSH_WINDOW_MS`] after a rotation, appends re-push the recent
+//! segments too (at most once per [`SEGMENT_REPUSH_MIN_GAP_MS`] each).
+//!
 //! Appends within a tab go through one writer queue, so concurrent `log` /
 //! `logEvent` calls never lose lines to each other's read-modify-write. Sibling
 //! tabs of one profile can still race (each has its own queue).
@@ -75,6 +81,41 @@ pub(crate) fn next_segment_seq(names: &[String], device: &str) -> u32 {
 /// Path of `device`'s immutable segment number `seq`, `events/<device>.NNNNNN.jsonl`.
 pub(crate) fn segment_path(device: &str, seq: u32) -> String {
     format!("events/{device}.{seq:06}.jsonl")
+}
+
+/// How long after a rotation appends keep re-pushing that segment. Time-based,
+/// not count-based: drops cluster in bursts, and the append that actually lands
+/// is usually the first one after the burst, however many appends that was.
+pub const SEGMENT_REPUSH_WINDOW_MS: f64 = 30_000.0;
+/// Minimum gap between re-pushes of one segment, bounding the extra traffic to
+/// ≤ 6 segment sends per rotation, and none once the window closes.
+pub const SEGMENT_REPUSH_MIN_GAP_MS: f64 = 5_000.0;
+
+/// A segment rotated in this tab recently, for [`due_repushes`].
+pub(crate) struct RecentSegment {
+    pub path: String,
+    pub rotated_ms: f64,
+    pub pushed_ms: f64,
+}
+
+/// The recent segments to re-push alongside an append at `now_ms`: drops those
+/// past `window_ms` since rotation, returns those not pushed within `gap_ms`
+/// (and marks them pushed now), oldest first.
+pub(crate) fn due_repushes(recent: &mut Vec<RecentSegment>, now_ms: f64, window_ms: f64, gap_ms: f64) -> Vec<String> {
+    recent.retain(|r| now_ms - r.rotated_ms < window_ms);
+    let mut due = Vec::new();
+    for r in recent.iter_mut() {
+        if now_ms - r.pushed_ms >= gap_ms {
+            r.pushed_ms = now_ms;
+            due.push(r.path.clone());
+        }
+    }
+    due
+}
+
+thread_local! {
+    /// Segments this tab rotated within the re-push window.
+    static RECENT_SEGMENTS: RefCell<Vec<RecentSegment>> = const { RefCell::new(Vec::new()) };
 }
 
 const RESERVED: [&str; 3] = ["ts", "device", "kind"];
@@ -181,6 +222,17 @@ async fn write_one(kind: &str, data: serde_json::Value) {
 
     let current = crate::opfs::read_path(&path).await.unwrap_or_default();
     let planned = plan_append(&current, &line, SEGMENT_MAX_BYTES);
+    let now = js_sys::Date::now();
+    // Re-push recently rotated segments first (before any new rotation is
+    // recorded, so a fresh segment's own push below isn't doubled).
+    let due = RECENT_SEGMENTS.with(|r| {
+        due_repushes(&mut r.borrow_mut(), now, SEGMENT_REPUSH_WINDOW_MS, SEGMENT_REPUSH_MIN_GAP_MS)
+    });
+    for seg in due {
+        if let Some(bytes) = crate::opfs::read_path(&seg).await {
+            crate::tree_sync::push(&seg, bytes.as_bytes());
+        }
+    }
     if let Some(archive) = planned.archive {
         let seq = next_segment_seq(&crate::opfs::list_path("events").await, &device);
         let seg = segment_path(&device, seq);
@@ -188,6 +240,7 @@ async fn write_one(kind: &str, data: serde_json::Value) {
             return;
         }
         crate::tree_sync::push(&seg, archive.as_bytes());
+        RECENT_SEGMENTS.with(|r| r.borrow_mut().push(RecentSegment { path: seg, rotated_ms: now, pushed_ms: now }));
     }
     if crate::opfs::write_path(&path, planned.active.as_bytes()).await.is_ok() {
         crate::tree_sync::push(&path, planned.active.as_bytes());
@@ -313,6 +366,23 @@ mod tests {
         assert_eq!(next_segment_seq(&names, "dev"), 4);
         assert_eq!(next_segment_seq(&[], "dev"), 1);
         assert_eq!(segment_path("dev", 4), "events/dev.000004.jsonl");
+    }
+
+    #[wasm_bindgen_test]
+    fn due_repushes_throttles_within_window_and_expires() {
+        let seg = |p: &str, t: f64| RecentSegment { path: p.into(), rotated_ms: t, pushed_ms: t };
+        let mut recent = vec![seg("s1", 0.0), seg("s2", 1_000.0)];
+        // Inside the gap of both: nothing due.
+        assert!(due_repushes(&mut recent, 4_000.0, 30_000.0, 5_000.0).is_empty());
+        // s1 is past its gap, s2 not yet.
+        assert_eq!(due_repushes(&mut recent, 5_500.0, 30_000.0, 5_000.0), vec!["s1"]);
+        // Both due now (s1 re-pushed at 5.5 s; burst of rotations all covered).
+        assert_eq!(due_repushes(&mut recent, 11_000.0, 30_000.0, 5_000.0), vec!["s1", "s2"]);
+        // s1 leaves the window at 30 s; s2 stays until 31 s.
+        assert_eq!(due_repushes(&mut recent, 30_500.0, 30_000.0, 5_000.0), vec!["s2"]);
+        assert_eq!(recent.len(), 1);
+        assert!(due_repushes(&mut recent, 31_000.0, 30_000.0, 5_000.0).is_empty());
+        assert!(recent.is_empty());
     }
 
     #[wasm_bindgen_test]

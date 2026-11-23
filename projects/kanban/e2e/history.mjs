@@ -5,8 +5,9 @@
 //   - events/* changes never re-render the board (boardRefreshes unchanged);
 //   - mesh.merge rows hide behind "Show sync events";
 //   - 120 concurrent appends lose nothing and rotate into immutable segments,
-//     which sync to the peer (after one settling append — gossip drops under a
-//     burst are only repaired by the next push or a neighbour join);
+//     which sync to the peer byte-for-byte (after one settling append — gossip
+//     drops under a burst are only repaired by the next push or a neighbour
+//     join; appends re-push recently rotated segments for 30 s);
 //   - on a claimed board the log is sealed like content: a late joiner and an
 //     unapproved peer can't read the owner's post-claim events.
 //
@@ -169,8 +170,10 @@ try {
   console.log("✓ mesh.merge rows hidden by default, shown with the toggle");
 
   // 11. 120 concurrent appends: none lost, the log rotates, segments sync.
+  const burstStart = Date.now();
   await a.evaluate(() =>
     Promise.all(Array.from({ length: 120 }, (_, i) => window.riftpipe.logEvent("test.bulk", { i, pad: "x".repeat(200) }))));
+  console.log(`  (info) 120 appends took ${((Date.now() - burstStart) / 1000).toFixed(1)} s on A`);
   const bulk = (await ev(a)).filter((e) => e.kind === "test.bulk");
   if (bulk.length !== 120) fail(`A should hold all 120 concurrent appends, got ${bulk.length}`);
   if (new Set(bulk.map((e) => e.i)).size !== 120) fail("A's 120 appends should have 120 distinct i");
@@ -190,17 +193,24 @@ try {
     ? `  (info) B converged on its own after ${((Date.now() - t0) / 1000).toFixed(1)} s`
     : `  (info) B still stale after 10 s without a further append: ${await bBulkCount()}/120 bulk events`);
   await a.evaluate(() => window.riftpipe.logEvent("test.settle", {}));
-  const bConverged = await until(async () => {
-    const bNames = await b.evaluate(() => window.riftpipe.listDir("events"));
-    return (await bBulkCount()) === 120 && segs.every((s) => bNames.includes(s)) ? true : null;
-  }, 20000);
+  // Segments converge byte-for-byte: a rotation's segment push may itself be
+  // dropped, so appends within the re-push window re-send recent segments.
+  const aSegText = await a.evaluate(
+    (ss) => Promise.all(ss.map((s) => window.riftpipe.readFile(`events/${s}`))), segs);
+  const segsMatch = async () => {
+    const bSegText = await b.evaluate(
+      (ss) => Promise.all(ss.map((s) => window.riftpipe.readFile(`events/${s}`))), segs);
+    return bSegText.every((t, k) => t === aSegText[k]);
+  };
+  const bConverged = await until(async () =>
+    (await bBulkCount()) === 120 && (await segsMatch()) ? true : null, 20000);
   if (!bConverged) {
     const have = new Set((await ev(b)).filter((e) => e.kind === "test.bulk").map((e) => e.i));
     const missing = Array.from({ length: 120 }, (_, i) => i).filter((i) => !have.has(i));
     const bNames = await b.evaluate(() => window.riftpipe.listDir("events"));
     fail(`B should receive all 120 bulk events and A's segments, got ${have.size}; missing i=${JSON.stringify(missing)}; A segments ${JSON.stringify(segs)}; B events/ ${JSON.stringify(bNames)}`);
   }
-  console.log(`✓ 120 concurrent appends kept; ${segs.length} segment(s) rotated; all 120 + the segments reached B`);
+  console.log(`✓ 120 concurrent appends kept; ${segs.length} segment(s) rotated; all 120 reached B and its segments match A's byte-for-byte`);
 
   // 12. Claimed board: the log is sealed like content.
   await a.locator(".lock-btn").click();
