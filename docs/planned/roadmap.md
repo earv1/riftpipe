@@ -419,8 +419,11 @@ over riftpipe's wasm file API). What remains:
     - Growth controls: the active log rotates into `<device>.NNNNNN.jsonl`
       segments at 16 KiB (appends re-push segments rotated in the last 30 s,
       ≤ once per 5 s each, so a dropped segment push can't wipe a live peer's
-      lines); one writer queue per tab; `mesh.merge` is logged at most once per
-      path per 10 s; `card.edit` is coalesced app-side, per board, and flushed
+      lines); one writer queue per tab; pushes are batched (500 ms trailing,
+      ≤ 2 s; `mesh.merge`-only changes ride along or go out after 15 s, so a
+      remote merge no longer makes every peer re-broadcast its log — 9→~5
+      event pushes per board write on 5 peers, far fewer under bursts);
+      `mesh.merge` is logged at most once per path per 10 s; `card.edit` is coalesced app-side, per board, and flushed
       on board switch / tab hide. Malformed lines are skipped (`readEvents`
       keeps objects; the app keeps string `ts`/`device`/`kind`).
     - Event data can't overwrite `ts`/`device`/`kind`; grant/revoke log
