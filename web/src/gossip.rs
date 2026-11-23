@@ -1049,21 +1049,33 @@ fn status_json(state: LinkState, peers: usize) -> String {
     format!(r#"{{"state":"{}","peers":{peers}}}"#, state.as_str())
 }
 
-/// If `(state, peers)` differs from what's in `cell`, store it and fire
-/// `riftpipe:mesh-status` on `window` with its JSON (see [`status_json`]) so
-/// any app on the library can render a status pill.
-fn emit_status(cell: &std::cell::RefCell<(LinkState, usize)>, state: LinkState, peers: usize) {
-    if *cell.borrow() == (state, peers) {
-        return;
-    }
-    *cell.borrow_mut() = (state, peers);
+/// The status with no active session (`meshStatus()`, and the event on teardown).
+const IDLE_STATUS: &str = r#"{"state":"idle","peers":0}"#;
+
+/// Fire `riftpipe:mesh-status` on `window` with `detail` (a status JSON) so any
+/// app on the library can render a status pill.
+fn dispatch_status(detail: &str) {
     if let Some(w) = web_sys::window() {
-        let detail = status_json(state, peers);
         let init = web_sys::CustomEventInit::new();
-        init.set_detail(&wasm_bindgen::JsValue::from_str(&detail));
+        init.set_detail(&wasm_bindgen::JsValue::from_str(detail));
         if let Ok(ev) = web_sys::CustomEvent::new_with_event_init_dict("riftpipe:mesh-status", &init) {
             let _ = w.dispatch_event(&ev);
         }
+    }
+}
+
+/// Store `(state, peers)` in `cell` and announce it, changed or not — a new
+/// session's first status must reach the app even if it equals the cell's
+/// initial value (the pill may still show the previous board's).
+fn publish_status(cell: &std::cell::RefCell<(LinkState, usize)>, state: LinkState, peers: usize) {
+    *cell.borrow_mut() = (state, peers);
+    dispatch_status(&status_json(state, peers));
+}
+
+/// [`publish_status`] only if `(state, peers)` differs from what's in `cell`.
+fn emit_status(cell: &std::cell::RefCell<(LinkState, usize)>, state: LinkState, peers: usize) {
+    if *cell.borrow() != (state, peers) {
+        publish_status(cell, state, peers);
     }
 }
 
@@ -1166,7 +1178,7 @@ impl GossipTreeSync {
             // listeners) gates the backoff rejoin and distinguishes "offline".
             let mut ever = false;
             let mut online = navigator_online();
-            emit_status(&st, link_state(0, false, online), 0);
+            publish_status(&st, link_state(0, false, online), 0);
             enum Wake {
                 Stop,
                 Tick,
@@ -1629,7 +1641,11 @@ pub(crate) fn set_active(bs: GossipTreeSync) {
 /// Tear down the active sync: its receive task stops and the topic is left. The
 /// page's `Node` (endpoint) stays bound for the next board.
 pub(crate) fn clear_active() {
-    drop(GOSSIP.with(|c| c.borrow_mut().take()));
+    let old = GOSSIP.with(|c| c.borrow_mut().take());
+    if old.is_some() {
+        drop(old);
+        dispatch_status(IDLE_STATUS);
+    }
 }
 
 /// Route a text push to the mesh if active; `true` if it was handled.
@@ -1707,7 +1723,7 @@ pub fn connected_peers() -> String {
 /// `offline`. Also fired as `riftpipe:mesh-status` on `window` whenever it changes.
 #[wasm_bindgen::prelude::wasm_bindgen(js_name = meshStatus)]
 pub fn mesh_status() -> String {
-    GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.status()).unwrap_or_else(|| r#"{"state":"idle","peers":0}"#.into()))
+    GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.status()).unwrap_or_else(|| IDLE_STATUS.into()))
 }
 
 /// Protocol-version status for the active mesh, as JSON:
@@ -2133,6 +2149,42 @@ mod tests {
     fn mesh_status_is_idle_without_a_session() {
         clear_active();
         assert_eq!(mesh_status(), r#"{"state":"idle","peers":0}"#);
+    }
+
+    /// Every session start announces its status even when it equals the cell's
+    /// initial `(Waiting, 0)`, and teardown announces `idle` — so a pill never
+    /// keeps showing the previous board's "connected" after an in-tab switch.
+    #[wasm_bindgen_test]
+    async fn status_events_mark_session_start_and_teardown() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        clear_active();
+        let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let _listen = WindowListener::add("riftpipe:mesh-status", move |e| {
+            use wasm_bindgen::JsCast;
+            if let Some(d) = e.dyn_ref::<web_sys::CustomEvent>().and_then(|c| c.detail().as_string()) {
+                log.borrow_mut().push(d);
+            }
+        });
+        let node = Node::bind(SecretKey::generate()).await.expect("bind");
+        let secret = riftpipe_core::crypto::generate_secret();
+        let mesh = node.join(secret, None, &[]).await.expect("join");
+        set_active(GossipTreeSync::new(
+            mesh,
+            riftpipe_core::sync::Syncer::new(gossip_agent()),
+            Rc::new(|_, _| {}),
+            Auth::load(DeviceKey::from_seed(&[84; 32]), riftpipe_core::crypto::topic_from_secret(&secret)),
+        ));
+        for _ in 0..100 {
+            if !seen.borrow().is_empty() {
+                break;
+            }
+            sleep_ms(20).await;
+        }
+        assert_eq!(seen.borrow().first().map(String::as_str), Some(r#"{"state":"waiting","peers":0}"#));
+        clear_active();
+        assert_eq!(seen.borrow().last().map(String::as_str), Some(IDLE_STATUS));
     }
 
     #[wasm_bindgen_test]

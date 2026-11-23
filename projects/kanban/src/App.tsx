@@ -112,7 +112,8 @@ export function App() {
     setInterval(refreshAuth, 2000);
 
     // Pasting a share link into this tab changes the hash — reconnect to it.
-    window.addEventListener("hashchange", () => void connect());
+    // The new board's status replaces the old one's on the pill straight away.
+    window.addEventListener("hashchange", () => void connect().then(() => setMesh(meshStatus())));
 
     // The library fires this when a peer speaks a different protocol version.
     window.addEventListener("riftpipe:protocol-mismatch", (e) => {

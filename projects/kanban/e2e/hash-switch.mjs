@@ -52,7 +52,10 @@ try {
   await a.waitForTimeout(3000);
   const leaked = await a.locator(`text=c-card-${r}`).count();
   if (leaked !== 0) throw new Error(`board C's card is still shown on board A (${leaked})`);
-  console.log("A switched back to board A; board C's cards are gone");
+  // Board A has no peer now: the pill must say so, not keep board C's "connected".
+  const pill = (await a.locator(".mesh-status").textContent()) ?? "";
+  if (!pill.includes("waiting")) throw new Error(`stale status pill after the switch back: "${pill}"`);
+  console.log("A switched back to board A; board C's cards are gone; pill:", pill);
 
   console.log("PASS: in-tab board switch both ways — no reload, no rebind");
   code = 0;
