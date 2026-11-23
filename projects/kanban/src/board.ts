@@ -11,8 +11,9 @@
 // (This was previously Rust — `kanban-wasm`'s handler.rs/format.rs. It moved here
 // so the wasm bundle stays a generic file-sync library with nothing kanban-
 // specific baked in.)
-import { read, write, list } from "./fs.ts";
+import { read, write, list, boardId } from "./fs.ts";
 import { logEvent } from "./events.ts";
+import { createEditSettler, EDIT_SETTLE_MS } from "./editSettle.ts";
 
 export interface Card {
   id: string;
@@ -277,24 +278,25 @@ export async function addCard(column: string, title: string): Promise<Card> {
 }
 
 /** Live saves fire per keystroke; history records ONE card.edit per field once
-*  typing settles (final value), and nothing if it ended where it started. */
-export const EDIT_SETTLE_MS = 1500;
-type PendingEdit = { timer: ReturnType<typeof setTimeout>; from: string; to: string };
-const pendingEdits = new Map<string, PendingEdit>();
-function logEditSettled(id: string, field: "title" | "description", from: string, to: string): void {
-  const key = `${id}\u0000${field}`;
-  const prev = pendingEdits.get(key);
-  if (prev) clearTimeout(prev.timer);
-  const entry: PendingEdit = {
-    from: prev?.from ?? from,
-    to,
-    timer: setTimeout(() => {
-      pendingEdits.delete(key);
-      if (entry.to === entry.from) return;
-      void logEvent("card.edit", field === "title" ? { id, field, value: entry.to } : { id, field });
-    }, EDIT_SETTLE_MS),
-  };
-  pendingEdits.set(key, entry);
+*  typing settles (`editSettle.ts`) — on the board it was typed on, or not at all. */
+export { EDIT_SETTLE_MS };
+const editSettler = createEditSettler({
+  settleMs: EDIT_SETTLE_MS,
+  board: boardId,
+  log: (data) => logEvent("card.edit", data),
+});
+
+/** Write pending (unsettled) card.edit events now, before the page switches
+ *  boards or goes away. */
+export function flushPendingEdits(): Promise<void> {
+  return editSettler.flush();
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", () => void flushPendingEdits());
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") void flushPendingEdits();
+  });
 }
 
 export async function patchCard(
@@ -323,9 +325,9 @@ export async function patchCard(
   // Record semantic history — the same events the old server logged.
   if (card.column !== before.column) await logEvent("card.move", { id, from: before.column, to: card.column });
   if (card.done !== before.done) await logEvent("card.check", { id, done: card.done });
-  if (card.title !== before.title) logEditSettled(id, "title", before.title, card.title);
+  if (card.title !== before.title) editSettler.queue(id, "title", before.title, card.title);
   if (patch.description !== undefined && description !== oldDescription) {
-    logEditSettled(id, "description", oldDescription, description);
+    editSettler.queue(id, "description", oldDescription, description);
   }
   return card;
 }

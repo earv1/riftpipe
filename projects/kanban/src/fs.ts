@@ -4,7 +4,7 @@
 // *and* pushes to peers), list a directory, and watch for changes. Nothing here
 // knows what a "board" or "card" is — the kanban model is built on top in
 // `board.ts`, exactly as any other file-based app would build its own.
-import init, { readFile, writeFile as wasmWriteFile, listDir } from "../wasm/pkg/kanban_wasm.js";
+import init, { readFile, writeFile as wasmWriteFile, listDir, activeBoard } from "../wasm/pkg/kanban_wasm.js";
 
 // Initialize the wasm module once, lazily — every file op awaits it, so callers
 // (board.ts and up) never touch init.
@@ -40,6 +40,12 @@ export async function write(path: string, content: string): Promise<void> {
 export async function list(path: string): Promise<string[]> {
   await ready();
   return await listDir(path);
+}
+
+/** An opaque id of the board this file API currently addresses (changes when
+ *  the page switches boards). Call after `ready()`. */
+export function boardId(): string {
+  return activeBoard();
 }
 
 /** Announce a local write to this tab (the lib fires this itself on a remote merge). */

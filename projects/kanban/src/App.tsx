@@ -1,6 +1,6 @@
 import { createMemo, createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, connectPeer, newBoard, watch, storageSupported, auth, startHistory, historyEvents, knownTitles, type AuthState, type PendingRequest, type Member, type Card, type Viewer } from "./api.ts";
+import { getBoard, addCard, patchCard, flushPendingEdits, connectPeer, newBoard, watch, storageSupported, auth, startHistory, historyEvents, knownTitles, type AuthState, type PendingRequest, type Member, type Card, type Viewer } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 import { ActivityPanel } from "./ActivityPanel.tsx";
 
@@ -89,6 +89,9 @@ export function App() {
     const connect = async () => {
       if (location.hash === lastHash) return; // e.g. the host writing its own ticket
       lastHash = location.hash;
+      // A board switch is coming: settle pending card.edit events on the board
+      // they were typed on (they're dropped if it has already switched).
+      await flushPendingEdits();
       try {
         await connectPeer();
       } catch (_e) {
