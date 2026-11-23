@@ -132,14 +132,21 @@ pub async fn iroh_connect(ticket: String, on_change: js_sys::Function) -> Result
     let on_merged = opfs_on_merged(on_change, topic);
     let syncer = crate::opfs::restore_syncer(topic, crate::gossip::gossip_agent()).await;
     let node = page_node(sk).await.map_err(|e| JsValue::from_str(&e))?;
+    // Peers seen on this board before: dialed now too (a reloaded host has no
+    // bootstrap of its own — this is how it finds its joiners again).
+    let known: Vec<iroh::EndpointId> = crate::gossip::load_peer_book(&topic)
+        .ids()
+        .iter()
+        .filter_map(|b| iroh::EndpointId::from_bytes(b).ok())
+        .collect();
 
     let (mesh, my_ticket) = if is_host {
-        let mesh = node.join(secret, None, &[]).await.map_err(|e| JsValue::from_str(&e))?;
+        let mesh = node.join(secret, None, &known).await.map_err(|e| JsValue::from_str(&e))?;
         let addr = node.wait_for_addr().await;
         (mesh, Some(ticket_of(&secret, &addr)))
     } else {
         let addr = parsed.unwrap().1;
-        let mesh = node.join(secret, Some(addr), &[]).await.map_err(|e| JsValue::from_str(&e))?;
+        let mesh = node.join(secret, Some(addr), &known).await.map_err(|e| JsValue::from_str(&e))?;
         (mesh, None)
     };
 

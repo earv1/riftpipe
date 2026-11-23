@@ -10,6 +10,10 @@
 //! bootstraps off it; after that, gossip membership spreads and the host is no
 //! longer special. Every frame is AEAD-sealed with a key derived from the same
 //! secret, so the relay and non-holders see only ciphertext.
+//!
+//! A restarted peer re-dials its remembered peers; total neighbor loss retries
+//! with backoff; NeighborUp sends a Hello so a one-sided reconnect pulls the
+//! other side's missed edits.
 
 use futures_util::{FutureExt, StreamExt};
 use iroh::address_lookup::MemoryLookup;
@@ -19,6 +23,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
+use riftpipe_core::reconnect::{rejoin_targets, PeerBook, Rejoin};
 
 /// The gossip topic for a board secret — `H(secret)`, underivable without the
 /// share link. Identical to the native `sync::mesh::topic_of`.
@@ -782,6 +787,24 @@ fn load_epochs(topic: &[u8; 32]) -> Vec<EpochAnnounce> {
     load_hex_postcard(&epoch_store_key(topic)).unwrap_or_default()
 }
 
+/// localStorage: `riftpipe:peers:<hex topic>` = hex(postcard(PeerBook)).
+const PEERS_STORE_PREFIX: &str = "riftpipe:peers:";
+
+fn peers_store_key(topic: &[u8; 32]) -> String {
+    format!("{PEERS_STORE_PREFIX}{}", hex32(topic))
+}
+
+/// The peers remembered for board `topic` (an empty book if none or corrupt).
+pub(crate) fn load_peer_book(topic: &[u8; 32]) -> PeerBook {
+    load_hex_postcard::<PeerBook>(&peers_store_key(topic))
+        .filter(|b| b.topic() == *topic)
+        .unwrap_or_else(|| PeerBook::new(*topic))
+}
+
+fn persist_peer_book(book: &PeerBook) {
+    store_hex_postcard(&peers_store_key(&book.topic()), book);
+}
+
 /// File-tree sync over the gossip mesh. Local pushes broadcast to everyone; received
 /// messages merge via the N-peer-safe `Syncer`. A new neighbor is caught up by
 /// re-broadcasting our full tree. Tracks direct neighbors + a gossiped routing map.
@@ -993,18 +1016,44 @@ impl GossipTreeSync {
             };
             // Reassembles incoming chunk frames into whole messages.
             let mut assembler = riftpipe_core::sync::MeshAssembler::new();
+            // Peers seen on this board (persisted, so a reload re-dials them) and
+            // the backoff schedule for re-dialing after total neighbor loss.
+            let mut book = load_peer_book(&topic);
+            let mut rejoin = Rejoin::new();
+            rejoin.on_neighbors(0, js_sys::Date::now() as u64);
+            let mut ticks = gloo_timers::future::IntervalStream::new(1_000).fuse();
             enum Wake {
                 Stop,
+                Tick,
                 Ev(Option<Result<Event, iroh_gossip::api::ApiError>>),
             }
             let mut stop = stop_rx.fuse();
             loop {
                 let wake = futures_util::select! {
                     _ = stop => Wake::Stop,
+                    _ = ticks.next() => Wake::Tick,
                     ev = receiver.next().fuse() => Wake::Ev(ev),
                 };
                 let ev = match wake {
                     Wake::Stop => break,
+                    Wake::Tick => {
+                        let now = js_sys::Date::now() as u64;
+                        if rejoin.due(now) {
+                            let targets: Vec<EndpointId> =
+                                rejoin_targets(bootstrap.map(|b| *b.as_bytes()), &book, my_id)
+                                    .iter()
+                                    .filter_map(|b| EndpointId::from_bytes(b).ok())
+                                    .collect();
+                            if !targets.is_empty() {
+                                if let Err(e) = snd.join_peers(targets).await {
+                                    web_sys::console::warn_1(
+                                        &format!("[mesh] re-join failed: {e}").into(),
+                                    );
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     Wake::Ev(Some(Ok(ev))) => ev,
                     Wake::Ev(_) => break,
                 };
@@ -1018,6 +1067,9 @@ impl GossipTreeSync {
                         match gm {
                             MeshMsg::Presence { id, neighbors } => {
                                 if id != my_id {
+                                    if book.note(id, my_id) {
+                                        persist_peer_book(&book);
+                                    }
                                     let now = js_sys::Date::now() as u64;
                                     if let Some(p) = vs.borrow_mut().on_presence(id, now) {
                                         report_mismatch(&p);
@@ -1072,7 +1124,7 @@ impl GossipTreeSync {
                             }
                         }
                     }
-                    Event::NeighborUp(_) => {
+                    Event::NeighborUp(id) => {
                         // Announce our protocol version BEFORE the Presence —
                         // that ordering is what lets peers deduce "Presence
                         // but no Version = pre-versioning peer".
@@ -1092,6 +1144,15 @@ impl GossipTreeSync {
                         if let Some(r) = rr {
                             send(&snd, &cph, &r, false).await;
                         }
+                        // A Hello makes a one-sided reconnect bidirectional: the
+                        // peer replies with what WE lack (e.g. its gap edits while
+                        // we were down). iroh-gossip emits NeighborUp only on the
+                        // side that sees a new active peer.
+                        let hello = sy.borrow().hello();
+                        let mm = au.borrow().sign(hello);
+                        if let Some(mm) = mm {
+                            send(&snd, &cph, &mm, true).await;
+                        }
                         let full = sy.borrow().full_state();
                         for msg in full {
                             let mm = au.borrow().sign(msg);
@@ -1102,7 +1163,12 @@ impl GossipTreeSync {
                         let list = snapshot(&receiver);
                         *nb.borrow_mut() = list.iter().copied().collect();
                         rt.borrow_mut().insert(my_id, list.clone());
+                        let n = list.len();
                         send(&snd, &cph, &MeshMsg::Presence { id: my_id, neighbors: list }, false).await;
+                        if book.note(*id.as_bytes(), my_id) {
+                            persist_peer_book(&book);
+                        }
+                        rejoin.on_neighbors(n, js_sys::Date::now() as u64);
                     }
                     Event::NeighborDown(_) => {
                         let ours = riftpipe_core::sync::PROTOCOL_VERSION;
@@ -1110,18 +1176,9 @@ impl GossipTreeSync {
                         let list = snapshot(&receiver);
                         *nb.borrow_mut() = list.iter().copied().collect();
                         // Total neighbor loss: hyparview refills only from its
-                        // passive view — it never re-dials the original
-                        // bootstrap. We still hold its address (MemoryLookup),
-                        // so ask the swarm to re-join it.
-                        if list.is_empty() {
-                            if let Some(b) = bootstrap {
-                                if let Err(e) = snd.join_peers(vec![b]).await {
-                                    web_sys::console::warn_1(
-                                        &format!("[mesh] re-join failed: {e}").into(),
-                                    );
-                                }
-                            }
-                        }
+                        // passive view — it never re-dials the bootstrap or the
+                        // peers we remember. The tick arm retries with backoff.
+                        rejoin.on_neighbors(list.len(), js_sys::Date::now() as u64);
                         rt.borrow_mut().insert(my_id, list.clone());
                         send(&snd, &cph, &MeshMsg::Presence { id: my_id, neighbors: list }, false).await;
                     }
@@ -1546,6 +1603,24 @@ mod tests {
             Some(s) => store.set_item("riftpipe:board_secret", &s).unwrap(),
             None => store.remove_item("riftpipe:board_secret").unwrap(),
         }
+    }
+
+    /// Offline: remembered peers are stored per board — another board's book is
+    /// never dialed, and a book stored under the wrong board's key is ignored.
+    #[wasm_bindgen_test]
+    fn peer_book_persists_per_board() {
+        let topic_a = riftpipe_core::crypto::generate_secret();
+        let topic_b = riftpipe_core::crypto::generate_secret();
+        let peer = [7u8; 32];
+        let mut book = PeerBook::new(topic_a);
+        assert!(book.note(peer, [1; 32]));
+        persist_peer_book(&book);
+        assert_eq!(load_peer_book(&topic_a).ids(), &[peer], "board A remembers its peer");
+        assert!(load_peer_book(&topic_b).ids().is_empty(), "board B remembers nothing");
+
+        store_hex_postcard(&peers_store_key(&topic_b), &book);
+        let b = load_peer_book(&topic_b);
+        assert!(b.ids().is_empty() && b.topic() == topic_b, "a foreign book under B's key is ignored");
     }
 
     /// Offline: a board known claimed only from its OPFS marker (localStorage —
