@@ -22,8 +22,8 @@ import {
   pendingRequests,
   authState,
 } from "../wasm/pkg/kanban_wasm.js";
-import { ready, watch } from "./fs.ts";
-import { readEvents } from "./events.ts";
+import { list, ready, watch } from "./fs.ts";
+import { logEvent, readEvents } from "./events.ts";
 
 // Domain model + types (Board, Card, Comment, CardDetail, getBoard, addCard,
 // patchCard, getCardDetail, addComment, …) — over the file API.
@@ -33,6 +33,10 @@ export * from "./board.ts";
 export { watch, read as readFile, write as writeFile, list as listDir } from "./fs.ts";
 // The synced, cross-peer event log (history + debugging).
 export { logEvent, readEvents, onEvent, type RiftEvent } from "./events.ts";
+// The shared, live history store (Activity panel + per-card History) and the
+// pure history helpers (labels, relative time, describe, filters) it's built on.
+export { events as historyEvents, now as historyNow, startHistory } from "./historyStore.ts";
+export * from "./history.ts";
 
 // The auth surface, backed entirely by the lib (wasm). Also on window.riftpipe
 // for console use:
@@ -44,6 +48,8 @@ export { logEvent, readEvents, onEvent, type RiftEvent } from "./events.ts";
 //   riftpipe.revokeDevice(id)    → admin-only: remove a device (rotates the read key)
 //   riftpipe.boardMembers()      → authorized devices [{device,role,founder,me}]
 //   riftpipe.authState()         → { locked, device, authorized, isAuthor, author, requested, canRead, epoch }
+//   riftpipe.logEvent(kind, data)    → append a debug event to this device's log
+//   riftpipe.listDir(path)           → entry names under a synced tree path
 export type AuthState = {
   locked: boolean;
   device: string;
@@ -78,6 +84,8 @@ export const auth = {
   boardMembers: () => JSON.parse(boardMembers()),
   authState: () => JSON.parse(authState()),
   readEvents: () => readEvents(),
+  logEvent: (kind: string, data: Record<string, unknown> = {}) => logEvent(kind, data),
+  listDir: (p: string) => list(p),
 };
 
 // Build-time config (Vite env). Set these for a deployed/cross-network build:
