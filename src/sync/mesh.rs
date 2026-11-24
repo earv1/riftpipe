@@ -769,8 +769,8 @@ pub async fn run(
                                 if let Some(c) = ob.hello {
                                     ae.on_hello(ae_now(), from, c.consistent());
                                 }
-                                for r in &ob.swarm {
-                                    out.swarm(r);
+                                for (key, r) in ob.keyed_swarm() {
+                                    out.push(Scope::Swarm, key, &r);
                                 }
                             }
                         }

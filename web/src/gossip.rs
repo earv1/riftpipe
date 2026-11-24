@@ -1506,10 +1506,13 @@ impl GossipTreeSync {
                                         on_merged(path.clone(), bytes);
                                         save_record(topic, &sy, &path);
                                     }
+                                    // A reply `Lww` is keyed: the same current-state
+                                    // reply to several Hellos collapses while queued.
                                     for r in replies {
+                                        let key = coalesce_key(&r);
                                         let mm = au.borrow().sign(r);
                                         if let Some(mm) = mm {
-                                            out.swarm(&mm);
+                                            out.push(Scope::Swarm, key, &mm);
                                         }
                                     }
                                 }

@@ -182,13 +182,23 @@ pub(crate) struct Outbound {
     /// To the whole swarm — every reply, including a `Hello`'s (see `SyncMsg::Hello`
     /// for why those can't go neighbors-only), a Resync answer, epoch housekeeping.
     pub(crate) swarm: Vec<MeshMsg>,
+    /// `swarm[i]`'s outbound-queue coalescing key (`outqueue::coalesce_key` of the
+    /// unwrapped reply), so identical `Lww` replies — several Hellos answered
+    /// from the same current state — replace each other while queued. Empty =
+    /// all unkeyed.
+    swarm_keys: Vec<Option<String>>,
     /// How an applied Hello compared to our state (anti-entropy).
     pub(crate) hello: Option<HelloCmp>,
 }
 
 impl Outbound {
     fn swarm(swarm: Vec<MeshMsg>) -> Self {
-        Outbound { swarm, hello: None }
+        Outbound { swarm, swarm_keys: Vec::new(), hello: None }
+    }
+    /// Every swarm message with its coalescing key.
+    pub(crate) fn keyed_swarm(self) -> impl Iterator<Item = (Option<String>, MeshMsg)> {
+        let keys = self.swarm_keys.into_iter().chain(std::iter::repeat(None));
+        keys.zip(self.swarm)
     }
 }
 
@@ -404,9 +414,15 @@ impl TreePeer {
             _ => return Outbound::default(),
         };
         let hello = self.syncer.compare_hello(&inner);
-        let swarm: Vec<MeshMsg> =
-            self.apply_and_persist(inner, dir).into_iter().filter_map(|r| self.sign_mesh(r)).collect();
-        Outbound { swarm, hello }
+        let (swarm_keys, swarm) = self
+            .apply_and_persist(inner, dir)
+            .into_iter()
+            .filter_map(|r| {
+                let key = riftpipe_core::outqueue::coalesce_key(&r);
+                self.sign_mesh(r).map(|m| (key, m))
+            })
+            .unzip();
+        Outbound { swarm, swarm_keys, hello }
     }
 
     /// Auth-aware receive for every mesh message the driver doesn't handle itself
@@ -1604,6 +1620,35 @@ mod tests {
         let again = b.authorize_and_apply(a.sign_mesh(a.hello()).unwrap(), &db);
         assert!(again.hello.expect("a Hello is compared").consistent());
 
+        for d in [&da, &db] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A Hello's `Lww` reply carries its path's coalescing key, so the same reply
+    /// to several neighbors' Hellos collapses in the outbound queue.
+    #[test]
+    fn hello_lww_replies_carry_their_coalescing_key() {
+        let (da, db) = (dir("ae-key-a"), dir("ae-key-b"));
+        let (mut a, b) = (TreePeer::new(), TreePeer::new());
+        std::fs::write(da.join("x.toml"), "v1").unwrap();
+        a.local_change(&da.join("x.toml"), &da).expect("a local write");
+        std::fs::write(da.join("n.md"), "# n\n").unwrap();
+        a.local_change(&da.join("n.md"), &da).expect("a local text write");
+        let out = a.authorize_and_apply(b.sign_mesh(b.hello()).unwrap(), &da);
+        let keys: Vec<Option<String>> = out.keyed_swarm().map(|(k, _)| k).collect();
+        assert_eq!(keys.len(), 2, "both files go back");
+        assert!(keys.contains(&Some("lww:x.toml".into())), "the LWW reply is keyed: {keys:?}");
+        assert!(keys.contains(&None), "a text delta stays unkeyed: {keys:?}");
+
+        let mut q = riftpipe_core::outqueue::OutQueue::new();
+        for _ in 0..3 {
+            let out = a.authorize_and_apply(b.sign_mesh(b.hello()).unwrap(), &da);
+            for (key, m) in out.keyed_swarm() {
+                q.push(riftpipe_core::outqueue::Scope::Swarm, key, &m);
+            }
+        }
+        assert_eq!(q.coalesced(), 2, "three identical LWW replies leave one queued");
         for d in [&da, &db] {
             std::fs::remove_dir_all(d).ok();
         }
