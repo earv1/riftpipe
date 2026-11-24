@@ -560,6 +560,17 @@ pub struct TreeTombstone {
     pub prior: Vec<u64>,
 }
 
+/// Whether a deleter whose doc reached frontier `vv` had seen every op of `doc` (same doc, the
+/// caller checks the origin): `doc.ops_since(vv)` is none, OR each tip `(agent, seq)` of `doc` has
+/// some `(agent, s ≥ seq)` in `vv`. The per-agent half is what judges a doc that is BEHIND tips
+/// `vv` names but `doc` lacks — `ops_since` drops unknown tips, so to it a lagging copy looks
+/// ahead. Sound because one agent's ops form a causal chain: holding `(agent, s)` means holding
+/// all of that agent's earlier ops and their history.
+fn seen_by(doc: &EgWalkerText, vv: &Vv) -> bool {
+    doc.ops_since(vv).is_none()
+        || doc.version_vector().iter().all(|(a, seq)| vv.iter().any(|(b, s)| a == b && s >= seq))
+}
+
 /// `t` as the `Delete` for `path`.
 fn delete_msg(path: &str, t: &TreeTombstone) -> SyncMsg {
     SyncMsg::Delete {
@@ -1329,7 +1340,7 @@ impl Syncer {
             if p.tomb.origin.as_ref() != Some(&origin) {
                 return None;
             }
-            let covered = doc.ops_since(&p.tomb.vv).is_none() || {
+            let covered = seen_by(doc, &p.tomb.vv) || {
                 let mut deleted = EgWalkerText::new(&self.agent);
                 !p.ops.is_empty() && deleted.merge(&p.ops) && tips.iter().all(|(a, s)| deleted.knows(a, *s))
             };
@@ -1459,7 +1470,7 @@ impl Syncer {
         let stale = match self.docs.get(&path) {
             Some(d) => {
                 d.origin().is_none()
-                    || (d.origin() == origin && d.ops_since(&vv).is_none())
+                    || (d.origin() == origin && seen_by(d, &vv))
                     || seen.contains(&fingerprint(d.content().as_bytes()))
             }
             None => {
@@ -1528,7 +1539,7 @@ impl Syncer {
             // New ops for us — but maybe not past the delete: our kept doc can be behind `t.vv`
             // (we accepted a re-asserted `Delete`, or merged another deleter's tips), so a late or
             // reordered delta the deleter had already seen must not undo it.
-            if doc.ops_since(&tomb.t.vv).is_none()
+            if seen_by(doc, &tomb.t.vv)
                 || tomb.t.seen.contains(&fingerprint(doc.content().as_bytes()))
             {
                 union_tips(&mut tomb.t.vv, &vv);
@@ -1549,7 +1560,7 @@ impl Syncer {
         self.parked.remove(&path);
         let t = &self.tombs[&path].t;
         let causally_seen =
-            t.origin.is_some() && fresh.origin() == t.origin && fresh.ops_since(&t.vv).is_none();
+            t.origin.is_some() && fresh.origin() == t.origin && seen_by(&fresh, &t.vv);
         // An empty doc (no origin) holds nothing to bring back.
         if fresh.origin().is_none()
             || causally_seen
@@ -3633,5 +3644,48 @@ mod tests {
             assert_eq!(text_of(s, "x.md").as_deref(), Some("new\n"), "peer {i}");
             assert!(!s.is_tombstoned("x.md"));
         }
+    }
+
+    /// Several deltas overtaken by their (small) `Delete`: a peer that is behind accepts the
+    /// delete at once (its tips are dominated per agent by the deleter's frontier), and a late
+    /// delta that is NOT the deleter's last one — so its tip isn't named in `t.vv` — still keeps
+    /// the path deleted; a genuinely newer edit still revives it.
+    #[test]
+    fn late_deltas_short_of_the_deleters_frontier_never_revive() {
+        let mut a = Syncer::new("a");
+        let mut b = Syncer::new("b");
+        let mut c = Syncer::new("c");
+        let t = a.local_text("x.md", "v1\n").unwrap();
+        b.receive(dup(&t));
+        c.receive(dup(&t));
+        let d2 = a.local_text("x.md", "v1\nv2\n").unwrap(); // overtaken
+        c.receive(dup(&d2));
+        let d3 = a.local_text("x.md", "v1\nv2\nv3\n").unwrap(); // overtaken
+        c.receive(dup(&d3));
+        let d = a.local_delete("x.md").unwrap();
+
+        let r = b.receive(dup(&d));
+        assert_eq!(r.change, Some(Change::Remove { path: "x.md".into() }), "behind, but seen by the deleter");
+        let r = b.receive(dup(&d2));
+        assert!(r.change.is_none(), "d2 is short of the deleter's frontier: no revival");
+        assert!(b.is_tombstoned("x.md"));
+        assert!(matches!(r.replies.as_slice(), [SyncMsg::Delete { .. }]));
+        let r = b.receive(dup(&d3));
+        assert!(r.change.is_none() && b.is_tombstoned("x.md"), "nor d3");
+
+        // The same after a re-assert round (the tombstone's vv also names the behind peer's tip,
+        // which `ops_since` CAN map — and so maps d2 as ahead of it).
+        let mut q = Syncer::new("q");
+        q.receive(dup(&t));
+        let mut p = vec![a, q];
+        flood(&mut p, 0, vec![dup(&d)]);
+        assert!(p[1].is_tombstoned("x.md"));
+        assert!(p[1].receive(dup(&d2)).change.is_none(), "d2 after a re-assert round: no revival");
+        assert!(p[1].is_tombstoned("x.md"));
+
+        let e = c.local_text("x.md", "v1\nv2\nv3\nv4 by c\n").unwrap();
+        let r = b.receive(dup(&e));
+        assert!(matches!(r.change, Some(Change::Write { .. })), "a newer edit beats the delete");
+        assert_eq!(text_of(&b, "x.md").as_deref(), Some("v1\nv2\nv3\nv4 by c\n"));
     }
 }

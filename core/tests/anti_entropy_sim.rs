@@ -685,6 +685,36 @@ fn lossy_delete_recreate_delete_ends_deleted() {
     println!("queued, 30% loss: delete/re-create/delete converged within {max_ticks} ticks");
 }
 
+/// Edits right before their delete, under loss: p3 edits card-3 on two consecutive ticks and
+/// deletes it on the next, so its deltas can arrive after the (small) `Delete` — every peer
+/// must still end deleted (a late delta the deleter had seen never revives the card).
+#[test]
+fn lossy_edits_overtaken_by_their_delete_end_deleted() {
+    let mut max_ticks = 0;
+    for seed in 1..=24 {
+        let mut sim = Sim::new(seed, 0.30, true).with_queues(16 * 1024, 4 * 1024);
+        sim.run_workload(120);
+        sim.settle(480).unwrap_or_else(|| panic!("seed {seed}: the workload didn't converge"));
+        for n in 0..2 {
+            sim.step(|sim| {
+                let s = &mut sim.peers[3].syncer;
+                let card = format!("{}late edit {n}\n", text_of(s, "card-3.md"));
+                vec![(3, s.local_text("card-3.md", &card).expect("a real edit"))]
+            });
+        }
+        sim.step(|sim| vec![(3, sim.peers[3].syncer.local_delete("card-3.md").expect("p3 holds card-3.md"))]);
+        let ticks = sim
+            .settle(480)
+            .unwrap_or_else(|| panic!("seed {seed}: edits + delete not converged"));
+        for (i, p) in sim.peers.iter().enumerate() {
+            assert!(p.syncer.is_tombstoned("card-3.md"), "seed {seed}: peer {i} revived card-3.md");
+        }
+        assert_pairwise_consistent(&sim);
+        max_ticks = max_ticks.max(ticks);
+    }
+    println!("queued, 30% loss: edits overtaken by their delete converged within {max_ticks} ticks");
+}
+
 #[test]
 fn control_without_anti_entropy_tail_loss_persists() {
     let unconverged: Vec<u64> = (1..=20)
