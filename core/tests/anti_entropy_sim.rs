@@ -3,7 +3,7 @@
 //! anti-entropy scheduler exactly as the mesh drivers drive it (`poll` every
 //! `AE_TICK_MS`, neighbors-only `Hello`, `compare_hello` → `on_hello`, every reply
 //! swarm-wide). Proves that periodic `Hello`s repair whatever the lossy broadcasts
-//! dropped, and that a converged idle mesh goes nearly silent — also when, as in
+//! dropped, and that a converged idle mesh goes silent — and converges also when, as in
 //! iroh-gossip's plumtree, a neighbors-only message never crosses a LAZY edge
 //! (pruned cycle edges, or one side's stale view after a restart). Public API only.
 
@@ -125,6 +125,8 @@ struct Sim {
     tick: u64,
     /// Peer 0's growing LWW event log (`events/p0.jsonl`).
     p0_log: String,
+    /// A peer that makes no local edits (see `PLUMTREE_LAZY_ASYMMETRIC`).
+    read_only: Option<usize>,
 }
 
 /// `s.hello()` with its (HashMap-ordered) inventories sorted — same meaning,
@@ -203,6 +205,7 @@ impl Sim {
             anti_entropy,
             tick: 0,
             p0_log: String::new(),
+            read_only: None,
         }
     }
 
@@ -237,6 +240,9 @@ impl Sim {
                 .local_lww("events/p0.jsonl", bytes, t * 250 + 1),
         ));
         for p in 1..PEERS {
+            if self.read_only == Some(p) {
+                continue;
+            }
             // Plan deviation: `t % 4 == p` never fires for p = 4, so peer p takes
             // the slot `t % 4 == p - 1`.
             if t % 4 != p as u64 - 1 {
@@ -366,15 +372,22 @@ const PLUMTREE_LAZY: &[(usize, usize)] = &[(0, 4), (4, 0), (0, 2), (2, 0)];
 /// 0–4 lazy both ways, and a stale one-sided view: 3 holds 4 as lazy while 4
 /// still holds 3 as eager (as after 4 restarted under the same key, or a prune
 /// racing 4's Hello). 4's Hellos reach only 3, and only a swarm-wide reply gets
-/// back to 4 — with neighbors-only replies this case never converges.
+/// back to 4 — with neighbors-only replies this case never converges. Nobody's
+/// Hello reaches 4 either, so 4's OWN writes would ride only their original
+/// broadcast; in iroh that one-sided view heals by `IHave` → `Graft` on 3's
+/// next swarm message, which the sim doesn't model — so 4 makes no edits here.
 const PLUMTREE_LAZY_ASYMMETRIC: &[(usize, usize)] = &[(0, 4), (4, 0), (3, 4)];
 
 #[test]
 fn lazy_edges_still_converge() {
-    for (name, lazy) in [("spanning tree", PLUMTREE_LAZY), ("one-sided stale", PLUMTREE_LAZY_ASYMMETRIC)] {
+    for (name, lazy, read_only) in [
+        ("spanning tree", PLUMTREE_LAZY, None),
+        ("one-sided stale", PLUMTREE_LAZY_ASYMMETRIC, Some(4)),
+    ] {
         let mut max_ticks = 0;
         for seed in 1..=20 {
             let mut sim = Sim::with_lazy(seed, 0.30, true, lazy);
+            sim.read_only = read_only;
             sim.run_workload(120);
             let ticks = sim
                 .settle(240)
@@ -409,7 +422,7 @@ fn lazy_edges_idle_cost_is_bounded() {
 }
 
 #[test]
-fn converged_idle_mesh_is_nearly_silent() {
+fn converged_idle_mesh_is_silent() {
     let mut sim = Sim::new(1, 0.0, true);
     sim.run_workload(40);
     sim.settle(480).expect("lossless mesh converges");
@@ -425,9 +438,9 @@ fn converged_idle_mesh_is_nearly_silent() {
             "peer {i}: {late} Hello(s) in the final 300 s (stats {:?})",
             p.ae.stats()
         );
-        assert!(
-            late <= 5,
-            "peer {i} sent {late} Hellos in the final 300 s of idle"
+        assert_eq!(
+            late, 0,
+            "peer {i} sent {late} Hellos in the final 300 s of a converged, fully-eager idle mesh"
         );
     }
 }

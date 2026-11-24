@@ -9,6 +9,10 @@ pub const AE_QUIET_MS: u64 = 1_500;
 pub const AE_MAX_DEFER_MS: u64 = 10_000;
 pub const AE_MIN_GAP_MS: u64 = 1_000;
 pub const AE_INCONSISTENT_GAP_MIN_MS: u64 = 8_000;
+/// Minimum gap between loss-triggered resets (doubling up to `AE_IMAX_MS` while
+/// losses keep coming): a peer under sustained loss must not answer every
+/// `Lagged` with a Hello, each of which draws diffs from every neighbor ahead.
+pub const AE_LOSS_GAP_MIN_MS: u64 = 8_000;
 /// How often drivers call `poll`.
 pub const AE_TICK_MS: u64 = 250;
 
@@ -26,11 +30,16 @@ pub struct AntiEntropy {
     last_sent: Option<u64>,
     generation: u64,
     changed: bool,
+    /// A neighbor just became confirmed: send it one Hello so it can confirm us
+    /// too (it only does on a Hello from us), else it keeps probing us.
+    ack: bool,
     activity_first: Option<u64>,
     activity_last: u64,
     confirmed: std::collections::HashSet<[u8; 32]>,
     inc_gap: u64,
     last_inc_reset: Option<u64>,
+    loss_gap: u64,
+    last_loss_reset: Option<u64>,
     rng: u64,
     stats: AeStats,
 }
@@ -44,11 +53,14 @@ impl AntiEntropy {
             last_sent: None,
             generation: 0,
             changed: true,
+            ack: false,
             activity_first: None,
             activity_last: now,
             confirmed: std::collections::HashSet::new(),
             inc_gap: AE_INCONSISTENT_GAP_MIN_MS,
             last_inc_reset: None,
+            loss_gap: AE_LOSS_GAP_MIN_MS,
+            last_loss_reset: None,
             rng,
             stats: AeStats::default(),
         };
@@ -90,6 +102,7 @@ impl AntiEntropy {
     pub fn on_sent(&mut self, now: u64) {
         self.last_sent = Some(now);
         self.changed = false;
+        self.ack = false;
         self.stats.sent += 1;
         self.schedule_next(now);
     }
@@ -98,15 +111,41 @@ impl AntiEntropy {
         self.confirmed.clear();
         self.changed = true;
         self.stats.losses += 1;
-        self.reset(now);
+        // `changed` alone makes the next scheduled round go out; the immediate
+        // reset is rate-limited, backing off while losses keep coming and
+        // starting over after a loss-free stretch.
+        if self.last_loss_reset.is_none_or(|t| now >= t + self.loss_gap) {
+            if let Some(t) = self.last_loss_reset {
+                self.loss_gap = if now < t + 2 * self.loss_gap {
+                    (self.loss_gap * 2).min(AE_IMAX_MS)
+                } else {
+                    AE_LOSS_GAP_MIN_MS
+                };
+            }
+            self.last_loss_reset = Some(now);
+            self.reset(now);
+        }
     }
 
     pub fn on_hello(&mut self, now: u64, from: [u8; 32], consistent: bool) {
         if consistent {
-            self.confirmed.insert(from);
+            if self.confirmed.insert(from) {
+                // Unconfirmed → confirmed: one Hello back. On the other side we
+                // are then already confirmed, so the exchange ends there.
+                self.ack = true;
+                let at = now + self.rand_in(AE_IMIN_MS / 4, AE_IMIN_MS / 2);
+                self.next_at = self.next_at.min(at);
+            }
             return;
         }
         self.confirmed.remove(&from);
+        // While our own state is still changing, the quiet / max-defer timer in
+        // `poll` already schedules the next round; resetting here too would make
+        // two editing neighbors (whose Hellos always mismatch while edits are in
+        // flight) answer each other's Hellos at the 1 s floor.
+        if self.activity_first.is_some() {
+            return;
+        }
         if self.last_inc_reset.is_none_or(|t| now >= t + self.inc_gap) {
             if self.last_inc_reset.is_some() {
                 self.inc_gap = (self.inc_gap * 2).min(AE_IMAX_MS);
@@ -122,8 +161,9 @@ impl AntiEntropy {
             self.generation = generation;
             self.changed = true;
             self.confirmed.clear();
+            // A fresh change restarts the mismatch backoff at its minimum gap, but
+            // the gap still runs from the last mismatch reset (not from now).
             self.inc_gap = AE_INCONSISTENT_GAP_MIN_MS;
-            self.last_inc_reset = None;
             self.activity_first.get_or_insert(now);
             self.activity_last = now;
         }
@@ -139,7 +179,9 @@ impl AntiEntropy {
         if self.last_sent.is_some_and(|t| now < t + AE_MIN_GAP_MS) {
             return false;
         }
-        if neighbors.is_empty() || (!self.changed && neighbors.iter().all(|n| self.confirmed.contains(n))) {
+        if neighbors.is_empty()
+            || (!self.changed && !self.ack && neighbors.iter().all(|n| self.confirmed.contains(n)))
+        {
             self.schedule_next(now);
             self.stats.skipped += 1;
             return false;
@@ -231,8 +273,46 @@ mod tests {
         ae.on_hello(t0, N1, true);
         let sends = drive(&mut ae, t0 + AE_TICK_MS, t0 + 600_000, &[N1], 0, |_, _| {});
         assert_min_gap(&sends);
-        assert!(sends.is_empty(), "confirmed neighbor should stay silent: {sends:?}");
+        assert_eq!(sends.len(), 1, "one Hello back to the newly confirmed neighbor, then silence: {sends:?}");
+        assert!(sends[0] <= t0 + AE_IMIN_MS / 2 + AE_MIN_GAP_MS + AE_TICK_MS);
+        ae.on_hello(t0 + 600_000, N1, true);
+        let later = drive(&mut ae, t0 + 600_000, t0 + 1_200_000, &[N1], 0, |_, _| {});
+        assert!(later.is_empty(), "an already-confirmed neighbor's Hello needs no answer: {later:?}");
         assert!(ae.stats().skipped > 0);
+    }
+
+    /// One-sided confirmation: B's first Hello reaches A before A caught up (a
+    /// mismatch), then A catches up (its generation moves) and sends a Hello B
+    /// finds consistent. B — with nothing changed — would skip, leaving A
+    /// unconfirmed about B and probing forever; B's one Hello back ends it.
+    #[test]
+    fn one_sided_confirmation_is_answered_then_silent() {
+        let (na, nb) = ([0xA; 32], [0xB; 32]);
+        let mut a = AntiEntropy::new(0, 3);
+        let mut b = AntiEntropy::new(0, 4);
+        let (mut sa, mut sb) = (Vec::new(), Vec::new());
+        let (mut a_gen, mut caught_up) = (0u64, false);
+        let mut now = 0;
+        while now < 900_000 {
+            if !caught_up && !sb.is_empty() && now >= sb[0] + 20_000 {
+                a_gen += 1; // A applies the write B's Hello told it about
+                caught_up = true;
+            }
+            if a.poll(now, a_gen, &[nb]) {
+                sa.push(now);
+                b.on_hello(now, na, caught_up);
+            }
+            if b.poll(now, 0, &[na]) {
+                sb.push(now);
+                a.on_hello(now, nb, caught_up);
+            }
+            now += AE_TICK_MS;
+        }
+        assert_min_gap(&sa);
+        assert_min_gap(&sb);
+        assert!(caught_up);
+        let late = sa.iter().chain(&sb).filter(|&&t| t >= 60_000).count();
+        assert_eq!(late, 0, "still probing long after convergence: A {sa:?} B {sb:?}");
     }
 
     #[test]
@@ -292,6 +372,47 @@ mod tests {
         );
     }
 
+    /// Two neighbors both editing continuously, each hearing the other's Hello
+    /// as a mismatch (edits in flight): the mismatches must not reset the
+    /// schedule on every Hello — activity already schedules the next round.
+    #[test]
+    fn sustained_editing_does_not_ping_pong() {
+        let (na, nb) = ([0xA; 32], [0xB; 32]);
+        let mut a = AntiEntropy::new(0, 7);
+        let mut b = AntiEntropy::new(0, 8);
+        // Converge and confirm each other first.
+        let mut now = 0;
+        while now < 60_000 {
+            if a.poll(now, 0, &[nb]) {
+                b.on_hello(now, na, true);
+            }
+            if b.poll(now, 0, &[na]) {
+                a.on_hello(now, nb, true);
+            }
+            now += AE_TICK_MS;
+        }
+        let t0 = now;
+        let (mut sa, mut sb) = (Vec::new(), Vec::new());
+        let mut generation = 0u64;
+        while now < t0 + 30_000 {
+            generation += 1;
+            if a.poll(now, generation, &[nb]) {
+                sa.push(now);
+                b.on_hello(now, na, false);
+            }
+            if b.poll(now, generation, &[na]) {
+                sb.push(now);
+                a.on_hello(now, nb, false);
+            }
+            now += AE_TICK_MS;
+        }
+        assert_min_gap(&sa);
+        assert_min_gap(&sb);
+        println!("30 s of sustained editing: A sent {}, B sent {}", sa.len(), sb.len());
+        assert!(sa.len() <= 6 && sb.len() <= 6, "ping-pong: A {sa:?} B {sb:?}");
+        assert!(!sa.is_empty() && !sb.is_empty(), "rounds still happen during activity");
+    }
+
     #[test]
     fn inconsistent_hellos_are_rate_limited() {
         let mut ae = AntiEntropy::new(0, 7);
@@ -347,6 +468,29 @@ mod tests {
             first_after <= t0 + AE_TICK_MS + AE_IMIN_MS / 2 + AE_TICK_MS,
             "send too late after loss: {first_after}"
         );
+    }
+
+    /// A loss on every tick (a peer drowning in `Lagged`) still backs off.
+    #[test]
+    fn sustained_loss_is_rate_limited() {
+        let mut ae = AntiEntropy::new(0, 7);
+        let first = drive(&mut ae, 0, AE_IMIN_MS + AE_TICK_MS, &[N1], 0, |_, _| {});
+        let t0 = *first.last().unwrap();
+        ae.on_hello(t0, N1, true);
+        let mut sends = Vec::new();
+        let mut now = t0 + AE_TICK_MS;
+        while now < t0 + 600_000 {
+            ae.on_loss(now);
+            if ae.poll(now, 0, &[N1]) {
+                sends.push(now);
+            }
+            now += AE_TICK_MS;
+        }
+        assert_min_gap(&sends);
+        let first_send = sends.first().copied().expect("a loss forces a round");
+        assert!(first_send <= t0 + AE_TICK_MS + AE_IMIN_MS / 2 + AE_TICK_MS, "first send too late: {first_send}");
+        println!("600 s of a loss every tick: {} sends", sends.len());
+        assert!(sends.len() <= 60, "loss-driven sends not rate-limited: {}", sends.len());
     }
 
     #[test]
