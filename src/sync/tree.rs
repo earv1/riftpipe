@@ -28,7 +28,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use riftpipe_core::epoch::{AccessMode, EpochBook, Ingested, OpenError};
 use riftpipe_core::identity::{DeviceKey, Role, TrustEntry, TrustLog};
 use riftpipe_core::onboard::JoinRequest;
-use riftpipe_core::sync::{record_name, DurablePath, MeshMsg, Restored, SyncMsg, Syncer};
+use riftpipe_core::sync::{record_name, DurablePath, HelloCmp, MeshMsg, Restored, SyncMsg, Syncer};
 
 use crate::net::{anyerr, Result, Sink, Source};
 use crate::sync::control::{clean_name, is_canonical_name, NAME_MAX_BYTES};
@@ -183,11 +183,13 @@ pub(crate) struct Outbound {
     pub(crate) swarm: Vec<MeshMsg>,
     /// To direct neighbors only: replies to a (neighbors-only) `Hello`.
     pub(crate) neighbors: Vec<MeshMsg>,
+    /// How an applied Hello compared to our state (anti-entropy).
+    pub(crate) hello: Option<HelloCmp>,
 }
 
 impl Outbound {
     fn swarm(swarm: Vec<MeshMsg>) -> Self {
-        Outbound { swarm, neighbors: Vec::new() }
+        Outbound { swarm, neighbors: Vec::new(), hello: None }
     }
     /// Every message, regardless of scope.
     pub(crate) fn all(self) -> Vec<MeshMsg> {
@@ -409,12 +411,13 @@ impl TreePeer {
         // A Hello arrives neighbors-only, so its replies (up to our whole tree, for
         // a fresh joiner) go back neighbors-only too — not flooded to the swarm.
         let to_neighbors = inner.replies_go_to_neighbors();
+        let hello = self.syncer.compare_hello(&inner);
         let replies: Vec<MeshMsg> =
             self.apply_and_persist(inner, dir).into_iter().filter_map(|r| self.sign_mesh(r)).collect();
         if to_neighbors {
-            Outbound { swarm: Vec::new(), neighbors: replies }
+            Outbound { swarm: Vec::new(), neighbors: replies, hello }
         } else {
-            Outbound { swarm: replies, neighbors: Vec::new() }
+            Outbound { swarm: replies, neighbors: Vec::new(), hello }
         }
     }
 
@@ -824,6 +827,11 @@ impl TreePeer {
     /// exactly what we lack).
     pub(crate) fn hello(&self) -> SyncMsg {
         self.syncer.hello()
+    }
+
+    /// The syncer's change counter — the mesh driver feeds it to `AntiEntropy::poll`.
+    pub(crate) fn generation(&self) -> u64 {
+        self.syncer.generation()
     }
 
     /// Load every file already on disk into the syncer — the native mirror of
@@ -1583,6 +1591,71 @@ mod tests {
         assert!(out.neighbors.is_empty());
         assert!(!out.swarm.is_empty(), "a Resync answer reaches whoever asked, anywhere in the swarm");
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Anti-entropy input: an applied Hello reports which side is ahead, and the
+    /// neighbors-only reply carries a write the other side never received.
+    #[test]
+    fn ae_hello_reports_divergence_and_pulls_the_missing_write() {
+        let (da, db) = (dir("ae-open-a"), dir("ae-open-b"));
+        let (mut a, mut b) = (TreePeer::new(), TreePeer::new());
+        std::fs::write(da.join("x.toml"), "v1").unwrap();
+        a.local_change(&da.join("x.toml"), &da).expect("a local write"); // never delivered
+
+        let out = a.authorize_and_apply(b.sign_mesh(b.hello()).unwrap(), &da);
+        assert_eq!(out.hello, Some(HelloCmp { we_ahead: true, they_ahead: false }));
+        assert!(out.swarm.is_empty());
+        assert_eq!(out.neighbors.len(), 1, "a answers b's Hello with the missed write");
+
+        let at_b = b.authorize_and_apply(a.sign_mesh(a.hello()).unwrap(), &db);
+        assert_eq!(at_b.hello, Some(HelloCmp { we_ahead: false, they_ahead: true }));
+
+        let generation = b.generation();
+        for m in out.neighbors {
+            b.authorize_and_apply(m, &db);
+        }
+        assert_eq!(std::fs::read(db.join("x.toml")).unwrap(), b"v1");
+        assert!(b.generation() > generation, "the repaired write moves b's generation");
+        let again = b.authorize_and_apply(a.sign_mesh(a.hello()).unwrap(), &db);
+        assert!(again.hello.expect("a Hello is compared").consistent());
+
+        for d in [&da, &db] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// On a restricted board the Hello travels sealed and is still compared; the
+    /// sealed reply repairs the missed write; an unsealed Hello is never compared.
+    #[test]
+    fn ae_hello_is_sealed_and_compared_on_a_restricted_board() {
+        let (mut founder, df, mut member, dm, _revokee, dc) = restricted_board("ae");
+        std::fs::write(dm.join("m.bin"), "v1").unwrap();
+        member.local_change(&dm.join("m.bin"), &dm).expect("a local write");
+        std::fs::write(dm.join("m.bin"), "v2").unwrap();
+        member.local_change(&dm.join("m.bin"), &dm).expect("a local change"); // the founder misses both
+
+        let member_hello = member.sign_mesh(member.hello()).expect("a wrapped member seals");
+        assert!(matches!(member_hello, MeshMsg::Sealed(_)));
+        let at_founder = founder.authorize_and_apply(member_hello, &df);
+        assert!(at_founder.hello.expect("a sealed Hello is compared").they_ahead);
+
+        let founder_hello = founder.sign_mesh(founder.hello()).expect("the founder seals");
+        let at_member = member.authorize_and_apply(founder_hello, &dm);
+        assert!(at_member.hello.expect("a sealed Hello is compared").we_ahead);
+        assert!(at_member.neighbors.iter().any(|m| matches!(m, MeshMsg::Sealed(_))), "the repair goes out sealed");
+
+        for m in at_member.neighbors {
+            founder.authorize_and_apply(m, &df);
+        }
+        assert_eq!(std::fs::read(df.join("m.bin")).unwrap(), b"v2", "the missed write reaches the founder");
+
+        let member_key = DeviceKey::from_seed(&[2u8; 32]);
+        let unsealed = MeshMsg::SignedSync(member_key.sign_write(postcard::to_allocvec(&member.hello()).unwrap()));
+        assert_eq!(founder.authorize_and_apply(unsealed, &df).hello, None, "an unsealed Hello is dropped unread");
+
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
     }
 
     #[test]
