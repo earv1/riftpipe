@@ -67,6 +67,16 @@ fail=0
 if [ "$ok" = 1 ]; then echo "OK: authorized member write reached founder; founder's write reached the member"; else
   echo "FAIL: authorized writes did not converge"; fail=1; fi
 
+# Deletes are content: an authorized member's delete lands, an outsider's doesn't.
+rm "$MEMBER/from_founder.txt"
+gone=0
+for _ in $(seq 1 40); do [ -f "$FOUNDER/from_founder.txt" ] || { gone=1; break; }; sleep 0.5; done
+if [ "$gone" = 1 ]; then echo "OK: an authorized member's delete reached the founder"; else
+  echo "FAIL: the authorized member's delete never reached the founder"; fail=1; fi
+echo mine > "$OUTSIDER/from_member.txt"; sleep 3; rm "$OUTSIDER/from_member.txt"; sleep 4
+if [ -f "$FOUNDER/from_member.txt" ]; then echo "OK: an unauthorized device's delete never lands"; else
+  echo "FAIL: an UNAUTHORIZED device's delete removed the founder's file!"; fail=1; fi
+
 # The key security assertion: give the rejected write ample time, then confirm
 # it never reached the founder or the member.
 sleep 3
