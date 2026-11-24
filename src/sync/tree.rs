@@ -31,6 +31,7 @@ use riftpipe_core::onboard::JoinRequest;
 use riftpipe_core::sync::{record_name, DurablePath, MeshMsg, Restored, SyncMsg, Syncer};
 
 use crate::net::{anyerr, Result, Sink, Source};
+use crate::sync::auth_store;
 use crate::sync::control::{clean_name, is_canonical_name, NAME_MAX_BYTES};
 
 /// Most verified join requests a peer keeps waiting (one per device); later ones
@@ -43,6 +44,28 @@ pub const REQUEST_INBOX_CAP: usize = 64;
 pub struct PendingRequest {
     pub request: JoinRequest,
     pub safety: String,
+}
+
+/// Outcome of [`TreePeer::restore_auth`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthRestore {
+    /// Not restricted, no identity, or no board bound: nothing persists.
+    Skipped,
+    /// No persisted state for this board.
+    Absent,
+    /// Restored this many trust entries / epoch announces (as stored).
+    Restored { trust: usize, epochs: usize },
+    /// A file exists but was rejected whole (corrupt, edited, other board/device) — nothing applied.
+    Rejected(String),
+}
+
+/// Outcome of [`TreePeer::grant_at_startup`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupGrant {
+    Granted,
+    AlreadyAuthorized,
+    Revoked,
+    NoIdentity,
 }
 
 fn hex32(b: &[u8; 32]) -> String {
@@ -174,24 +197,34 @@ pub struct TreePeer {
     /// a dir reused for another board never restores (and ships) the old
     /// board's history. `None` = link sync.
     board: Option<[u8; 32]>,
+    /// (trust entries, epoch announces) counts last persisted to auth.state — skip unchanged saves.
+    auth_saved: (usize, usize),
+    /// The last auth.state save failed (reported once; retried on every `save_auth`).
+    auth_save_failing: bool,
+    /// Host only: every auth.state save also raises the high-water mark in
+    /// `<dir>/.riftpipe-host` (see [`track_auth_mark`](Self::track_auth_mark)).
+    auth_mark: bool,
 }
 
-/// What an apply sends back out, by scope.
+/// What an apply sends back out — always to the whole swarm. Even a `Hello`'s
+/// replies (which only the asker needs) go swarm-wide: iroh-gossip's
+/// neighbors-only scope reaches only plumtree's EAGER peers, and plumtree prunes a
+/// fresh neighbor to lazy within milliseconds of NeighborUp (a duplicate of any
+/// swarm frame that also arrived via a third peer), so in a mesh with a cycle a
+/// neighbors-only reply can silently miss the asker. Swarm scope reaches a lazy
+/// peer via `IHave` → `Graft`. See `docs/planned/iroh-gossip-upstream.md`.
 #[derive(Default)]
 pub(crate) struct Outbound {
-    /// To the whole swarm (e.g. a Resync answer, epoch housekeeping).
     pub(crate) swarm: Vec<MeshMsg>,
-    /// To direct neighbors only: replies to a (neighbors-only) `Hello`.
-    pub(crate) neighbors: Vec<MeshMsg>,
 }
 
 impl Outbound {
     fn swarm(swarm: Vec<MeshMsg>) -> Self {
-        Outbound { swarm, neighbors: Vec::new() }
+        Outbound { swarm }
     }
-    /// Every message, regardless of scope.
+    /// Every message.
     pub(crate) fn all(self) -> Vec<MeshMsg> {
-        self.swarm.into_iter().chain(self.neighbors).collect()
+        self.swarm
     }
 }
 
@@ -217,6 +250,9 @@ impl TreePeer {
             inbox_overflow: false,
             warned_bad_name: false,
             board: None,
+            auth_saved: (0, 0),
+            auth_save_failing: false,
+            auth_mark: false,
         }
     }
 
@@ -281,6 +317,132 @@ impl TreePeer {
     /// The board's authorized devices and their roles, sorted by id.
     pub fn members(&self) -> Vec<([u8; 32], Role)> {
         self.trust.devices()
+    }
+
+    /// The board's founder (the genesis signer), once the trust log has a genesis.
+    pub fn founder(&self) -> Option<[u8; 32]> {
+        self.trust.founder()
+    }
+
+    /// Restore this board's persisted trust log + accepted epoch announces
+    /// (`auth_store`): trust entries first, then announces (accepted only once
+    /// their signer is a known Admin), re-opening this device's own wraps. Call
+    /// after [`set_identity`](Self::set_identity) and [`set_board`](Self::set_board),
+    /// before `startup`.
+    pub fn restore_auth(&mut self, dir: &Path) -> AuthRestore {
+        let loaded = {
+            let (Some(key), Some(board)) = (self.identity.as_ref(), self.board) else {
+                return AuthRestore::Skipped;
+            };
+            if !self.mode.seals_content() {
+                return AuthRestore::Skipped;
+            }
+            let path = auth_store::auth_path(dir, &board);
+            auth_store::load(&path, &board, key)
+        };
+        match loaded {
+            auth_store::Loaded::Absent => AuthRestore::Absent,
+            auth_store::Loaded::Corrupt(why) => AuthRestore::Rejected(why),
+            auth_store::Loaded::Found(s) => {
+                let (trust, epochs) = (s.trust.len(), s.epochs.len());
+                for entry in s.trust {
+                    self.add_trust(entry);
+                }
+                if let Some(book) = self.epochs.as_mut() {
+                    for a in s.epochs {
+                        let _ = book.ingest(a, &self.trust);
+                    }
+                    let _ = book.retry_pending(&self.trust);
+                }
+                self.auth_saved = self.auth_counts();
+                AuthRestore::Restored { trust, epochs }
+            }
+        }
+    }
+
+    /// (trust entries, accepted epoch announces) held right now.
+    fn auth_counts(&self) -> (usize, usize) {
+        (self.trust_entries.len(), self.epochs.as_ref().map_or(0, |b| b.announces().len()))
+    }
+
+    /// Host only: after each auth.state save, raise the high-water mark kept in
+    /// `<dir>/.riftpipe-host` to the saved item count, so a resume refuses an older
+    /// copy of auth.state (`mesh::check_restricted_resume`).
+    pub fn track_auth_mark(&mut self) {
+        self.auth_mark = true;
+    }
+
+    /// Write our trust log (plus `extra`, not applied yet) and accepted announces to
+    /// auth.state (read-union-write, see `auth_store`), then raise the host's
+    /// high-water mark. `None` when this peer persists nothing (not restricted, no
+    /// identity, or no board bound). A failed mark raise is only reported: the
+    /// state itself is on disk.
+    fn write_auth(&self, dir: &Path, extra: Option<&TrustEntry>) -> Option<std::io::Result<()>> {
+        let (Some(key), Some(board), Some(book)) = (self.identity.as_ref(), self.board, self.epochs.as_ref()) else {
+            return None;
+        };
+        if !self.mode.seals_content() {
+            return None;
+        }
+        let path = auth_store::auth_path(dir, &board);
+        let trust: Vec<TrustEntry> = self.trust_entries.iter().chain(extra).cloned().collect();
+        let saved = match auth_store::save(&path, &board, key, &trust, book.announces()) {
+            Ok(n) => n,
+            Err(e) => return Some(Err(e)),
+        };
+        if self.auth_mark {
+            if let Err(e) = crate::sync::mesh::raise_auth_mark(dir, saved) {
+                eprintln!("[auth] recording the auth.state high-water mark in {}/.riftpipe-host failed: {e}", dir.display());
+            }
+        }
+        Some(Ok(()))
+    }
+
+    /// Persist the trust log + accepted epoch announces (read-union-write, see
+    /// `auth_store`) when they changed since the last save. Restricted peers with
+    /// an identity and a bound board only. A failure is reported once and retried
+    /// on the next call (the mesh driver also calls this every second).
+    pub fn save_auth(&mut self, dir: &Path) {
+        let now = self.auth_counts();
+        if now == self.auth_saved {
+            return;
+        }
+        match self.write_auth(dir, None) {
+            None => {}
+            Some(Ok(())) => {
+                self.auth_saved = now;
+                if std::mem::take(&mut self.auth_save_failing) {
+                    eprintln!("[auth] the trust log + epochs are persisted again");
+                }
+            }
+            Some(Err(e)) => {
+                let first_failure = !self.auth_save_failing;
+                self.auth_save_failing = true;
+                if first_failure {
+                    eprintln!(
+                        "[auth] persisting the trust log + epochs under {} failed: {e} — changes since the last save \
+                         would be lost on a restart; retrying",
+                        dir.display()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A founder's `--grant`: skipped when the log already knows the device, so a
+    /// restart never re-authorizes a device revoked live (re-authorize it on the
+    /// running board with `riftpipe grant`).
+    pub fn grant_at_startup(&mut self, id: [u8; 32]) -> StartupGrant {
+        if self.trust.is_revoked(&id) {
+            return StartupGrant::Revoked;
+        }
+        if self.trust.is_authorized(&id) {
+            return StartupGrant::AlreadyAuthorized;
+        }
+        let Some(key) = self.identity.as_ref() else { return StartupGrant::NoIdentity };
+        let entry = key.grant(id, Role::Member, rand::random::<[u8; 16]>());
+        self.add_trust(entry);
+        StartupGrant::Granted
     }
 
     /// Is this device in the trust log?
@@ -406,16 +568,10 @@ impl TreePeer {
             }
             _ => return Outbound::default(),
         };
-        // A Hello arrives neighbors-only, so its replies (up to our whole tree, for
-        // a fresh joiner) go back neighbors-only too — not flooded to the swarm.
-        let to_neighbors = inner.replies_go_to_neighbors();
+        // Replies (a Hello's included — see `Outbound`) go to the whole swarm.
         let replies: Vec<MeshMsg> =
             self.apply_and_persist(inner, dir).into_iter().filter_map(|r| self.sign_mesh(r)).collect();
-        if to_neighbors {
-            Outbound { swarm: Vec::new(), neighbors: replies }
-        } else {
-            Outbound { swarm: replies, neighbors: Vec::new() }
-        }
+        Outbound::swarm(replies)
     }
 
     /// Auth-aware receive for every mesh message the driver doesn't handle itself
@@ -423,7 +579,15 @@ impl TreePeer {
     /// restricted board, reads are epoch-gated: only `Sealed` content is accepted,
     /// and only if we hold its epoch key. Returns messages to broadcast, already
     /// wrapped for the wire. `Presence`/`Version`/`Chunk` are handled by the driver.
+    /// Persists auth-state changes before returning (so before anything is broadcast).
     pub(crate) fn authorize_and_apply(&mut self, msg: MeshMsg, dir: &Path) -> Outbound {
+        let out = self.route(msg, dir);
+        self.save_auth(dir);
+        out
+    }
+
+    /// [`authorize_and_apply`](Self::authorize_and_apply) without the persist step.
+    fn route(&mut self, msg: MeshMsg, dir: &Path) -> Outbound {
         match msg {
             MeshMsg::Trust(e) => {
                 let (was_authorized, was_held) = (self.me_authorized(), self.writes_held());
@@ -635,11 +799,23 @@ impl TreePeer {
             }
             key.revoke(id, rand::random::<[u8; 16]>())
         };
+        // On disk before it is applied or sent: a revoke that went out but isn't
+        // persisted would be undone by a restart (the restored log still grants it).
+        if let Some(Err(e)) = self.write_auth(dir, Some(&entry)) {
+            eprintln!(
+                "[auth] revoke of {} aborted: persisting it under {} failed ({e}) — nothing was applied or sent; \
+                 fix the disk and run the revoke again",
+                hex32(&id),
+                dir.display()
+            );
+            return Vec::new();
+        }
         let was_held = self.writes_held();
         self.add_trust(entry.clone());
         eprintln!("[auth] revoked device {}", hex32(&id));
         let mut out = vec![MeshMsg::Trust(entry)];
         out.extend(self.after_trust_change(dir, was_held));
+        self.save_auth(dir);
         out
     }
 
@@ -667,6 +843,7 @@ impl TreePeer {
         eprintln!("[auth] granted device {} (Member)", hex32(&id));
         let mut out = vec![MeshMsg::Trust(entry)];
         out.extend(self.after_trust_change(dir, was_held));
+        self.save_auth(dir);
         out
     }
 
@@ -1565,22 +1742,21 @@ mod tests {
         std::fs::remove_dir_all(&df).ok();
     }
 
-    /// A Hello's replies (our whole tree, to a fresh joiner) go to direct
-    /// neighbors only; a Resync answer still goes swarm-wide.
+    /// A Hello's replies go to the whole swarm, like a Resync answer: a
+    /// neighbors-only reply can miss an asker that plumtree holds as lazy (see
+    /// `Outbound`) — the restricted CLI host-restart e2e lost gap edits that way.
     #[test]
-    fn hello_replies_are_neighbors_only() {
+    fn hello_replies_go_to_the_whole_swarm() {
         let d = dir("hello-scope");
         std::fs::write(d.join("a.md"), "# a\n").unwrap();
         let mut peer = TreePeer::new();
         peer.seed(&d);
         let out = peer.authorize_and_apply(MeshMsg::Sync(SyncMsg::Hello { versions: vec![], lww_versions: vec![] }), &d);
-        assert!(out.swarm.is_empty(), "nothing flooded to the swarm");
         assert!(
-            out.neighbors.iter().any(|m| matches!(m, MeshMsg::Sync(SyncMsg::TextDelta { path, .. }) if path == "a.md")),
-            "the joiner's missing doc goes to the neighbors"
+            out.swarm.iter().any(|m| matches!(m, MeshMsg::Sync(SyncMsg::TextDelta { path, .. }) if path == "a.md")),
+            "the asker's missing doc goes swarm-wide"
         );
         let out = peer.authorize_and_apply(MeshMsg::Sync(SyncMsg::Resync { path: "a.md".into() }), &d);
-        assert!(out.neighbors.is_empty());
         assert!(!out.swarm.is_empty(), "a Resync answer reaches whoever asked, anywhere in the swarm");
         std::fs::remove_dir_all(&d).ok();
     }
@@ -1876,7 +2052,7 @@ mod tests {
     }
 
     /// The NeighborUp Hello on a restricted board: it goes out sealed, a wrapped
-    /// member answers it (sealed, neighbors-only) with its gap edit, and the
+    /// member answers it (sealed, swarm-wide) with its gap edit, and the
     /// founder persists it. An unsealed Hello is dropped, and a device revoked
     /// since can't read the new-epoch Hello, so it answers nothing.
     #[test]
@@ -1888,9 +2064,8 @@ mod tests {
         let hello = founder.sign_mesh(founder.hello()).expect("a key holder can send its Hello");
         assert!(matches!(hello, MeshMsg::Sealed(_)), "the Hello is sealed on a restricted board");
         let out = member.authorize_and_apply(hello, &dm);
-        assert!(out.swarm.is_empty(), "Hello replies stay with the neighbors");
-        assert!(!out.neighbors.is_empty() && out.neighbors.iter().all(|m| matches!(m, MeshMsg::Sealed(_))));
-        for m in out.neighbors {
+        assert!(!out.swarm.is_empty() && out.swarm.iter().all(|m| matches!(m, MeshMsg::Sealed(_))));
+        for m in out.swarm {
             founder.authorize_and_apply(m, &df);
         }
         assert_eq!(std::fs::read(df.join("gap.md")).unwrap(), b"# made while apart\n");
@@ -1901,6 +2076,267 @@ mod tests {
         founder.revoke_device(DeviceKey::from_seed(&[3u8; 32]).id(), &df);
         let hello2 = founder.sign_mesh(founder.hello()).expect("sealed under the new epoch");
         assert!(revokee.authorize_and_apply(hello2, &dc).all().is_empty(), "a revoked device can't answer it");
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    const BOARD: [u8; 32] = [0x5b; 32];
+
+    /// A restricted founder restarted after a live revoke restores its trust log +
+    /// epochs: the revoke sticks (a replayed `--grant` is skipped), nothing is
+    /// re-minted, it re-opens its own wraps to read epoch-2 content, still rejects
+    /// the revokee, and can rotate again.
+    #[test]
+    fn restart_after_a_live_revoke_keeps_the_device_revoked_and_the_host_reads_and_rotates() {
+        let (mut founder, df, mut member, dm, revokee, dc) = restricted_board("persist-revoke");
+        let (b_id, c_id) = (DeviceKey::from_seed(&[2u8; 32]).id(), DeviceKey::from_seed(&[3u8; 32]).id());
+        founder.set_board(BOARD);
+        founder.save_auth(&df);
+        member.set_board(BOARD);
+        member.save_auth(&dm);
+        for m in founder.revoke_device(c_id, &df) {
+            member.authorize_and_apply(m, &dm);
+        }
+        assert_eq!(member.epoch_held(), Some(2));
+        drop(founder);
+
+        let mut f2 = restricted_peer(1);
+        f2.set_board(BOARD);
+        assert!(matches!(f2.restore_auth(&df), AuthRestore::Restored { trust: 4, .. }));
+        f2.add_trust(DeviceKey::from_seed(&[1u8; 32]).genesis());
+        assert_eq!(f2.grant_at_startup(b_id), StartupGrant::AlreadyAuthorized);
+        assert_eq!(f2.grant_at_startup(c_id), StartupGrant::Revoked, "a replayed --grant can't undo a live revoke");
+        assert!(f2.startup().is_empty(), "no re-mint, no rotation");
+        assert!(!f2.members().iter().any(|(d, _)| *d == c_id));
+        assert_eq!((f2.epoch_held(), f2.epoch_known()), (Some(2), Some(2)));
+
+        let after = member.sign_mesh(lww("after.bin", b"epoch two")).unwrap();
+        f2.authorize_and_apply(after, &df);
+        assert_eq!(std::fs::read(df.join("after.bin")).unwrap(), b"epoch two", "the restarted host reads epoch 2");
+
+        let evil = revokee.sign_mesh(lww("evil.bin", b"z")).expect("the revokee still holds epoch 1");
+        f2.authorize_and_apply(evil, &df);
+        assert!(!df.join("evil.bin").exists(), "the revoked device stays out after the restart");
+
+        let out = f2.revoke_device(b_id, &df);
+        assert!(out.iter().any(|m| matches!(m, MeshMsg::Epoch(a) if a.seq == 3)), "the restarted host rotates");
+        assert_eq!(f2.epoch_held(), Some(3));
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A restarted member re-opens its own wraps: it reads again with no Admin around.
+    #[test]
+    fn a_restarted_member_reads_without_an_admin() {
+        let (founder, df, mut member, dm, _revokee, dc) = restricted_board("persist-member");
+        member.set_board(BOARD);
+        member.save_auth(&dm);
+        drop(member);
+
+        let mut m2 = restricted_peer(2);
+        m2.set_board(BOARD);
+        assert!(matches!(m2.restore_auth(&dm), AuthRestore::Restored { .. }));
+        assert_eq!(m2.epoch_held(), Some(1));
+        assert!(m2.read_request().is_none(), "a restored member doesn't ask again");
+        m2.authorize_and_apply(founder.sign_mesh(lww("x.bin", b"sealed")).unwrap(), &dm);
+        assert_eq!(std::fs::read(dm.join("x.bin")).unwrap(), b"sealed");
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// `auth.state` is owner-only and holds the announces' wraps, never the raw epoch key.
+    #[test]
+    fn auth_state_is_owner_only_and_never_holds_a_raw_epoch_key() {
+        let d = dir("persist-nokey");
+        let mut founder = founder_peer();
+        founder.set_board(BOARD);
+        founder.save_auth(&d);
+        let path = auth_store::auth_path(&d, &BOARD);
+        let bytes = std::fs::read(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let me = DeviceKey::from_seed(&[1u8; 32]).id();
+        let a = founder
+            .auth_catchup()
+            .into_iter()
+            .find_map(|m| match m {
+                MeshMsg::Epoch(a) => Some(a),
+                _ => None,
+            })
+            .expect("epoch 1's announce");
+        let w = a.wraps.iter().find(|w| w.device == me).expect("the founder is wrapped in");
+        let k = riftpipe_core::keywrap::open_epoch(
+            std::slice::from_ref(&w.wrapped),
+            &riftpipe_core::keywrap::ClientEncKey::from_seed(&[1u8; 32]),
+        )
+        .unwrap();
+        assert!(!bytes.windows(32).any(|w| w == k), "the raw epoch key is never written");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A tampered or foreign file is rejected whole: nothing is applied.
+    #[test]
+    fn a_tampered_auth_state_restores_nothing() {
+        let d = dir("persist-tamper");
+        let mut founder = founder_peer();
+        founder.set_board(BOARD);
+        founder.save_auth(&d);
+        let path = auth_store::auth_path(&d, &BOARD);
+        let original = std::fs::read(&path).unwrap();
+        let mut tampered = original.clone();
+        tampered[5] ^= 0x01;
+        std::fs::write(&path, &tampered).unwrap();
+
+        let mut f2 = restricted_peer(1);
+        f2.set_board(BOARD);
+        assert!(matches!(f2.restore_auth(&d), AuthRestore::Rejected(_)));
+        assert!(f2.members().is_empty());
+        assert_eq!(f2.epoch_known(), None);
+
+        std::fs::write(&path, &original).unwrap();
+        let mut other_device = restricted_peer(9);
+        other_device.set_board(BOARD);
+        assert!(matches!(other_device.restore_auth(&d), AuthRestore::Rejected(_)), "written for another device");
+
+        let mut other_board = restricted_peer(1);
+        other_board.set_board([0x5c; 32]);
+        assert_eq!(other_board.restore_auth(&d), AuthRestore::Absent);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Open peers and peers with no bound board neither restore nor persist auth state.
+    #[test]
+    fn open_or_unbound_peers_neither_save_nor_restore() {
+        let d = dir("persist-skip");
+        assert_eq!(TreePeer::new().restore_auth(&d), AuthRestore::Skipped);
+        let mut unbound = founder_peer();
+        assert_eq!(unbound.restore_auth(&d), AuthRestore::Skipped);
+        unbound.save_auth(&d);
+        assert!(!d.join(SYNC_DIR).exists(), "no board bound: nothing written");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Make every auth.state write under `d` for BOARD fail (its tmp path is a dir).
+    fn break_auth_writes(d: &Path) -> PathBuf {
+        let tmp = PathBuf::from(format!("{}.tmp", auth_store::auth_path(d, &BOARD).display()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    /// The ids of the trust entries `d`'s auth.state holds for the founder (seed 1).
+    fn stored_trust(d: &Path) -> Vec<[u8; 32]> {
+        match auth_store::load(&auth_store::auth_path(d, &BOARD), &BOARD, &DeviceKey::from_seed(&[1u8; 32])) {
+            auth_store::Loaded::Found(s) => s.trust.iter().map(auth_store::trust_id).collect(),
+            other => panic!("expected a stored auth state, got {other:?}"),
+        }
+    }
+
+    /// A revoke that can't be persisted is aborted whole: nothing applied, nothing
+    /// to send — a restart would otherwise restore the pre-revoke log. Once the
+    /// disk works again the same revoke goes through and is on disk first.
+    #[test]
+    fn a_revoke_that_cannot_be_persisted_is_aborted_and_not_sent() {
+        let (mut founder, df, _member, dm, _revokee, dc) = restricted_board("persist-abort");
+        let c_id = DeviceKey::from_seed(&[3u8; 32]).id();
+        founder.set_board(BOARD);
+        founder.save_auth(&df);
+        let before = stored_trust(&df);
+
+        let tmp = break_auth_writes(&df);
+        assert!(founder.revoke_device(c_id, &df).is_empty(), "nothing goes out");
+        assert!(founder.members().iter().any(|(d, _)| *d == c_id), "the revoke wasn't applied");
+        assert!(!founder.trust.is_revoked(&c_id));
+        assert_eq!(founder.epoch_held(), Some(1), "no rotation");
+        assert_eq!(stored_trust(&df), before, "the file is unchanged");
+
+        std::fs::remove_dir(&tmp).unwrap();
+        let out = founder.revoke_device(c_id, &df);
+        assert!(out.iter().any(|m| matches!(m, MeshMsg::Trust(_))));
+        assert!(out.iter().any(|m| matches!(m, MeshMsg::Epoch(a) if a.seq == 2)));
+        let mut f2 = restricted_peer(1);
+        f2.set_board(BOARD);
+        assert!(matches!(f2.restore_auth(&df), AuthRestore::Restored { .. }));
+        assert!(f2.trust.is_revoked(&c_id), "the revoke is on disk");
+        assert_eq!(f2.epoch_known(), Some(2), "and so is the rotation");
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A failed save is remembered and retried on the next `save_auth`, even with
+    /// no further auth change.
+    #[test]
+    fn a_failed_auth_save_is_retried() {
+        let d = dir("persist-retry");
+        let mut founder = founder_peer();
+        founder.set_board(BOARD);
+        let tmp = break_auth_writes(&d);
+        founder.save_auth(&d);
+        assert!(founder.auth_save_failing);
+        assert!(!auth_store::auth_path(&d, &BOARD).exists());
+
+        std::fs::remove_dir(&tmp).unwrap();
+        founder.save_auth(&d);
+        assert!(!founder.auth_save_failing);
+        assert_eq!(stored_trust(&d).len(), 1, "the genesis is on disk");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// grant → revoke → re-grant restores as authorized (not revoked): the stored
+    /// order is the applied order, so a restart lands where the live log did.
+    #[test]
+    fn a_regranted_device_restores_as_authorized() {
+        let d = dir("persist-regrant");
+        let x = DeviceKey::from_seed(&[6u8; 32]).id();
+        let mut founder = founder_peer();
+        founder.set_board(BOARD);
+        founder.grant_device(x, &d);
+        founder.revoke_device(x, &d);
+        founder.grant_device(x, &d);
+        assert!(founder.trust.is_authorized(&x));
+
+        let mut f2 = restricted_peer(1);
+        f2.set_board(BOARD);
+        assert!(matches!(f2.restore_auth(&d), AuthRestore::Restored { trust: 4, .. }));
+        assert!(f2.trust.is_authorized(&x));
+        assert!(!f2.trust.is_revoked(&x));
+        assert_eq!(f2.grant_at_startup(x), StartupGrant::AlreadyAuthorized);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A restored log holding a revoke whose rotation never reached the disk: the
+    /// restarted founder rotates away from the revoked device at startup.
+    #[test]
+    fn a_restored_epoch_that_still_wraps_a_revoked_device_rotates_at_startup() {
+        let (mut founder, df, _member, dm, _revokee, dc) = restricted_board("persist-rotate");
+        let (f_key, c_id) = (DeviceKey::from_seed(&[1u8; 32]), DeviceKey::from_seed(&[3u8; 32]).id());
+        founder.set_board(BOARD);
+        founder.save_auth(&df);
+        auth_store::save(&auth_store::auth_path(&df, &BOARD), &BOARD, &f_key, &[f_key.revoke(c_id, [9u8; 16])], &[])
+            .unwrap();
+        drop(founder);
+
+        let mut f2 = restricted_peer(1);
+        f2.set_board(BOARD);
+        assert!(matches!(f2.restore_auth(&df), AuthRestore::Restored { .. }));
+        assert_eq!(f2.epoch_held(), Some(1), "epoch 1 restored, still wrapping the revoked device");
+        assert!(f2.trust.is_revoked(&c_id));
+        let out = f2.startup();
+        let rotated = out
+            .iter()
+            .find_map(|m| match m {
+                MeshMsg::Epoch(a) if a.seq == 2 => Some(a),
+                _ => None,
+            })
+            .expect("startup rotates to epoch 2");
+        assert!(!rotated.wraps.iter().any(|w| w.device == c_id), "the revoked device isn't wrapped in");
+        assert_eq!(f2.epoch_held(), Some(2));
         for d in [&df, &dm, &dc] {
             std::fs::remove_dir_all(d).ok();
         }

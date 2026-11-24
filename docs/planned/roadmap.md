@@ -87,6 +87,22 @@ sense to do it, not strict priority.
     Proven by `tests/mesh.rs::mesh_host_crash_restart_resyncs_gap_edits` (a
     SIGKILLed CLI host; fails without the fix) and `run-reconnect.sh` /
     `run-cli-host-restart.sh`. An upstream iroh-gossip fix would make it moot.
+  - *Hello replies go swarm-wide (native):* iroh-gossip sends `broadcast_neighbors`
+    (Scope::Neighbors) to plumtree's EAGER peers only; lazy peers get nothing, not
+    even an `IHave`. In a mesh with a cycle, plumtree prunes a fresh neighbor to lazy
+    within milliseconds of NeighborUp: a duplicate of any swarm frame from the
+    catch-up also arrives through a third peer. A silent connection swap keeps a
+    stale lazy entry too. So a neighbors-only reply to a `Hello` (the gap edits) can
+    silently miss the asker; this made `run-cli-host-restart-restricted.sh` (three
+    peers) fail about 1 run in 6. The native driver now sends a `Hello`'s replies
+    swarm-wide, which reaches a lazy peer via `IHave` → `Graft`. The cost: each reply
+    (only the asker's diff) floods the swarm once. The `Hello` and the NeighborUp
+    `full_state` stay neighbors-only. The browser driver still replies
+    neighbors-only. Known limit: the NeighborUp `Hello` itself is neighbors-only
+    and can be dropped by the same pruning. With the fix, the e2e failed 1 run
+    in 45, with no trace. A general "the request and its reply must reach each
+    other" fix (anti-entropy) is planned separately. Draft upstream issue:
+    `docs/planned/iroh-gossip-upstream.md`.
   - *Durable sync records (D4):* `Syncer::durable/restore` + one `DurablePath` per
     path in the never-synced `.riftpipe-sync/` (OPFS per board, natively
     `<dir>/.riftpipe-sync/<hex topic>/` — also per board, so a reused dir never
@@ -97,7 +113,9 @@ sense to do it, not strict priority.
     with the old file (which would author a revert of the merge).
   - *CLI host identity (D5):* `connect --accept <dir>` persists its iroh key + board
     secret in `<dir>/.riftpipe-host` (restart = same board); `--new-board` mints a
-    new link.
+    new link. A `--restricted` host also persists its trust log + epoch
+    announces (`auth.state`) and resumes; a startup `--grant` skips devices the
+    log already knows; e2e `run-cli-host-restart-restricted.sh`.
   - *Status (D6):* `waiting | connected | reconnecting | offline` (`idle` with no
     session) as the `riftpipe:mesh-status` event + `meshStatus()` in the browser
     (kanban renders a pill), `[mesh] status=<s> peers=<n>` lines natively.
@@ -115,12 +133,8 @@ sense to do it, not strict priority.
     its record landing can duplicate that one merged edit on the next start (fails
     toward duplication, never loss); no app-level heartbeat or `pagehide` →
     Disconnect, so a joiner notices a vanished host only via QUIC idle (~15–30 s)
-    and the pill can read "connected" that long; a `--restricted` CLI host doesn't
-    persist its trust log/epochs, and a restart would replay its `--grant`s under
-    fresh nonces (re-authorizing a device revoked live, on peers that saw the
-    revoke first) and re-mint epoch 1 — so `connect --accept --restricted` refuses
-    to resume a dir that already hosts a board; restart it with `--new-board`; the
-    legacy WebRTC/signaling `connectAndSync` path has no records or reconnection;
+    and the pill can read "connected" that long; the legacy WebRTC/signaling
+    `connectAndSync` path has no records or reconnection;
     the npm wrapper doesn't parse `[mesh] status=` lines. Pre-existing and
     separate: tree/mesh deletes, out-of-order OPFS writes of rapid merges to one
     file, the fresh joiner's `ensureSeed` `board.md` origin race.

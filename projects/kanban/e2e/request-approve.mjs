@@ -136,7 +136,11 @@ try {
   await a.waitForSelector("text=edited-by-cli", { timeout: 60000 });
   console.log("✓ the approved CLI joiner's edit reached the browser owner");
 
-  const jMembers = cliJson("members", J) ?? [];
+  // The joiner rewrites its state file as the grant lands; poll briefly for it.
+  const listsJoinerAndOwner = (ms) =>
+    ms.some((m) => m.device === jId && m.role === "member" && m.me) && ms.some((m) => m.device === aDevice && m.founder);
+  const jMembers = (await poll(() => { const m = cliJson("members", J) ?? []; return listsJoinerAndOwner(m) ? m : null; }, 5000))
+    ?? cliJson("members", J) ?? [];
   if (!jMembers.some((m) => m.device === jId && m.role === "member" && m.me))
     fail(`CLI members should list itself as a member, got ${JSON.stringify(jMembers)}`);
   if (!jMembers.some((m) => m.device === aDevice && m.founder))

@@ -119,7 +119,13 @@ done
 if [ "$ok" = 1 ]; then echo "OK: founder's inbox is empty and the joiner is listed as a member"
 else echo "FAIL: founder's requests/members never settled"; fail=1; fi
 
-if ! "$BIN" members "$JOINER" 2>/dev/null | grep -q "^$J_ID  member  (this device)$"; then
+# The joiner rewrites its state file as the grant lands; poll briefly for it.
+ok=0
+for _ in $(seq 1 20); do
+  "$BIN" members "$JOINER" 2>/dev/null | grep -q "^$J_ID  member  (this device)$" && { ok=1; break; }
+  sleep 0.25
+done
+if [ "$ok" != 1 ]; then
   echo "FAIL: joiner's own members view doesn't show itself as a member"
   fail=1
 fi
