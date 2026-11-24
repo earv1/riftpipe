@@ -975,3 +975,194 @@ async fn mesh_lww_burst_converges_without_a_settle_write() {
     std::fs::remove_dir_all(&da).ok();
     std::fs::remove_dir_all(&db).ok();
 }
+
+/// Poll until none of `paths` exist; panic after [`BUDGET`]. Mirrors [`wait_for`]'s
+/// shape but waits for absence instead of presence.
+async fn wait_gone(paths: &[PathBuf], what: &str) {
+    tokio::time::timeout(BUDGET, async {
+        while paths.iter().any(|p| p.exists()) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out: {what}"));
+}
+
+/// Deletes over the REAL mesh reach a live peer and a peer that was offline when the
+/// delete happened — three peers: host A, joiner B (stays up throughout), joiner C
+/// (taken down for the delete, then restarted). A's local `remove_dir_all` deletes a
+/// card (two files, detected by `detect_missing`'s two-tick grace and synced live to
+/// B); a file removed from C's own disk while it's down is a tombstone C re-asserts
+/// once it rejoins, same as a live delete. On restart, C's offline delete (the
+/// records at `.riftpipe-sync/`) catches the other two peers up on the card.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mesh_deletes_reach_live_and_restarted_peers() {
+    let da = dir("del-host");
+    let db = dir("del-b");
+    let dc = dir("del-c");
+
+    std::fs::create_dir_all(da.join("tickets/tk_1")).unwrap();
+    std::fs::write(da.join("tickets/tk_1/card.md"), "# doomed\n").unwrap();
+    std::fs::write(da.join("tickets/tk_1/meta.toml"), "column = \"Todo\"\n").unwrap();
+    std::fs::write(da.join("keep.md"), "# keep\n").unwrap();
+    std::fs::write(da.join("gone-offline.md"), "# gone offline\n").unwrap();
+
+    let secret = riftpipe_core::crypto::generate_secret();
+    let host = MeshConn::join(secret, None).await.expect("host join");
+    let host_addr = dialable_addr(&host).await;
+
+    let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    for rel in ["tickets/tk_1/card.md", "tickets/tk_1/meta.toml", "keep.md", "gone-offline.md"] {
+        tx_a.send(da.join(rel)).unwrap();
+    }
+    let da_task = da.clone();
+    let a_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        let _ = riftpipe::sync::mesh::run(host, &da_task, &mut peer, &mut rx_a, false).await;
+        drop(tx_a);
+    });
+
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let (db_task, addr_b) = (db.clone(), host_addr.clone());
+    let b_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        let _ = riftpipe::sync::mesh::join_and_run(secret, addr_b, &db_task, &mut peer, &mut rx_b, false).await;
+        drop(tx_b);
+    });
+
+    let (tx_c, mut rx_c) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let (stop_c, stop_c_rx) = tokio::sync::oneshot::channel::<()>();
+    let (dc_task, addr_c) = (dc.clone(), host_addr.clone());
+    let c_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        tokio::select! {
+            _ = riftpipe::sync::mesh::join_and_run(secret, addr_c, &dc_task, &mut peer, &mut rx_c, false) => {}
+            _ = stop_c_rx => {}
+        }
+        drop(tx_c);
+    });
+
+    // Phase 1: all four files land on both joiners.
+    let all_four = |root: &PathBuf| {
+        [
+            root.join("tickets/tk_1/card.md"),
+            root.join("tickets/tk_1/meta.toml"),
+            root.join("keep.md"),
+            root.join("gone-offline.md"),
+        ]
+    };
+    wait_for(&all_four(&db), "B gets the host's tree").await;
+    wait_for(&all_four(&dc), "C gets the host's tree").await;
+    assert!(dc.join(".riftpipe-sync").is_dir(), "C persisted durable records");
+
+    let _ = stop_c.send(());
+    let _ = c_task.await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Phase 2: A deletes the card WHILE C is down; B (live) must follow along.
+    std::fs::remove_dir_all(da.join("tickets/tk_1")).unwrap();
+    wait_gone(
+        &[db.join("tickets/tk_1/card.md"), db.join("tickets/tk_1/meta.toml")],
+        "B loses the card A deleted",
+    )
+    .await;
+    assert!(dc.join("tickets/tk_1/card.md").is_file(), "C (down) still has the card");
+    assert!(dc.join("tickets/tk_1/meta.toml").is_file(), "C (down) still has the card's meta");
+
+    // C's own OFFLINE delete, made while disconnected from the mesh entirely.
+    std::fs::remove_file(dc.join("gone-offline.md")).unwrap();
+
+    // Phase 3: restart C — it must sync in A's card delete and re-assert its own
+    // offline delete to A and B.
+    let (tx_c2, mut rx_c2) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let (dc_task2, addr_c2) = (dc.clone(), host_addr.clone());
+    let c_task2 = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        let _ = riftpipe::sync::mesh::join_and_run(secret, addr_c2, &dc_task2, &mut peer, &mut rx_c2, false).await;
+        drop(tx_c2);
+    });
+
+    wait_gone(
+        &[
+            dc.join("tickets/tk_1/card.md"),
+            dc.join("tickets/tk_1/meta.toml"),
+            da.join("gone-offline.md"),
+            db.join("gone-offline.md"),
+        ],
+        "C catches up on A's delete, and A/B learn C's offline delete",
+    )
+    .await;
+
+    // Phase 4: settle, then the final state holds everywhere.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for root in [&da, &db, &dc] {
+        assert!(!root.join("tickets/tk_1/card.md").exists(), "{root:?}: card.md gone");
+        assert!(!root.join("gone-offline.md").exists(), "{root:?}: gone-offline.md gone");
+        assert!(root.join("keep.md").is_file(), "{root:?}: keep.md survives");
+    }
+
+    a_task.abort();
+    b_task.abort();
+    c_task2.abort();
+    std::fs::remove_dir_all(&da).ok();
+    std::fs::remove_dir_all(&db).ok();
+    std::fs::remove_dir_all(&dc).ok();
+}
+
+/// A delete the host A pushes while the joiner B is in a `receive_blackout` never
+/// reaches it live — B's periodic `Hello` (anti-entropy) is what repairs it once the
+/// blackout ends, with no further write from A. Modeled on
+/// [`mesh_lww_burst_converges_without_a_settle_write`]'s blackout pattern.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mesh_lost_delete_is_repaired_by_anti_entropy() {
+    let da = dir("lost-del-host");
+    let db = dir("lost-del-joiner");
+    std::fs::write(da.join("doomed.md"), "# doomed\n").unwrap();
+    std::fs::write(da.join("keep.md"), "# keep\n").unwrap();
+    let secret = riftpipe_core::crypto::generate_secret();
+
+    let host = MeshConn::join(secret, None).await.expect("host join");
+    let host_addr = dialable_addr(&host).await;
+    let blackout = host.receive_blackout();
+
+    let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    tx_a.send(da.join("doomed.md")).unwrap();
+    tx_a.send(da.join("keep.md")).unwrap();
+    let da_task = da.clone();
+    let a_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        let _ = riftpipe::sync::mesh::run(host, &da_task, &mut peer, &mut rx_a, false).await;
+        drop(tx_a);
+    });
+
+    let (_tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let (db_task, addr) = (db.clone(), host_addr.clone());
+    let b_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        let _ = riftpipe::sync::mesh::join_and_run(secret, addr, &db_task, &mut peer, &mut rx_b, false).await;
+    });
+
+    wait_for(&[db.join("doomed.md"), db.join("keep.md")], "joiner gets both files").await;
+    // Let the connect-time catch-up settle before the host goes deaf.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    blackout.store(true, std::sync::atomic::Ordering::Relaxed);
+    std::fs::remove_file(db.join("doomed.md")).unwrap();
+    // Two detect_missing ticks (1 s each) plus the queue drain, while A hears nothing.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let dst = da.join("doomed.md");
+    assert!(dst.is_file(), "the host lost the joiner's Delete during the blackout");
+
+    blackout.store(false, std::sync::atomic::Ordering::Relaxed);
+    // No further writes: only anti-entropy (the host's own periodic Hello, answered
+    // with the joiner's Delete once it's heard) can deliver the repair now.
+    let t0 = std::time::Instant::now();
+    wait_gone(&[dst.clone()], "anti-entropy never repaired the lost delete").await;
+    assert!(da.join("keep.md").is_file(), "the unrelated file is untouched");
+    println!("anti-entropy repaired the lost delete {:.1} s after the blackout", t0.elapsed().as_secs_f64());
+
+    a_task.abort();
+    b_task.abort();
+    std::fs::remove_dir_all(&da).ok();
+    std::fs::remove_dir_all(&db).ok();
+}
