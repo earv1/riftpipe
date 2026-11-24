@@ -337,7 +337,7 @@ async fn main() {
             eprintln!("                                      # peer joins with `connect <ticket> <dir>` — one protocol, N peers, no signaling.");
             eprintln!("                                      # <dir> is the same board across restarts (identity persists in <dir>/.riftpipe-host)");
             eprintln!("                                      # --new-board: forget <dir>/.riftpipe-host and mint a new board/link");
-            eprintln!("                                      #   (a --restricted host can't resume yet: restart it with --new-board)");
+            eprintln!("                                      #   a --restricted host also resumes its trust log + epochs (<dir>/.riftpipe-sync/<board>/auth.state)");
             eprintln!("                                      # --restricted: only devices the founder grants can READ or write — content is sealed under a rotating epoch key");
             eprintln!("                                      # --grant <id> authorizes a device at startup (get one via `device-id <dir>`)");
             eprintln!("  riftpipe device-id <dir>            # print (creating if absent) this device's id for <dir> — share it to be --grant'ed");
@@ -468,7 +468,8 @@ async fn connect_dial(target: &str, dir: &str, opts: &Opts) -> riftpipe::net::Re
         let dir = riftpipe::sync::tree::prepare_dir(std::path::Path::new(dir))?;
         let (watcher, mut rx) = riftpipe::sync::tree::watch(&dir);
         let mut peer = riftpipe::sync::tree::TreePeer::new();
-        apply_auth(&mut peer, &dir, opts, false); // joiner
+        let board = riftpipe_core::crypto::topic_from_secret(&secret);
+        apply_auth(&mut peer, &dir, opts, AuthRole::Joiner, board)?;
         eprintln!("[riftpipe] joining sealed board (host {}); syncing {}", addr.id, dir.display());
         return riftpipe::sync::mesh::join_and_run(secret, addr, &dir, &mut peer, &mut rx, watcher.is_none()).await;
     }
@@ -518,39 +519,77 @@ fn hex_to_32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Configure device-linking auth on a mesh `TreePeer` when `--restricted` is set:
-/// load/persist this device's identity, turn on signing + enforcement, and — for
-/// a founder — self-sign the genesis and grant any `--grant <hex>` device ids as
-/// Members. Prints this device's id (share it to be granted). No-op otherwise.
-fn apply_auth(peer: &mut riftpipe::sync::tree::TreePeer, dir: &std::path::Path, opts: &Opts, founder: bool) {
-    use riftpipe_core::identity::Role;
+/// Which side configures auth: the board's host (founder) or a joiner.
+#[derive(Clone, Copy)]
+enum AuthRole {
+    /// `connect --accept`; `resuming` = an existing `<dir>/.riftpipe-host` is resumed.
+    Host { resuming: bool },
+    /// `connect <ticket> <dir>`.
+    Joiner,
+}
+
+/// Configure device-linking auth on a mesh `TreePeer` bound to `board` when
+/// `--restricted` is set: load/persist this device's identity, turn on signing +
+/// enforcement, and restore the board's persisted trust log + epoch announces
+/// (`<dir>/.riftpipe-sync/<board>/auth.state`). A host then checks it may resume
+/// (`mesh::check_restricted_resume`), self-signs the genesis, and grants each
+/// `--grant <hex>` device id as a Member unless the log already knows it. Prints
+/// this device's id (share it to be granted). No-op otherwise.
+fn apply_auth(
+    peer: &mut riftpipe::sync::tree::TreePeer,
+    dir: &std::path::Path,
+    opts: &Opts,
+    role: AuthRole,
+    board: [u8; 32],
+) -> riftpipe::net::Result<()> {
+    use riftpipe::sync::tree::{AuthRestore, StartupGrant};
     if !opts.restricted {
         if opts.name.is_some() {
             eprintln!("[auth] --name only applies with --restricted (ignored)");
         }
-        return;
+        return Ok(());
     }
     let key = load_or_create_device(dir);
     let id_hex: String = key.id().iter().map(|b| format!("{b:02x}")).collect();
-    if founder {
-        peer.add_trust(key.genesis());
+    let genesis = key.genesis();
+    peer.set_identity(key, true);
+    peer.set_board(board);
+    let restore = peer.restore_auth(dir);
+    match (&restore, role) {
+        (AuthRestore::Restored { trust, epochs }, _) => {
+            eprintln!("[auth] restored {trust} trust entries and {epochs} epoch announces for this board")
+        }
+        (AuthRestore::Rejected(why), AuthRole::Joiner) => {
+            eprintln!("[auth] ignoring the persisted trust log/epochs ({why}) — relearning them from the board")
+        }
+        _ => {}
+    }
+    if let AuthRole::Host { resuming } = role {
+        riftpipe::sync::mesh::check_restricted_resume(dir, resuming, &restore, peer.founder(), peer.device_id())?;
+        peer.add_trust(genesis);
         for g in &opts.grant {
-            match hex_to_32(g) {
-                Some(gid) => {
-                    let nonce = rand::random::<[u8; 16]>();
-                    peer.add_trust(key.grant(gid, Role::Member, nonce));
-                    eprintln!("[auth] granted device {g} (Member)");
+            let Some(gid) = hex_to_32(g) else {
+                eprintln!("[auth] ignoring malformed --grant {g}");
+                continue;
+            };
+            match peer.grant_at_startup(gid) {
+                StartupGrant::Granted => eprintln!("[auth] granted device {g} (Member)"),
+                StartupGrant::AlreadyAuthorized => {
+                    eprintln!("[auth] --grant {g} skipped: already authorized on this board")
                 }
-                None => eprintln!("[auth] ignoring malformed --grant {g}"),
+                StartupGrant::Revoked => eprintln!(
+                    "[auth] --grant {g} skipped: this device was revoked on this board — re-authorize it on the running board with: riftpipe grant {} {g}",
+                    dir.display()
+                ),
+                StartupGrant::NoIdentity => {}
             }
         }
     }
-    peer.set_identity(key, true);
     if let Some(n) = &opts.name {
         peer.set_request_name(n);
     }
     eprintln!("[auth] restricted mode — this device id: {id_hex}");
-    if !founder {
+    if matches!(role, AuthRole::Joiner) {
         if let Some(req) = peer.my_request() {
             let name_json = serde_json::to_string(&req.name).unwrap_or_default();
             let safety = req.safety_code();
@@ -560,6 +599,7 @@ fn apply_auth(peer: &mut riftpipe::sync::tree::TreePeer, dir: &std::path::Path, 
             );
         }
     }
+    Ok(())
 }
 
 /// Encode a mesh ticket: `hex(postcard((secret, addr)))` — the exact encoding of
@@ -596,23 +636,26 @@ fn decode_mesh_ticket(s: &str) -> Option<([u8; 32], iroh::EndpointAddr)> {
 /// converge. `_opts` (e.g. `--metrics`) is unused: the metrics side-car reports
 /// a single link's `connection_kind`, which a swarm doesn't have. The same
 /// `dir` is the same board across restarts (identity + board secret persist
-/// in `<dir>/.riftpipe-host`); `--new-board` mints a new one.
+/// in `<dir>/.riftpipe-host`); `--new-board` mints a new one. A `--restricted`
+/// host also resumes its trust log + epochs from
+/// `<dir>/.riftpipe-sync/<board>/auth.state`.
 async fn connect_accept(dir: &str, opts: &Opts) -> riftpipe::net::Result<()> {
     use riftpipe::sync::{mesh, tree};
     use std::time::Duration;
 
     let dir = tree::prepare_dir(std::path::Path::new(dir))?;
-    mesh::check_restricted_resume(&dir, opts.restricted, opts.new_board)?;
-    let (watcher, mut rx) = tree::watch(&dir);
-    let mut peer = tree::TreePeer::new();
-    apply_auth(&mut peer, &dir, opts, true); // founder: genesis + any --grant ids
-
     // Host role: load (or mint) a persisted identity + board secret, so a
     // restart resumes the SAME board (same topic, same EndpointId) instead of
-    // a different one. Go online (best-effort relay home) so the ticket dials
-    // cross-network.
+    // a different one.
+    let resuming = mesh::host_resumes(&dir, opts.new_board);
     let (sk, secret) = mesh::load_or_create_host(&dir, opts.new_board)?;
-    let peers = mesh::load_peer_book(&dir, riftpipe_core::crypto::topic_from_secret(&secret));
+    let board = riftpipe_core::crypto::topic_from_secret(&secret);
+    let mut peer = tree::TreePeer::new();
+    apply_auth(&mut peer, &dir, opts, AuthRole::Host { resuming }, board)?; // founder: genesis + any --grant ids
+    let (watcher, mut rx) = tree::watch(&dir);
+
+    // Go online (best-effort relay home) so the ticket dials cross-network.
+    let peers = mesh::load_peer_book(&dir, board);
     let conn =
         mesh::MeshConn::join_with(mesh::JoinOpts { secret, bootstrap: None, secret_key: Some(sk), peers }).await?;
     let _ = tokio::time::timeout(Duration::from_secs(5), conn.endpoint().online()).await;

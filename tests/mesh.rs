@@ -665,10 +665,11 @@ async fn mesh_host_crash_restart_resyncs_gap_edits() {
 }
 
 /// `connect --accept --restricted` on a dir that already hosted a board stops
-/// before going online and keeps the old identity file untouched: resuming would
-/// replay `--grant`s and could re-authorize a live-revoked device.
+/// before going online and keeps the old identity file untouched: a dir hosted by
+/// an older build or hosted open has no auth state, so a restricted host refuses
+/// to resume it.
 #[test]
-fn restricted_cli_host_restart_requires_new_board() {
+fn restricted_cli_host_without_persisted_auth_refuses_to_resume() {
     let d = dir("restricted-restart");
     let (sk, _) = load_or_create_host(&d, false).unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_riftpipe"))
@@ -683,4 +684,88 @@ fn restricted_cli_host_restart_requires_new_board() {
     let (sk2, _) = load_or_create_host(&d, false).unwrap();
     assert_eq!(sk2.to_bytes(), sk.to_bytes(), "the persisted identity is untouched");
     std::fs::remove_dir_all(&d).ok();
+}
+
+/// A `--restricted` CLI host restarted after a live revoke resumes the SAME board
+/// from its persisted trust log + epochs: the revoke sticks (its replayed `--grant`
+/// is skipped), and nothing is re-minted. Run 1 is SIGKILLed — there's no save at
+/// exit, so the state on disk is what was saved when the revoke happened.
+#[test]
+fn restricted_cli_host_restart_resumes_and_keeps_a_live_revoke() {
+    use riftpipe_core::identity::DeviceKey;
+    use std::fs::File;
+    use std::process::{Child, Command, Stdio};
+
+    let d = dir("restricted-resume");
+    let x = hex(&DeviceKey::from_seed(&[77u8; 32]).id());
+    let log = |n: u32| std::env::temp_dir().join(format!("riftpipe-mesh-{}-rr-run{n}.log", std::process::id()));
+    let spawn = |log: &PathBuf| -> Child {
+        Command::new(env!("CARGO_BIN_EXE_riftpipe"))
+            .args(["connect", "--accept"])
+            .arg(&d)
+            .args(["--restricted", "--grant", &x])
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(File::create(log).unwrap()))
+            .spawn()
+            .unwrap()
+    };
+    let wait_until = |what: &str, mut ok: Box<dyn FnMut() -> bool + '_>| {
+        let start = std::time::Instant::now();
+        while !ok() {
+            assert!(start.elapsed() < BUDGET, "timed out waiting until {what}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let has_member = |id: &str| {
+        riftpipe::sync::control::read_state(&d).is_some_and(|state| {
+            state["members"].as_array().is_some_and(|a| a.iter().any(|m| m["device"].as_str() == Some(id)))
+        })
+    };
+
+    let (log1, log2) = (log(1), log(2));
+    let mut run1 = spawn(&log1);
+    wait_until("the --grant is applied", Box::new(|| has_member(&x)));
+    // x never sent a join request, so it isn't wrapped into epoch 1: the revoke
+    // needs no rotation. The control file is tailed from its length when the run
+    // loop opens it (just after the first state write), so re-append until seen.
+    let mut last_append: Option<std::time::Instant> = None;
+    wait_until(
+        "the live revoke is applied",
+        Box::new(|| {
+            if last_append.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
+                riftpipe::sync::control::append(&d, "revoke", &x).unwrap();
+                last_append = Some(std::time::Instant::now());
+            }
+            riftpipe::sync::control::read_state(&d).is_some() && !has_member(&x)
+        }),
+    );
+
+    let (_, secret) = load_or_create_host(&d, false).unwrap();
+    let p = riftpipe::sync::auth_store::auth_path(&d, &riftpipe_core::crypto::topic_from_secret(&secret));
+    assert!(p.is_file(), "the host persisted its trust log + epochs");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "auth.state is owner-only");
+    }
+    run1.kill().unwrap();
+    let _ = run1.wait();
+    riftpipe::sync::control::remove_state(&d);
+
+    let mut run2 = spawn(&log2);
+    wait_until("the restarted host is running", Box::new(|| riftpipe::sync::control::read_state(&d).is_some()));
+    let out2 = std::fs::read_to_string(&log2).unwrap();
+    assert!(out2.contains("[auth] restored"), "restored its trust log + epochs: {out2}");
+    assert!(out2.contains(&format!("--grant {x} skipped")), "the replayed --grant is skipped: {out2}");
+    assert!(!out2.contains("rerun with --new-board"), "resumed, not refused: {out2}");
+    assert!(!out2.contains("rotated to epoch"), "no re-mint: {out2}");
+    assert!(!has_member(&x), "the live revoke sticks across the restart");
+    let state = riftpipe::sync::control::read_state(&d).unwrap();
+    assert_eq!(state["epoch"], 1, "still epoch 1: {state}");
+
+    run2.kill().unwrap();
+    let _ = run2.wait();
+    std::fs::remove_dir_all(&d).ok();
+    std::fs::remove_file(&log1).ok();
+    std::fs::remove_file(&log2).ok();
 }

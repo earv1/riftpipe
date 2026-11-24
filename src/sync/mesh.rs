@@ -45,7 +45,7 @@ use riftpipe_core::sync::{
 };
 
 use crate::net::{anyerr, Result};
-use crate::sync::tree::{scan_files, TreePeer};
+use crate::sync::tree::{scan_files, AuthRestore, TreePeer};
 
 /// The gossip topic for a board secret — `H(secret)`, so it's underivable
 /// without the share link. Identical to `web/src/gossip.rs::topic_of`.
@@ -74,6 +74,23 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Parse `<dir>/.riftpipe-host` (line 1 = iroh secret key hex, line 2 = board
+/// secret hex). `None` if absent or unparseable.
+fn read_host(path: &Path) -> Option<(SecretKey, [u8; 32])> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    let k = lines.next().and_then(parse_hex32)?;
+    let s = lines.next().and_then(parse_hex32)?;
+    Some((SecretKey::from_bytes(&k), s))
+}
+
+/// Does starting a host on `dir` resume an existing board? `fresh` = `--new-board`.
+/// An unparseable host file is not a resume: `load_or_create_host` mints a new
+/// board over it.
+pub fn host_resumes(dir: &Path, fresh: bool) -> bool {
+    !fresh && read_host(&dir.join(HOST_FILE)).is_some()
+}
+
 /// Load `<dir>/.riftpipe-host`'s persisted identity, or mint and save a fresh
 /// one. `fresh` forgets any existing file first (`--new-board`: mint a new
 /// link). Same key ⇒ same `EndpointId` ⇒ a restarted host is the SAME board.
@@ -82,19 +99,16 @@ pub fn load_or_create_host(dir: &Path, fresh: bool) -> Result<(SecretKey, [u8; 3
     if fresh {
         let _ = std::fs::remove_file(&path);
     }
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        let mut lines = text.lines();
-        if let (Some(k), Some(s)) = (lines.next().and_then(parse_hex32), lines.next().and_then(parse_hex32)) {
-            // A resumed file loosened by hand (or by an older build) goes back to owner-only.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-                }
+    if let Some(host) = read_host(&path) {
+        // A resumed file loosened by hand (or by an older build) goes back to owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
             }
-            return Ok((SecretKey::from_bytes(&k), s));
         }
+        return Ok(host);
     }
     let sk = SecretKey::generate();
     let secret = riftpipe_core::crypto::generate_secret();
@@ -123,21 +137,37 @@ pub(crate) fn write_owner_only(path: &Path, contents: &[u8]) -> std::io::Result<
     std::fs::rename(&tmp, path)
 }
 
-/// Refuse to resume a board `dir` already hosted when `restricted`, unless
-/// `fresh` (`--new-board`). `TreePeer` doesn't persist the trust log or epochs,
-/// so a restarted restricted founder would replay its `--grant`s under fresh
-/// nonces — on peers that already hold `[grant, revoke]` the new grant lands
-/// after the revoke and re-authorizes a device revoked live — and re-mint
-/// epoch 1. Until trust + epochs persist, a restricted host starts a new board.
-pub fn check_restricted_resume(dir: &Path, restricted: bool, fresh: bool) -> Result<()> {
-    if restricted && !fresh && dir.join(HOST_FILE).exists() {
-        return Err(anyerr(format!(
-            "{} already hosts a board; a --restricted host can't resume it yet (its trust log and epochs \
-             aren't persisted, so a restart could re-authorize a revoked device) — rerun with --new-board",
-            dir.display()
-        )));
+/// May a `--restricted` host start? `resuming` = `host_resumes(dir, --new-board)`. A resumed
+/// restricted board needs its persisted trust log + epochs (`auth_store`), founded by this
+/// `.device`: without them a restart would replay `--grant`s and re-mint epoch 1, which could
+/// re-authorize a device revoked live. A rejected (corrupt/edited) file always refuses.
+pub fn check_restricted_resume(
+    dir: &Path,
+    resuming: bool,
+    restore: &AuthRestore,
+    founder: Option<[u8; 32]>,
+    me: Option<[u8; 32]>,
+) -> Result<()> {
+    match restore {
+        AuthRestore::Rejected(why) => refuse(dir, &format!("its persisted trust log/epochs were rejected ({why})")),
+        _ if !resuming => Ok(()),
+        AuthRestore::Absent | AuthRestore::Skipped => {
+            refuse(dir, "it has no persisted trust log/epochs for this board (hosted open, or by an older riftpipe)")
+        }
+        AuthRestore::Restored { .. } if founder.is_none() || founder != me => refuse(
+            dir,
+            &format!("its persisted trust log was founded by a device other than {}/.device", dir.display()),
+        ),
+        AuthRestore::Restored { .. } => Ok(()),
     }
-    Ok(())
+}
+
+fn refuse(dir: &Path, why: &str) -> Result<()> {
+    Err(anyerr(format!(
+        "{} already hosts a board, but a --restricted host won't resume it: {why} — a restart without its \
+         trust log could re-authorize a revoked device; rerun with --new-board to mint a new board/link",
+        dir.display()
+    )))
 }
 
 /// This board's remembered peers (`<dir>/.riftpipe-peers`), or an empty book
@@ -816,18 +846,36 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// A restricted host refuses to resume a board its dir already hosted
-    /// (`--grant` replay could re-authorize a live-revoked device); a first run,
-    /// `--new-board`, or an open board are fine.
+    /// A `--restricted` host resumes only with a valid persisted trust log founded by
+    /// this `.device`; a rejected file refuses even on a first run.
     #[test]
-    fn restricted_host_refuses_to_resume_without_new_board() {
+    fn restricted_resume_rule() {
         let d = dir("restricted-resume");
-        assert!(check_restricted_resume(&d, true, false).is_ok(), "first run: nothing to resume");
+        let me = Some([1u8; 32]);
+        let restored = AuthRestore::Restored { trust: 1, epochs: 1 };
+        let rejected = AuthRestore::Rejected("x".into());
+        assert!(check_restricted_resume(&d, false, &AuthRestore::Absent, None, me).is_ok(), "first run");
+        assert!(check_restricted_resume(&d, false, &AuthRestore::Skipped, None, me).is_ok());
+        let err = check_restricted_resume(&d, true, &AuthRestore::Absent, None, me).expect_err("nothing persisted");
+        assert!(err.to_string().contains("rerun with --new-board"), "the error says how to proceed: {err}");
+        assert!(check_restricted_resume(&d, true, &rejected, None, me).is_err());
+        assert!(check_restricted_resume(&d, false, &rejected, None, me).is_err(), "a rejected file always refuses");
+        assert!(check_restricted_resume(&d, true, &restored, Some([1u8; 32]), me).is_ok(), "our own board resumes");
+        assert!(check_restricted_resume(&d, true, &restored, Some([2u8; 32]), me).is_err(), "another founder");
+        assert!(check_restricted_resume(&d, true, &restored, None, me).is_err(), "no genesis");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Only a parseable host file, without `--new-board`, is a resume.
+    #[test]
+    fn host_resumes_only_a_parseable_host_file() {
+        let d = dir("host-resumes");
+        assert!(!host_resumes(&d, false), "empty dir");
         load_or_create_host(&d, false).unwrap();
-        let err = check_restricted_resume(&d, true, false).expect_err("restricted resume refused");
-        assert!(err.to_string().contains("--new-board"), "the error says how to proceed: {err}");
-        assert!(check_restricted_resume(&d, true, true).is_ok(), "--new-board starts over");
-        assert!(check_restricted_resume(&d, false, false).is_ok(), "an open board resumes");
+        assert!(host_resumes(&d, false));
+        assert!(!host_resumes(&d, true), "--new-board");
+        std::fs::write(d.join(HOST_FILE), "corrupt\n").unwrap();
+        assert!(!host_resumes(&d, false), "a corrupt host file is re-minted, not resumed");
         std::fs::remove_dir_all(&d).ok();
     }
 
