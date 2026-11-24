@@ -979,6 +979,9 @@ impl TreePeer {
         if self.seen.get(&rel) == Some(&hash) {
             return None;
         }
+        // A local edit of a file whose remote delete is still being retried: the edit wins, so
+        // the retry must never remove it.
+        self.failed_removes.remove(&rel);
         let msg = if riftpipe_core::sync::is_text_path(&rel) {
             self.syncer.local_text(&rel, &String::from_utf8_lossy(&bytes))
         } else {
@@ -1027,7 +1030,9 @@ impl TreePeer {
             self.write_merged(dir, path, bytes);
         }
         for path in std::mem::take(&mut self.failed_removes) {
-            self.remove_merged(dir, path);
+            if self.syncer.is_tombstoned(&path) {
+                self.remove_merged(dir, path);
+            }
         }
         let Applied { change, mut replies, save } = self.syncer.receive(msg);
         self.report_parked();
@@ -2108,6 +2113,38 @@ mod tests {
         let decoded: DurablePath = postcard::from_bytes(&rec).unwrap();
         assert!(matches!(decoded.kind, DurableKind::Deleted { .. }));
 
+        for d in [&da, &db] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A delete that failed to remove its file and waits for a retry never removes the file once
+    /// the user edits it (the edit re-creates it): the retry is dropped.
+    #[test]
+    #[cfg(unix)]
+    fn failed_remove_retry_never_deletes_a_recreated_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let (da, db) = (dir("rmfail-recreate-a"), dir("rmfail-recreate-b"));
+        let (mut a, mut b) = (TreePeer::new(), TreePeer::new());
+        std::fs::create_dir_all(da.join("sub")).unwrap();
+        std::fs::write(da.join("sub/x.toml"), "v1").unwrap();
+        let msg = a.local_change(&da.join("sub/x.toml"), &da).expect("a local write");
+        assert!(b.apply_and_persist(msg, &db).is_empty());
+        std::fs::remove_file(da.join("sub/x.toml")).unwrap();
+        assert!(a.detect_missing(&da).is_empty());
+        let del = a.detect_missing(&da).remove(0);
+        let del_bytes = postcard::to_allocvec(&del).unwrap();
+
+        std::fs::set_permissions(db.join("sub"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        b.apply_and_persist(del, &db);
+        assert!(db.join("sub/x.toml").exists(), "the remove failed and waits for a retry");
+        std::fs::write(db.join("sub/x.toml"), "v2 by b").unwrap(); // the file itself stays writable
+        assert!(b.local_change(&db.join("sub/x.toml"), &db).is_some(), "the edit re-creates it");
+        std::fs::set_permissions(db.join("sub"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        b.apply_and_persist(postcard::from_bytes(&del_bytes).unwrap(), &db); // any later message
+        assert_eq!(std::fs::read(db.join("sub/x.toml")).unwrap(), b"v2 by b", "the retry never ran");
+        assert!(!b.syncer.is_tombstoned("sub/x.toml"));
         for d in [&da, &db] {
             std::fs::remove_dir_all(d).ok();
         }
