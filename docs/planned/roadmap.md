@@ -98,7 +98,11 @@ sense to do it, not strict priority.
     swarm-wide, which reaches a lazy peer via `IHave` → `Graft`. The cost: each reply
     (only the asker's diff) floods the swarm once. The `Hello` and the NeighborUp
     `full_state` stay neighbors-only. The browser driver still replies
-    neighbors-only. Draft upstream issue: `docs/planned/iroh-gossip-upstream.md`.
+    neighbors-only. Known limit: the NeighborUp `Hello` itself is neighbors-only
+    and can be dropped by the same pruning. With the fix, the e2e failed 1 run
+    in 45, with no trace. A general "the request and its reply must reach each
+    other" fix (anti-entropy) is planned separately. Draft upstream issue:
+    `docs/planned/iroh-gossip-upstream.md`.
   - *Durable sync records (D4):* `Syncer::durable/restore` + one `DurablePath` per
     path in the never-synced `.riftpipe-sync/` (OPFS per board, natively
     `<dir>/.riftpipe-sync/<hex topic>/` — also per board, so a reused dir never
