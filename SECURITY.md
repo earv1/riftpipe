@@ -271,9 +271,24 @@ same board. None of it ever syncs (dot-paths are machine-local):
   key **and the board secret**. The board secret is ticket-equivalent: anyone who
   reads this file can join, read and (on an open board) write the board. Guard it
   like `<dir>/.device`; it is written mode `0600`. `--new-board` deletes it and
-  mints a new board/link. A `--restricted` host refuses to resume it (its trust
-  log and epochs aren't persisted, so replaying `--grant`s could re-authorize a
-  device revoked live) — restart a restricted board with `--new-board`.
+  mints a new board/link. A `--restricted` host resumes only together with the
+  board's persisted trust log + epochs (next bullet) founded by this `.device`.
+  Otherwise (a dir hosted by an older build or hosted open, or a missing or
+  rejected state file) it refuses with a hint to use `--new-board`. On resume a
+  `--grant` for a device the log already knows is skipped, so a device revoked
+  live stays revoked; re-authorize it live with `riftpipe grant`.
+- **`<dir>/.riftpipe-sync/<hex topic>/auth.state`** (restricted CLI host or joiner):
+  - It holds the trust log and the epoch announces this peer accepted, **never
+    a raw epoch key**. Wraps are ciphertext to each recipient, and this device
+    re-opens its own with its `.device` seed, the same as the browser's
+    `riftpipe:epochs:<topic>`.
+  - It is mode `0600`, written atomically and read-union-write, and saved
+    before the change is broadcast.
+  - A keyed-BLAKE3 tag (key from the `.device` seed) and the board id guard
+    it. A corrupt, edited or foreign file is rejected whole: a restricted
+    host refuses to resume; a joiner ignores it and relearns from the board.
+  - The tag doesn't stop someone who can read `.device`; guard the dir.
+  - Not wire-visible; `PROTOCOL_VERSION` is unchanged.
 - **`<dir>/.riftpipe-peers`** and the browser's `riftpipe:peers:<topic>`
   localStorage key hold a per-board list of recently seen peer EndpointIds —
   public ids only, no secrets.

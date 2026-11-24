@@ -137,9 +137,10 @@ requires an explicit wrap.
   and re-opened with the device seed. The browser keeps them, and the trust
   log, per board: `localStorage["riftpipe:epochs:<topic>"]` and
   `["riftpipe:trust:v2:<topic>"]`, so opening another board never overwrites
-  (and so never unlocks) a claimed one; native peers keep nothing
-  on disk and relearn every epoch from the swarm each session, the same as
-  the native trust log.
+  (and so never unlocks) a claimed one; native restricted peers keep the same
+  two (trust log + verified announces) per board in
+  `<dir>/.riftpipe-sync/<hex topic>/auth.state` (see `SECURITY.md` → *Local
+  state*).
 - **Browser files are per board** — OPFS is one per origin, so each board's
   synced tree lives in `.boards/<topic>/` and a claimed board's files can never
   be primed or pushed into another board. A pre-scoping tree at the OPFS root
