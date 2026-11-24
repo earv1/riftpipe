@@ -25,6 +25,7 @@ import {
   claimWithPasskey,
   linkWithPasskey,
   meshStatus as wasmMeshStatus,
+  meshStats as wasmMeshStats,
 } from "../wasm/pkg/kanban_wasm.js";
 import { ready, watch, read, write, list } from "./fs.ts";
 import { readEvents } from "./events.ts";
@@ -111,6 +112,8 @@ export const auth = {
   claimWithPasskey: () => claimWithPasskey(),
   linkWithPasskey: () => linkWithPasskey(),
   meshStatus: () => meshStatus(),
+  // Anti-entropy + outbound-queue counters (diagnostics; see the lib's `meshStats`).
+  meshStats: () => JSON.parse(wasmMeshStats()),
   readFile: (p: string) => read(p),
   writeFile: (p: string, c: string) => write(p, c),
   listDir: (p: string) => list(p),
