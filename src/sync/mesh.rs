@@ -53,8 +53,10 @@ pub fn topic_of(secret: &[u8; 32]) -> TopicId {
     TopicId::from_bytes(topic_from_secret(secret))
 }
 
-/// `<dir>/.riftpipe-host`: line 1 = iroh secret key hex, line 2 = board secret hex.
-/// Same key ⇒ same EndpointId, same secret ⇒ same topic: a restarted host is the SAME board.
+/// `<dir>/.riftpipe-host`: line 1 = iroh secret key hex, line 2 = board secret hex, optional
+/// line 3 = a restricted host's auth.state high-water mark (decimal item count; see
+/// [`raise_auth_mark`]). Same key ⇒ same EndpointId, same secret ⇒ same topic: a restarted
+/// host is the SAME board.
 pub const HOST_FILE: &str = ".riftpipe-host";
 /// `<dir>/.riftpipe-peers`: postcard `PeerBook` (peers seen on this board).
 pub const PEERS_FILE: &str = ".riftpipe-peers";
@@ -112,13 +114,40 @@ pub fn load_or_create_host(dir: &Path, fresh: bool) -> Result<(SecretKey, [u8; 3
     }
     let sk = SecretKey::generate();
     let secret = riftpipe_core::crypto::generate_secret();
-    write_owner_only(&path, format!("{}\n{}\n", hex32(&sk.to_bytes()), hex32(&secret)).as_bytes()).map_err(anyerr)?;
+    write_host(&path, &sk, &secret, 0).map_err(anyerr)?;
     Ok((sk, secret))
+}
+
+fn write_host(path: &Path, sk: &SecretKey, secret: &[u8; 32], auth_mark: u64) -> std::io::Result<()> {
+    let mark = if auth_mark > 0 { format!("{auth_mark}\n") } else { String::new() };
+    write_owner_only(path, format!("{}\n{}\n{mark}", hex32(&sk.to_bytes()), hex32(secret)).as_bytes())
+}
+
+/// The auth.state high-water mark recorded in `<dir>/.riftpipe-host` (0 if none).
+pub fn read_auth_mark(dir: &Path) -> u64 {
+    let text = std::fs::read_to_string(dir.join(HOST_FILE)).unwrap_or_default();
+    text.lines().nth(2).and_then(|l| l.trim().parse().ok()).unwrap_or(0)
+}
+
+/// Raise the auth.state high-water mark in `<dir>/.riftpipe-host` to `count` (the
+/// item count of the auth.state just written — it never shrinks). A resume then
+/// refuses an auth.state holding fewer items: an older copy of the file (a backup
+/// restore, or a rollback to undo a revoke). Call AFTER the auth.state write, so a
+/// crash in between leaves the mark behind the file, never ahead of it.
+pub fn raise_auth_mark(dir: &Path, count: u64) -> std::io::Result<()> {
+    if count <= read_auth_mark(dir) {
+        return Ok(());
+    }
+    let path = dir.join(HOST_FILE);
+    let (sk, secret) = read_host(&path)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no parseable host file"))?;
+    write_host(&path, &sk, &secret, count)
 }
 
 /// Write `contents` to `path` so it is NEVER readable by others, not even
 /// briefly: a fresh tmp file created with mode 0600 (unix), then renamed over
-/// `path` (which replaces any looser-permissioned file there).
+/// `path` (which replaces any looser-permissioned file there). The parent dir is
+/// fsynced after the rename (unix), so the new file survives a power loss.
 pub(crate) fn write_owner_only(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
@@ -134,19 +163,26 @@ pub(crate) fn write_owner_only(path: &Path, contents: &[u8]) -> std::io::Result<
     f.write_all(contents)?;
     f.sync_all()?;
     drop(f);
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
+    }
+    Ok(())
 }
 
 /// May a `--restricted` host start? `resuming` = `host_resumes(dir, --new-board)`. A resumed
 /// restricted board needs its persisted trust log + epochs (`auth_store`), founded by this
 /// `.device`: without them a restart would replay `--grant`s and re-mint epoch 1, which could
-/// re-authorize a device revoked live. A rejected (corrupt/edited) file always refuses.
+/// re-authorize a device revoked live. A rejected (corrupt/edited) file always refuses, and so
+/// does one holding fewer items than `auth_mark` ([`read_auth_mark`]): an older copy.
 pub fn check_restricted_resume(
     dir: &Path,
     resuming: bool,
     restore: &AuthRestore,
     founder: Option<[u8; 32]>,
     me: Option<[u8; 32]>,
+    auth_mark: u64,
 ) -> Result<()> {
     match restore {
         AuthRestore::Rejected(why) => refuse(dir, &format!("its persisted trust log/epochs were rejected ({why})")),
@@ -157,6 +193,15 @@ pub fn check_restricted_resume(
         AuthRestore::Restored { .. } if founder.is_none() || founder != me => refuse(
             dir,
             &format!("its persisted trust log was founded by a device other than {}/.device", dir.display()),
+        ),
+        AuthRestore::Restored { trust, epochs } if ((trust + epochs) as u64) < auth_mark => refuse(
+            dir,
+            &format!(
+                "its persisted trust log/epochs ({} items) are older than the last save recorded in {}/{HOST_FILE} \
+                 ({auth_mark} items) — an older copy of auth.state was restored",
+                trust + epochs,
+                dir.display()
+            ),
         ),
         AuthRestore::Restored { .. } => Ok(()),
     }
@@ -630,6 +675,8 @@ pub async fn run(
                         broadcast(&sender, &cipher, &m).await;
                     }
                 }
+                // Retry a failed auth.state save (cheap no-op when nothing changed).
+                peer.save_auth(dir);
                 sync_state(peer, dir, &mut last_state);
             }
             // Re-Join restarted neighbors that re-dialed us (`SwapRejoin`). Total
@@ -854,15 +901,81 @@ mod tests {
         let me = Some([1u8; 32]);
         let restored = AuthRestore::Restored { trust: 1, epochs: 1 };
         let rejected = AuthRestore::Rejected("x".into());
-        assert!(check_restricted_resume(&d, false, &AuthRestore::Absent, None, me).is_ok(), "first run");
-        assert!(check_restricted_resume(&d, false, &AuthRestore::Skipped, None, me).is_ok());
-        let err = check_restricted_resume(&d, true, &AuthRestore::Absent, None, me).expect_err("nothing persisted");
+        assert!(check_restricted_resume(&d, false, &AuthRestore::Absent, None, me, 0).is_ok(), "first run");
+        assert!(check_restricted_resume(&d, false, &AuthRestore::Skipped, None, me, 0).is_ok());
+        let err = check_restricted_resume(&d, true, &AuthRestore::Absent, None, me, 0).expect_err("nothing persisted");
         assert!(err.to_string().contains("rerun with --new-board"), "the error says how to proceed: {err}");
-        assert!(check_restricted_resume(&d, true, &rejected, None, me).is_err());
-        assert!(check_restricted_resume(&d, false, &rejected, None, me).is_err(), "a rejected file always refuses");
-        assert!(check_restricted_resume(&d, true, &restored, Some([1u8; 32]), me).is_ok(), "our own board resumes");
-        assert!(check_restricted_resume(&d, true, &restored, Some([2u8; 32]), me).is_err(), "another founder");
-        assert!(check_restricted_resume(&d, true, &restored, None, me).is_err(), "no genesis");
+        assert!(check_restricted_resume(&d, true, &rejected, None, me, 0).is_err());
+        assert!(check_restricted_resume(&d, false, &rejected, None, me, 0).is_err(), "a rejected file always refuses");
+        assert!(check_restricted_resume(&d, true, &restored, Some([1u8; 32]), me, 0).is_ok(), "our own board resumes");
+        assert!(check_restricted_resume(&d, true, &restored, Some([2u8; 32]), me, 0).is_err(), "another founder");
+        assert!(check_restricted_resume(&d, true, &restored, None, me, 0).is_err(), "no genesis");
+        assert!(check_restricted_resume(&d, true, &restored, Some([1u8; 32]), me, 2).is_ok(), "at the mark");
+        assert!(check_restricted_resume(&d, true, &restored, Some([1u8; 32]), me, 3).is_err(), "below the mark");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// The auth.state high-water mark lives on line 3 of the host file: it only
+    /// rises, and writing it keeps the host identity intact.
+    #[test]
+    fn auth_mark_only_rises_and_keeps_the_host_identity() {
+        let d = dir("auth-mark");
+        assert_eq!(read_auth_mark(&d), 0, "no host file");
+        assert!(raise_auth_mark(&d, 3).is_err(), "no host file to record it in");
+        let (sk, secret) = load_or_create_host(&d, false).unwrap();
+        assert_eq!(read_auth_mark(&d), 0);
+        raise_auth_mark(&d, 5).unwrap();
+        raise_auth_mark(&d, 2).unwrap();
+        assert_eq!(read_auth_mark(&d), 5, "never lowered");
+        assert!(host_resumes(&d, false));
+        let (sk2, secret2) = load_or_create_host(&d, false).unwrap();
+        assert_eq!((sk2.to_bytes(), secret2), (sk.to_bytes(), secret), "same board");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(d.join(HOST_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        load_or_create_host(&d, true).unwrap();
+        assert_eq!(read_auth_mark(&d), 0, "--new-board starts a new mark");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Restoring an older copy of auth.state (from before a live revoke) is refused
+    /// on resume: it holds fewer items than the mark the host recorded.
+    #[test]
+    fn an_older_auth_state_copy_is_refused_on_resume() {
+        use riftpipe_core::identity::{DeviceKey, Role};
+        let d = dir("auth-rollback");
+        let (_, secret) = load_or_create_host(&d, false).unwrap();
+        let board = topic_from_secret(&secret);
+        let f_key = DeviceKey::from_seed(&[1u8; 32]);
+        let x = DeviceKey::from_seed(&[6u8; 32]).id();
+        let mut host = TreePeer::new();
+        host.set_identity(DeviceKey::from_seed(&[1u8; 32]), true);
+        host.set_board(board);
+        host.track_auth_mark();
+        host.add_trust(f_key.genesis());
+        host.add_trust(f_key.grant(x, Role::Member, [1u8; 16]));
+        let _ = host.startup();
+        host.save_auth(&d);
+        let path = crate::sync::auth_store::auth_path(&d, &board);
+        let old = std::fs::read(&path).unwrap();
+        assert_eq!(read_auth_mark(&d), 3, "genesis + grant + epoch 1");
+        assert!(!host.revoke_device(x, &d).is_empty());
+        assert!(read_auth_mark(&d) > 3);
+
+        let resume = |d: &Path| {
+            let mut p = TreePeer::new();
+            p.set_identity(DeviceKey::from_seed(&[1u8; 32]), true);
+            p.set_board(board);
+            let r = p.restore_auth(d);
+            check_restricted_resume(d, true, &r, p.founder(), p.device_id(), read_auth_mark(d))
+        };
+        assert!(resume(&d).is_ok(), "the current file resumes");
+        std::fs::write(&path, &old).unwrap();
+        let err = resume(&d).expect_err("an older copy is refused");
+        assert!(err.to_string().contains("older copy of auth.state"), "{err}");
+        assert!(err.to_string().contains("rerun with --new-board"), "{err}");
         std::fs::remove_dir_all(&d).ok();
     }
 

@@ -565,7 +565,9 @@ fn apply_auth(
         _ => {}
     }
     if let AuthRole::Host { resuming } = role {
-        riftpipe::sync::mesh::check_restricted_resume(dir, resuming, &restore, peer.founder(), peer.device_id())?;
+        let mark = riftpipe::sync::mesh::read_auth_mark(dir);
+        riftpipe::sync::mesh::check_restricted_resume(dir, resuming, &restore, peer.founder(), peer.device_id(), mark)?;
+        peer.track_auth_mark();
         peer.add_trust(genesis);
         for g in &opts.grant {
             let Some(gid) = hex_to_32(g) else {
@@ -584,6 +586,10 @@ fn apply_auth(
                 StartupGrant::NoIdentity => {}
             }
         }
+        // Persist the genesis + grants now, not first in the mesh loop: a first run
+        // that dies while going online must still be resumable (its .riftpipe-host
+        // already exists). Epoch 1 is minted and saved by the loop's startup.
+        peer.save_auth(dir);
     }
     if let Some(n) = &opts.name {
         peer.set_request_name(n);

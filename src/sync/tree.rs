@@ -199,6 +199,11 @@ pub struct TreePeer {
     board: Option<[u8; 32]>,
     /// (trust entries, epoch announces) counts last persisted to auth.state — skip unchanged saves.
     auth_saved: (usize, usize),
+    /// The last auth.state save failed (reported once; retried on every `save_auth`).
+    auth_save_failing: bool,
+    /// Host only: every auth.state save also raises the high-water mark in
+    /// `<dir>/.riftpipe-host` (see [`track_auth_mark`](Self::track_auth_mark)).
+    auth_mark: bool,
 }
 
 /// What an apply sends back out, by scope.
@@ -243,6 +248,8 @@ impl TreePeer {
             warned_bad_name: false,
             board: None,
             auth_saved: (0, 0),
+            auth_save_failing: false,
+            auth_mark: false,
         }
     }
 
@@ -355,24 +362,67 @@ impl TreePeer {
         (self.trust_entries.len(), self.epochs.as_ref().map_or(0, |b| b.announces().len()))
     }
 
-    /// Persist the trust log + accepted epoch announces (read-union-write, see
-    /// `auth_store`) when they changed since the last save. Restricted peers with
-    /// an identity and a bound board only.
-    pub(crate) fn save_auth(&mut self, dir: &Path) {
+    /// Host only: after each auth.state save, raise the high-water mark kept in
+    /// `<dir>/.riftpipe-host` to the saved item count, so a resume refuses an older
+    /// copy of auth.state (`mesh::check_restricted_resume`).
+    pub fn track_auth_mark(&mut self) {
+        self.auth_mark = true;
+    }
+
+    /// Write our trust log (plus `extra`, not applied yet) and accepted announces to
+    /// auth.state (read-union-write, see `auth_store`), then raise the host's
+    /// high-water mark. `None` when this peer persists nothing (not restricted, no
+    /// identity, or no board bound). A failed mark raise is only reported: the
+    /// state itself is on disk.
+    fn write_auth(&self, dir: &Path, extra: Option<&TrustEntry>) -> Option<std::io::Result<()>> {
         let (Some(key), Some(board), Some(book)) = (self.identity.as_ref(), self.board, self.epochs.as_ref()) else {
-            return;
+            return None;
         };
         if !self.mode.seals_content() {
-            return;
+            return None;
         }
+        let path = auth_store::auth_path(dir, &board);
+        let trust: Vec<TrustEntry> = self.trust_entries.iter().chain(extra).cloned().collect();
+        let saved = match auth_store::save(&path, &board, key, &trust, book.announces()) {
+            Ok(n) => n,
+            Err(e) => return Some(Err(e)),
+        };
+        if self.auth_mark {
+            if let Err(e) = crate::sync::mesh::raise_auth_mark(dir, saved) {
+                eprintln!("[auth] recording the auth.state high-water mark in {}/.riftpipe-host failed: {e}", dir.display());
+            }
+        }
+        Some(Ok(()))
+    }
+
+    /// Persist the trust log + accepted epoch announces (read-union-write, see
+    /// `auth_store`) when they changed since the last save. Restricted peers with
+    /// an identity and a bound board only. A failure is reported once and retried
+    /// on the next call (the mesh driver also calls this every second).
+    pub fn save_auth(&mut self, dir: &Path) {
         let now = self.auth_counts();
         if now == self.auth_saved {
             return;
         }
-        let path = auth_store::auth_path(dir, &board);
-        match auth_store::save(&path, &board, key, &self.trust_entries, book.announces()) {
-            Ok(()) => self.auth_saved = now,
-            Err(e) => eprintln!("[auth] persisting {} failed: {e}", path.display()),
+        match self.write_auth(dir, None) {
+            None => {}
+            Some(Ok(())) => {
+                self.auth_saved = now;
+                if std::mem::take(&mut self.auth_save_failing) {
+                    eprintln!("[auth] the trust log + epochs are persisted again");
+                }
+            }
+            Some(Err(e)) => {
+                let first_failure = !self.auth_save_failing;
+                self.auth_save_failing = true;
+                if first_failure {
+                    eprintln!(
+                        "[auth] persisting the trust log + epochs under {} failed: {e} — changes since the last save \
+                         would be lost on a restart; retrying",
+                        dir.display()
+                    );
+                }
+            }
         }
     }
 
@@ -752,6 +802,17 @@ impl TreePeer {
             }
             key.revoke(id, rand::random::<[u8; 16]>())
         };
+        // On disk before it is applied or sent: a revoke that went out but isn't
+        // persisted would be undone by a restart (the restored log still grants it).
+        if let Some(Err(e)) = self.write_auth(dir, Some(&entry)) {
+            eprintln!(
+                "[auth] revoke of {} aborted: persisting it under {} failed ({e}) — nothing was applied or sent; \
+                 fix the disk and run the revoke again",
+                hex32(&id),
+                dir.display()
+            );
+            return Vec::new();
+        }
         let was_held = self.writes_held();
         self.add_trust(entry.clone());
         eprintln!("[auth] revoked device {}", hex32(&id));
@@ -2164,5 +2225,125 @@ mod tests {
         unbound.save_auth(&d);
         assert!(!d.join(SYNC_DIR).exists(), "no board bound: nothing written");
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Make every auth.state write under `d` for BOARD fail (its tmp path is a dir).
+    fn break_auth_writes(d: &Path) -> PathBuf {
+        let tmp = PathBuf::from(format!("{}.tmp", auth_store::auth_path(d, &BOARD).display()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    /// The ids of the trust entries `d`'s auth.state holds for the founder (seed 1).
+    fn stored_trust(d: &Path) -> Vec<[u8; 32]> {
+        match auth_store::load(&auth_store::auth_path(d, &BOARD), &BOARD, &DeviceKey::from_seed(&[1u8; 32])) {
+            auth_store::Loaded::Found(s) => s.trust.iter().map(auth_store::trust_id).collect(),
+            other => panic!("expected a stored auth state, got {other:?}"),
+        }
+    }
+
+    /// A revoke that can't be persisted is aborted whole: nothing applied, nothing
+    /// to send — a restart would otherwise restore the pre-revoke log. Once the
+    /// disk works again the same revoke goes through and is on disk first.
+    #[test]
+    fn a_revoke_that_cannot_be_persisted_is_aborted_and_not_sent() {
+        let (mut founder, df, _member, dm, _revokee, dc) = restricted_board("persist-abort");
+        let c_id = DeviceKey::from_seed(&[3u8; 32]).id();
+        founder.set_board(BOARD);
+        founder.save_auth(&df);
+        let before = stored_trust(&df);
+
+        let tmp = break_auth_writes(&df);
+        assert!(founder.revoke_device(c_id, &df).is_empty(), "nothing goes out");
+        assert!(founder.members().iter().any(|(d, _)| *d == c_id), "the revoke wasn't applied");
+        assert!(!founder.trust.is_revoked(&c_id));
+        assert_eq!(founder.epoch_held(), Some(1), "no rotation");
+        assert_eq!(stored_trust(&df), before, "the file is unchanged");
+
+        std::fs::remove_dir(&tmp).unwrap();
+        let out = founder.revoke_device(c_id, &df);
+        assert!(out.iter().any(|m| matches!(m, MeshMsg::Trust(_))));
+        assert!(out.iter().any(|m| matches!(m, MeshMsg::Epoch(a) if a.seq == 2)));
+        let mut f2 = restricted_peer(1);
+        f2.set_board(BOARD);
+        assert!(matches!(f2.restore_auth(&df), AuthRestore::Restored { .. }));
+        assert!(f2.trust.is_revoked(&c_id), "the revoke is on disk");
+        assert_eq!(f2.epoch_known(), Some(2), "and so is the rotation");
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A failed save is remembered and retried on the next `save_auth`, even with
+    /// no further auth change.
+    #[test]
+    fn a_failed_auth_save_is_retried() {
+        let d = dir("persist-retry");
+        let mut founder = founder_peer();
+        founder.set_board(BOARD);
+        let tmp = break_auth_writes(&d);
+        founder.save_auth(&d);
+        assert!(founder.auth_save_failing);
+        assert!(!auth_store::auth_path(&d, &BOARD).exists());
+
+        std::fs::remove_dir(&tmp).unwrap();
+        founder.save_auth(&d);
+        assert!(!founder.auth_save_failing);
+        assert_eq!(stored_trust(&d).len(), 1, "the genesis is on disk");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// grant → revoke → re-grant restores as authorized (not revoked): the stored
+    /// order is the applied order, so a restart lands where the live log did.
+    #[test]
+    fn a_regranted_device_restores_as_authorized() {
+        let d = dir("persist-regrant");
+        let x = DeviceKey::from_seed(&[6u8; 32]).id();
+        let mut founder = founder_peer();
+        founder.set_board(BOARD);
+        founder.grant_device(x, &d);
+        founder.revoke_device(x, &d);
+        founder.grant_device(x, &d);
+        assert!(founder.trust.is_authorized(&x));
+
+        let mut f2 = restricted_peer(1);
+        f2.set_board(BOARD);
+        assert!(matches!(f2.restore_auth(&d), AuthRestore::Restored { trust: 4, .. }));
+        assert!(f2.trust.is_authorized(&x));
+        assert!(!f2.trust.is_revoked(&x));
+        assert_eq!(f2.grant_at_startup(x), StartupGrant::AlreadyAuthorized);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A restored log holding a revoke whose rotation never reached the disk: the
+    /// restarted founder rotates away from the revoked device at startup.
+    #[test]
+    fn a_restored_epoch_that_still_wraps_a_revoked_device_rotates_at_startup() {
+        let (mut founder, df, _member, dm, _revokee, dc) = restricted_board("persist-rotate");
+        let (f_key, c_id) = (DeviceKey::from_seed(&[1u8; 32]), DeviceKey::from_seed(&[3u8; 32]).id());
+        founder.set_board(BOARD);
+        founder.save_auth(&df);
+        auth_store::save(&auth_store::auth_path(&df, &BOARD), &BOARD, &f_key, &[f_key.revoke(c_id, [9u8; 16])], &[])
+            .unwrap();
+        drop(founder);
+
+        let mut f2 = restricted_peer(1);
+        f2.set_board(BOARD);
+        assert!(matches!(f2.restore_auth(&df), AuthRestore::Restored { .. }));
+        assert_eq!(f2.epoch_held(), Some(1), "epoch 1 restored, still wrapping the revoked device");
+        assert!(f2.trust.is_revoked(&c_id));
+        let out = f2.startup();
+        let rotated = out
+            .iter()
+            .find_map(|m| match m {
+                MeshMsg::Epoch(a) if a.seq == 2 => Some(a),
+                _ => None,
+            })
+            .expect("startup rotates to epoch 2");
+        assert!(!rotated.wraps.iter().any(|w| w.device == c_id), "the revoked device isn't wrapped in");
+        assert_eq!(f2.epoch_held(), Some(2));
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
     }
 }

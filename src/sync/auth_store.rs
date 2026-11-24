@@ -132,14 +132,16 @@ fn union_by<T: Clone>(mut stored: Vec<T>, ours: &[T], id: impl Fn(&T) -> [u8; 32
 }
 
 /// Read-union-write: the valid stored file (a corrupt one is replaced) unioned
-/// with `trust`/`epochs`, then written owner-only, atomically.
+/// with `trust`/`epochs`, then written owner-only, atomically. Returns how many
+/// items (trust entries + announces) the file now holds — it never shrinks, which
+/// is what the host's high-water mark in `.riftpipe-host` relies on.
 pub fn save(
     path: &Path,
     board: &[u8; 32],
     key: &DeviceKey,
     trust: &[TrustEntry],
     epochs: &[EpochAnnounce],
-) -> std::io::Result<()> {
+) -> std::io::Result<u64> {
     let stored = match load(path, board, key) {
         Loaded::Found(s) => s,
         Loaded::Absent | Loaded::Corrupt(_) => AuthState::default(),
@@ -151,7 +153,8 @@ pub fn save(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    write_owner_only(path, &encode(board, key, &merged))
+    write_owner_only(path, &encode(board, key, &merged))?;
+    Ok((merged.trust.len() + merged.epochs.len()) as u64)
 }
 
 #[cfg(test)]
