@@ -16,6 +16,14 @@
 //! other side's missed edits; a current neighbor that re-dials us (it restarted
 //! under the same key) is re-Joined (`SwapRejoin`: hyparview stale-pending
 //! workaround).
+//!
+//! Periodic anti-entropy (`core::antientropy`): a jittered, backing-off `Hello`
+//! to direct neighbors repairs any dropped broadcast; gossip `Lagged`, a dropped
+//! partial chunked message, or a shed queued message force a round. Replies to a
+//! `Hello` go swarm-wide (see `SyncMsg::Hello`). Every send
+//! goes through ONE ordered outbound queue (`core::outqueue`) drained by one
+//! task, so a message's chunk frames go out back-to-back and a queued LWW update
+//! is replaced by a newer one for the same path. `meshStats()` reports both.
 
 use futures_util::{FutureExt, StreamExt};
 use iroh::address_lookup::MemoryLookup;
@@ -25,6 +33,8 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
+use riftpipe_core::antientropy::{AeStats, AntiEntropy, AE_TICK_MS};
+use riftpipe_core::outqueue::{coalesce_key, OutQueue, Scope};
 use riftpipe_core::reconnect::{
     link_state, rejoin_targets, LinkState, PeerBook, Rejoin, SwapRejoin,
 };
@@ -941,8 +951,10 @@ pub struct GossipTreeSync {
     syncer: std::rc::Rc<std::cell::RefCell<riftpipe_core::sync::Syncer>>,
     /// The board this sync's durable records save under (see `opfs::queue_record`).
     topic: [u8; 32],
-    sender: GossipSender,
-    cipher: std::rc::Rc<riftpipe_core::crypto::MeshCipher>,
+    /// The one outbound queue (drained by one task; see [`spawn_drain`]).
+    out: Out,
+    /// Anti-entropy / queue counters for `meshStats()`, written by the receive task.
+    stats: std::rc::Rc<std::cell::Cell<MeshStats>>,
     neighbors: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<[u8; 32]>>>,
     routing: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<[u8; 32], Vec<[u8; 32]>>>>,
     versions: std::rc::Rc<std::cell::RefCell<riftpipe_core::sync::VersionMonitor>>,
@@ -1037,16 +1049,15 @@ fn save_local_record(
 }
 
 /// Act on auth output produced outside the receive loop: apply its content
-/// (firing `on_merged`), then broadcast its messages, the replies, and (if
-/// asked) our full state — all signed/sealed, in order, from one task.
+/// (firing `on_merged`), then queue its messages, the replies, and (if asked)
+/// our full state — all signed/sealed, in order.
 fn apply_and_broadcast(
     topic: [u8; 32],
     acc: Accepted,
     sy: &std::cell::RefCell<riftpipe_core::sync::Syncer>,
     au: &std::cell::RefCell<Auth>,
     on_merged: &dyn Fn(String, Vec<u8>),
-    sender: &GossipSender,
-    cipher: &std::rc::Rc<riftpipe_core::crypto::MeshCipher>,
+    out: &Out,
 ) {
     let mut msgs = acc.send;
     for msg in acc.apply {
@@ -1063,27 +1074,81 @@ fn apply_and_broadcast(
         let a = au.borrow();
         msgs.extend(full.into_iter().filter_map(|m| a.sign(m)));
     }
-    broadcast_msgs(sender, cipher, msgs);
+    out.swarm_all(msgs);
 }
 
-/// Encode and seal every frame of every message, sent in order from ONE task
-/// (so e.g. a trust entry precedes the epoch announce it authorizes).
-fn broadcast_msgs(sender: &GossipSender, cipher: &std::rc::Rc<riftpipe_core::crypto::MeshCipher>, msgs: Vec<MeshMsg>) {
-    if msgs.is_empty() {
-        return;
+/// The sync's one outbound queue (see `core::outqueue`) + the drain task's wakeup.
+#[derive(Clone)]
+struct Out {
+    q: std::rc::Rc<std::cell::RefCell<OutQueue>>,
+    wake: futures_channel::mpsc::UnboundedSender<()>,
+}
+
+impl Out {
+    fn push(&self, scope: Scope, key: Option<String>, m: &MeshMsg) {
+        self.q.borrow_mut().push(scope, key, m);
+        let _ = self.wake.unbounded_send(());
     }
-    let frames: Vec<Vec<u8>> = msgs.iter().flat_map(riftpipe_core::sync::encode_mesh_frames).collect();
-    let sender = sender.clone();
-    let cipher = cipher.clone();
+    fn swarm(&self, m: &MeshMsg) {
+        self.push(Scope::Swarm, None, m)
+    }
+    /// Direct neighbors only (plumtree-eager ones — iroh-gossip skips lazy peers):
+    /// the `NeighborUp` catch-up and anti-entropy Hellos.
+    fn neighbors(&self, m: &MeshMsg) {
+        self.push(Scope::Neighbors, None, m)
+    }
+    fn swarm_all(&self, msgs: Vec<MeshMsg>) {
+        for m in &msgs {
+            self.swarm(m)
+        }
+    }
+}
+
+/// Seal + send queued messages one at a time (frames back-to-back), until every
+/// `Out` is dropped. Every frame is AEAD-sealed so only link-holders can
+/// read/inject. A failed send must not kill the session (anti-entropy repairs
+/// it), but it must be VISIBLE — a silently dropped broadcast reads as "synced".
+fn spawn_drain(
+    sender: GossipSender,
+    cipher: std::rc::Rc<riftpipe_core::crypto::MeshCipher>,
+    q: std::rc::Rc<std::cell::RefCell<OutQueue>>,
+    mut wake: futures_channel::mpsc::UnboundedReceiver<()>,
+) {
     wasm_bindgen_futures::spawn_local(async move {
-        for b in frames {
-            let sealed = cipher.seal(&b);
-            let n = sealed.len();
-            if let Err(e) = sender.broadcast(sealed.into()).await {
-                web_sys::console::warn_1(&format!("[mesh] broadcast of {n} bytes failed: {e}").into());
+        while wake.next().await.is_some() {
+            loop {
+                let next = q.borrow_mut().pop();
+                let Some((scope, frames)) = next else { break };
+                for b in frames {
+                    let sealed = cipher.seal(&b);
+                    let n = sealed.len();
+                    let r = match scope {
+                        Scope::Swarm => sender.broadcast(sealed.into()).await,
+                        Scope::Neighbors => sender.broadcast_neighbors(sealed.into()).await,
+                    };
+                    if let Err(e) = r {
+                        web_sys::console::warn_1(&format!("[mesh] broadcast of {n} bytes failed: {e}").into());
+                    }
+                }
             }
         }
     });
+}
+
+/// Anti-entropy and outbound-queue counters for `meshStats()` (diagnostics).
+#[derive(Clone, Copy, Default)]
+struct MeshStats {
+    ae: AeStats,
+    /// Gossip `Lagged` events (the library dropped messages for us).
+    lagged: u64,
+    /// Partial chunked messages the assembler dropped.
+    evictions: u64,
+    /// Queued messages dropped over the outbound byte budget.
+    shed: u64,
+    /// Queued LWW updates replaced by a newer one for the same path.
+    coalesced: u64,
+    /// Messages waiting in the outbound queue.
+    queued: usize,
 }
 
 /// Write the board's OPFS claimed-marker once it first has a founder, so the
@@ -1203,7 +1268,16 @@ impl GossipTreeSync {
             })
         };
 
-        let (sy, nb, rt, vs, snd, cph, au, st) = (
+        // Every send goes through one ordered queue, drained by one task (see
+        // `spawn_drain`): the receive loop never awaits a broadcast, and a
+        // message's chunk frames are never interleaved with another's.
+        let (wake_tx, wake_rx) = futures_channel::mpsc::unbounded::<()>();
+        let queue = Rc::new(RefCell::new(OutQueue::new()));
+        spawn_drain(sender.clone(), cipher.clone(), queue.clone(), wake_rx);
+        let out = Out { q: queue, wake: wake_tx };
+        let stats = Rc::new(std::cell::Cell::new(MeshStats::default()));
+
+        let (sy, nb, rt, vs, snd, cph, au, st, ot, ms) = (
             syncer.clone(),
             neighbors.clone(),
             routing.clone(),
@@ -1212,33 +1286,11 @@ impl GossipTreeSync {
             cipher.clone(),
             auth.clone(),
             status.clone(),
+            out.clone(),
+            stats.clone(),
         );
         wasm_bindgen_futures::spawn_local(async move {
-            // A failed send must not kill the session, but it must be VISIBLE —
-            // a silently dropped broadcast reads as "synced". Big messages go
-            // out as chunk frames (each under the 4 KiB limit), and every frame
-            // is AEAD-sealed so only link-holders can read/inject.
-            async fn send(
-                snd: &GossipSender,
-                cph: &riftpipe_core::crypto::MeshCipher,
-                gm: &MeshMsg,
-                neighbors_only: bool,
-            ) {
-                for b in riftpipe_core::sync::encode_mesh_frames(gm) {
-                    let sealed = cph.seal(&b);
-                    let n = sealed.len();
-                    let r = if neighbors_only {
-                        snd.broadcast_neighbors(sealed.into()).await
-                    } else {
-                        snd.broadcast(sealed.into()).await
-                    };
-                    if let Err(e) = r {
-                        web_sys::console::warn_1(
-                            &format!("[mesh] broadcast of {n} bytes failed: {e}").into(),
-                        );
-                    }
-                }
-            }
+            let out = ot;
             // Mirror the library's authoritative neighbor set into the shared
             // cell (for the `connectedPeers()` debug accessor + Presence).
             let snapshot = |receiver: &GossipReceiver| -> Vec<[u8; 32]> {
@@ -1261,9 +1313,31 @@ impl GossipTreeSync {
             let mut ever = false;
             let mut online = navigator_online();
             publish_status(&st, link_state(0, false, online), 0);
+            // Anti-entropy: when to send our `Hello` digest to direct neighbors
+            // (see `core::antientropy`). Losses we can see (gossip `Lagged`, an
+            // evicted partial message, a shed queued message) force a round.
+            let mut ae = AntiEntropy::new(
+                js_sys::Date::now() as u64,
+                (js_sys::Math::random() * 9_007_199_254_740_992.0) as u64,
+            );
+            let mut ae_ticks = gloo_timers::future::IntervalStream::new(AE_TICK_MS as u32).fuse();
+            let mut lagged = 0u64;
+            let mut last_lag_ms = f64::NEG_INFINITY;
+            let (mut seen_evictions, mut seen_shed) = (0u64, 0u64);
+            let publish_stats = |ae: &AntiEntropy, lagged: u64, evictions: u64, q: &OutQueue| {
+                ms.set(MeshStats {
+                    ae: ae.stats(),
+                    lagged,
+                    evictions,
+                    shed: q.shed(),
+                    coalesced: q.coalesced(),
+                    queued: q.len(),
+                });
+            };
             enum Wake {
                 Stop,
                 Tick,
+                Ae,
                 Net(Option<bool>),
                 Incoming(Option<EndpointId>),
                 Ev(Option<Result<Event, iroh_gossip::api::ApiError>>),
@@ -1273,6 +1347,7 @@ impl GossipTreeSync {
                 let wake = futures_util::select! {
                     _ = stop => Wake::Stop,
                     _ = ticks.next() => Wake::Tick,
+                    _ = ae_ticks.next() => Wake::Ae,
                     n = net_rx.next() => Wake::Net(n),
                     id = incoming.next() => Wake::Incoming(id),
                     ev = receiver.next().fuse() => Wake::Ev(ev),
@@ -1312,6 +1387,46 @@ impl GossipTreeSync {
                         }
                         continue;
                     }
+                    // Anti-entropy: note losses, then maybe send our Hello digest
+                    // to direct neighbors (they reply with what we lack, or pull back).
+                    Wake::Ae => {
+                        let now = js_sys::Date::now() as u64;
+                        let ev = assembler.evictions();
+                        if ev != seen_evictions {
+                            web_sys::console::info_1(
+                                &format!(
+                                    "[mesh] dropped {} partial message(s) — anti-entropy will repair",
+                                    ev - seen_evictions
+                                )
+                                .into(),
+                            );
+                            seen_evictions = ev;
+                            ae.on_loss(now);
+                        }
+                        let shed = out.q.borrow().shed();
+                        if shed != seen_shed {
+                            web_sys::console::info_1(
+                                &format!(
+                                    "[mesh] outbound queue over budget — shed {} message(s); anti-entropy will repair",
+                                    shed - seen_shed
+                                )
+                                .into(),
+                            );
+                            seen_shed = shed;
+                            ae.on_loss(now);
+                        }
+                        let nbrs = snapshot(&receiver);
+                        let gen = sy.borrow().generation();
+                        if ae.poll(now, gen, &nbrs) {
+                            let hello = sy.borrow().hello();
+                            let mm = au.borrow().sign(hello);
+                            if let Some(mm) = mm {
+                                out.neighbors(&mm);
+                            }
+                        }
+                        publish_stats(&ae, lagged, seen_evictions, &out.q.borrow());
+                        continue;
+                    }
                     Wake::Net(Some(on)) => {
                         online = on;
                         if on {
@@ -1335,6 +1450,7 @@ impl GossipTreeSync {
                 };
                 match ev {
                     Event::Received(m) => {
+                        let from = *m.delivered_from.as_bytes();
                         // Open the sealed frame (an outsider's or a corrupt frame
                         // won't decrypt — drop it). Then plain frames pass through
                         // and chunk frames buffer until whole.
@@ -1367,36 +1483,46 @@ impl GossipTreeSync {
                             // ingested; a write is opened (if sealed), verified
                             // and, if accepted, applied. Whatever auth wants
                             // broadcast goes to the whole swarm; replies are
-                            // signed (and sealed) on the way back out. No borrow
-                            // is held across an `.await`.
+                            // signed (and sealed) on the way back out. Sends only
+                            // queue (no `.await`), so no borrow spans one.
                             other => {
                                 let acc = au.borrow_mut().accept(other);
                                 mark_claimed_if_due(&au, topic);
                                 for m in &acc.send {
-                                    send(&snd, &cph, m, false).await;
+                                    out.swarm(m);
                                 }
                                 for msg in acc.apply {
-                                    // A Hello's replies (up to our whole tree, for a
-                                    // fresh joiner) go back neighbors-only, like it came.
-                                    let to_neighbors = msg.replies_go_to_neighbors();
+                                    // An applied Hello feeds anti-entropy: does the
+                                    // sender agree with us, or must one side catch up?
+                                    let cmp = sy.borrow().compare_hello(&msg);
+                                    if let Some(c) = cmp {
+                                        ae.on_hello(js_sys::Date::now() as u64, from, c.consistent());
+                                    }
+                                    // Every reply goes swarm-wide — a Hello's too (see
+                                    // `SyncMsg::Hello`: a neighbors-only reply can miss
+                                    // a requester gossip holds as lazy).
                                     let (persist, replies) = sy.borrow_mut().apply(msg);
                                     if let Some((path, bytes)) = persist {
                                         on_merged(path.clone(), bytes);
                                         save_record(topic, &sy, &path);
                                     }
+                                    // A reply `Lww` is keyed: the same current-state
+                                    // reply to several Hellos collapses while queued.
                                     for r in replies {
+                                        let key = coalesce_key(&r);
                                         let mm = au.borrow().sign(r);
                                         if let Some(mm) = mm {
-                                            send(&snd, &cph, &mm, to_neighbors).await;
+                                            out.push(Scope::Swarm, key, &mm);
                                         }
                                     }
                                 }
                                 if acc.send_full_state {
                                     let full = sy.borrow().full_state();
                                     for msg in full {
+                                        let key = coalesce_key(&msg);
                                         let mm = au.borrow().sign(msg);
                                         if let Some(mm) = mm {
-                                            send(&snd, &cph, &mm, false).await;
+                                            out.push(Scope::Swarm, key, &mm);
                                         }
                                     }
                                 }
@@ -1408,7 +1534,7 @@ impl GossipTreeSync {
                         // that ordering is what lets peers deduce "Presence
                         // but no Version = pre-versioning peer".
                         let ours = riftpipe_core::sync::PROTOCOL_VERSION;
-                        send(&snd, &cph, &MeshMsg::Version { id: my_id, proto: ours }, false).await;
+                        out.swarm(&MeshMsg::Version { id: my_id, proto: ours });
                         // Catch the new neighbor up: the trust log first (so it
                         // learns the authorized set — gossip is ephemeral), then
                         // the epoch announces, then our whole (signed, sealed)
@@ -1417,11 +1543,11 @@ impl GossipTreeSync {
                         // since the admin may not be a direct neighbor.
                         let catchup = au.borrow().catchup();
                         for m in catchup {
-                            send(&snd, &cph, &m, true).await;
+                            out.neighbors(&m);
                         }
                         let rr = au.borrow().read_request();
                         if let Some(r) = rr {
-                            send(&snd, &cph, &r, false).await;
+                            out.swarm(&r);
                         }
                         // A Hello makes a one-sided reconnect bidirectional: the
                         // peer replies with what WE lack (e.g. its gap edits while
@@ -1430,20 +1556,22 @@ impl GossipTreeSync {
                         let hello = sy.borrow().hello();
                         let mm = au.borrow().sign(hello);
                         if let Some(mm) = mm {
-                            send(&snd, &cph, &mm, true).await;
+                            out.neighbors(&mm);
                         }
+                        ae.on_sent(js_sys::Date::now() as u64);
                         let full = sy.borrow().full_state();
                         for msg in full {
+                            let key = coalesce_key(&msg);
                             let mm = au.borrow().sign(msg);
                             if let Some(mm) = mm {
-                                send(&snd, &cph, &mm, true).await;
+                                out.push(Scope::Neighbors, key, &mm);
                             }
                         }
                         let list = snapshot(&receiver);
                         *nb.borrow_mut() = list.iter().copied().collect();
                         rt.borrow_mut().insert(my_id, list.clone());
                         let n = list.len();
-                        send(&snd, &cph, &MeshMsg::Presence { id: my_id, neighbors: list }, false).await;
+                        out.swarm(&MeshMsg::Presence { id: my_id, neighbors: list });
                         if book.note(*id.as_bytes(), my_id) {
                             persist_peer_book(&book);
                         }
@@ -1453,7 +1581,7 @@ impl GossipTreeSync {
                     }
                     Event::NeighborDown(_) => {
                         let ours = riftpipe_core::sync::PROTOCOL_VERSION;
-                        send(&snd, &cph, &MeshMsg::Version { id: my_id, proto: ours }, false).await;
+                        out.swarm(&MeshMsg::Version { id: my_id, proto: ours });
                         let list = snapshot(&receiver);
                         *nb.borrow_mut() = list.iter().copied().collect();
                         // Total neighbor loss: hyparview refills only from its
@@ -1462,9 +1590,20 @@ impl GossipTreeSync {
                         rejoin.on_neighbors(list.len(), js_sys::Date::now() as u64);
                         emit_status(&st, link_state(list.len(), ever, online), list.len());
                         rt.borrow_mut().insert(my_id, list.clone());
-                        send(&snd, &cph, &MeshMsg::Presence { id: my_id, neighbors: list }, false).await;
+                        out.swarm(&MeshMsg::Presence { id: my_id, neighbors: list });
                     }
-                    Event::Lagged => {}
+                    Event::Lagged => {
+                        lagged += 1;
+                        let now_ms = js_sys::Date::now();
+                        if now_ms - last_lag_ms >= 10_000.0 {
+                            web_sys::console::warn_1(
+                                &"[mesh] receiver lagged — gossip dropped messages; anti-entropy will repair".into(),
+                            );
+                            last_lag_ms = now_ms;
+                        }
+                        ae.on_loss(now_ms as u64);
+                        publish_stats(&ae, lagged, seen_evictions, &out.q.borrow());
+                    }
                 }
             }
         });
@@ -1488,21 +1627,21 @@ impl GossipTreeSync {
         // the listener must not keep a torn-down sync alive.
         let storage = {
             let (wsy, wau) = (Rc::downgrade(&syncer), Rc::downgrade(&auth));
-            let (snd, cph, on_merged) = (sender.clone(), cipher.clone(), on_merged_storage);
+            let (out, on_merged) = (out.clone(), on_merged_storage);
             StorageListener::add(move |ev: web_sys::StorageEvent| {
                 let (Some(key), Some(value)) = (ev.key(), ev.new_value()) else { return };
                 let (Some(sy), Some(au)) = (wsy.upgrade(), wau.upgrade()) else { return };
                 let acc = au.borrow_mut().sync_from_storage(&key, &value);
                 mark_claimed_if_due(&au, topic);
-                apply_and_broadcast(topic, acc, &sy, &au, &*on_merged, &snd, &cph);
+                apply_and_broadcast(topic, acc, &sy, &au, &*on_merged, &out);
             })
         };
 
         GossipTreeSync {
             syncer,
             topic,
-            sender,
-            cipher,
+            out,
+            stats,
             neighbors,
             routing,
             versions,
@@ -1522,7 +1661,7 @@ impl GossipTreeSync {
             save_local_record(self.topic, &self.syncer, path, content.as_bytes());
             let mm = self.auth.borrow().sign(msg);
             if let Some(mm) = mm {
-                self.broadcast(mm);
+                self.out.swarm(&mm);
             }
         }
     }
@@ -1531,9 +1670,11 @@ impl GossipTreeSync {
         let now = js_sys::Date::now() as u64;
         let msg = self.syncer.borrow_mut().local_lww(path, bytes.to_vec(), now);
         save_local_record(self.topic, &self.syncer, path, bytes);
+        // A queued, unsent LWW update for this path is superseded by this one.
+        let key = coalesce_key(&msg);
         let mm = self.auth.borrow().sign(msg);
         if let Some(mm) = mm {
-            self.broadcast(mm);
+            self.out.push(Scope::Swarm, key, &mm);
         }
     }
 
@@ -1617,7 +1758,7 @@ impl GossipTreeSync {
     pub fn request_access(&self) -> bool {
         match self.auth.borrow_mut().request_access() {
             Some(m) => {
-                self.broadcast(m);
+                self.out.swarm(&m);
                 true
             }
             None => false,
@@ -1699,15 +1840,7 @@ impl GossipTreeSync {
             let a = self.auth.borrow();
             msgs.extend(full.into_iter().filter_map(|m| a.sign(m)));
         }
-        self.broadcast_all(msgs);
-    }
-
-    fn broadcast(&self, gm: MeshMsg) {
-        self.broadcast_all(vec![gm]);
-    }
-
-    fn broadcast_all(&self, msgs: Vec<MeshMsg>) {
-        broadcast_msgs(&self.sender, &self.cipher, msgs);
+        self.out.swarm_all(msgs);
     }
 
     /// Direct neighbors in the swarm (this peer's connected peers), as hex ids.
@@ -1743,6 +1876,24 @@ impl GossipTreeSync {
     pub fn status(&self) -> String {
         let (s, n) = *self.status.borrow();
         status_json(s, n)
+    }
+
+    /// Anti-entropy + outbound-queue counters as JSON (diagnostics; see
+    /// [`MeshStats`]), as of the receive task's last anti-entropy tick.
+    pub fn stats_json(&self) -> String {
+        let s = self.stats.get();
+        serde_json::json!({
+            "aeSent": s.ae.sent,
+            "aeSkipped": s.ae.skipped,
+            "aeResets": s.ae.resets,
+            "losses": s.ae.losses,
+            "lagged": s.lagged,
+            "evictions": s.evictions,
+            "shed": s.shed,
+            "coalesced": s.coalesced,
+            "queued": s.queued,
+        })
+        .to_string()
     }
 }
 
@@ -1863,6 +2014,14 @@ pub fn connected_peers() -> String {
 #[wasm_bindgen::prelude::wasm_bindgen(js_name = meshStatus)]
 pub fn mesh_status() -> String {
     GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.status()).unwrap_or_else(|| IDLE_STATUS.into()))
+}
+
+/// Anti-entropy + outbound-queue counters for the active mesh, as JSON
+/// `{"aeSent","aeSkipped","aeResets","losses","lagged","evictions","shed","coalesced","queued"}`
+/// (diagnostics); `{}` with no active session.
+#[wasm_bindgen::prelude::wasm_bindgen(js_name = meshStats)]
+pub fn mesh_stats() -> String {
+    GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.stats_json()).unwrap_or_else(|| "{}".into()))
 }
 
 /// Protocol-version status for the active mesh, as JSON:

@@ -241,18 +241,9 @@ try {
   const segs = names.filter((n) => segRe.test(n));
   if (segs.length < 1) fail(`events/ should hold at least one rotated segment, got ${JSON.stringify(names)}`);
   const bBulkCount = async () => (await ev(b)).filter((e) => e.kind === "test.bulk").length;
-  // Gossip is best-effort and only repairs on a neighbour join: under a burst
-  // the active log's LAST update can be dropped, leaving B stale until A's next
-  // append. Measure that gap (informational), then append once more so the
-  // active log goes out as one uncontended message, and require convergence.
-  const t0 = Date.now();
-  const unsettled = await until(async () => ((await bBulkCount()) === 120 ? true : null), 10000);
-  console.log(unsettled
-    ? `  (info) B converged on its own after ${((Date.now() - t0) / 1000).toFixed(1)} s`
-    : `  (info) B still stale after 10 s without a further append: ${await bBulkCount()}/120 bulk events`);
-  await a.evaluate(() => window.riftpipe.logEvent("test.settle", {}));
-  // Segments converge byte-for-byte: a rotation's segment push may itself be
-  // dropped, so appends within the re-push window re-send recent segments.
+  // No further append: whatever the burst dropped (the active log's last
+  // version, a rotated segment), periodic anti-entropy Hellos deliver it, and
+  // the segments converge byte-for-byte.
   const aSegText = await a.evaluate(
     (ss) => Promise.all(ss.map((s) => window.riftpipe.readFile(`events/${s}`))), segs);
   const segsMatch = async () => {
@@ -260,14 +251,17 @@ try {
       (ss) => Promise.all(ss.map((s) => window.riftpipe.readFile(`events/${s}`))), segs);
     return bSegText.every((t, k) => t === aSegText[k]);
   };
+  const t0 = Date.now();
   const bConverged = await until(async () =>
-    (await bBulkCount()) === 120 && (await segsMatch()) ? true : null, 20000);
+    (await bBulkCount()) === 120 && (await segsMatch()) ? true : null, 30000);
   if (!bConverged) {
     const have = new Set((await ev(b)).filter((e) => e.kind === "test.bulk").map((e) => e.i));
     const missing = Array.from({ length: 120 }, (_, i) => i).filter((i) => !have.has(i));
     const bNames = await b.evaluate(() => window.riftpipe.listDir("events"));
     fail(`B should receive all 120 bulk events and A's segments, got ${have.size}; missing i=${JSON.stringify(missing)}; A segments ${JSON.stringify(segs)}; B events/ ${JSON.stringify(bNames)}`);
   }
+  console.log(`  (info) B converged ${((Date.now() - t0) / 1000).toFixed(1)} s after the burst; meshStats A`, await a.evaluate(() => window.riftpipe.meshStats()),
+    "B", await b.evaluate(() => window.riftpipe.meshStats()));
   console.log(`✓ 120 concurrent appends kept; ${segs.length} segment(s) rotated; all 120 reached B and its segments match A's byte-for-byte`);
 
   // 12. Claimed board: the log is sealed like content.

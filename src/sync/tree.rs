@@ -28,7 +28,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use riftpipe_core::epoch::{AccessMode, EpochBook, Ingested, OpenError};
 use riftpipe_core::identity::{DeviceKey, Role, TrustEntry, TrustLog};
 use riftpipe_core::onboard::JoinRequest;
-use riftpipe_core::sync::{record_name, DurablePath, MeshMsg, Restored, SyncMsg, Syncer};
+use riftpipe_core::sync::{record_name, DurablePath, HelloCmp, MeshMsg, Restored, SyncMsg, Syncer};
 
 use crate::net::{anyerr, Result, Sink, Source};
 use crate::sync::auth_store;
@@ -150,6 +150,10 @@ pub struct TreePeer {
     /// `Syncer`), so the stderr breadcrumb fires once per park — and again if a
     /// path recovers and later parks anew.
     parked_reported: HashSet<String>,
+    /// Merged bytes whose disk write failed, by rel path, retried before every
+    /// later apply. (A duplicate delivery used to rewrite the file; a merge that
+    /// adds nothing now persists nothing, so this is what repairs a failed write.)
+    failed_writes: HashMap<String, Vec<u8>>,
     // --- device-linking auth (protocol v3) ---
     /// This device's signing identity. `None` = open mode (writes unsigned).
     identity: Option<DeviceKey>,
@@ -215,16 +219,26 @@ pub struct TreePeer {
 /// peer via `IHave` → `Graft`. See `docs/planned/iroh-gossip-upstream.md`.
 #[derive(Default)]
 pub(crate) struct Outbound {
+    /// To the whole swarm — every reply, including a `Hello`'s, a Resync answer,
+    /// epoch housekeeping.
     pub(crate) swarm: Vec<MeshMsg>,
+    /// `swarm[i]`'s outbound-queue coalescing key (`outqueue::coalesce_key` of the
+    /// unwrapped reply), so identical `Lww` replies — several Hellos answered
+    /// from the same current state — replace each other while queued. Empty =
+    /// all unkeyed.
+    swarm_keys: Vec<Option<String>>,
+    /// How an applied Hello compared to our state (anti-entropy).
+    pub(crate) hello: Option<HelloCmp>,
 }
 
 impl Outbound {
     fn swarm(swarm: Vec<MeshMsg>) -> Self {
-        Outbound { swarm }
+        Outbound { swarm, swarm_keys: Vec::new(), hello: None }
     }
-    /// Every message.
-    pub(crate) fn all(self) -> Vec<MeshMsg> {
-        self.swarm
+    /// Every swarm message with its coalescing key.
+    pub(crate) fn keyed_swarm(self) -> impl Iterator<Item = (Option<String>, MeshMsg)> {
+        let keys = self.swarm_keys.into_iter().chain(std::iter::repeat(None));
+        keys.zip(self.swarm)
     }
 }
 
@@ -234,6 +248,7 @@ impl TreePeer {
             syncer: Syncer::new(format!("n{:08x}", rand::random::<u32>())),
             seen: HashMap::new(),
             parked_reported: HashSet::new(),
+            failed_writes: HashMap::new(),
             identity: None,
             trust: TrustLog::new(),
             trust_entries: Vec::new(),
@@ -568,10 +583,16 @@ impl TreePeer {
             }
             _ => return Outbound::default(),
         };
-        // Replies (a Hello's included — see `Outbound`) go to the whole swarm.
-        let replies: Vec<MeshMsg> =
-            self.apply_and_persist(inner, dir).into_iter().filter_map(|r| self.sign_mesh(r)).collect();
-        Outbound::swarm(replies)
+        let hello = self.syncer.compare_hello(&inner);
+        let (swarm_keys, swarm) = self
+            .apply_and_persist(inner, dir)
+            .into_iter()
+            .filter_map(|r| {
+                let key = riftpipe_core::outqueue::coalesce_key(&r);
+                self.sign_mesh(r).map(|m| (key, m))
+            })
+            .unzip();
+        Outbound { swarm, swarm_keys, hello }
     }
 
     /// Auth-aware receive for every mesh message the driver doesn't handle itself
@@ -734,7 +755,7 @@ impl TreePeer {
             eprintln!("[epoch] holding epoch {seq} — new content is sealed under it");
         }
         for m in ing.released {
-            out.extend(self.apply_content(m, dir).all());
+            out.extend(self.apply_content(m, dir).swarm);
         }
         if ing.gained_first_key {
             let n = self.epoch_held().unwrap_or(0);
@@ -973,21 +994,39 @@ impl TreePeer {
     /// not be overwritten). Prints the `SYNCED:{path}` breadcrumb on persist.
     /// Returns the replies to send back out.
     pub(crate) fn apply_and_persist(&mut self, msg: SyncMsg, dir: &Path) -> Vec<SyncMsg> {
+        for (path, bytes) in std::mem::take(&mut self.failed_writes) {
+            self.write_merged(dir, path, bytes);
+        }
         let (persist, replies) = self.syncer.apply(msg);
         self.report_parked();
         if let Some((path, bytes)) = persist {
             if !escapes(&path) && !hidden(&path) {
-                self.seen.insert(path.clone(), *blake3::hash(&bytes).as_bytes());
-                let full = dir.join(&path);
-                if let Some(parent) = full.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::write(&full, &bytes);
-                self.save_record(dir, &path);
-                println!("SYNCED:{path}");
+                self.write_merged(dir, path, bytes);
             }
         }
         replies
+    }
+
+    /// Write merged bytes to disk, then their record. On failure the file keeps
+    /// its old bytes, so neither `seen` (the poll would push the old bytes back
+    /// as a local edit) nor the record (a restart would restore a state the
+    /// disk doesn't hold) moves; the bytes wait in `failed_writes` for a retry.
+    fn write_merged(&mut self, dir: &Path, path: String, bytes: Vec<u8>) {
+        let full = dir.join(&path);
+        if let Some(parent) = full.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&full, &bytes) {
+            Ok(()) => {
+                self.seen.insert(path.clone(), *blake3::hash(&bytes).as_bytes());
+                self.save_record(dir, &path);
+                println!("SYNCED:{path}");
+            }
+            Err(e) => {
+                eprintln!("[sync] writing {path} failed: {e} — retrying on the next message");
+                self.failed_writes.insert(path, bytes);
+            }
+        }
     }
 
     /// The whole tree as self-contained messages — how a mesh driver catches a
@@ -1001,6 +1040,11 @@ impl TreePeer {
     /// exactly what we lack).
     pub(crate) fn hello(&self) -> SyncMsg {
         self.syncer.hello()
+    }
+
+    /// The syncer's change counter — the mesh driver feeds it to `AntiEntropy::poll`.
+    pub(crate) fn generation(&self) -> u64 {
+        self.syncer.generation()
     }
 
     /// Load every file already on disk into the syncer — the native mirror of
@@ -1395,7 +1439,7 @@ mod tests {
         assert!(member.sign_local(edit).is_none(), "epoch 1 still wraps the revoked device");
         let mut released = Vec::new();
         for m in epochs {
-            released.extend(member.authorize_and_apply(m, &dm).all());
+            released.extend(member.authorize_and_apply(m, &dm).swarm);
         }
         assert!(
             released.iter().any(|m| matches!(m, MeshMsg::Sealed(s) if s.seq == 2)),
@@ -1422,7 +1466,7 @@ mod tests {
         assert!(member.sign_local(edit).is_none(), "held: epoch 1 wraps the revoked device");
 
         let regrant = founder.grant_device(c_id, &df).into_iter().find(|m| matches!(m, MeshMsg::Trust(_))).unwrap();
-        let out = member.authorize_and_apply(regrant, &dm).all();
+        let out = member.authorize_and_apply(regrant, &dm).swarm;
         assert!(
             out.iter().any(|m| matches!(m, MeshMsg::Sealed(s) if s.seq == 1)),
             "the hold lifted (no new key): held state goes out sealed"
@@ -1761,13 +1805,126 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
+    /// Anti-entropy input: an applied Hello reports which side is ahead, and the
+    /// reply carries a write the other side never received.
+    #[test]
+    fn ae_hello_reports_divergence_and_pulls_the_missing_write() {
+        let (da, db) = (dir("ae-open-a"), dir("ae-open-b"));
+        let (mut a, mut b) = (TreePeer::new(), TreePeer::new());
+        std::fs::write(da.join("x.toml"), "v1").unwrap();
+        a.local_change(&da.join("x.toml"), &da).expect("a local write"); // never delivered
+
+        let out = a.authorize_and_apply(b.sign_mesh(b.hello()).unwrap(), &da);
+        assert_eq!(out.hello, Some(HelloCmp { we_ahead: true, they_ahead: false }));
+        assert_eq!(out.swarm.len(), 1, "a answers b's Hello with the missed write");
+
+        let at_b = b.authorize_and_apply(a.sign_mesh(a.hello()).unwrap(), &db);
+        assert_eq!(at_b.hello, Some(HelloCmp { we_ahead: false, they_ahead: true }));
+
+        let generation = b.generation();
+        for m in out.swarm {
+            b.authorize_and_apply(m, &db);
+        }
+        assert_eq!(std::fs::read(db.join("x.toml")).unwrap(), b"v1");
+        assert!(b.generation() > generation, "the repaired write moves b's generation");
+        let again = b.authorize_and_apply(a.sign_mesh(a.hello()).unwrap(), &db);
+        assert!(again.hello.expect("a Hello is compared").consistent());
+
+        for d in [&da, &db] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A merged file whose disk write failed is written on a later message, even
+    /// a duplicate that merges nothing (and so persists nothing by itself).
+    #[test]
+    fn failed_merge_write_is_retried_on_a_later_message() {
+        let (da, db) = (dir("wfail-a"), dir("wfail-b"));
+        let (mut a, mut b) = (TreePeer::new(), TreePeer::new());
+        std::fs::write(da.join("x.toml"), "v1").unwrap();
+        let msg = a.local_change(&da.join("x.toml"), &da).expect("a local write");
+        let bytes = postcard::to_allocvec(&msg).unwrap();
+        std::fs::create_dir_all(db.join("x.toml")).unwrap(); // a dir in the way: the write fails
+        b.apply_and_persist(postcard::from_bytes(&bytes).unwrap(), &db);
+        assert!(db.join("x.toml").is_dir(), "the write failed");
+        std::fs::remove_dir_all(db.join("x.toml")).unwrap();
+        b.apply_and_persist(postcard::from_bytes(&bytes).unwrap(), &db); // a duplicate: merges nothing
+        assert_eq!(std::fs::read(db.join("x.toml")).unwrap(), b"v1", "the failed write was retried");
+        for d in [&da, &db] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A Hello's `Lww` reply carries its path's coalescing key, so the same reply
+    /// to several neighbors' Hellos collapses in the outbound queue.
+    #[test]
+    fn hello_lww_replies_carry_their_coalescing_key() {
+        let (da, db) = (dir("ae-key-a"), dir("ae-key-b"));
+        let (mut a, b) = (TreePeer::new(), TreePeer::new());
+        std::fs::write(da.join("x.toml"), "v1").unwrap();
+        a.local_change(&da.join("x.toml"), &da).expect("a local write");
+        std::fs::write(da.join("n.md"), "# n\n").unwrap();
+        a.local_change(&da.join("n.md"), &da).expect("a local text write");
+        let out = a.authorize_and_apply(b.sign_mesh(b.hello()).unwrap(), &da);
+        let keys: Vec<Option<String>> = out.keyed_swarm().map(|(k, _)| k).collect();
+        assert_eq!(keys.len(), 2, "both files go back");
+        assert!(keys.contains(&Some("lww:x.toml".into())), "the LWW reply is keyed: {keys:?}");
+        assert!(keys.contains(&None), "a text delta stays unkeyed: {keys:?}");
+
+        let mut q = riftpipe_core::outqueue::OutQueue::new();
+        for _ in 0..3 {
+            let out = a.authorize_and_apply(b.sign_mesh(b.hello()).unwrap(), &da);
+            for (key, m) in out.keyed_swarm() {
+                q.push(riftpipe_core::outqueue::Scope::Swarm, key, &m);
+            }
+        }
+        assert_eq!(q.coalesced(), 2, "three identical LWW replies leave one queued");
+        for d in [&da, &db] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// On a restricted board the Hello travels sealed and is still compared; the
+    /// sealed reply repairs the missed write; an unsealed Hello is never compared.
+    #[test]
+    fn ae_hello_is_sealed_and_compared_on_a_restricted_board() {
+        let (mut founder, df, mut member, dm, _revokee, dc) = restricted_board("ae");
+        std::fs::write(dm.join("m.bin"), "v1").unwrap();
+        member.local_change(&dm.join("m.bin"), &dm).expect("a local write");
+        std::fs::write(dm.join("m.bin"), "v2").unwrap();
+        member.local_change(&dm.join("m.bin"), &dm).expect("a local change"); // the founder misses both
+
+        let member_hello = member.sign_mesh(member.hello()).expect("a wrapped member seals");
+        assert!(matches!(member_hello, MeshMsg::Sealed(_)));
+        let at_founder = founder.authorize_and_apply(member_hello, &df);
+        assert!(at_founder.hello.expect("a sealed Hello is compared").they_ahead);
+
+        let founder_hello = founder.sign_mesh(founder.hello()).expect("the founder seals");
+        let at_member = member.authorize_and_apply(founder_hello, &dm);
+        assert!(at_member.hello.expect("a sealed Hello is compared").we_ahead);
+        assert!(at_member.swarm.iter().any(|m| matches!(m, MeshMsg::Sealed(_))), "the repair goes out sealed");
+
+        for m in at_member.swarm {
+            founder.authorize_and_apply(m, &df);
+        }
+        assert_eq!(std::fs::read(df.join("m.bin")).unwrap(), b"v2", "the missed write reaches the founder");
+
+        let member_key = DeviceKey::from_seed(&[2u8; 32]);
+        let unsealed = MeshMsg::SignedSync(member_key.sign_write(postcard::to_allocvec(&member.hello()).unwrap()));
+        assert_eq!(founder.authorize_and_apply(unsealed, &df).hello, None, "an unsealed Hello is dropped unread");
+
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
     #[test]
     fn open_peer_ignores_sealed_content() {
         use riftpipe_core::epoch::SealedMsg;
         let d = dir("open-sealed");
         let mut peer = TreePeer::new();
         let out = peer.authorize_and_apply(MeshMsg::Sealed(SealedMsg { seq: 1, id: [0; 8], body: vec![1] }), &d);
-        assert!(out.all().is_empty());
+        assert!(out.swarm.is_empty());
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "nothing persisted");
         std::fs::remove_dir_all(&d).ok();
     }
@@ -2071,11 +2228,11 @@ mod tests {
         assert_eq!(std::fs::read(df.join("gap.md")).unwrap(), b"# made while apart\n");
 
         let plain = MeshMsg::Sync(SyncMsg::Hello { versions: vec![], lww_versions: vec![] });
-        assert!(member.authorize_and_apply(plain, &dm).all().is_empty(), "an unsealed Hello is dropped");
+        assert!(member.authorize_and_apply(plain, &dm).swarm.is_empty(), "an unsealed Hello is dropped");
 
         founder.revoke_device(DeviceKey::from_seed(&[3u8; 32]).id(), &df);
         let hello2 = founder.sign_mesh(founder.hello()).expect("sealed under the new epoch");
-        assert!(revokee.authorize_and_apply(hello2, &dc).all().is_empty(), "a revoked device can't answer it");
+        assert!(revokee.authorize_and_apply(hello2, &dc).swarm.is_empty(), "a revoked device can't answer it");
         for d in [&df, &dm, &dc] {
             std::fs::remove_dir_all(d).ok();
         }
