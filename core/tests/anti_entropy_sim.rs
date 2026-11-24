@@ -7,7 +7,9 @@
 //! iroh-gossip's plumtree, a neighbors-only message never crosses a LAZY edge
 //! (pruned cycle edges, or one side's stale view after a restart), and when every
 //! send goes through a bandwidth-limited `OutQueue` that coalesces and sheds
-//! (shed → `on_loss`, as the drivers do). Public API only.
+//! (shed → `on_loss`, as the drivers do). Deletes ride the same machinery: a
+//! tombstone counts as converged state, and a lost `Delete` is repaired by
+//! anti-entropy. Public API only.
 
 use std::collections::BTreeMap;
 
@@ -63,22 +65,52 @@ struct Net {
     rng: Rng,
     /// `(to, from, encoded SyncMsg)`.
     inflight: Vec<(usize, usize, Vec<u8>)>,
+    /// Messages sent (one per `send`, whatever the fan-out).
+    sent: u64,
+}
+
+/// The path a per-path message is about.
+fn msg_path(m: &SyncMsg) -> Option<&str> {
+    match m {
+        SyncMsg::TextDelta { path, .. }
+        | SyncMsg::Resync { path }
+        | SyncMsg::Lww { path, .. }
+        | SyncMsg::Delete { path, .. }
+        | SyncMsg::Restore { path, .. } => Some(path),
+        _ => None,
+    }
+}
+
+/// A batch in canonical order: sorted by encoded bytes, then each `Restore`
+/// moved to just before the first same-path message (the byte sort would put
+/// it, variant index 9, after the full state it precedes). A batch without a
+/// `Restore` keeps the plain byte order.
+fn canonical_batch(msgs: &[SyncMsg]) -> Vec<(Vec<u8>, &SyncMsg)> {
+    let mut sorted: Vec<(Vec<u8>, &SyncMsg)> =
+        msgs.iter().map(|m| (postcard::to_allocvec(m).unwrap(), m)).collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let restores: Vec<usize> = (0..sorted.len())
+        .filter(|&i| matches!(sorted[i].1, SyncMsg::Restore { .. }))
+        .collect();
+    for i in restores.into_iter().rev() {
+        let path = msg_path(sorted[i].1);
+        let item = sorted.remove(i);
+        let at = sorted.iter().position(|(_, m)| msg_path(m) == path).unwrap_or(sorted.len());
+        sorted.insert(at, item);
+    }
+    sorted
 }
 
 impl Net {
     /// Send a batch from one peer, in canonical (byte) order.
     fn send_all(&mut self, from: usize, scope: Scope, msgs: &[SyncMsg]) {
-        let mut encoded: Vec<Vec<u8>> = msgs
-            .iter()
-            .map(|m| postcard::to_allocvec(m).unwrap())
-            .collect();
-        encoded.sort();
-        for bytes in encoded {
+        for (bytes, _) in canonical_batch(msgs) {
             self.send(from, scope, bytes);
         }
     }
 
     fn send(&mut self, from: usize, scope: Scope, bytes: Vec<u8>) {
+        self.sent += 1;
         let targets: Vec<usize> = match scope {
             Scope::Swarm => (0..PEERS).filter(|&p| p != from).collect(),
             Scope::Neighbors => GRAPH[from]
@@ -164,15 +196,16 @@ fn text_of(s: &Syncer, path: &str) -> String {
     let Some(rec) = s.durable(path) else {
         return String::new();
     };
-    let DurableKind::Text { ops } = rec.kind else {
-        panic!("{path} is not a text doc")
+    let (DurableKind::Text { ops } | DurableKind::TextReborn { ops, .. }) = rec.kind else {
+        panic!("{path} is not a live text doc")
     };
     let mut doc = EgWalkerText::new("viewer");
     assert!(doc.merge(&ops));
     doc.content()
 }
 
-/// Every path `s` advertises, with the blake3 of the bytes it materializes.
+/// Every path `s` advertises or holds a tombstone for, with the blake3 of the
+/// bytes it materializes (`[0; 32]` for a tombstone).
 fn state(s: &Syncer) -> BTreeMap<String, [u8; 32]> {
     let SyncMsg::Hello {
         versions,
@@ -185,6 +218,7 @@ fn state(s: &Syncer) -> BTreeMap<String, [u8; 32]> {
         .into_iter()
         .map(|(p, _)| p)
         .chain(lww_versions.into_iter().map(|(p, _)| p))
+        .chain(s.tombstoned_paths())
         .map(|p| {
             let disk = s.durable(&p).unwrap().disk;
             (p, disk)
@@ -213,6 +247,7 @@ impl Sim {
                 lazy,
                 rng: Rng::new(seed),
                 inflight: Vec::new(),
+                sent: 0,
             },
             anti_entropy,
             tick: 0,
@@ -288,10 +323,7 @@ impl Sim {
             self.net.send_all(from, scope, msgs);
             return;
         };
-        let mut sorted: Vec<(Vec<u8>, &SyncMsg)> =
-            msgs.iter().map(|m| (postcard::to_allocvec(m).unwrap(), m)).collect();
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        for (bytes, m) in sorted {
+        for (bytes, m) in canonical_batch(msgs) {
             let wrapped = MeshMsg::Sync(postcard::from_bytes(&bytes).unwrap());
             qs.qs[from].push(scope, coalesce_key(m), &wrapped);
         }
@@ -334,8 +366,8 @@ impl Sim {
             if let Some(c) = peer.syncer.compare_hello(&msg) {
                 peer.ae.on_hello(now, id(from), c.consistent());
             }
-            let (_, replies) = peer.syncer.apply(msg);
-            self.send(to, Scope::Swarm, &replies);
+            let a = peer.syncer.receive(msg);
+            self.send(to, Scope::Swarm, &a.replies);
         }
         for (from, msg) in local(self) {
             self.send(from, Scope::Swarm, &[msg]);
@@ -549,6 +581,138 @@ fn converged_idle_mesh_is_silent() {
             "peer {i} sent {late} Hellos in the final 300 s of a converged, fully-eager idle mesh"
         );
     }
+}
+
+/// The delete step after a settled W(120): two plain deletes (a text card and
+/// peer 0's LWW event log) and a delete racing a concurrent edit of the same
+/// card (the edit must win), all in one tick.
+fn delete_step(sim: &mut Sim) {
+    sim.step(|sim| {
+        let edited = format!("{}edit by p4\n", text_of(&sim.peers[4].syncer, "card-1.md"));
+        vec![
+            (2, sim.peers[2].syncer.local_delete("card-2.md").expect("p2 holds card-2.md")),
+            (0, sim.peers[0].syncer.local_delete("events/p0.jsonl").expect("p0 holds its log")),
+            (1, sim.peers[1].syncer.local_delete("card-1.md").expect("p1 holds card-1.md")),
+            (4, sim.peers[4].syncer.local_text("card-1.md", &edited).expect("a real edit")),
+        ]
+    });
+}
+
+fn assert_deletes_landed(sim: &Sim, what: &str) {
+    for (i, p) in sim.peers.iter().enumerate() {
+        assert!(p.syncer.is_tombstoned("card-2.md"), "{what}: peer {i} still holds card-2.md");
+        assert!(p.syncer.is_tombstoned("events/p0.jsonl"), "{what}: peer {i} still holds events/p0.jsonl");
+        assert!(!p.syncer.is_tombstoned("card-1.md"), "{what}: peer {i} lost card-1.md to the delete");
+        assert!(
+            text_of(&p.syncer, "card-1.md").contains("edit by p4"),
+            "{what}: peer {i}'s card-1.md lacks the concurrent edit"
+        );
+    }
+    assert_pairwise_consistent(sim);
+}
+
+#[test]
+fn lossy_deletes_converge_and_go_silent() {
+    let mut max_ticks = 0;
+    for seed in 1..=10 {
+        let mut sim = Sim::new(seed, 0.30, true).with_queues(16 * 1024, 4 * 1024);
+        sim.run_workload(120);
+        sim.settle(480).unwrap_or_else(|| panic!("seed {seed}: the workload didn't converge"));
+        delete_step(&mut sim);
+        let ticks = sim
+            .settle(480)
+            .unwrap_or_else(|| panic!("seed {seed}: deletes not converged after 480 ticks"));
+        assert_deletes_landed(&sim, &format!("seed {seed}"));
+        max_ticks = max_ticks.max(ticks);
+    }
+    println!(
+        "queued, 30% loss: deletes (+ an edit racing one) converged within {max_ticks} ticks ({} ms)",
+        max_ticks * AE_TICK_MS
+    );
+
+    // No ping-pong: once converged, tombstones and the restored card go silent.
+    let mut sim = Sim::new(1, 0.0, true);
+    sim.run_workload(120);
+    sim.settle(480).expect("lossless mesh converges");
+    delete_step(&mut sim);
+    let ticks = sim.settle(480).expect("lossless deletes converge");
+    assert_deletes_landed(&sim, "lossless");
+    println!("lossless: deletes converged within {ticks} ticks ({} ms)", ticks * AE_TICK_MS);
+    let idle_ticks = 600_000 / AE_TICK_MS;
+    let half = idle_ticks / 2;
+    for _ in 0..half {
+        sim.step(|_| Vec::new());
+    }
+    let (window_start, sent_before) = (sim.now(), sim.net.sent);
+    for _ in half..idle_ticks {
+        sim.step(|_| Vec::new());
+    }
+    assert!(sim.converged());
+    for (i, p) in sim.peers.iter().enumerate() {
+        let late = p.hellos.iter().filter(|&&t| t >= window_start).count();
+        assert_eq!(late, 0, "peer {i} sent {late} Hellos in the final 300 s after deletes");
+    }
+    assert_eq!(sim.net.sent, sent_before, "messages kept flowing in the final 300 s after deletes");
+}
+
+/// Delete → re-create → delete again in quick succession under loss, so stale copies and
+/// tombstones from different rounds are in flight together: every peer must end deleted
+/// (an older, overruled deletion id must never let a `Restore` cancel the latest delete).
+#[test]
+fn lossy_delete_recreate_delete_ends_deleted() {
+    let mut max_ticks = 0;
+    for seed in 1..=24 {
+        let mut sim = Sim::new(seed, 0.30, true).with_queues(16 * 1024, 4 * 1024);
+        sim.run_workload(120);
+        sim.settle(480).unwrap_or_else(|| panic!("seed {seed}: the workload didn't converge"));
+        sim.step(|sim| vec![(2, sim.peers[2].syncer.local_delete("card-2.md").expect("p2 holds card-2.md"))]);
+        sim.step(|_| Vec::new());
+        sim.step(|sim| {
+            let m = sim.peers[3].syncer.local_text("card-2.md", "# card 2, again\n");
+            vec![(3, m.expect("a re-creation (or an edit) of card-2.md"))]
+        });
+        sim.step(|_| Vec::new());
+        sim.step(|sim| vec![(3, sim.peers[3].syncer.local_delete("card-2.md").expect("p3 holds card-2.md"))]);
+        let ticks = sim
+            .settle(480)
+            .unwrap_or_else(|| panic!("seed {seed}: delete/re-create/delete not converged"));
+        for (i, p) in sim.peers.iter().enumerate() {
+            assert!(p.syncer.is_tombstoned("card-2.md"), "seed {seed}: peer {i} brought card-2.md back");
+        }
+        assert_pairwise_consistent(&sim);
+        max_ticks = max_ticks.max(ticks);
+    }
+    println!("queued, 30% loss: delete/re-create/delete converged within {max_ticks} ticks");
+}
+
+/// Edits right before their delete, under loss: p3 edits card-3 on two consecutive ticks and
+/// deletes it on the next, so its deltas can arrive after the (small) `Delete` — every peer
+/// must still end deleted (a late delta the deleter had seen never revives the card).
+#[test]
+fn lossy_edits_overtaken_by_their_delete_end_deleted() {
+    let mut max_ticks = 0;
+    for seed in 1..=24 {
+        let mut sim = Sim::new(seed, 0.30, true).with_queues(16 * 1024, 4 * 1024);
+        sim.run_workload(120);
+        sim.settle(480).unwrap_or_else(|| panic!("seed {seed}: the workload didn't converge"));
+        for n in 0..2 {
+            sim.step(|sim| {
+                let s = &mut sim.peers[3].syncer;
+                let card = format!("{}late edit {n}\n", text_of(s, "card-3.md"));
+                vec![(3, s.local_text("card-3.md", &card).expect("a real edit"))]
+            });
+        }
+        sim.step(|sim| vec![(3, sim.peers[3].syncer.local_delete("card-3.md").expect("p3 holds card-3.md"))]);
+        let ticks = sim
+            .settle(480)
+            .unwrap_or_else(|| panic!("seed {seed}: edits + delete not converged"));
+        for (i, p) in sim.peers.iter().enumerate() {
+            assert!(p.syncer.is_tombstoned("card-3.md"), "seed {seed}: peer {i} revived card-3.md");
+        }
+        assert_pairwise_consistent(&sim);
+        max_ticks = max_ticks.max(ticks);
+    }
+    println!("queued, 30% loss: edits overtaken by their delete converged within {max_ticks} ticks");
 }
 
 #[test]

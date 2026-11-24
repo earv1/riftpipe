@@ -50,6 +50,23 @@ try {
   if (!after.includes("smoke card")) fail(`card lost after reload, got ${JSON.stringify(after)}`);
   console.log("✓ persisted across reload");
 
+  // Delete the comment, then the card (deleteComment / deleteCard → deleteFile).
+  p.on("dialog", (d) => d.accept());
+  await p.locator(".card .title-link", { hasText: "smoke card" }).click();
+  await p.waitForSelector(".drawer .comment-text", { timeout: 8000 });
+  await p.locator(".drawer .comment-delete").click();
+  await p.waitForSelector(".drawer .comments-empty", { timeout: 8000 });
+  console.log("✓ deleteComment removed the comment");
+  await p.locator(".drawer .card-delete").click();
+  const noSmokeCard = () => !Array.from(document.querySelectorAll(".card .title")).some((e) => e.textContent?.trim() === "smoke card");
+  await p.waitForFunction(noSmokeCard, null, { timeout: 8000 });
+  console.log("✓ deleteCard removed the card");
+  await p.reload({ waitUntil: "load" });
+  await p.waitForSelector(".add-card input", { timeout: 20000 });
+  await wait(1500);
+  if (!(await p.evaluate(noSmokeCard))) fail("deleted card came back after reload");
+  console.log("✓ delete persisted across reload");
+
   console.log("\nPASS — full CRUD works over the TS domain + file API");
 } finally {
   await browser.close();

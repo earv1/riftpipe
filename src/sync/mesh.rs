@@ -16,6 +16,8 @@
 //! - `NeighborDown` → drop the neighbor + re-broadcast `Presence`; total neighbor
 //!   loss starts a backoff `Rejoin` (re-dials the bootstrap + persisted `PeerBook`)
 //! - local file change → `.md` as text CRDT, else LWW with a ms timestamp
+//! - local delete (missing on two 1 s checks) → `Delete` tombstone, swarm-wide like any local
+//!   edit; a lost one is repaired by anti-entropy (the holder's `Hello` draws the `Delete`)
 //! - every neighbor seen is noted in a per-board `PeerBook`, persisted to
 //!   `<dir>/.riftpipe-peers` so a restart can re-dial them
 //! - a NEW incoming connection from a current neighbor (it restarted under the
@@ -606,6 +608,8 @@ pub async fn run(
 
     let mut rescan = interval(Duration::from_secs(2));
     rescan.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut delete_tick = interval(crate::sync::tree::DELETE_CHECK);
+    delete_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut rx_open = true;
     // Last-written `.riftpipe-auth.json` snapshot (unstamped text + when), so we
     // rewrite the file only when it changed or the heartbeat is due.
@@ -771,6 +775,15 @@ pub async fn run(
                         if let Some(mm) = peer.sign_local(msg) {
                             out.push(Scope::Swarm, key, &mm);
                         }
+                    }
+                }
+            }
+            // Local deletes: a path missing on disk on two consecutive checks.
+            _ = delete_tick.tick() => {
+                for msg in peer.detect_missing(dir) {
+                    let key = coalesce_key(&msg);
+                    if let Some(mm) = peer.sign_local(msg) {
+                        out.push(Scope::Swarm, key, &mm);
                     }
                 }
             }

@@ -1,6 +1,7 @@
 // Tree sync (`riftpipe connect`): sync a whole directory with a mesh or a
-// single peer. Remote writes land on disk and each is announced as a
-// `SYNCED:{path}` breadcrumb on stdout — the programmatic surface.
+// single peer. Remote writes and deletes land on disk and each is announced
+// as a `SYNCED:{path}` / `DELETED:{path}` breadcrumb on stdout — the
+// programmatic surface.
 
 import { spawnRiftpipe } from "./process.js";
 import type { PendingRequest } from "./auth.js";
@@ -69,6 +70,7 @@ export class TreeSession {
 
   #proc: ReturnType<typeof spawnRiftpipe>;
   #syncedCbs: Array<(path: string) => void> = [];
+  #deletedCbs: Array<(path: string) => void> = [];
   #mismatchCbs: Array<(m: ProtocolMismatch) => void> = [];
   #accessRequestCbs: Array<(r: PendingRequest) => void> = [];
   #readKeyCbs: Array<(epoch: number) => void> = [];
@@ -79,6 +81,10 @@ export class TreeSession {
       if (line.startsWith("SYNCED:")) {
         const path = line.slice("SYNCED:".length);
         for (const cb of this.#syncedCbs) cb(path);
+      }
+      if (line.startsWith("DELETED:")) {
+        const path = line.slice("DELETED:".length);
+        for (const cb of this.#deletedCbs) cb(path);
       }
     });
     // The CLI prints one stable line per mismatched peer:
@@ -111,6 +117,12 @@ export class TreeSession {
     this.#syncedCbs.push(cb);
   }
 
+  /** Subscribe to remote-delete breadcrumbs: fires with each rel path a peer's
+   *  delete removed from disk. */
+  onDeleted(cb: (path: string) => void): void {
+    this.#deletedCbs.push(cb);
+  }
+
   /** Fires once per peer whose riftpipe protocol version differs from ours. */
   onProtocolMismatch(cb: (m: ProtocolMismatch) => void): void {
     this.#mismatchCbs.push(cb);
@@ -133,6 +145,15 @@ export class TreeSession {
   synced(path: string): Promise<string> {
     return new Promise((res) => {
       this.onSynced((p) => {
+        if (p === path) res(p);
+      });
+    });
+  }
+
+  /** Wait until `path` (relative to the dir) has been deleted by a peer. */
+  deleted(path: string): Promise<string> {
+    return new Promise((res) => {
+      this.onDeleted((p) => {
         if (p === path) res(p);
       });
     });

@@ -299,6 +299,67 @@ pub fn log_merge(path: &str) {
     }
 }
 
+/// How long remote deletes are gathered into one `mesh.delete` event: a peer's delete of a
+/// directory (a kanban card: card.md, comments, meta.toml) lands as a burst of file removals.
+pub const DELETE_LOG_BATCH_MS: u32 = 1_500;
+
+thread_local! {
+    /// Last `mesh.delete` log time (ms) per path, for [`should_log_merge`]-style coalescing.
+    static LAST_DELETE: RefCell<HashMap<String, f64>> = RefCell::new(HashMap::new());
+    /// Remote deletes gathered for the next batched `mesh.delete` event.
+    static PENDING_DELETES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The `mesh.delete` event data for a batch of removed paths: `path` (the first), plus, for more
+/// than one, `paths` (all, sorted) and `dir` (their deepest common directory, `""` if none).
+pub(crate) fn delete_log_data(batch: &[String]) -> serde_json::Value {
+    let mut paths = batch.to_vec();
+    paths.sort();
+    paths.dedup();
+    if paths.len() == 1 {
+        return serde_json::json!({ "path": paths[0] });
+    }
+    let dirs: Vec<Vec<&str>> = paths
+        .iter()
+        .map(|p| {
+            let mut parts: Vec<&str> = p.split('/').collect();
+            parts.pop();
+            parts
+        })
+        .collect();
+    let mut common: Vec<&str> = dirs[0].clone();
+    for d in &dirs[1..] {
+        let n = common.iter().zip(d).take_while(|(a, b)| a == b).count();
+        common.truncate(n);
+    }
+    serde_json::json!({ "path": paths[0], "paths": paths, "dir": common.join("/") })
+}
+
+/// Log that a peer's delete removed `path` (never for `events/` paths; a path already logged in
+/// the last [`MERGE_LOG_COALESCE_MS`] is skipped). Deletes landing within
+/// [`DELETE_LOG_BATCH_MS`] share ONE `mesh.delete` event ([`delete_log_data`]), so a card delete
+/// costs each peer one event, not one per file.
+pub fn log_delete(path: &str) {
+    let now = js_sys::Date::now();
+    if !LAST_DELETE.with(|m| should_log_merge(&mut m.borrow_mut(), path, now, MERGE_LOG_COALESCE_MS)) {
+        return;
+    }
+    let first = PENDING_DELETES.with(|p| {
+        let mut p = p.borrow_mut();
+        p.push(path.to_string());
+        p.len() == 1
+    });
+    if first {
+        wasm_bindgen_futures::spawn_local(async {
+            gloo_timers::future::TimeoutFuture::new(DELETE_LOG_BATCH_MS).await;
+            let batch = PENDING_DELETES.with(|p| std::mem::take(&mut *p.borrow_mut()));
+            if !batch.is_empty() {
+                log("mesh.delete", delete_log_data(&batch));
+            }
+        });
+    }
+}
+
 /// One queued append; `done` fires once its line is written (or dropped).
 struct Job {
     kind: String,
@@ -432,6 +493,7 @@ pub async fn read_events() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
 
     #[wasm_bindgen_test]
@@ -537,6 +599,53 @@ mod tests {
         // An app event after a merge pushes promptly, capped by the merge's age.
         assert_eq!(plan_flush(Some(m), 1_000.0, d, true, w).due_ms, 1_500.0);
         assert_eq!(plan_flush(Some(m), 9_000.0, d, true, w).due_ms, 2_000.0);
+    }
+
+    #[wasm_bindgen_test]
+    fn delete_log_data_batches_a_directory() {
+        let one = delete_log_data(&["tickets/t/card.md".to_string()]);
+        assert_eq!(one, serde_json::json!({ "path": "tickets/t/card.md" }));
+        let card: Vec<String> = ["tickets/t/meta.toml", "tickets/t/card.md", "tickets/t/comments/c1.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let v = delete_log_data(&card);
+        assert_eq!(v["dir"], "tickets/t");
+        assert_eq!(v["path"], "tickets/t/card.md");
+        assert_eq!(v["paths"].as_array().unwrap().len(), 3);
+        let loose = delete_log_data(&["a.md".to_string(), "b/c.md".to_string()]);
+        assert_eq!(loose["dir"], "");
+    }
+
+    /// A burst of remote deletes (a card's files) is logged as ONE `mesh.delete` event.
+    #[wasm_bindgen_test]
+    async fn remote_delete_burst_logs_one_event() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        crate::opfs::set_active_board(topic);
+        let seen = std::rc::Rc::new(RefCell::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let cb = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
+            if let Some(line) = e.detail().as_string() {
+                sink.borrow_mut().push(line);
+            }
+        });
+        let w = web_sys::window().unwrap();
+        w.add_event_listener_with_callback("riftpipe:event", cb.as_ref().unchecked_ref()).unwrap();
+        for p in ["tickets/burst/card.md", "tickets/burst/comments/c.md", "tickets/burst/meta.toml"] {
+            log_delete(p);
+        }
+        log_delete("tickets/burst/card.md"); // a duplicate: coalesced away
+        gloo_timers::future::TimeoutFuture::new(DELETE_LOG_BATCH_MS + 1_500).await;
+        w.remove_event_listener_with_callback("riftpipe:event", cb.as_ref().unchecked_ref()).unwrap();
+        let deletes: Vec<serde_json::Value> = seen
+            .borrow()
+            .iter()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["kind"] == "mesh.delete" && v["path"].as_str().is_some_and(|p| p.starts_with("tickets/burst/")))
+            .collect();
+        assert_eq!(deletes.len(), 1, "one event for the burst: {deletes:?}");
+        assert_eq!(deletes[0]["dir"], "tickets/burst");
+        assert_eq!(deletes[0]["paths"].as_array().unwrap().len(), 3);
     }
 
     #[wasm_bindgen_test]

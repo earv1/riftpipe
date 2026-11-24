@@ -90,6 +90,10 @@ link-holder can still:
   (LWW versions are unvalidated wall-clock ms — nothing newer ever wins).
 - **Replace a whole text document** by crafting one with a higher origin agent id,
   which the origin-conflict adoption rule in `core::sync` accepts.
+- **Delete any file** on an open board (`SyncMsg::Delete`, protocol v6), just as
+  it can overwrite it: a delete that carries the holder's current content
+  fingerprint (or its whole text frontier) is applied. A concurrent edit the
+  deleter hadn't seen still wins, but nothing checks who deleted.
 
 Closing this is the **signing** follow-on: a per-message Ed25519 signature makes
 authorship provable (killing the forgeries), and a read/write key split — a
@@ -173,6 +177,12 @@ rotates.
   revoke but not yet the new epoch holds its writes (it never seals under an
   epoch that still wraps a revoked device) and sends them once the new epoch
   arrives.
+- **Deletes are content.** A tree/mesh `Delete` (and its `Restore`) travels
+  inside `SignedSync`/`Sealed` exactly like a write, so it is signed, sealed
+  under the epoch and trust-gated: an authorized device's delete lands, a
+  removed (or never-granted) device's delete is rejected everywhere, and its
+  removal stays local to that device (`e2e/delete-claimed.mjs`,
+  `run-restricted-mesh.sh`).
 
 ## Passkey device linking (protocol v5)
 
@@ -309,7 +319,10 @@ same board. None of it ever syncs (dot-paths are machine-local):
 - **`.riftpipe-sync/`** (natively `<dir>/.riftpipe-sync/<hex topic>/`, in OPFS per board) holds each
   path's CRDT history / LWW version in plaintext, next to the plaintext files it
   materializes — no more sensitive than the tree itself (though history can retain
-  text since deleted from a file).
+  text since deleted from a file). A **deleted** text file's history is kept too,
+  in its tombstone record (natively in the same `.riftpipe-sync/<hex topic>/`
+  dir, next to `auth.state`), in plaintext like live records — deleting a file
+  does not remove its past contents from this device's sync state.
 
 ## How other local-first / P2P systems handle this
 

@@ -1,5 +1,5 @@
 //! The generic, app-agnostic **file API** riftpipe exposes to JS: read, write,
-//! and list files on the synced OPFS tree. This is the library's honest surface
+//! delete (`deleteFile`) and list files on the synced OPFS tree. This is the library's honest surface
 //! — a shared file tree that syncs — the same shape the native CLI presents as
 //! real files. An app builds its domain model (a board, a wiki, …) on top in
 //! plain JS; the library never knows the layout.
@@ -26,6 +26,27 @@ pub async fn write_file(path: String, content: String) -> Result<(), JsValue> {
     crate::opfs::write_path(&path, content.as_bytes()).await?;
     crate::tree_sync::push(&path, content.as_bytes());
     Ok(())
+}
+
+/// Delete the file at `path` from the synced tree: remove it from OPFS (pruning directories left
+/// empty) and sync the delete to peers. Resolves to whether a file was removed here. Dot-paths
+/// are refused. Offline (no session), the delete syncs on the next connect (restore sees it).
+#[wasm_bindgen(js_name = deleteFile)]
+pub async fn delete_file(path: String) -> Result<bool, JsValue> {
+    let removed = crate::opfs::remove_path(&path).await?;
+    crate::tree_sync::delete(&path);
+    Ok(removed)
+}
+
+/// Whether `path` is known DELETED on the synced tree (a tombstone — this peer or a peer deleted
+/// it), as opposed to merely absent (never existed, or not synced here yet). Asks the live sync
+/// when one is up for the active board, else the path's durable record.
+#[wasm_bindgen(js_name = isDeleted)]
+pub async fn is_deleted(path: String) -> bool {
+    match crate::tree_sync::is_tombstoned(&path) {
+        Some(t) => t,
+        None => crate::opfs::record_is_deleted(&path).await,
+    }
 }
 
 /// Entry names directly under directory `path` (`""` = the tree root), as a JS

@@ -51,6 +51,17 @@ pub struct DurablePath {
 pub enum DurableKind {
     Text { ops: Vec<u8> },
     Lww { version: u64 },
+    /// APPENDED: the path is deleted — its tombstone, plus the deleted text doc's oplog (empty for LWW
+    /// or a tombstone learned for a never-held path), so a stale copy arriving after a restart is
+    /// still recognized and the delete is never undone by a restore.
+    /// `past`: the earlier-round text tombstones the path was re-created after (see
+    /// `Syncer::past`).
+    Deleted { tomb: TreeTombstone, ops: Vec<u8>, past: Vec<PastTomb> },
+    /// APPENDED: a text doc re-created after deletion(s) `superseded` (which it overrules); `past`
+    /// as for `Deleted`.
+    TextReborn { ops: Vec<u8>, superseded: Vec<u64>, past: Vec<PastTomb> },
+    /// APPENDED: an LWW file re-created after deletion(s) `superseded`.
+    LwwReborn { version: u64, superseded: Vec<u64> },
 }
 
 /// What [`Syncer::restore`] found.
@@ -60,8 +71,11 @@ pub enum Restored {
     /// The file changed while we were down: history restored + this local edit
     /// (already applied to our state; the driver re-saves the record).
     Changed(SyncMsg),
-    /// No file, a corrupt record, a kind/path mismatch, or the path already has
-    /// state: nothing restored — treat the file as new (or drop the record).
+    /// No file, but a live record: the file was deleted while we were down — now tombstoned; this
+    /// Delete (also in full_state) syncs it. The driver re-saves the record.
+    Deleted(SyncMsg),
+    /// A corrupt record, a kind/path mismatch, a dot-path, or the path already has state: nothing
+    /// restored — treat the file as new (or drop the record).
     Unusable,
 }
 
@@ -88,7 +102,8 @@ pub enum Restored {
 /// by an assertion from it), carried in `MeshMsg::Trust`. A v4 peer fails to decode
 /// those frames and skips them, so it never authorizes a passkey-linked device (and
 /// drops its writes) — the bump surfaces that.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// v6: tree/mesh deletes — two APPENDED SyncMsg variants, Delete (8, a tombstone) and Restore (9). A v5 peer fails to decode either and skips it, so it keeps deleted files and re-offers them on catch-up (v6 peers re-assert the delete) — the bump surfaces that.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Per-chunk payload budget for [`encode_mesh_frames`]. iroh-gossip's message
 /// limit defaults to 4096 bytes and is enforced on SEND AND RECEIVE — so
@@ -165,6 +180,18 @@ pub enum SyncMsg {
     /// `StratDelta` and the deleter resurrects the file). [`Syncer`] ignores it.
     /// APPENDED (wire index 7): peers that predate it skip it cleanly.
     StratDelete { path: String, ids: Vec<u64>, seen: Vec<[u8; 32]> },
+    /// Tree-dialect **tombstone** (text CRDT or LWW file): "I deleted `path`". `ids`: deterministic
+    /// deletion ids it stands for (oldest first; merged across independent deletes) — a peer that
+    /// re-created the path after any of them answers `Restore`. `seen`: blake3 fingerprints of the
+    /// content the deleters removed. `origin`/`vv`: the deleted text doc's origin + frontier (empty for
+    /// LWW). `version`: the deleted LWW version (0 for text). A receiver deletes only if it provably
+    /// holds nothing the deleter hadn't seen; otherwise its concurrent edit wins and it answers with
+    /// its full state. APPENDED (wire index 8, v6). Folder sessions ignore it.
+    Delete { path: String, ids: Vec<u64>, seen: Vec<[u8; 32]>, origin: Origin, vv: Vv, version: u64 },
+    /// "My copy of `path` re-creates it after deletion(s) `ids` — they are overruled." Sent with the
+    /// full state by a peer refusing a stale `Delete`; a peer whose tombstone shares an id drops it.
+    /// APPENDED (wire index 9, v6).
+    Restore { path: String, ids: Vec<u64> },
 }
 
 /// How a peer's `Hello` compares to our state (anti-entropy).
@@ -460,6 +487,133 @@ struct ResyncState {
     failures: u8,
 }
 
+/// Most fingerprints a tree tombstone keeps in `seen` (oldest dropped).
+pub const TREE_SEEN_CAP: usize = 16;
+/// Most deletion ids a tree tombstone stands for (oldest dropped).
+pub const TREE_DELETION_IDS_CAP: usize = 8;
+/// Most overruled deletion ids a re-created path remembers (oldest dropped).
+pub const TREE_SUPERSEDED_CAP: usize = 64;
+/// Most `(agent, seq)` tips a tree tombstone's `vv` keeps (oldest dropped).
+pub const TREE_VV_CAP: usize = 256;
+/// Most earlier-round text tombstones a path remembers (`Syncer::past`; oldest dropped).
+pub const TREE_PAST_CAP: usize = 4;
+
+/// blake3 of a file's bytes — what `Delete::seen` / `DurablePath::disk` hold.
+pub fn fingerprint(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
+}
+
+/// Deterministic deletion id (two peers deleting the same content with the same history mint the
+/// same id). Body = src/sync/workspace.rs::deletion_id with domain b"riftpipe/tree-delete/v1\0" and
+/// `fp` in place of `seen.last()`.
+pub fn tree_deletion_id(path: &str, fp: &[u8; 32], superseded: &[u64]) -> u64 {
+    let mut h = blake3::Hasher::new();
+    h.update(b"riftpipe/tree-delete/v1\0");
+    h.update(path.as_bytes());
+    h.update(&[0]);
+    h.update(fp);
+    let mut sup = superseded.to_vec();
+    sup.sort_unstable();
+    sup.dedup();
+    for id in sup {
+        h.update(&id.to_le_bytes());
+    }
+    u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("8 bytes"))
+}
+
+/// A path a tree delete may name: non-empty, relative, no empty or dot-leading component (so no
+/// `..`, no hidden/sync-state dirs like `.riftpipe-sync`).
+fn deletable_path(p: &str) -> bool {
+    !p.is_empty() && p.split('/').all(|c| !c.is_empty() && !c.starts_with('.'))
+}
+
+/// Push `item` unless present; drop oldest beyond `cap`. True if it was added.
+fn push_absent<T: PartialEq>(list: &mut Vec<T>, item: T, cap: usize) -> bool {
+    if list.contains(&item) {
+        return false;
+    }
+    list.push(item);
+    while list.len() > cap {
+        list.remove(0);
+    }
+    true
+}
+
+/// Add tips of `from` not already in `into` (exact pair); drop oldest beyond TREE_VV_CAP. True if changed.
+fn union_tips(into: &mut Vv, from: &[(String, usize)]) -> bool {
+    let mut changed = false;
+    for tip in from {
+        changed |= push_absent(into, tip.clone(), TREE_VV_CAP);
+    }
+    changed
+}
+
+/// A tree tombstone: what a peer needs to judge delete-vs-concurrent-edit (see `SyncMsg::Delete`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TreeTombstone {
+    pub ids: Vec<u64>,
+    pub seen: Vec<[u8; 32]>,
+    pub origin: Origin,
+    pub vv: Vv,
+    pub version: u64,
+    /// Deletion ids the deleted file had itself overruled (local-only, never sent).
+    pub prior: Vec<u64>,
+}
+
+/// Whether a deleter whose doc reached frontier `vv` had seen every op of `doc` (same doc, the
+/// caller checks the origin): `doc.ops_since(vv)` is none, OR each tip `(agent, seq)` of `doc` has
+/// some `(agent, s ≥ seq)` in `vv`. The per-agent half is what judges a doc that is BEHIND tips
+/// `vv` names but `doc` lacks — `ops_since` drops unknown tips, so to it a lagging copy looks
+/// ahead. Sound because one agent's ops form a causal chain: holding `(agent, s)` means holding
+/// all of that agent's earlier ops and their history.
+fn seen_by(doc: &EgWalkerText, vv: &Vv) -> bool {
+    doc.ops_since(vv).is_none()
+        || doc.version_vector().iter().all(|(a, seq)| vv.iter().any(|(b, s)| a == b && s >= seq))
+}
+
+/// `t` as the `Delete` for `path`.
+fn delete_msg(path: &str, t: &TreeTombstone) -> SyncMsg {
+    SyncMsg::Delete {
+        path: path.to_string(),
+        ids: t.ids.clone(),
+        seen: t.seen.clone(),
+        origin: t.origin.clone(),
+        vv: t.vv.clone(),
+        version: t.version,
+    }
+}
+
+/// An earlier-round text tombstone a re-created path remembers (`Syncer::past`), with the deleted
+/// doc's oplog (empty if this peer never held it) so an OLDER copy of it is recognized too.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PastTomb {
+    pub tomb: TreeTombstone,
+    pub ops: Vec<u8>,
+}
+
+/// A deleted path's state: its tombstone plus, for text, the deleted doc (so a stale copy of the
+/// same doc is recognized as already-seen, and genuinely new ops revive it with full history).
+struct Tomb {
+    t: TreeTombstone,
+    doc: Option<EgWalkerText>,
+}
+
+/// A file-level effect of [`Syncer::receive`] for the driver to apply on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    Write { path: String, bytes: Vec<u8> },
+    Remove { path: String },
+}
+
+/// What `receive` produced. Drivers apply `change` (write / delete the file), THEN rewrite `save`'s
+/// durable record from `durable(save)` — or delete that record when `durable` is `None`.
+#[derive(Default)]
+pub struct Applied {
+    pub change: Option<Change>,
+    pub replies: Vec<SyncMsg>,
+    pub save: Option<String>,
+}
+
 /// Per-file sync state for one peer. Author under a **unique** `agent` (a shared
 /// agent id would corrupt the CRDT).
 pub struct Syncer {
@@ -483,6 +637,20 @@ pub struct Syncer {
     /// Bumped whenever held state actually changes — drivers feed it to
     /// `AntiEntropy::poll`.
     generation: u64,
+    /// Per re-created path: the deletion ids it overrules (a `Delete` naming any is answered with
+    /// `Restore` + full state instead of being applied).
+    superseded: HashMap<String, Vec<u64>>,
+    /// Per deleted path: its tombstone (and, for text, the deleted doc).
+    tombs: HashMap<String, Tomb>,
+    /// Local re-creations so far — each re-created text doc is authored under
+    /// `"{agent}~{rebirths}"` so its op ids can't collide with the deleted doc's.
+    rebirths: u64,
+    /// Per path: the TEXT tombstones it was re-created after, newest last (capped). The latest
+    /// tombstone describes the latest doc only, so a peer that was away since an EARLIER round and
+    /// still holds that round's (different) doc can't be judged by it; a copy one of these covers
+    /// is answered with that round's own `Delete`, which the holder can judge. Kept across later
+    /// deletes and re-creations.
+    past: HashMap<String, Vec<PastTomb>>,
 }
 
 impl Syncer {
@@ -495,6 +663,10 @@ impl Syncer {
             parked: HashSet::new(),
             lww: HashMap::new(),
             generation: 0,
+            superseded: HashMap::new(),
+            tombs: HashMap::new(),
+            rebirths: 0,
+            past: HashMap::new(),
         }
     }
 
@@ -535,7 +707,9 @@ impl Syncer {
     }
 
     /// How `msg` (expected to be a `Hello`) compares to our own state —
-    /// `None` unless `msg` is a `Hello`.
+    /// `None` unless `msg` is a `Hello`. A tombstoned path they still hold counts as `we_ahead`
+    /// (we answer with its `Delete`), plus `they_ahead` if their copy may hold ops or a version
+    /// past the delete.
     pub fn compare_hello(&self, msg: &SyncMsg) -> Option<HelloCmp> {
         let SyncMsg::Hello { versions, lww_versions } = msg else { return None };
         let mut cmp = HelloCmp::default();
@@ -544,6 +718,16 @@ impl Syncer {
         // Text, their side.
         for (path, vv) in &their {
             if self.parked.contains(path) {
+                continue;
+            }
+            if let Some(tomb) = self.tombs.get(path) {
+                cmp.we_ahead = true;
+                let known = tomb.doc.as_ref().is_some_and(|d| {
+                    d.origin().is_some() && vv.iter().all(|(a, s)| d.knows(a, *s))
+                });
+                if !vv.is_empty() && !known {
+                    cmp.they_ahead = true;
+                }
                 continue;
             }
             match self.docs.get(path) {
@@ -569,6 +753,11 @@ impl Syncer {
         // LWW, their side.
         let their_lww: HashMap<String, u64> = lww_versions.iter().cloned().collect();
         for (path, v) in &their_lww {
+            if let Some(tomb) = self.tombs.get(path) {
+                cmp.we_ahead = true;
+                cmp.they_ahead |= *v > tomb.t.version;
+                continue;
+            }
             if self.lww.get(path).is_none_or(|(mine, _)| v > mine) {
                 cmp.they_ahead = true;
             }
@@ -600,7 +789,16 @@ impl Syncer {
 
     /// Record a local text edit (snapshot diff-to-ops); returns a **delta** of the
     /// new ops to send, or `None` if the peer already has everything.
+    /// Re-creating a tombstoned path starts a NEW doc (a fresh agent, so op ids can't collide with
+    /// the deleted doc's) that overrules the deletion(s).
     pub fn local_text(&mut self, path: &str, content: &str) -> Option<SyncMsg> {
+        let reborn = self.untomb(path).is_some();
+        if reborn {
+            self.rebirths += 1;
+            let agent = format!("{}~{}", self.agent, self.rebirths);
+            self.docs.insert(path.to_string(), EgWalkerText::new(&agent));
+            self.peer_vv.remove(path);
+        }
         let peer = self.peer_vv.get(path).cloned().unwrap_or_default();
         let changed = {
             let doc = self.doc(path);
@@ -608,7 +806,7 @@ impl Syncer {
             doc.edit_to(content);
             doc.version() != before
         };
-        if changed {
+        if changed || reborn {
             self.generation += 1;
         }
         let doc = self.docs.get(path).expect("doc() just ensured it");
@@ -619,8 +817,9 @@ impl Syncer {
         Some(SyncMsg::TextDelta { path: path.to_string(), ops, vv, origin })
     }
 
-    /// Full self-contained state of every text doc — broadcast to a newly-joined
-    /// neighbor (gossip has no per-peer delta) so it catches up + merges.
+    /// Full self-contained state of every text doc, LWW file and tombstone (a `Delete` per deleted
+    /// path, last, sorted) — broadcast to a newly-joined neighbor (gossip has no per-peer delta) so
+    /// it catches up + merges.
     pub fn full_state(&self) -> Vec<SyncMsg> {
         let mut msgs: Vec<SyncMsg> = self
             .docs
@@ -635,6 +834,9 @@ impl Syncer {
             })
             .collect();
         msgs.extend(self.lww_updates_for(&HashMap::new()));
+        let mut deleted: Vec<&String> = self.tombs.keys().collect();
+        deleted.sort();
+        msgs.extend(deleted.into_iter().map(|path| self.tomb_msg(path)));
         msgs
     }
 
@@ -649,9 +851,11 @@ impl Syncer {
     }
 
     /// Record a local structural write; `now` is a millisecond clock.
+    /// Re-creating a tombstoned path stamps a version past the deleted one.
     pub fn local_lww(&mut self, path: &str, bytes: Vec<u8>, now: u64) -> SyncMsg {
+        let floor = self.untomb(path).map(|t| t.t.version.saturating_add(1)).unwrap_or(0);
         let entry = self.lww.entry(path.to_string()).or_insert((0, Vec::new()));
-        entry.0 = now.max(entry.0 + 1);
+        entry.0 = now.max(entry.0 + 1).max(floor);
         entry.1 = bytes.clone();
         self.generation += 1;
         SyncMsg::Lww { path: path.to_string(), version: entry.0, bytes }
@@ -660,69 +864,174 @@ impl Syncer {
     /// The durable record for `path` (None if we hold no state for it). Call after
     /// every local change or persisted merge of `path`.
     pub fn durable(&self, path: &str) -> Option<DurablePath> {
+        let superseded = self.superseded.get(path).filter(|s| !s.is_empty()).cloned();
+        let past = self.past.get(path).cloned().unwrap_or_default();
         if let Some(doc) = self.docs.get(path) {
             let content = doc.content();
+            let kind = if superseded.is_some() || !past.is_empty() {
+                let superseded = superseded.unwrap_or_default();
+                DurableKind::TextReborn { ops: doc.encode_full(), superseded, past }
+            } else {
+                DurableKind::Text { ops: doc.encode_full() }
+            };
             return Some(DurablePath {
                 path: path.to_string(),
-                kind: DurableKind::Text { ops: doc.encode_full() },
+                kind,
                 disk: *blake3::hash(content.as_bytes()).as_bytes(),
             });
         }
-        let (version, bytes) = self.lww.get(path)?;
-        Some(DurablePath {
-            path: path.to_string(),
-            kind: DurableKind::Lww { version: *version },
-            disk: *blake3::hash(bytes).as_bytes(),
-        })
+        if let Some((version, bytes)) = self.lww.get(path) {
+            let kind = match superseded {
+                Some(superseded) => DurableKind::LwwReborn { version: *version, superseded },
+                None => DurableKind::Lww { version: *version },
+            };
+            return Some(DurablePath {
+                path: path.to_string(),
+                kind,
+                disk: *blake3::hash(bytes).as_bytes(),
+            });
+        }
+        if let Some(tomb) = self.tombs.get(path) {
+            let ops = tomb.doc.as_ref().map(|d| d.encode_full()).unwrap_or_default();
+            return Some(DurablePath {
+                path: path.to_string(),
+                kind: DurableKind::Deleted { tomb: tomb.t.clone(), ops, past },
+                disk: [0; 32],
+            });
+        }
+        None
     }
 
-    /// Restore `rec` given the file's current bytes. Call BEFORE any apply/local_* for
-    /// that path (drivers restore before the session starts). New local ops are authored
-    /// under THIS syncer's agent; the record's ops (and so the origin) are kept as history.
-    /// `peer_vv` is untouched.
+    /// Restore `rec` given the file's current bytes (`None` if it is gone — an offline delete).
+    /// Call BEFORE any apply/local_* for that path (drivers restore before the session starts).
+    /// New local ops are authored under THIS syncer's agent; the record's ops (and so the origin)
+    /// are kept as history. `peer_vv` is untouched. A missing file for a live record tombstones it
+    /// (the id matches what a live `local_delete` would have produced); a `Deleted` record is never
+    /// resurrected by a restore — only a file reappearing next to it counts as a re-creation.
     pub fn restore(&mut self, rec: DurablePath, file: Option<&[u8]>, now: u64) -> Restored {
-        let Some(file) = file else { return Restored::Unusable };
-        if self.docs.contains_key(&rec.path) || self.lww.contains_key(&rec.path) {
+        if !deletable_path(&rec.path)
+            || self.docs.contains_key(&rec.path)
+            || self.lww.contains_key(&rec.path)
+            || self.tombs.contains_key(&rec.path)
+        {
             return Restored::Unusable;
         }
-        let unchanged = *blake3::hash(file).as_bytes() == rec.disk;
         match rec.kind {
-            DurableKind::Text { ops } => {
-                if !is_text_path(&rec.path) {
-                    return Restored::Unusable;
+            DurableKind::Text { ops } => self.restore_text(rec.path, ops, Vec::new(), Vec::new(), rec.disk, file),
+            DurableKind::TextReborn { ops, superseded, past } => {
+                self.restore_text(rec.path, ops, superseded, past, rec.disk, file)
+            }
+            DurableKind::Lww { version } => self.restore_lww(rec.path, version, Vec::new(), rec.disk, file, now),
+            DurableKind::LwwReborn { version, superseded } => {
+                self.restore_lww(rec.path, version, superseded, rec.disk, file, now)
+            }
+            DurableKind::Deleted { tomb, ops, past } => {
+                if !past.is_empty() {
+                    self.past.insert(rec.path.clone(), past);
                 }
-                let mut doc = EgWalkerText::new(&self.agent);
-                if !doc.merge(&ops) || doc.origin().is_none() {
-                    return Restored::Unusable;
-                }
-                self.docs.insert(rec.path.clone(), doc);
-                if unchanged {
+                let doc = if ops.is_empty() {
+                    None
+                } else {
+                    let mut d = EgWalkerText::new(&self.agent);
+                    (d.merge(&ops) && d.origin().is_some()).then_some(d)
+                };
+                self.bury(&rec.path, tomb, doc);
+                let Some(file) = file else {
                     self.generation += 1;
                     return Restored::Clean;
-                }
-                match self.local_text(&rec.path, &String::from_utf8_lossy(file)) {
+                };
+                let msg = if is_text_path(&rec.path) {
+                    self.local_text(&rec.path, &String::from_utf8_lossy(file))
+                } else {
+                    Some(self.local_lww(&rec.path, file.to_vec(), now))
+                };
+                match msg {
                     Some(m) => Restored::Changed(m),
                     None => Restored::Clean,
                 }
             }
-            DurableKind::Lww { version } => {
-                if is_text_path(&rec.path) {
-                    return Restored::Unusable;
-                }
-                if unchanged {
-                    self.lww.insert(rec.path, (version, file.to_vec()));
-                    self.generation += 1;
-                    return Restored::Clean;
-                }
-                self.lww.insert(rec.path.clone(), (version, Vec::new()));
-                Restored::Changed(self.local_lww(&rec.path, file.to_vec(), now))
-            }
         }
     }
 
-    /// Apply a received message: returns `(bytes to persist, messages to send
+    /// A restored `Text`/`TextReborn` record: rebuild the document from `ops`, then reconcile it
+    /// with `file`. No file means the path was deleted while we were down: the document is
+    /// installed and immediately tombstoned, as a live `local_delete` would.
+    fn restore_text(
+        &mut self,
+        path: String,
+        ops: Vec<u8>,
+        superseded: Vec<u64>,
+        past: Vec<PastTomb>,
+        disk: [u8; 32],
+        file: Option<&[u8]>,
+    ) -> Restored {
+        if !is_text_path(&path) {
+            return Restored::Unusable;
+        }
+        let mut doc = EgWalkerText::new(&self.agent);
+        if !doc.merge(&ops) || doc.origin().is_none() {
+            return Restored::Unusable;
+        }
+        if !superseded.is_empty() {
+            self.superseded.insert(path.clone(), superseded);
+        }
+        if !past.is_empty() {
+            self.past.insert(path.clone(), past);
+        }
+        self.docs.insert(path.clone(), doc);
+        let Some(file) = file else {
+            return match self.local_delete(&path) {
+                Some(m) => Restored::Deleted(m),
+                None => Restored::Unusable,
+            };
+        };
+        if *blake3::hash(file).as_bytes() == disk {
+            self.generation += 1;
+            return Restored::Clean;
+        }
+        match self.local_text(&path, &String::from_utf8_lossy(file)) {
+            Some(m) => Restored::Changed(m),
+            None => Restored::Clean,
+        }
+    }
+
+    /// A restored `Lww`/`LwwReborn` record: reconcile the cached version with `file`. No file means
+    /// the path was deleted while we were down: bury a tombstone directly (there's no live entry to
+    /// route through `local_delete`), with the same id a live delete would have produced.
+    fn restore_lww(
+        &mut self,
+        path: String,
+        version: u64,
+        superseded: Vec<u64>,
+        disk: [u8; 32],
+        file: Option<&[u8]>,
+        now: u64,
+    ) -> Restored {
+        if is_text_path(&path) {
+            return Restored::Unusable;
+        }
+        let Some(file) = file else {
+            let ids = vec![tree_deletion_id(&path, &disk, &superseded)];
+            let t = TreeTombstone { ids, seen: vec![disk], origin: None, vv: Vec::new(), version, prior: superseded };
+            self.bury(&path, t, None);
+            self.generation += 1;
+            return Restored::Deleted(self.tomb_msg(&path));
+        };
+        if !superseded.is_empty() {
+            self.superseded.insert(path.clone(), superseded);
+        }
+        if *blake3::hash(file).as_bytes() == disk {
+            self.lww.insert(path, (version, file.to_vec()));
+            self.generation += 1;
+            return Restored::Clean;
+        }
+        self.lww.insert(path.clone(), (version, Vec::new()));
+        Restored::Changed(self.local_lww(&path, file.to_vec(), now))
+    }
+
+    /// The live-state merge (no tombstones involved): returns `(bytes to persist, messages to send
     /// back)`. A `Hello` produces reply deltas; a `TextDelta`/`Lww` produces bytes.
-    pub fn apply(&mut self, msg: SyncMsg) -> (Option<(String, Vec<u8>)>, Vec<SyncMsg>) {
+    fn apply_live(&mut self, msg: SyncMsg) -> (Option<(String, Vec<u8>)>, Vec<SyncMsg>) {
         match msg {
             SyncMsg::Hello { versions, lww_versions } => {
                 let their: HashMap<String, Vv> = versions.into_iter().collect();
@@ -750,6 +1059,17 @@ impl Syncer {
                 (None, replies)
             }
             SyncMsg::TextDelta { path, ops, vv, origin } => {
+                // A copy of a doc deleted in an earlier round (we re-created the path since):
+                // answer with that round's Delete rather than take it in.
+                let mine = self.docs.get(&path).and_then(|d| d.origin());
+                if self.past.contains_key(&path) && origin.is_some() && mine != origin {
+                    let mut fresh = EgWalkerText::new(&self.agent);
+                    if fresh.merge(&ops) {
+                        if let Some(old) = self.past_delete_covering(&path, &fresh) {
+                            return (None, vec![old]);
+                        }
+                    }
+                }
                 // Independently-created conflict on a file we already hold: same
                 // path, DIFFERENT origin (root op). Don't naively merge — that
                 // interleaves two unrelated texts. Resolve deterministically by
@@ -760,7 +1080,12 @@ impl Syncer {
                     (self.docs.get(&path).and_then(|d| d.origin()), origin.as_ref())
                 {
                     if mine != *theirs {
-                        if mine.0.as_str() < theirs.0.as_str() {
+                        // Ours is itself an earlier round's deleted doc: never let it win.
+                        let ours_deleted = self
+                            .docs
+                            .get(&path)
+                            .is_some_and(|d| self.past_delete_covering(&path, d).is_some());
+                        if ours_deleted || mine.0.as_str() < theirs.0.as_str() {
                             // We lose — adopt their version (their ops are a
                             // self-contained full on a fresh conflict).
                             let mut fresh = EgWalkerText::new(&self.agent);
@@ -786,27 +1111,10 @@ impl Syncer {
                     // the full state itself keeps failing to merge, re-ask a bounded
                     // number of times, then PARK the path (visible via
                     // `parked_paths`) instead of looping forever.
-                    if self.parked.contains(&path) {
-                        return (None, Vec::new()); // gave up; stay quiet
-                    }
-                    let Some(st) = self.resync.get_mut(&path) else {
-                        self.resync
-                            .insert(path.clone(), ResyncState { requests: 1, failures: 0 });
+                    if self.merge_failed_should_request(&path) {
                         return (None, vec![SyncMsg::Resync { path }]);
-                    };
-                    st.failures += 1;
-                    if st.failures < RESYNC_FAILURES_PER_RETRY {
-                        return (None, Vec::new()); // suppressed while awaiting
                     }
-                    if st.requests >= MAX_RESYNC_REQUESTS {
-                        // Retry budget exhausted — park and go quiet.
-                        self.resync.remove(&path);
-                        self.parked.insert(path);
-                        return (None, Vec::new());
-                    }
-                    st.requests += 1;
-                    st.failures = 0;
-                    return (None, vec![SyncMsg::Resync { path }]);
+                    return (None, Vec::new()); // suppressed, or parked: stay quiet
                 }
                 self.resync.remove(&path);
                 self.parked.remove(&path); // any successful merge un-parks
@@ -847,14 +1155,437 @@ impl Syncer {
             }
             // The strategy channel belongs to the workspace/strategy layer
             // (folder mode), and version announcements to the driver; a
-            // text/LWW syncer has nothing to do with either.
+            // text/LWW syncer has nothing to do with either. Tree deletes
+            // (`Delete`/`Restore`) are handled by `receive` before this.
             SyncMsg::StratAdvert { .. }
             | SyncMsg::StratDelta { .. }
             | SyncMsg::StratDelete { .. }
-            | SyncMsg::Version { .. } => {
+            | SyncMsg::Version { .. }
+            | SyncMsg::Delete { .. }
+            | SyncMsg::Restore { .. } => {
                 (None, Vec::new())
             }
         }
+    }
+
+    /// One failed merge for `path` under the bounded full-resync budget: true when the caller
+    /// should (re-)ask for the full state now; false while suppressed or once parked.
+    fn merge_failed_should_request(&mut self, path: &str) -> bool {
+        if self.parked.contains(path) {
+            return false; // gave up; stay quiet
+        }
+        let Some(st) = self.resync.get_mut(path) else {
+            self.resync.insert(path.to_string(), ResyncState { requests: 1, failures: 0 });
+            return true;
+        };
+        st.failures += 1;
+        if st.failures < RESYNC_FAILURES_PER_RETRY {
+            return false; // suppressed while awaiting
+        }
+        if st.requests >= MAX_RESYNC_REQUESTS {
+            // Retry budget exhausted — park and go quiet.
+            self.resync.remove(path);
+            self.parked.insert(path.to_string());
+            return false;
+        }
+        st.requests += 1;
+        st.failures = 0;
+        true
+    }
+
+    /// Apply a received message (tombstone-aware); see [`Applied`] for what the driver does with
+    /// the result. A `Delete` removes our copy only if we provably hold nothing the deleter hadn't
+    /// seen (else our edit wins: we answer with our full state); a tombstoned path answers stale
+    /// copies, `Resync`s and `Hello`s naming it with its `Delete`, and revives on genuinely newer
+    /// content. `generation` moves once per tombstone change (`save` set), never on a re-assert.
+    pub fn receive(&mut self, msg: SyncMsg) -> Applied {
+        let applied = match msg {
+            SyncMsg::Delete { path, ids, seen, origin, vv, version } => {
+                self.remote_delete(path, ids, seen, origin, vv, version)
+            }
+            SyncMsg::Restore { path, ids } => self.remote_restore(path, &ids),
+            SyncMsg::TextDelta { path, ops, vv, origin } if self.tombs.contains_key(&path) => {
+                self.text_for_tomb(path, ops, vv, origin)
+            }
+            SyncMsg::Lww { path, version, bytes } if self.tombs.contains_key(&path) => {
+                self.lww_for_tomb(path, version, bytes)
+            }
+            SyncMsg::Resync { path } if self.tombs.contains_key(&path) => return self.reassert(&path),
+            SyncMsg::Hello { versions, lww_versions } => {
+                let mut named: Vec<String> = versions
+                    .iter()
+                    .map(|(p, _)| p)
+                    .chain(lww_versions.iter().map(|(p, _)| p))
+                    .filter(|p| self.tombs.contains_key(*p))
+                    .cloned()
+                    .collect();
+                named.sort();
+                named.dedup();
+                let (_, mut replies) = self.apply_live(SyncMsg::Hello { versions, lww_versions });
+                replies.extend(named.iter().map(|p| self.tomb_msg(p)));
+                return Applied { replies, ..Default::default() };
+            }
+            other => {
+                let (persist, replies) = self.apply_live(other);
+                return match persist {
+                    Some((path, bytes)) => Applied {
+                        change: Some(Change::Write { path: path.clone(), bytes }),
+                        replies,
+                        save: Some(path),
+                    },
+                    None => Applied { replies, ..Default::default() },
+                };
+            }
+        };
+        if applied.save.is_some() {
+            self.generation += 1;
+        }
+        applied
+    }
+
+    /// Shorthand for [`receive`](Self::receive) that DROPS removals and `save` — tests only; drivers
+    /// use `receive`.
+    pub fn apply(&mut self, msg: SyncMsg) -> (Option<(String, Vec<u8>)>, Vec<SyncMsg>) {
+        let Applied { change, replies, .. } = self.receive(msg);
+        let write = match change {
+            Some(Change::Write { path, bytes }) => Some((path, bytes)),
+            _ => None,
+        };
+        (write, replies)
+    }
+
+    /// Record a local delete (the file is gone): tombstone `path` and return the `Delete` to send.
+    /// `None` for a dot/escaping path or one we hold nothing for. An already-tombstoned path
+    /// returns its current `Delete` (idempotent).
+    pub fn local_delete(&mut self, path: &str) -> Option<SyncMsg> {
+        if !deletable_path(path) {
+            return None;
+        }
+        if self.tombs.contains_key(path) {
+            return Some(self.tomb_msg(path));
+        }
+        if !self.docs.contains_key(path) && !self.lww.contains_key(path) {
+            return None;
+        }
+        let prior = self.superseded.remove(path).unwrap_or_default();
+        let (fp, origin, vv, version, doc) = match self.drop_live(path) {
+            (Some(d), _) => {
+                (fingerprint(d.content().as_bytes()), d.origin(), d.version_vector(), 0, Some(d))
+            }
+            (None, Some((version, bytes))) => (fingerprint(&bytes), None, Vec::new(), version, None),
+            (None, None) => unreachable!("held state checked above"),
+        };
+        let ids = vec![tree_deletion_id(path, &fp, &prior)];
+        self.bury(path, TreeTombstone { ids, seen: vec![fp], origin, vv, version, prior }, doc);
+        self.generation += 1;
+        Some(self.tomb_msg(path))
+    }
+
+    pub fn is_tombstoned(&self, path: &str) -> bool {
+        self.tombs.contains_key(path)
+    }
+
+    /// Every tombstoned path, sorted.
+    pub fn tombstoned_paths(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.tombs.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Drop `path`'s tombstone; its id chain (`prior`, then `ids`) becomes overruled by whatever
+    /// re-creates the path.
+    fn untomb(&mut self, path: &str) -> Option<Tomb> {
+        let tomb = self.tombs.remove(path)?;
+        let sup = self.superseded.entry(path.to_string()).or_default();
+        for id in tomb.t.prior.iter().chain(&tomb.t.ids) {
+            push_absent(sup, *id, TREE_SUPERSEDED_CAP);
+        }
+        if tomb.t.origin.is_some() {
+            let ops = tomb.doc.as_ref().map(|d| d.encode_full()).unwrap_or_default();
+            let past = PastTomb { tomb: tomb.t.clone(), ops };
+            push_absent(self.past.entry(path.to_string()).or_default(), past, TREE_PAST_CAP);
+        }
+        self.resync.remove(path);
+        self.parked.remove(path);
+        Some(tomb)
+    }
+
+    /// Forget `path`'s live state; returns the dropped text doc and LWW entry.
+    fn drop_live(&mut self, path: &str) -> (Option<EgWalkerText>, Option<(u64, Vec<u8>)>) {
+        self.peer_vv.remove(path);
+        self.resync.remove(path);
+        self.parked.remove(path);
+        (self.docs.remove(path), self.lww.remove(path))
+    }
+
+    fn bury(&mut self, path: &str, t: TreeTombstone, doc: Option<EgWalkerText>) {
+        self.tombs.insert(path.to_string(), Tomb { t, doc });
+    }
+
+    /// `path`'s `Delete`; the caller ensures `path` is tombstoned.
+    fn tomb_msg(&self, path: &str) -> SyncMsg {
+        delete_msg(path, &self.tombs.get(path).expect("tomb_msg of a tombstoned path").t)
+    }
+
+    /// The `Delete` of an earlier-round text tombstone of `path` (newest first) that covers `doc`:
+    /// same origin, and every op of `doc` was in that round's deleted doc (or `doc` is at that
+    /// round's frontier). Its `vv` gains `doc`'s tips, so the holder's own stale check accepts
+    /// it, exactly like a deleter re-asserting to a peer that is behind. Causal only (no
+    /// fingerprint): a revived doc has ops past the deletion and a re-created one has a new
+    /// origin, so neither is ever covered and this can't ping-pong with their `Restore`.
+    fn past_delete_covering(&self, path: &str, doc: &EgWalkerText) -> Option<SyncMsg> {
+        let origin = doc.origin()?;
+        let tips = doc.version_vector();
+        self.past.get(path)?.iter().rev().find_map(|p| {
+            if p.tomb.origin.as_ref() != Some(&origin) {
+                return None;
+            }
+            let covered = seen_by(doc, &p.tomb.vv) || {
+                let mut deleted = EgWalkerText::new(&self.agent);
+                !p.ops.is_empty() && deleted.merge(&p.ops) && tips.iter().all(|(a, s)| deleted.knows(a, *s))
+            };
+            covered.then(|| {
+                let mut t = p.tomb.clone();
+                union_tips(&mut t.vv, &tips);
+                delete_msg(path, &t)
+            })
+        })
+    }
+
+    /// Answer with `path`'s `Delete` again (no state change).
+    fn reassert(&self, path: &str) -> Applied {
+        Applied { replies: vec![self.tomb_msg(path)], ..Default::default() }
+    }
+
+    /// `path`'s full self-contained live state, if we hold it.
+    fn full_msg(&self, path: &str) -> Option<SyncMsg> {
+        if let Some(doc) = self.docs.get(path) {
+            return Some(SyncMsg::TextDelta {
+                path: path.to_string(),
+                ops: doc.encode_full(),
+                vv: doc.version_vector(),
+                origin: doc.origin(),
+            });
+        }
+        let (version, bytes) = self.lww.get(path)?;
+        Some(SyncMsg::Lww { path: path.to_string(), version: *version, bytes: bytes.clone() })
+    }
+
+    /// Bring a deleted text path back as `doc` (already untombed); reply with the ops the sender
+    /// (at `their_vv`) lacks.
+    fn revive_text(&mut self, path: String, doc: EgWalkerText, their_vv: &Vv) -> Applied {
+        let reply = doc.ops_since(their_vv).map(|ops| SyncMsg::TextDelta {
+            path: path.clone(),
+            ops,
+            vv: doc.version_vector(),
+            origin: doc.origin(),
+        });
+        let content = doc.content().into_bytes();
+        self.docs.insert(path.clone(), doc);
+        self.advance_peer_vv(&path, their_vv);
+        Applied {
+            change: Some(Change::Write { path: path.clone(), bytes: content }),
+            replies: reply.into_iter().collect(),
+            save: Some(path),
+        }
+    }
+
+    /// A content merge for a tombstoned path failed: re-assert the `Delete` under the same bounded
+    /// budget as a live path's resync requests (so unmergeable content can't loop forever).
+    fn tomb_merge_failed(&mut self, path: &str) -> Applied {
+        if self.merge_failed_should_request(path) {
+            self.reassert(path)
+        } else {
+            Applied::default()
+        }
+    }
+
+    fn remote_delete(
+        &mut self,
+        path: String,
+        mut ids: Vec<u64>,
+        mut seen: Vec<[u8; 32]>,
+        origin: Origin,
+        mut vv: Vv,
+        version: u64,
+    ) -> Applied {
+        if !deletable_path(&path) || ids.is_empty() {
+            return Applied::default();
+        }
+        if ids.len() > TREE_DELETION_IDS_CAP {
+            ids.drain(..ids.len() - TREE_DELETION_IDS_CAP);
+        }
+        if seen.len() > TREE_SEEN_CAP {
+            seen.drain(..seen.len() - TREE_SEEN_CAP);
+        }
+        vv.truncate(TREE_VV_CAP);
+
+        // Already tombstoned: merge what's new; a duplicate changes (and answers) nothing.
+        if let Some(tomb) = self.tombs.get_mut(&path) {
+            let t = &mut tomb.t;
+            let mut changed = false;
+            for id in ids {
+                // An id this delete's own chain already overruled (`prior`) is an older round's
+                // deletion — merging it would let a stale re-creator's `Restore` cancel this one.
+                if !t.prior.contains(&id) {
+                    changed |= push_absent(&mut t.ids, id, TREE_DELETION_IDS_CAP);
+                }
+            }
+            for fp in seen {
+                changed |= push_absent(&mut t.seen, fp, TREE_SEEN_CAP);
+            }
+            if t.origin.is_none() && origin.is_some() {
+                t.origin = origin;
+                changed = true;
+                changed |= union_tips(&mut t.vv, &vv);
+            } else if t.origin == origin {
+                changed |= union_tips(&mut t.vv, &vv);
+            }
+            if version > t.version {
+                t.version = version;
+                changed = true;
+            }
+            return Applied { save: changed.then_some(path), ..Default::default() };
+        }
+
+        // We re-created the path after ALL of these deletions: they're overruled. (Any overlap is
+        // not enough — a tombstone merged with an older, already-overruled deletion still carries
+        // a newer one.)
+        let sup = self.superseded.get(&path).cloned().unwrap_or_default();
+        if ids.iter().all(|id| sup.contains(id)) {
+            let mut replies = vec![SyncMsg::Restore { path: path.clone(), ids: sup }];
+            replies.extend(self.full_msg(&path));
+            return Applied { replies, ..Default::default() };
+        }
+
+        // Never held: remember the tombstone, leave the disk alone.
+        if !self.docs.contains_key(&path) && !self.lww.contains_key(&path) {
+            let prior = self.superseded.remove(&path).unwrap_or_default();
+            self.bury(&path, TreeTombstone { ids, seen, origin, vv, version, prior }, None);
+            return Applied { save: Some(path), ..Default::default() };
+        }
+
+        // Live: delete only if we provably hold nothing the deleter hadn't seen. An empty doc
+        // (no ops, no origin) holds nothing at all.
+        let stale = match self.docs.get(&path) {
+            Some(d) => {
+                d.origin().is_none()
+                    || (d.origin() == origin && seen_by(d, &vv))
+                    || seen.contains(&fingerprint(d.content().as_bytes()))
+            }
+            None => {
+                let (mine, bytes) = &self.lww[&path];
+                *mine <= version || seen.contains(&fingerprint(bytes))
+            }
+        };
+        if !stale {
+            // Our concurrent edit wins: answer with it.
+            return Applied { replies: self.full_msg(&path).into_iter().collect(), ..Default::default() };
+        }
+        let prior = self.superseded.remove(&path).unwrap_or_default();
+        let mut t = TreeTombstone { ids, seen, origin, vv, version, prior };
+        let kept = match self.drop_live(&path) {
+            (Some(d), _) => {
+                push_absent(&mut t.seen, fingerprint(d.content().as_bytes()), TREE_SEEN_CAP);
+                if d.origin().is_some() && d.origin() == t.origin {
+                    union_tips(&mut t.vv, &d.version_vector());
+                    Some(d)
+                } else {
+                    None
+                }
+            }
+            (None, Some((mine, bytes))) => {
+                push_absent(&mut t.seen, fingerprint(&bytes), TREE_SEEN_CAP);
+                t.version = t.version.max(mine);
+                None
+            }
+            (None, None) => None,
+        };
+        self.bury(&path, t, kept);
+        Applied { change: Some(Change::Remove { path: path.clone() }), replies: Vec::new(), save: Some(path) }
+    }
+
+    /// Drop `path`'s tombstone only if the restorer overrules EVERY deletion it stands for — a
+    /// tombstone merged with a later deletion survives a `Restore` of just the earlier one.
+    fn remote_restore(&mut self, path: String, ids: &[u64]) -> Applied {
+        let overruled = self.tombs.get(&path).is_some_and(|t| t.t.ids.iter().all(|id| ids.contains(id)));
+        if !overruled {
+            return Applied::default();
+        }
+        self.untomb(&path);
+        Applied { save: Some(path), ..Default::default() }
+    }
+
+    /// Text content for a tombstoned path: re-assert the `Delete` if it holds nothing the delete
+    /// hadn't seen, else bring the path back with it.
+    fn text_for_tomb(&mut self, path: String, ops: Vec<u8>, vv: Vv, origin: Origin) -> Applied {
+        let tomb = self.tombs.get_mut(&path).expect("caller checked the tombstone");
+        if let Some(doc) = tomb.doc.as_mut().filter(|d| origin.is_some() && d.origin() == origin) {
+            // The deleted doc itself: merge into it.
+            let before = doc.version();
+            if !doc.merge(&ops) {
+                return self.tomb_merge_failed(&path);
+            }
+            if doc.version() == before {
+                // Nothing new: learn the sender's tips (so a sender that is behind can prove it's
+                // stale next round) and re-assert.
+                let changed = union_tips(&mut tomb.t.vv, &vv);
+                self.resync.remove(&path);
+                self.parked.remove(&path);
+                let mut a = self.reassert(&path);
+                a.save = changed.then_some(path);
+                return a;
+            }
+            // New ops for us — but maybe not past the delete: our kept doc can be behind `t.vv`
+            // (we accepted a re-asserted `Delete`, or merged another deleter's tips), so a late or
+            // reordered delta the deleter had already seen must not undo it.
+            if seen_by(doc, &tomb.t.vv)
+                || tomb.t.seen.contains(&fingerprint(doc.content().as_bytes()))
+            {
+                union_tips(&mut tomb.t.vv, &vv);
+                self.resync.remove(&path);
+                self.parked.remove(&path);
+                let mut a = self.reassert(&path);
+                a.save = Some(path); // the kept doc grew
+                return a;
+            }
+            let doc = self.untomb(&path).and_then(|t| t.doc).expect("the tomb's doc just merged");
+            return self.revive_text(path, doc, &vv);
+        }
+        let mut fresh = EgWalkerText::new(&self.agent);
+        if !fresh.merge(&ops) {
+            return self.tomb_merge_failed(&path);
+        }
+        self.resync.remove(&path);
+        self.parked.remove(&path);
+        let t = &self.tombs[&path].t;
+        let causally_seen =
+            t.origin.is_some() && fresh.origin() == t.origin && seen_by(&fresh, &t.vv);
+        // An empty doc (no origin) holds nothing to bring back.
+        if fresh.origin().is_none()
+            || causally_seen
+            || t.seen.contains(&fingerprint(fresh.content().as_bytes()))
+        {
+            return self.reassert(&path);
+        }
+        if let Some(old) = self.past_delete_covering(&path, &fresh) {
+            // A doc deleted in an earlier round (its holder was away since): that round's Delete
+            // lets the holder see it is stale; ours follows.
+            return Applied { replies: vec![old, self.tomb_msg(&path)], ..Default::default() };
+        }
+        self.untomb(&path);
+        self.revive_text(path, fresh, &vv)
+    }
+
+    /// LWW content for a tombstoned path: re-assert unless it's newer than the delete and unseen.
+    fn lww_for_tomb(&mut self, path: String, version: u64, bytes: Vec<u8>) -> Applied {
+        let t = &self.tombs[&path].t;
+        if version <= t.version || t.seen.contains(&fingerprint(&bytes)) {
+            return self.reassert(&path);
+        }
+        self.untomb(&path);
+        self.lww.insert(path.clone(), (version, bytes.clone()));
+        Applied { change: Some(Change::Write { path: path.clone(), bytes }), replies: Vec::new(), save: Some(path) }
     }
 }
 
@@ -863,7 +1594,7 @@ mod wire_compat {
     use super::*;
 
     /// Postcard encodes an enum as a varint of its variant index, so the FIRST
-    /// byte of every encoded `SyncMsg` is its wire index (all eight fit in one
+    /// byte of every encoded `SyncMsg` is its wire index (all ten fit in one
     /// varint byte). Deployed peers already speak indexes 0–3 — this pins the
     /// full table so a reorder/insertion fails loudly, not on live browsers.
     #[test]
@@ -877,6 +1608,8 @@ mod wire_compat {
             (SyncMsg::StratDelta { path: "p".into(), bytes: vec![] }, 5),
             (SyncMsg::Version { proto: 1 }, 6),
             (SyncMsg::StratDelete { path: "p".into(), ids: vec![1], seen: vec![] }, 7),
+            (SyncMsg::Delete { path: "p".into(), ids: vec![1], seen: vec![], origin: None, vv: vec![], version: 0 }, 8),
+            (SyncMsg::Restore { path: "p".into(), ids: vec![1] }, 9),
         ];
         for (msg, index) in cases {
             let bytes = postcard::to_allocvec(&msg).unwrap();
@@ -936,6 +1669,87 @@ mod wire_compat {
                 assert_eq!(seen, vec![[1; 32], [2; 32]]);
             }
             _ => panic!("expected StratDelete"),
+        }
+    }
+
+    /// A v5 peer (built before tree/mesh deletes) decodes `Delete`/`Restore` as an
+    /// ERROR, not as garbage, so it skips them and keeps the deleted file instead of
+    /// misreading the bytes as something else; `Hello` still decodes fine.
+    #[test]
+    fn v5_peers_skip_tree_deletes() {
+        /// The wire enum exactly as a v5 peer knows it (indexes 0–7).
+        #[derive(serde::Deserialize)]
+        enum LegacyV5SyncMsg {
+            #[allow(dead_code)]
+            Hello { versions: Vec<(String, Vv)>, lww_versions: Vec<(String, u64)> },
+            #[allow(dead_code)]
+            TextDelta { path: String, ops: Vec<u8>, vv: Vv, origin: Origin },
+            #[allow(dead_code)]
+            Resync { path: String },
+            #[allow(dead_code)]
+            Lww { path: String, version: u64, bytes: Vec<u8> },
+            #[allow(dead_code)]
+            StratAdvert { path: String, sv: Vec<u8>, reply: bool },
+            #[allow(dead_code)]
+            StratDelta { path: String, bytes: Vec<u8> },
+            #[allow(dead_code)]
+            Version { proto: u32 },
+            #[allow(dead_code)]
+            StratDelete { path: String, ids: Vec<u64>, seen: Vec<[u8; 32]> },
+        }
+
+        let del = SyncMsg::Delete {
+            path: "p".into(),
+            ids: vec![1],
+            seen: vec![],
+            origin: None,
+            vv: vec![],
+            version: 0,
+        };
+        let restore = SyncMsg::Restore { path: "p".into(), ids: vec![1] };
+        for msg in [del, restore] {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            assert!(
+                postcard::from_bytes::<LegacyV5SyncMsg>(&bytes).is_err(),
+                "a v5 peer must reject (and thus skip) tree/mesh deletes",
+            );
+        }
+        let hello = postcard::to_allocvec(&SyncMsg::Hello { versions: vec![], lww_versions: vec![] }).unwrap();
+        assert!(postcard::from_bytes::<LegacyV5SyncMsg>(&hello).is_ok());
+    }
+
+    /// `Delete` and `Restore` round-trip every field.
+    #[test]
+    fn tree_delete_round_trips() {
+        let msg = SyncMsg::Delete {
+            path: "d/x.bin".into(),
+            ids: vec![u64::MAX, 3],
+            seen: vec![[1; 32]],
+            origin: Some(("a".into(), 0)),
+            vv: vec![("a".into(), 3)],
+            version: 7,
+        };
+        let bytes = postcard::to_allocvec(&msg).unwrap();
+        match postcard::from_bytes::<SyncMsg>(&bytes).unwrap() {
+            SyncMsg::Delete { path, ids, seen, origin, vv, version } => {
+                assert_eq!(path, "d/x.bin");
+                assert_eq!(ids, vec![u64::MAX, 3]);
+                assert_eq!(seen, vec![[1; 32]]);
+                assert_eq!(origin, Some(("a".into(), 0)));
+                assert_eq!(vv, vec![("a".into(), 3)]);
+                assert_eq!(version, 7);
+            }
+            _ => panic!("expected Delete"),
+        }
+
+        let restore = SyncMsg::Restore { path: "d/x.bin".into(), ids: vec![u64::MAX, 3] };
+        let bytes = postcard::to_allocvec(&restore).unwrap();
+        match postcard::from_bytes::<SyncMsg>(&bytes).unwrap() {
+            SyncMsg::Restore { path, ids } => {
+                assert_eq!(path, "d/x.bin");
+                assert_eq!(ids, vec![u64::MAX, 3]);
+            }
+            _ => panic!("expected Restore"),
         }
     }
 
@@ -1840,13 +2654,11 @@ mod tests {
     }
 
     #[test]
-    fn restore_refuses_missing_files_mismatched_kinds_and_corrupt_records() {
+    fn restore_refuses_mismatched_kinds_and_corrupt_records() {
         let mut a = Syncer::new("a");
         a.local_text("x.md", "hello\n");
         let rec = a.durable("x.md").unwrap();
         let mut b = Syncer::new("b");
-
-        assert!(matches!(b.restore(rec.clone(), None, 0), Restored::Unusable));
 
         let text_for_toml = DurablePath {
             path: "m.toml".into(),
@@ -1862,6 +2674,13 @@ mod tests {
         };
         assert!(matches!(b.restore(corrupt, Some(b"y"), 0), Restored::Unusable));
         assert!(b.durable("y.md").is_none(), "a corrupt record leaves no state");
+
+        let hidden = DurablePath {
+            path: ".hidden.md".into(),
+            kind: DurableKind::Text { ops: a.docs["x.md"].encode_full() },
+            disk: [0; 32],
+        };
+        assert!(matches!(b.restore(hidden, Some(b"x"), 0), Restored::Unusable));
 
         assert!(matches!(b.restore(rec.clone(), Some(b"hello\n"), 0), Restored::Clean));
         assert!(matches!(b.restore(rec, Some(b"hello\n"), 0), Restored::Unusable));
@@ -1922,6 +2741,41 @@ mod tests {
         let bytes = postcard::to_allocvec(&text).unwrap();
         assert!(bytes.starts_with(&[1, 97, 0, 1, 7]), "got {bytes:?}");
         assert_eq!(postcard::from_bytes::<DurablePath>(&bytes).unwrap(), text);
+
+        let tomb = TreeTombstone { ids: vec![], seen: vec![], origin: None, vv: vec![], version: 0, prior: vec![] };
+        let past = vec![PastTomb { tomb: tomb.clone(), ops: vec![9] }];
+        let deleted = DurablePath {
+            path: "a".into(),
+            kind: DurableKind::Deleted { tomb, ops: vec![], past },
+            disk: [0; 32],
+        };
+        let bytes = postcard::to_allocvec(&deleted).unwrap();
+        // path, variant 2, tomb (6 empty fields), ops [], past [{empty tomb, ops [9]}], disk.
+        let mut expected = vec![1u8, 97, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 9];
+        expected.extend_from_slice(&[0u8; 32]);
+        assert_eq!(bytes, expected);
+        assert_eq!(postcard::from_bytes::<DurablePath>(&bytes).unwrap(), deleted);
+
+        let reborn = DurablePath {
+            path: "a".into(),
+            kind: DurableKind::TextReborn { ops: vec![7], superseded: vec![1], past: vec![] },
+            disk: [0; 32],
+        };
+        let bytes = postcard::to_allocvec(&reborn).unwrap();
+        // path, variant 3, ops [7], superseded [1], past [], disk.
+        let mut expected = vec![1u8, 97, 3, 1, 7, 1, 1, 0];
+        expected.extend_from_slice(&[0u8; 32]);
+        assert_eq!(bytes, expected);
+        assert_eq!(postcard::from_bytes::<DurablePath>(&bytes).unwrap(), reborn);
+
+        let lww_reborn = DurablePath {
+            path: "a".into(),
+            kind: DurableKind::LwwReborn { version: 1, superseded: vec![1] },
+            disk: [0; 32],
+        };
+        let bytes = postcard::to_allocvec(&lww_reborn).unwrap();
+        assert_eq!(&bytes[..3], [1, 97, 4]);
+        assert_eq!(postcard::from_bytes::<DurablePath>(&bytes).unwrap(), lww_reborn);
     }
 
     #[test]
@@ -1931,6 +2785,119 @@ mod tests {
         assert!(n.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_eq!(n, record_name("tickets/tk_1/card.md"));
         assert_ne!(record_name("a"), record_name("b"));
+    }
+
+    #[test]
+    fn durable_tombstone_never_resurrects() {
+        let mut a = Syncer::new("a");
+        let t = a.local_text("x.md", "hello\n").unwrap();
+        let l = a.local_lww("m.toml", b"col=Todo".to_vec(), 1000);
+        let mut c = Syncer::new("c");
+        c.apply(t);
+        c.apply(l);
+
+        a.local_delete("x.md").unwrap();
+        a.local_delete("m.toml").unwrap();
+
+        let rx = a.durable("x.md").unwrap();
+        let rm = a.durable("m.toml").unwrap();
+        assert!(matches!(&rx.kind, DurableKind::Deleted { ops, .. } if !ops.is_empty()));
+        assert!(matches!(&rm.kind, DurableKind::Deleted { ops, .. } if ops.is_empty()));
+
+        let mut a2 = Syncer::new("a");
+        assert!(matches!(a2.restore(rx, None, 0), Restored::Clean));
+        assert!(matches!(a2.restore(rm, None, 0), Restored::Clean));
+        assert!(a2.is_tombstoned("x.md") && a2.is_tombstoned("m.toml"));
+
+        for m in c.full_state() {
+            let applied = a2.receive(m);
+            assert!(applied.change.is_none());
+            assert!(matches!(applied.replies.as_slice(), [SyncMsg::Delete { .. }]));
+        }
+    }
+
+    #[test]
+    fn restore_of_a_missing_file_is_an_offline_delete() {
+        let mut s1 = Syncer::new("s1");
+        s1.local_text("x.md", "hi\n");
+        s1.local_lww("m.toml", b"col=Todo".to_vec(), 100);
+        let rx = s1.durable("x.md").unwrap();
+        let rm = s1.durable("m.toml").unwrap();
+
+        let live_x = s1.local_delete("x.md").unwrap();
+        let live_m = s1.local_delete("m.toml").unwrap();
+
+        let mut s2 = Syncer::new("s2");
+        let Restored::Deleted(dx) = s2.restore(rx, None, 0) else { panic!("expected Deleted") };
+        match (&dx, &live_x) {
+            (SyncMsg::Delete { ids: a, version: 0, origin, .. }, SyncMsg::Delete { ids: b, .. }) => {
+                assert_eq!(a, b);
+                assert!(origin.is_some());
+            }
+            _ => panic!("expected matching Delete messages"),
+        }
+        assert!(matches!(s2.durable("x.md").unwrap().kind, DurableKind::Deleted { .. }));
+
+        let Restored::Deleted(dm) = s2.restore(rm, None, 0) else { panic!("expected Deleted") };
+        match (&dm, &live_m) {
+            (SyncMsg::Delete { ids: a, version: 100, .. }, SyncMsg::Delete { ids: b, .. }) => {
+                assert_eq!(a, b);
+            }
+            _ => panic!("expected matching Delete messages"),
+        }
+        assert!(matches!(s2.durable("m.toml").unwrap().kind, DurableKind::Deleted { .. }));
+    }
+
+    #[test]
+    fn restore_of_a_tombstone_with_a_file_is_a_recreation() {
+        let mut s1 = Syncer::new("s1");
+        s1.local_text("x.md", "gone\n");
+        let old = s1.local_delete("x.md").unwrap();
+        let old_origin = msg_origin(&old);
+        let old_ids = delete_ids(&old);
+        let rec = s1.durable("x.md").unwrap();
+        assert!(matches!(rec.kind, DurableKind::Deleted { .. }));
+
+        let mut s2 = Syncer::new("s2");
+        let Restored::Changed(m) = s2.restore(rec, Some(b"# back\n"), 0) else { panic!("expected Changed") };
+        match &m {
+            SyncMsg::TextDelta { origin, .. } => assert_ne!(*origin, old_origin),
+            _ => panic!("expected a TextDelta"),
+        }
+        assert!(!s2.is_tombstoned("x.md"));
+        match s2.durable("x.md").unwrap().kind {
+            DurableKind::TextReborn { superseded, .. } => assert_eq!(superseded, old_ids),
+            other => panic!("expected TextReborn, got {other:?}"),
+        }
+
+        let a = s2.receive(dup(&old));
+        assert!(a.change.is_none());
+        match a.replies.as_slice() {
+            [SyncMsg::Restore { ids, .. }, SyncMsg::TextDelta { .. }] => assert_eq!(ids, &old_ids),
+            _ => panic!("expected [Restore, TextDelta]"),
+        }
+
+        let mut s3 = Syncer::new("s3");
+        assert!(matches!(s3.restore(s2.durable("x.md").unwrap(), Some(b"# back\n"), 0), Restored::Clean));
+        let a3 = s3.receive(dup(&old));
+        assert!(matches!(a3.replies.first(), Some(SyncMsg::Restore { .. })));
+
+        // Same for LWW.
+        let mut l1 = Syncer::new("l1");
+        l1.local_lww("m.toml", b"col=Todo".to_vec(), 1000);
+        let old_l = l1.local_delete("m.toml").unwrap();
+        let old_l_version = match &old_l {
+            SyncMsg::Delete { version, .. } => *version,
+            _ => panic!("expected a Delete"),
+        };
+        let rec_l = l1.durable("m.toml").unwrap();
+        let mut l2 = Syncer::new("l2");
+        let Restored::Changed(ml) = l2.restore(rec_l, Some(b"col=Done"), 0) else { panic!("expected Changed") };
+        match &ml {
+            SyncMsg::Lww { version, .. } => assert!(*version > old_l_version),
+            _ => panic!("expected an Lww"),
+        }
+        assert!(matches!(l2.durable("m.toml").unwrap().kind, DurableKind::LwwReborn { .. }));
     }
 
     #[test]
@@ -2061,5 +3028,664 @@ mod tests {
         assert_eq!(dst.generation(), g_before_hello, "hello() never bumps");
         dst.apply(src.hello());
         assert_eq!(dst.generation(), g_before_hello, "apply(Hello) never bumps");
+    }
+
+    // ---- tree deletes (tombstones) ----
+
+    /// A wire round-trip copy (as a peer would receive it).
+    fn dup(m: &SyncMsg) -> SyncMsg {
+        postcard::from_bytes(&postcard::to_allocvec(m).unwrap()).unwrap()
+    }
+
+    fn text_of(s: &Syncer, path: &str) -> Option<String> {
+        s.docs.get(path).map(|d| d.content())
+    }
+
+    /// Epidemic delivery: every message reaches every peer but its sender; every reply is
+    /// flooded the same way. Returns the number of messages delivered.
+    fn flood(peers: &mut [Syncer], from: usize, msgs: Vec<SyncMsg>) -> usize {
+        let mut queue: std::collections::VecDeque<(usize, SyncMsg)> =
+            msgs.into_iter().map(|m| (from, m)).collect();
+        let mut n = 0;
+        while let Some((src, m)) = queue.pop_front() {
+            n += 1;
+            assert!(n < 500, "message storm");
+            for (i, peer) in peers.iter_mut().enumerate() {
+                if i == src {
+                    continue;
+                }
+                for r in peer.receive(dup(&m)).replies {
+                    queue.push_back((i, r));
+                }
+            }
+        }
+        n
+    }
+
+    fn is_noop(a: &Applied) -> bool {
+        a.change.is_none() && a.replies.is_empty() && a.save.is_none()
+    }
+
+    fn is_delete_of(m: &SyncMsg, p: &str) -> bool {
+        matches!(m, SyncMsg::Delete { path, .. } if path == p)
+    }
+
+    fn delete_ids(m: &SyncMsg) -> Vec<u64> {
+        match m {
+            SyncMsg::Delete { ids, .. } => ids.clone(),
+            _ => panic!("expected a Delete"),
+        }
+    }
+
+    fn msg_origin(m: &SyncMsg) -> Origin {
+        match m {
+            SyncMsg::TextDelta { origin, .. } | SyncMsg::Delete { origin, .. } => origin.clone(),
+            _ => panic!("expected a TextDelta or Delete"),
+        }
+    }
+
+    fn three() -> Vec<Syncer> {
+        vec![Syncer::new("p0"), Syncer::new("p1"), Syncer::new("p2")]
+    }
+
+    #[test]
+    fn local_delete_tombstones_and_reasserts() {
+        let mut a = Syncer::new("a");
+        a.local_text("x.md", "hello\n");
+        a.local_lww("m.toml", b"col=Todo".to_vec(), 1000);
+
+        let d = a.local_delete("x.md").unwrap();
+        match &d {
+            SyncMsg::Delete { path, ids, seen, origin, vv, version } => {
+                assert_eq!(path, "x.md");
+                assert_eq!(seen, &vec![fingerprint(b"hello\n")]);
+                assert!(origin.is_some());
+                assert!(!vv.is_empty());
+                assert_eq!(*version, 0);
+                assert_eq!(ids.len(), 1);
+            }
+            _ => panic!("expected a Delete"),
+        }
+        assert!(!a.docs.contains_key("x.md"));
+        let again = a.local_delete("x.md").unwrap();
+        assert_eq!(postcard::to_allocvec(&again).unwrap(), postcard::to_allocvec(&d).unwrap());
+
+        match a.local_delete("m.toml").unwrap() {
+            SyncMsg::Delete { version, origin, vv, seen, .. } => {
+                assert_eq!(version, 1000);
+                assert!(origin.is_none() && vv.is_empty());
+                assert_eq!(seen, vec![fingerprint(b"col=Todo")]);
+            }
+            _ => panic!("expected a Delete"),
+        }
+        assert!(!a.lww.contains_key("m.toml"));
+
+        assert!(a.local_delete("nope.md").is_none(), "nothing held");
+        for p in [".site", "../x", "a/.h/b.md"] {
+            a.local_text(p, "x\n");
+            assert!(a.local_delete(p).is_none(), "{p} is not deletable");
+            assert!(a.docs.contains_key(p));
+        }
+        a.local_text("b.md", "b\n");
+        a.local_delete("b.md").unwrap();
+        assert_eq!(a.tombstoned_paths(), vec!["b.md", "m.toml", "x.md"]);
+    }
+
+    #[test]
+    fn delete_propagates_to_three_peers() {
+        let mut p = three();
+        let t = p[0].local_text("card.md", "# card\n").unwrap();
+        let l = p[0].local_lww("meta.toml", b"col=Todo".to_vec(), 1000);
+        flood(&mut p, 0, vec![t, l]);
+        for s in &p {
+            assert_eq!(text_of(s, "card.md").as_deref(), Some("# card\n"));
+            assert!(s.lww.contains_key("meta.toml"));
+        }
+
+        let d1 = p[0].local_delete("card.md").unwrap();
+        let d2 = p[0].local_delete("meta.toml").unwrap();
+        let a = p[1].receive(dup(&d1));
+        assert_eq!(a.change, Some(Change::Remove { path: "card.md".into() }));
+        assert_eq!(a.save.as_deref(), Some("card.md"));
+        assert!(a.replies.is_empty());
+
+        flood(&mut p, 0, vec![d1, d2]);
+        for s in &p {
+            assert!(s.is_tombstoned("card.md") && s.is_tombstoned("meta.toml"));
+            assert!(!s.docs.contains_key("card.md") && !s.lww.contains_key("meta.toml"));
+        }
+    }
+
+    #[test]
+    fn concurrent_text_edit_beats_delete() {
+        let mut p = three();
+        let base = p[0].local_text("x.md", "base\n").unwrap();
+        flood(&mut p, 0, vec![base]);
+
+        let d = p[0].local_delete("x.md").unwrap();
+        let e = p[1].local_text("x.md", "base\nedit by b\n").unwrap(); // held back
+        flood(&mut p, 0, vec![d]);
+        flood(&mut p, 1, vec![e]);
+        for s in &p {
+            assert_eq!(text_of(s, "x.md").as_deref(), Some("base\nedit by b\n"));
+            assert!(!s.is_tombstoned("x.md"));
+        }
+    }
+
+    #[test]
+    fn concurrent_newer_lww_beats_delete() {
+        let mut p = three();
+        let l = p[0].local_lww("m.toml", b"col=Todo".to_vec(), 1000);
+        flood(&mut p, 0, vec![l]);
+
+        let d = p[0].local_delete("m.toml").unwrap();
+        let w = p[1].local_lww("m.toml", b"col=Done".to_vec(), 2000); // held back
+        flood(&mut p, 0, vec![d]);
+        flood(&mut p, 1, vec![w]);
+        for s in &p {
+            assert_eq!(s.lww.get("m.toml"), Some(&(2000, b"col=Done".to_vec())));
+            assert!(!s.is_tombstoned("m.toml"));
+        }
+    }
+
+    #[test]
+    fn stale_lww_loses_to_delete() {
+        let mut p = three();
+        let old = SyncMsg::Lww { path: "m.toml".into(), version: 500, bytes: b"old".to_vec() };
+        p[1].receive(dup(&old));
+        let cur = SyncMsg::Lww { path: "m.toml".into(), version: 1000, bytes: b"cur".to_vec() };
+        p[0].receive(dup(&cur));
+        p[2].receive(dup(&cur));
+
+        let d = p[0].local_delete("m.toml").unwrap();
+        flood(&mut p, 0, vec![d]);
+        assert!(p.iter().all(|s| s.is_tombstoned("m.toml")));
+
+        flood(&mut p, 1, vec![old]);
+        for s in &p {
+            assert!(s.is_tombstoned("m.toml"), "a stale copy brings nothing back");
+            assert!(!s.lww.contains_key("m.toml"));
+        }
+    }
+
+    #[test]
+    fn hello_and_resync_answer_with_the_tombstone() {
+        let mut a = Syncer::new("a");
+        let mut c = Syncer::new("c");
+        c.receive(a.local_text("x.md", "hi\n").unwrap());
+        a.local_delete("x.md").unwrap();
+
+        let r = a.receive(c.hello());
+        assert!(r.replies.iter().any(|m| is_delete_of(m, "x.md")));
+        for m in r.replies {
+            c.receive(m);
+        }
+        assert!(c.is_tombstoned("x.md"));
+
+        let r = a.receive(SyncMsg::Resync { path: "x.md".into() });
+        assert!(matches!(r.replies.as_slice(), [SyncMsg::Delete { .. }]));
+        assert!(r.save.is_none());
+        assert!(a.full_state().iter().any(|m| is_delete_of(m, "x.md")));
+
+        let mut j = Syncer::new("j");
+        let r = a.receive(j.hello());
+        assert!(!r.replies.iter().any(|m| matches!(m, SyncMsg::Delete { .. })));
+        for m in a.full_state() {
+            assert!(j.receive(m).change.is_none());
+        }
+        assert!(j.is_tombstoned("x.md"));
+    }
+
+    #[test]
+    fn reseeded_identical_copy_is_deleted() {
+        let mut a = Syncer::new("a");
+        a.local_text("x.md", "same\n");
+        a.local_lww("m.toml", b"col=Todo".to_vec(), 1000);
+        a.local_delete("x.md").unwrap();
+        a.local_delete("m.toml").unwrap();
+
+        let mut c2 = Syncer::new("c2");
+        c2.local_text("x.md", "same\n");
+        c2.local_lww("m.toml", b"col=Todo".to_vec(), 5000);
+        let state = c2.full_state();
+        let mut p = vec![a, c2];
+        flood(&mut p, 1, state);
+        for s in &p {
+            assert!(s.is_tombstoned("x.md") && s.is_tombstoned("m.toml"));
+        }
+        assert!(!p[0].docs.contains_key("x.md"));
+    }
+
+    #[test]
+    fn recreation_survives_old_tombstone() {
+        let mut p = vec![Syncer::new("a"), Syncer::new("b")];
+        let t = p[0].local_text("x.md", "hi\n").unwrap();
+        flood(&mut p, 0, vec![t]);
+        let old = p[0].local_delete("x.md").unwrap();
+        flood(&mut p, 0, vec![dup(&old)]);
+        assert!(p.iter().all(|s| s.is_tombstoned("x.md")));
+
+        let rec = p[0].local_text("x.md", "hi\n").unwrap();
+        assert_ne!(msg_origin(&rec), msg_origin(&old), "a re-creation is a new doc");
+        flood(&mut p, 0, vec![rec]);
+        for s in &p {
+            assert_eq!(text_of(s, "x.md").as_deref(), Some("hi\n"));
+            assert!(!s.is_tombstoned("x.md"));
+        }
+
+        let r = p[0].receive(dup(&old));
+        assert!(r.change.is_none());
+        assert!(matches!(r.replies.first(), Some(SyncMsg::Restore { .. })));
+
+        // A second delete, then a re-creation with different bytes.
+        let d2 = p[0].local_delete("x.md").unwrap();
+        assert_ne!(delete_ids(&d2), delete_ids(&old));
+        flood(&mut p, 0, vec![d2]);
+        assert!(p.iter().all(|s| s.is_tombstoned("x.md")));
+        let rec2 = p[0].local_text("x.md", "different\n").unwrap();
+        flood(&mut p, 0, vec![rec2]);
+        for s in &p {
+            assert_eq!(text_of(s, "x.md").as_deref(), Some("different\n"));
+            assert!(!s.is_tombstoned("x.md"));
+        }
+    }
+
+    #[test]
+    fn behind_holder_converges() {
+        let mut p = vec![Syncer::new("a"), Syncer::new("b")];
+        let t = p[0].local_text("x.md", "v0\n").unwrap();
+        flood(&mut p, 0, vec![t]);
+        for i in 1..=20 {
+            p[0].local_text("x.md", &format!("v0\n{}", "e\n".repeat(i))); // never delivered
+        }
+        let d = p[0].local_delete("x.md").unwrap();
+        let n = flood(&mut p, 0, vec![d]);
+        assert!(p.iter().all(|s| s.is_tombstoned("x.md")));
+        assert!(n < 50, "converged in {n} messages");
+    }
+
+    #[test]
+    fn independent_deletes_then_recreate() {
+        let mut p = vec![Syncer::new("a"), Syncer::new("b")];
+        let t = p[0].local_text("x.md", "hi\n").unwrap();
+        flood(&mut p, 0, vec![t]);
+        let da = p[0].local_delete("x.md").unwrap();
+        let db = p[1].local_delete("x.md").unwrap();
+        assert_eq!(delete_ids(&da), delete_ids(&db), "same content + history mint the same id");
+        flood(&mut p, 0, vec![da]);
+        flood(&mut p, 1, vec![db]);
+        assert!(p.iter().all(|s| s.is_tombstoned("x.md")));
+
+        let rec = p[0].local_text("x.md", "again\n").unwrap();
+        flood(&mut p, 0, vec![rec]);
+        for s in &p {
+            assert_eq!(text_of(s, "x.md").as_deref(), Some("again\n"));
+            assert!(!s.is_tombstoned("x.md"));
+        }
+    }
+
+    #[test]
+    fn unknown_path_delete_is_remembered() {
+        let mut a = Syncer::new("a");
+        a.local_text("p.md", "same\n");
+        let d = a.local_delete("p.md").unwrap();
+
+        let mut c = Syncer::new("c");
+        let r = c.receive(dup(&d));
+        assert!(r.change.is_none());
+        assert_eq!(r.save.as_deref(), Some("p.md"));
+        assert!(c.is_tombstoned("p.md"));
+
+        let mut z = Syncer::new("z");
+        let m = z.local_text("p.md", "same\n").unwrap();
+        let r = c.receive(m);
+        assert!(r.change.is_none());
+        assert!(matches!(r.replies.as_slice(), [SyncMsg::Delete { .. }]));
+        assert!(r.save.is_none());
+        assert!(c.is_tombstoned("p.md"));
+    }
+
+    #[test]
+    fn deletes_refuse_dot_and_escaping_paths() {
+        let mut s = Syncer::new("s");
+        s.local_lww(".site", b"x".to_vec(), 1);
+        for p in [".site", "../x", "a//b", ""] {
+            let r = s.receive(SyncMsg::Delete {
+                path: p.into(),
+                ids: vec![1],
+                seen: vec![],
+                origin: None,
+                vv: vec![],
+                version: u64::MAX,
+            });
+            assert!(is_noop(&r), "{p:?}");
+            assert!(!s.is_tombstoned(p));
+        }
+        assert!(s.lww.contains_key(".site"));
+    }
+
+    #[test]
+    fn compare_hello_sees_tombstones() {
+        let mut a = Syncer::new("a");
+        let mut b = Syncer::new("b");
+        let mut c = Syncer::new("c");
+        a.local_text("x.md", "hi\n");
+        a.local_lww("m.toml", b"v".to_vec(), 1000);
+        sync(&mut a, &mut b);
+        sync(&mut a, &mut c); // c: synced pre-delete
+        let dx = a.local_delete("x.md").unwrap();
+        let dm = a.local_delete("m.toml").unwrap();
+
+        let ahead = Some(HelloCmp { we_ahead: true, they_ahead: false });
+        assert_eq!(a.compare_hello(&b.hello()), ahead, "we hold deletes b lacks");
+        assert_eq!(b.compare_hello(&a.hello()), ahead, "b holds copies a lacks");
+
+        b.receive(dup(&dx));
+        b.receive(dup(&dm));
+        assert!(a.compare_hello(&b.hello()).unwrap().consistent());
+        assert!(b.compare_hello(&a.hello()).unwrap().consistent());
+
+        c.local_text("x.md", "hi\nmore\n");
+        assert!(a.compare_hello(&c.hello()).unwrap().they_ahead, "a new op may overrule the delete");
+
+        let mut d = Syncer::new("d");
+        d.receive(SyncMsg::Lww { path: "m.toml".into(), version: 2000, bytes: b"w".to_vec() });
+        assert!(a.compare_hello(&d.hello()).unwrap().they_ahead, "a newer version may overrule it");
+    }
+
+    #[test]
+    fn generation_moves_only_on_tombstone_changes() {
+        let mut a = Syncer::new("a");
+        let mut b = Syncer::new("b");
+        b.receive(a.local_text("x.md", "hi\n").unwrap());
+        let stale = b.full_state();
+
+        let g = a.generation();
+        let d = a.local_delete("x.md").unwrap();
+        assert!(a.generation() > g, "a local delete bumps");
+        let g = a.generation();
+        a.local_delete("x.md").unwrap();
+        assert_eq!(a.generation(), g, "re-asking for the Delete does not bump");
+
+        let gb = b.generation();
+        assert!(b.receive(dup(&d)).save.is_some());
+        assert_eq!(b.generation(), gb + 1, "the first Delete bumps once");
+        let gb = b.generation();
+        assert!(is_noop(&b.receive(dup(&d))), "a duplicate Delete is a no-op");
+        assert_eq!(b.generation(), gb);
+
+        b.receive(SyncMsg::Resync { path: "x.md".into() });
+        let hello = SyncMsg::Hello { versions: vec![("x.md".into(), vec![])], lww_versions: vec![] };
+        assert!(b.receive(hello).replies.iter().any(|m| is_delete_of(m, "x.md")));
+        for m in stale {
+            let r = b.receive(m);
+            assert!(r.save.is_none() && matches!(r.replies.as_slice(), [SyncMsg::Delete { .. }]));
+        }
+        assert_eq!(b.generation(), gb, "Resync / Hello / a stale copy only re-assert");
+
+        let restore = SyncMsg::Restore { path: "x.md".into(), ids: delete_ids(&d) };
+        assert!(b.receive(restore).save.is_some());
+        assert!(b.generation() > gb, "a Restore dropping the tombstone bumps");
+        assert!(!b.is_tombstoned("x.md"));
+
+        let g = a.generation();
+        a.local_text("x.md", "back\n").unwrap();
+        assert!(a.generation() > g, "a re-creation bumps");
+    }
+
+    #[test]
+    fn no_ping_pong_between_tombstone_and_stale_copy() {
+        let mut p = vec![Syncer::new("a"), Syncer::new("b")];
+        let t = p[0].local_text("x.md", "hi\n").unwrap();
+        let l = p[0].local_lww("m.toml", b"v".to_vec(), 1000);
+        flood(&mut p, 0, vec![t, l]);
+        p[0].local_delete("x.md").unwrap(); // b never sees these
+        p[0].local_delete("m.toml").unwrap();
+
+        let copy = p[1].full_state();
+        let n = flood(&mut p, 1, copy);
+        assert!(n <= 4, "{n} messages");
+        for s in &p {
+            assert!(s.is_tombstoned("x.md") && s.is_tombstoned("m.toml"));
+        }
+
+        let deletes = p[1].full_state();
+        assert!(deletes.iter().all(|m| matches!(m, SyncMsg::Delete { .. })));
+        let sent = deletes.len();
+        let n = flood(&mut p, 1, deletes);
+        assert!(n <= 2, "{n} messages");
+        assert_eq!(n, sent, "converged tombstones draw no reply");
+    }
+
+    #[test]
+    fn unmergeable_content_for_a_tombstone_parks() {
+        let mut probe = EgWalkerText::new("s");
+        probe.edit_to("one\n");
+        let v1 = probe.version();
+        probe.edit_to("one\ntwo\n");
+        let bad = |probe: &EgWalkerText| SyncMsg::TextDelta {
+            path: "note.md".into(),
+            ops: probe.encode_delta(&v1),
+            vv: probe.version_vector(),
+            origin: probe.origin(),
+        };
+
+        let mut a = Syncer::new("a");
+        a.local_text("note.md", "x\n");
+        a.local_delete("note.md").unwrap();
+        let mut deletes = 0;
+        let mut fed = 0;
+        while a.parked_paths().is_empty() {
+            let r = a.receive(bad(&probe));
+            deletes += r.replies.iter().filter(|m| is_delete_of(m, "note.md")).count();
+            fed += 1;
+            assert!(fed < 32, "must park after the cap, not loop forever");
+        }
+        assert_eq!(deletes, MAX_RESYNC_REQUESTS as usize, "bounded re-asserts");
+        assert_eq!(a.parked_paths(), vec!["note.md".to_string()]);
+        assert!(is_noop(&a.receive(bad(&probe))), "a parked tombstone stays quiet");
+        assert!(a.is_tombstoned("note.md"));
+
+        let mut src = Syncer::new("s");
+        src.local_text("note.md", "one\n");
+        src.local_text("note.md", "one\ntwo\n");
+        assert!(a.compare_hello(&src.hello()).unwrap().consistent(), "anti-entropy ignores it");
+    }
+
+    /// `flood` restricted to the `online` peers (the rest are offline: they get nothing).
+    fn flood_among(peers: &mut [Syncer], online: &[usize], from: usize, msgs: Vec<SyncMsg>) -> usize {
+        let mut queue: std::collections::VecDeque<(usize, SyncMsg)> =
+            msgs.into_iter().map(|m| (from, m)).collect();
+        let mut n = 0;
+        while let Some((src, m)) = queue.pop_front() {
+            n += 1;
+            assert!(n < 500, "message storm");
+            for &i in online {
+                if i == src {
+                    continue;
+                }
+                for r in peers[i].receive(dup(&m)).replies {
+                    queue.push_back((i, r));
+                }
+            }
+        }
+        n
+    }
+
+    /// A delta the deleter had already seen, arriving AFTER the (small) `Delete` at a peer that
+    /// was behind — a chunked delta overtaken by its delete — must not revive the file; a
+    /// genuinely newer edit still does.
+    #[test]
+    fn late_delta_the_deleter_saw_never_revives() {
+        let mut p = vec![Syncer::new("a"), Syncer::new("b")];
+        let mut c = Syncer::new("c");
+        let t = p[0].local_text("x.md", "v1\n").unwrap();
+        c.receive(dup(&t));
+        flood(&mut p, 0, vec![t]);
+        let d2 = p[0].local_text("x.md", "v1\nv2\n").unwrap(); // overtaken by the delete
+        c.receive(dup(&d2));
+        let d = p[0].local_delete("x.md").unwrap();
+        flood(&mut p, 0, vec![d]);
+        assert!(p[1].is_tombstoned("x.md"), "b was behind, proved stale, deleted");
+
+        let r = p[1].receive(dup(&d2));
+        assert!(r.change.is_none(), "the deleter saw this delta: no revival");
+        assert!(p[1].is_tombstoned("x.md"));
+        assert!(matches!(r.replies.as_slice(), [SyncMsg::Delete { .. }]), "re-asserts the delete");
+        assert!(r.save.is_some(), "the kept doc grew: its record changes");
+
+        let e = c.local_text("x.md", "v1\nv2\nv3 by c\n").unwrap();
+        let r = p[1].receive(dup(&e));
+        assert!(matches!(r.change, Some(Change::Write { .. })), "a newer edit beats the delete");
+        assert_eq!(text_of(&p[1], "x.md").as_deref(), Some("v1\nv2\nv3 by c\n"));
+    }
+
+    /// Delete (id1) → re-create → delete (id2), with one peer offline holding the id1 tombstone
+    /// and another offline holding the re-created copy. When both come back, the old id1 must
+    /// not let the re-creator's `Restore` cancel id2: everyone ends deleted.
+    #[test]
+    fn stale_peers_from_different_delete_rounds_never_undo_the_latest_delete() {
+        let mut p: Vec<Syncer> = ["a", "b", "c", "d", "e"].into_iter().map(Syncer::new).collect();
+        let all = [0, 1, 2, 3, 4];
+        let t = p[0].local_text("x.md", "v1\n").unwrap();
+        flood_among(&mut p, &all, 0, vec![t]);
+        let d1 = p[0].local_delete("x.md").unwrap();
+        flood_among(&mut p, &all, 0, vec![d1]);
+        assert!(p.iter().all(|s| s.is_tombstoned("x.md")));
+
+        // d goes offline holding the id1 tombstone; b re-creates.
+        let rec = p[1].local_text("x.md", "v2\n").unwrap();
+        flood_among(&mut p, &[0, 1, 2, 4], 1, vec![rec]);
+        for i in [0, 1, 2, 4] {
+            assert_eq!(text_of(&p[i], "x.md").as_deref(), Some("v2\n"));
+        }
+
+        // e goes offline holding the re-created copy; c deletes it (id2).
+        let d2 = p[2].local_delete("x.md").unwrap();
+        flood_among(&mut p, &[0, 1, 2], 2, vec![d2]);
+        assert!([0, 1, 2].iter().all(|&i| p[i].is_tombstoned("x.md")));
+
+        // d returns (catch-up both ways), then e does.
+        let live = [0, 1, 2, 3];
+        let s = p[3].full_state();
+        flood_among(&mut p, &live, 3, s);
+        let s = p[0].full_state();
+        flood_among(&mut p, &live, 0, s);
+        let s = p[4].full_state();
+        flood_among(&mut p, &all, 4, s);
+        let s = p[0].full_state();
+        flood_among(&mut p, &all, 0, s);
+        for (i, s) in p.iter().enumerate() {
+            assert!(s.is_tombstoned("x.md"), "peer {i} brought the deleted file back");
+            assert!(text_of(s, "x.md").is_none());
+        }
+    }
+
+    /// A peer away since BEFORE the first of two delete rounds comes back holding an OLDER copy
+    /// of the round-1 doc. The latest tombstone (round 2, a different doc) can't judge it, so the
+    /// round-1 tombstone each peer remembers (`past`, persisted) answers it: everyone ends deleted.
+    #[test]
+    fn returning_copy_older_than_an_earlier_round_delete_is_deleted() {
+        let mut p: Vec<Syncer> = ["a", "b", "c", "f"].into_iter().map(Syncer::new).collect();
+        let (all, live) = ([0, 1, 2, 3], [0, 1, 2]);
+        let t = p[0].local_text("x.md", "v1\n").unwrap();
+        flood_among(&mut p, &all, 0, vec![t]);
+        // f goes away holding v1; a edits on, deletes (round 1); b re-creates; c deletes (round 2).
+        let e = p[0].local_text("x.md", "v1\nv2\n").unwrap();
+        flood_among(&mut p, &live, 0, vec![e]);
+        let d1 = p[0].local_delete("x.md").unwrap();
+        flood_among(&mut p, &live, 0, vec![dup(&d1)]);
+        let rec = p[1].local_text("x.md", "new\n").unwrap();
+        flood_among(&mut p, &live, 1, vec![rec]);
+        let d2 = p[2].local_delete("x.md").unwrap();
+        flood_among(&mut p, &live, 2, vec![d2]);
+        assert!(live.iter().all(|&i| p[i].is_tombstoned("x.md")));
+
+        let old_copy = p[3].full_state();
+        flood_among(&mut p, &all, 3, old_copy.iter().map(dup).collect());
+        let s = p[0].full_state();
+        flood_among(&mut p, &all, 0, s);
+        for (i, s) in p.iter().enumerate() {
+            assert!(s.is_tombstoned("x.md"), "peer {i} brought round-1 content back");
+        }
+
+        // The round-1 tombstone survives a restart.
+        let rec = p[2].durable("x.md").unwrap();
+        assert!(matches!(&rec.kind, DurableKind::Deleted { past, .. } if !past.is_empty()));
+        let mut c2 = Syncer::new("c2");
+        assert!(matches!(c2.restore(rec, None, 0), Restored::Clean));
+        let r = c2.receive(dup(&old_copy[0]));
+        assert!(r.change.is_none());
+        assert!(
+            r.replies.iter().any(|m| matches!(m, SyncMsg::Delete { ids, .. } if *ids == delete_ids(&d1))),
+            "answers with the round-1 Delete"
+        );
+    }
+
+    /// While the path is live again (re-created), a returning copy of the doc deleted earlier must
+    /// not win the origin conflict against the re-creation, whatever the agent ids.
+    #[test]
+    fn live_recreation_beats_a_returning_copy_of_the_deleted_doc() {
+        // "z" (the original author) outranks "b~1" (the re-creation) in the origin rule.
+        let mut p: Vec<Syncer> = ["z", "b", "f"].into_iter().map(Syncer::new).collect();
+        let (all, live) = ([0, 1, 2], [0, 1]);
+        let t = p[0].local_text("x.md", "old\n").unwrap();
+        flood_among(&mut p, &all, 0, vec![t]);
+        let d1 = p[0].local_delete("x.md").unwrap();
+        flood_among(&mut p, &live, 0, vec![d1]);
+        let rec = p[1].local_text("x.md", "new\n").unwrap();
+        flood_among(&mut p, &live, 1, vec![rec]);
+
+        let old_copy = p[2].full_state();
+        flood_among(&mut p, &all, 2, old_copy);
+        let s = p[1].full_state();
+        flood_among(&mut p, &all, 1, s);
+        for (i, s) in p.iter().enumerate() {
+            assert_eq!(text_of(s, "x.md").as_deref(), Some("new\n"), "peer {i}");
+            assert!(!s.is_tombstoned("x.md"));
+        }
+    }
+
+    /// Several deltas overtaken by their (small) `Delete`: a peer that is behind accepts the
+    /// delete at once (its tips are dominated per agent by the deleter's frontier), and a late
+    /// delta that is NOT the deleter's last one — so its tip isn't named in `t.vv` — still keeps
+    /// the path deleted; a genuinely newer edit still revives it.
+    #[test]
+    fn late_deltas_short_of_the_deleters_frontier_never_revive() {
+        let mut a = Syncer::new("a");
+        let mut b = Syncer::new("b");
+        let mut c = Syncer::new("c");
+        let t = a.local_text("x.md", "v1\n").unwrap();
+        b.receive(dup(&t));
+        c.receive(dup(&t));
+        let d2 = a.local_text("x.md", "v1\nv2\n").unwrap(); // overtaken
+        c.receive(dup(&d2));
+        let d3 = a.local_text("x.md", "v1\nv2\nv3\n").unwrap(); // overtaken
+        c.receive(dup(&d3));
+        let d = a.local_delete("x.md").unwrap();
+
+        let r = b.receive(dup(&d));
+        assert_eq!(r.change, Some(Change::Remove { path: "x.md".into() }), "behind, but seen by the deleter");
+        let r = b.receive(dup(&d2));
+        assert!(r.change.is_none(), "d2 is short of the deleter's frontier: no revival");
+        assert!(b.is_tombstoned("x.md"));
+        assert!(matches!(r.replies.as_slice(), [SyncMsg::Delete { .. }]));
+        let r = b.receive(dup(&d3));
+        assert!(r.change.is_none() && b.is_tombstoned("x.md"), "nor d3");
+
+        // The same after a re-assert round (the tombstone's vv also names the behind peer's tip,
+        // which `ops_since` CAN map — and so maps d2 as ahead of it).
+        let mut q = Syncer::new("q");
+        q.receive(dup(&t));
+        let mut p = vec![a, q];
+        flood(&mut p, 0, vec![dup(&d)]);
+        assert!(p[1].is_tombstoned("x.md"));
+        assert!(p[1].receive(dup(&d2)).change.is_none(), "d2 after a re-assert round: no revival");
+        assert!(p[1].is_tombstoned("x.md"));
+
+        let e = c.local_text("x.md", "v1\nv2\nv3\nv4 by c\n").unwrap();
+        let r = b.receive(dup(&e));
+        assert!(matches!(r.change, Some(Change::Write { .. })), "a newer edit beats the delete");
+        assert_eq!(text_of(&b, "x.md").as_deref(), Some("v1\nv2\nv3\nv4 by c\n"));
     }
 }

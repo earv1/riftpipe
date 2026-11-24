@@ -144,10 +144,11 @@ Roughly priority order. Most of this is *wiring and UI*, not new sync code.
 
 These need work in the riftpipe *core*, not just the app:
 
-- **Folder move/delete sync** — track resources by stable id, not path
-  ([`DESIGN.md`](../../../DESIGN.md) §17 TODO). Until it lands, "delete a card" =
-  set `column = "archived"` in `meta.toml` (a hidden lane), which also gives undo
-  for free. Real deletion + tombstone GC follows.
+- **Folder move/delete sync** — deletes are *done*: "delete a card" really
+  deletes `tickets/<id>/` and syncs (tree/mesh deletes, see
+  [`data-model.md`](data-model.md) §Deletes). Moves are still open: track
+  resources by stable id, not path ([`DESIGN.md`](../../../DESIGN.md) §17 TODO);
+  a move/rename is a delete + create today. Tombstone GC follows.
 - **`--memory` boards** — keep the tree in RAM (memory backings) and surface
   resources in the `process` file (size + hash) for ephemeral boards.
 - **Multi-board** — falls out of "a parent dir of board dirs" later; v1 is one

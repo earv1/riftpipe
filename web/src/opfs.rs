@@ -132,6 +132,88 @@ async fn write_path_under(root: &FileSystemDirectoryHandle, path: &str, bytes: &
     write_text(&dir, file, &String::from_utf8_lossy(bytes)).await
 }
 
+/// Delete the file at `path` on board `topic`'s tree, then remove the directories
+/// it leaves empty (never the board root). `Ok(false)` — nothing removed — if there
+/// was no file there (a directory isn't one), or `path` has a dot-prefixed part:
+/// machine-local entries (`.claimed`, `.riftpipe-sync`) are never deleted this way.
+pub async fn remove_path_in(topic: &[u8; 32], path: &str) -> Result<bool, JsValue> {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.iter().any(|p| p.starts_with('.')) {
+        return Ok(false);
+    }
+    let Some((file, dirs)) = parts.split_last() else { return Ok(false) };
+    let mut chain = vec![board_root(topic).await?];
+    for d in dirs {
+        match subdir(chain.last().expect("chain starts at the root"), d, false).await {
+            Ok(sub) => chain.push(sub),
+            Err(_) => return Ok(false),
+        }
+    }
+    let parent = chain.last().expect("chain starts at the root");
+    if JsFuture::from(parent.get_file_handle(file)).await.is_err() {
+        return Ok(false);
+    }
+    if JsFuture::from(parent.remove_entry(file)).await.is_err() {
+        return Ok(false);
+    }
+    for i in (1..chain.len()).rev() {
+        if !list(&chain[i]).await.is_empty() {
+            break;
+        }
+        if JsFuture::from(chain[i - 1].remove_entry(dirs[i - 1])).await.is_err() {
+            break;
+        }
+    }
+    Ok(true)
+}
+
+/// Delete the file at `path` on the active board's tree ([`remove_path_in`]). An app
+/// (local) delete: it first lets any queued merged write of the same path land, so
+/// the older merge can't bring the file back afterwards (mirrors [`write_path`]).
+pub async fn remove_path(path: &str) -> Result<bool, JsValue> {
+    let topic = active_board();
+    writes_settled(topic, Some(path)).await;
+    remove_path_in(&topic, path).await
+}
+
+/// Whether `path`'s durable record on the active board is a tombstone (`DurableKind::Deleted`),
+/// once any queued write for it has landed.
+pub async fn record_is_deleted(path: &str) -> bool {
+    let topic = active_board();
+    writes_settled(topic, Some(path)).await;
+    let Ok(root) = board_root(&topic).await else { return false };
+    let Ok(dir) = subdir(&root, SYNC_DIR, false).await else { return false };
+    let Some(bytes) = read_bytes(&dir, &format!("{}.rec", riftpipe_core::sync::record_name(path))).await else {
+        return false;
+    };
+    matches!(
+        postcard::from_bytes::<DurablePath>(&bytes).map(|r| r.kind),
+        Ok(riftpipe_core::sync::DurableKind::Deleted { .. })
+    )
+}
+
+/// Is there (still) a file at `path` on board `topic`'s tree?
+async fn file_still_there(topic: &[u8; 32], path: &str) -> bool {
+    match board_root(topic).await {
+        Ok(root) => file_exists_in(&root, path).await,
+        Err(_) => false,
+    }
+}
+
+/// Is there a file at `path` under `root`?
+async fn file_exists_in(root: &FileSystemDirectoryHandle, path: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some((file, dirs)) = parts.split_last() else { return false };
+    let mut dir = root.clone();
+    for d in dirs {
+        match subdir(&dir, d, false).await {
+            Ok(sub) => dir = sub,
+            Err(_) => return false,
+        }
+    }
+    JsFuture::from(dir.get_file_handle(file)).await.is_ok()
+}
+
 /// Read an OPFS file at a nested `path` like `tickets/<id>/card.md` as text, or
 /// `None` if it doesn't exist (or isn't UTF-8). The path-addressed read that the
 /// generic file API (`readFile`) exposes to JS.
@@ -211,19 +293,31 @@ pub async fn prime_all(topic: [u8; 32]) {
     }
 }
 
-/// One path's not-yet-written durable state: the merged file bytes and/or its
-/// record, plus what to run once the file has landed.
+/// What a queued entry does to its file: write these bytes, or delete it.
+enum FileOp {
+    Write(Vec<u8>),
+    Remove,
+}
+
+/// What a queued entry does to its durable record: write these bytes, or delete it.
+enum RecordOp {
+    Write(Vec<u8>),
+    Remove,
+}
+
+/// One path's not-yet-applied durable state: the merged file write/removal and/or
+/// its record write/removal, plus what to run once the file op has landed.
 #[derive(Default)]
 struct PendingWrite {
-    file: Option<Vec<u8>>,
-    record: Option<Vec<u8>>,
+    file: Option<FileOp>,
+    record: Option<RecordOp>,
     after: Vec<Box<dyn FnOnce()>>,
 }
 
 /// Every durable write of the mesh path — merged files AND their records — goes
 /// through ONE serialized queue, latest-wins per `(board, path)`, and each entry
-/// writes its file BEFORE its record. So a record never lands ahead of the file it
-/// describes: a reload mid-write can only see the new file with the old record
+/// writes/removes its file BEFORE its record. So a record never lands ahead of the
+/// file it describes: a reload mid-write can only see the new file with the old record
 /// (restore treats it as a local edit = the merge again: duplication, never loss),
 /// never the new record with the old file (restore would author a revert of the
 /// merge and broadcast it mesh-wide). Rapid merges to one file can't land out of
@@ -257,7 +351,7 @@ fn enqueue(key: ([u8; 32], String), f: impl FnOnce(&mut PendingWrite, bool)) {
 /// its record with [`queue_record`] right after, so the pair is written in order.
 pub(crate) fn queue_merged_file(topic: [u8; 32], path: String, bytes: Vec<u8>, after: impl FnOnce() + 'static) {
     enqueue((topic, path), |e, _| {
-        e.file = Some(bytes);
+        e.file = Some(FileOp::Write(bytes));
         e.after.push(Box::new(after));
     });
 }
@@ -266,7 +360,36 @@ pub(crate) fn queue_merged_file(topic: [u8; 32], path: String, bytes: Vec<u8>, a
 /// it, or of a file restore found on disk.
 pub(crate) fn queue_record(topic: [u8; 32], rec: &DurablePath) {
     let bytes = postcard::to_allocvec(rec).unwrap_or_default();
-    enqueue((topic, rec.path.clone()), |e, _| e.record = Some(bytes));
+    enqueue((topic, rec.path.clone()), |e, _| e.record = Some(RecordOp::Write(bytes)));
+}
+
+/// Queue the removal of a peer-deleted file for board `topic` (replacing any
+/// not-yet-written bytes for that path); `after` runs once it is gone. Queue its
+/// (tombstone) record with [`queue_record`] right after, as for a merged file.
+pub(crate) fn queue_removed_file(topic: [u8; 32], path: String, after: impl FnOnce() + 'static) {
+    enqueue((topic, path), |e, _| {
+        e.file = Some(FileOp::Remove);
+        e.after.push(Box::new(after));
+    });
+}
+
+/// Queue the deletion of `path`'s durable record on board `topic` (its state is gone:
+/// a restore found the record unusable, or the syncer holds nothing for it).
+pub(crate) fn queue_record_removal(topic: [u8; 32], path: String) {
+    enqueue((topic, path), |e, _| e.record = Some(RecordOp::Remove));
+}
+
+/// Queue `rec` (the tombstone) after a LOCAL delete (the app removed the file itself,
+/// then pushed): an older queued merged write must not bring the file back, so a
+/// merged file still queued or being written for that path is replaced by a removal.
+pub(crate) fn queue_local_delete_record(topic: [u8; 32], rec: &DurablePath) {
+    let bytes = postcard::to_allocvec(rec).unwrap_or_default();
+    enqueue((topic, rec.path.clone()), |e, in_flight| {
+        if in_flight || e.file.is_some() {
+            e.file = Some(FileOp::Remove);
+        }
+        e.record = Some(RecordOp::Write(bytes));
+    });
 }
 
 /// Queue `rec` after a LOCAL write of `written` to its path (the app wrote the
@@ -277,13 +400,13 @@ pub(crate) fn queue_local_record(topic: [u8; 32], rec: &DurablePath, written: &[
     let bytes = postcard::to_allocvec(rec).unwrap_or_default();
     enqueue((topic, rec.path.clone()), |e, in_flight| {
         if in_flight || e.file.is_some() {
-            e.file = Some(written.to_vec());
+            e.file = Some(FileOp::Write(written.to_vec()));
         }
-        e.record = Some(bytes);
+        e.record = Some(RecordOp::Write(bytes));
     });
 }
 
-/// Drain [`WRITES`] one entry at a time until it's empty: file, then record.
+/// Drain [`WRITES`] one entry at a time until it's empty: file op, then record op.
 async fn drain_writes() {
     loop {
         let next = WRITES.with(|q| {
@@ -296,18 +419,42 @@ async fn drain_writes() {
             next
         });
         let Some(((topic, path), w)) = next else { break };
-        if let Some(bytes) = &w.file {
-            let _ = write_path_in(&topic, &path, bytes).await;
+        let mut record = w.record;
+        match &w.file {
+            Some(FileOp::Write(bytes)) => {
+                let _ = write_path_in(&topic, &path, bytes).await;
+            }
+            Some(FileOp::Remove) => {
+                if !matches!(remove_path_in(&topic, &path).await, Ok(true)) && file_still_there(&topic, &path).await {
+                    // The file couldn't be removed: keep its live record (a `Deleted` record next
+                    // to a present file would restore as a re-creation, overruling the delete for
+                    // every peer). A restart re-learns the delete from peers.
+                    web_sys::console::warn_1(&format!("[opfs] could not delete {path}; keeping its record").into());
+                    record = None;
+                }
+            }
+            None => {}
         }
         for f in w.after {
             f();
         }
-        if let Some(rec) = &w.record {
-            if let Ok(root) = board_root(&topic).await {
-                if let Ok(dir) = subdir(&root, SYNC_DIR, true).await {
-                    let _ = write_bytes(&dir, &format!("{}.rec", riftpipe_core::sync::record_name(&path)), rec).await;
+        let name = format!("{}.rec", riftpipe_core::sync::record_name(&path));
+        match &record {
+            Some(RecordOp::Write(rec)) => {
+                if let Ok(root) = board_root(&topic).await {
+                    if let Ok(dir) = subdir(&root, SYNC_DIR, true).await {
+                        let _ = write_bytes(&dir, &name, rec).await;
+                    }
                 }
             }
+            Some(RecordOp::Remove) => {
+                if let Ok(root) = board_root(&topic).await {
+                    if let Ok(dir) = subdir(&root, SYNC_DIR, false).await {
+                        let _ = JsFuture::from(dir.remove_entry(&name)).await;
+                    }
+                }
+            }
+            None => {}
         }
     }
 }
@@ -349,8 +496,10 @@ pub(crate) async fn flush_records() {
 /// Rebuild board `topic`'s Syncer from its durable records + OPFS files, BEFORE the
 /// mesh starts: unchanged files resume their exact history (same CRDT origin, same LWW
 /// version); files changed while closed become local edits on top; files without a
-/// usable record are primed as new (the old `prime_all` behaviour); records of files
-/// that are gone are deleted. Nothing is broadcast
+/// usable record are primed as new (the old `prime_all` behaviour); files deleted
+/// while closed become tombstones (the NeighborUp catch-up ships their `Delete`);
+/// tombstone records stay deleted, and one whose file is back is a re-creation;
+/// unusable records are dropped. Nothing is broadcast
 /// — the NeighborUp catch-up ships the whole state.
 pub async fn restore_syncer(topic: [u8; 32], agent: String) -> Syncer {
     let mut syncer = Syncer::new(agent);
@@ -370,10 +519,10 @@ pub async fn restore_syncer(topic: [u8; 32], agent: String) -> Syncer {
         }
     }
     let now = js_sys::Date::now() as u64;
-    for (path, text) in tree_files(root).await {
+    for (path, text) in tree_files(root.clone()).await {
         match recs.remove(&path).map(|rec| syncer.restore(rec, Some(text.as_bytes()), now)) {
             Some(Restored::Clean) => {}
-            Some(Restored::Changed(_)) => {
+            Some(Restored::Changed(_)) | Some(Restored::Deleted(_)) => {
                 if let Some(r) = syncer.durable(&path) {
                     queue_record(topic, &r);
                 }
@@ -390,12 +539,22 @@ pub async fn restore_syncer(topic: [u8; 32], agent: String) -> Syncer {
             }
         }
     }
-    // Records whose file is gone (deleted while closed): drop them, as the native
-    // `TreePeer::seed` does, so they don't pile up.
-    if let Some(dir) = &records {
-        for path in recs.into_keys() {
-            let name = format!("{}.rec", riftpipe_core::sync::record_name(&path));
-            let _ = JsFuture::from(dir.remove_entry(&name)).await;
+    // Records whose file is gone: deleted while closed (now a tombstone, re-saved), or
+    // already a tombstone (stays deleted, as the native `TreePeer::seed` does).
+    let mut rest: Vec<(String, DurablePath)> = recs.into_iter().collect();
+    rest.sort_by(|a, b| a.0.cmp(&b.0));
+    for (path, rec) in rest {
+        if file_exists_in(&root, &path).await {
+            continue; // on disk but not readable as text: not a delete — keep the record
+        }
+        match syncer.restore(rec, None, now) {
+            Restored::Deleted(_) | Restored::Changed(_) => {
+                if let Some(r) = syncer.durable(&path) {
+                    queue_record(topic, &r);
+                }
+            }
+            Restored::Clean => {} // a tombstone record: stays deleted
+            Restored::Unusable => queue_record_removal(topic, path),
         }
     }
     syncer
@@ -798,10 +957,120 @@ mod tests {
         assert_eq!(record_in(&topic, "x.toml").await, Some(rec));
     }
 
-    /// A record whose file was deleted while the tab was closed is dropped on
-    /// restore (like the native `seed`), not kept forever.
+    /// `remove_path` deletes just the file, prunes the directories it leaves empty,
+    /// and refuses absent files, directories, dot-paths and escaping paths.
     #[wasm_bindgen_test]
-    async fn restore_drops_records_of_deleted_files() {
+    async fn remove_path_prunes_empty_dirs_and_refuses_dot_paths() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        set_active_board(topic);
+        write_path("tickets/t1/card.md", b"# t1\n").await.unwrap();
+        write_path("tickets/t1/comments/c.md", b"hi\n").await.unwrap();
+        write_path("tickets/t2/card.md", b"# t2\n").await.unwrap();
+
+        assert!(remove_path("tickets/t1/comments/c.md").await.unwrap());
+        assert_eq!(list_path("tickets/t1").await, vec!["card.md".to_string()], "the emptied comments/ is pruned");
+        assert!(remove_path("tickets/t1/card.md").await.unwrap());
+        let mut tickets = list_path("tickets").await;
+        tickets.sort();
+        assert_eq!(tickets, vec!["t2".to_string()], "the emptied t1/ is pruned, t2/ stays");
+
+        assert!(!remove_path("tickets/t1/card.md").await.unwrap(), "an absent file");
+        assert!(!remove_path("tickets").await.unwrap(), "a directory is not a file");
+        let root = board_root(&topic).await.unwrap();
+        write_text(&root, ".claimed", "claimed\n").await.unwrap();
+        assert!(!remove_path(".claimed").await.unwrap(), "dot-paths are refused");
+        assert!(read_text(&root, ".claimed").await.is_some(), "and kept");
+        assert!(!remove_path("../x").await.unwrap(), "escaping paths are refused");
+    }
+
+    /// A text file deleted on a Syncer: its tombstone record (`DurableKind::Deleted`).
+    fn deleted_record(path: &str) -> DurablePath {
+        let mut s = Syncer::new("d1");
+        s.local_text(path, "# doomed\n");
+        s.local_delete(path).expect("a delete");
+        let rec = s.durable(path).expect("a tombstone record");
+        assert!(matches!(rec.kind, riftpipe_core::sync::DurableKind::Deleted { .. }));
+        rec
+    }
+
+    /// A queued removal and its tombstone record land in order: file gone, then record.
+    #[wasm_bindgen_test]
+    async fn queued_remove_lands_before_its_record() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        write_path_in(&topic, "a.md", b"# doomed\n").await.unwrap();
+        let rec = deleted_record("a.md");
+        queue_removed_file(topic, "a.md".into(), || {});
+        queue_record(topic, &rec);
+        flush_records().await;
+        assert!(read_in(&topic, "a.md").await.is_none(), "the file is removed");
+        assert_eq!(record_in(&topic, "a.md").await, Some(rec));
+    }
+
+    /// A queued removal that fails (the file is locked by an open writable) keeps the file's
+    /// live record: a `Deleted` record next to a present file would restore as a re-creation.
+    #[wasm_bindgen_test]
+    async fn failed_remove_keeps_the_live_record() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        write_path_in(&topic, "a.md", b"# doomed\n").await.unwrap();
+        let mut s = Syncer::new("k1");
+        s.local_text("a.md", "# doomed\n");
+        let live = s.durable("a.md").unwrap();
+        queue_record(topic, &live);
+        flush_records().await;
+
+        let root = board_root(&topic).await.unwrap();
+        let handle: FileSystemFileHandle = JsFuture::from(root.get_file_handle("a.md")).await.unwrap().unchecked_into();
+        let lock: FileSystemWritableFileStream = JsFuture::from(handle.create_writable()).await.unwrap().unchecked_into();
+        assert!(
+            JsFuture::from(root.remove_entry("a.md")).await.is_err(),
+            "precondition: an open writable blocks removal"
+        );
+        queue_removed_file(topic, "a.md".into(), || {});
+        queue_record(topic, &deleted_record("a.md"));
+        flush_records().await;
+        assert_eq!(read_in(&topic, "a.md").await.as_deref(), Some("# doomed\n"), "the file is still there");
+        assert_eq!(record_in(&topic, "a.md").await, Some(live), "so its live record stays");
+        let _ = JsFuture::from(lock.abort()).await;
+    }
+
+    /// `record_is_deleted` (and so `isDeleted` with no live session) is true only for a tombstone
+    /// record: an absent path or a live record is not deleted.
+    #[wasm_bindgen_test]
+    async fn is_deleted_only_for_a_tombstone() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        set_active_board(topic);
+        assert!(!record_is_deleted("a.md").await, "absent (still arriving, or never existed)");
+        let mut s = Syncer::new("t1");
+        s.local_text("a.md", "# a\n");
+        queue_record(topic, &s.durable("a.md").unwrap());
+        flush_records().await;
+        assert!(!record_is_deleted("a.md").await, "live");
+        queue_record(topic, &deleted_record("a.md"));
+        flush_records().await;
+        assert!(record_is_deleted("a.md").await, "tombstoned");
+        assert!(crate::file::is_deleted("a.md".into()).await, "no live session: the record decides");
+    }
+
+    /// `queue_record_removal` deletes a path's record.
+    #[wasm_bindgen_test]
+    async fn record_removal_deletes_the_record() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        let mut s = Syncer::new("r1");
+        s.local_text("a.md", "# a\n");
+        queue_record(topic, &s.durable("a.md").unwrap());
+        flush_records().await;
+        assert!(record_in(&topic, "a.md").await.is_some());
+        queue_record_removal(topic, "a.md".into());
+        flush_records().await;
+        assert!(record_in(&topic, "a.md").await.is_none());
+    }
+
+    /// A file deleted while the tab was closed becomes a tombstone on restore (its
+    /// record re-saved as `Deleted`); a later restore keeps it deleted and still
+    /// ships its `Delete` — the record never brings the file back.
+    #[wasm_bindgen_test]
+    async fn restore_tombstones_files_deleted_while_closed() {
+        use riftpipe_core::sync::{DurableKind, SyncMsg};
         let topic = riftpipe_core::crypto::generate_secret();
         let mut s1 = Syncer::new("o1");
         s1.local_text("gone.md", "# gone\n");
@@ -810,10 +1079,34 @@ mod tests {
         queue_record(topic, &s1.durable("gone.md").unwrap());
         queue_record(topic, &s1.durable("kept.md").unwrap());
         flush_records().await;
-        assert!(record_in(&topic, "gone.md").await.is_some());
 
-        let _ = restore_syncer(topic, "o2".into()).await;
-        assert!(record_in(&topic, "gone.md").await.is_none(), "orphan record dropped");
-        assert!(record_in(&topic, "kept.md").await.is_some(), "a live file's record stays");
+        let s2 = restore_syncer(topic, "o2".into()).await;
+        assert!(s2.is_tombstoned("gone.md"));
+        assert!(!s2.is_tombstoned("kept.md"));
+        flush_records().await;
+        assert!(matches!(record_in(&topic, "gone.md").await.map(|r| r.kind), Some(DurableKind::Deleted { .. })));
+        assert!(matches!(record_in(&topic, "kept.md").await.map(|r| r.kind), Some(DurableKind::Text { .. })));
+
+        let s3 = restore_syncer(topic, "o3".into()).await;
+        assert!(s3.is_tombstoned("gone.md"));
+        assert!(read_in(&topic, "gone.md").await.is_none(), "never brought back");
+        assert!(s3.full_state().iter().any(|m| matches!(m, SyncMsg::Delete { path, .. } if path == "gone.md")));
+    }
+
+    /// A tombstone record whose file is back on disk (re-created while closed)
+    /// restores as a re-creation: live again, its record `TextReborn`.
+    #[wasm_bindgen_test]
+    async fn restore_recreates_a_path_whose_file_is_back() {
+        use riftpipe_core::sync::DurableKind;
+        let topic = riftpipe_core::crypto::generate_secret();
+        queue_record(topic, &deleted_record("gone.md"));
+        flush_records().await;
+        assert!(restore_syncer(topic, "b1".into()).await.is_tombstoned("gone.md"));
+
+        write_path_in(&topic, "gone.md", b"# back\n").await.unwrap();
+        let s = restore_syncer(topic, "b2".into()).await;
+        assert!(!s.is_tombstoned("gone.md"));
+        flush_records().await;
+        assert!(matches!(record_in(&topic, "gone.md").await.map(|r| r.kind), Some(DurableKind::TextReborn { .. })));
     }
 }

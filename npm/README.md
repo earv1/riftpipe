@@ -7,7 +7,7 @@ its language-agnostic seams:
 | Seam | CLI | API |
 |---|---|---|
 | Editor edit-stream (JSON lines on stdio) | `share/join --pipe` | `PipeSession` |
-| Tree sync breadcrumbs (`SYNCED:` lines) | `connect` / `connect --accept` | `TreeSession` |
+| Tree sync breadcrumbs (`SYNCED:` / `DELETED:` lines) | `connect` / `connect --accept` | `TreeSession` |
 | Auth (restricted boards) | `requests`/`approve`/`members`/`grant`/`revoke` | `requests`/`approve`/`members`/`grant`/`revoke`, `TreeSession.onAccessRequest`/`onReadKey` |
 | Static hosting + SSE change events | `serve` | `Serve` |
 
@@ -33,6 +33,7 @@ host.send({ op: "insert", pos: 0, text: "hello " });
 const mesh = TreeSession.host("shared/");
 console.log("join with:", await mesh.ticket());
 mesh.onSynced((path) => console.log("peer wrote", path));
+mesh.onDeleted((path) => console.log("peer deleted", path));
 
 // Restricted board: approve a keyless joiner by its safety code.
 const board = TreeSession.host("board/", { restricted: true });

@@ -718,8 +718,8 @@ mod tests {
         let got_a = Rc::new(RefCell::new(HashMap::<String, Vec<u8>>::new()));
         let got_b = Rc::new(RefCell::new(HashMap::<String, Vec<u8>>::new()));
         let (ga, gb) = (got_a.clone(), got_b.clone());
-        let sync_a = TreeSync::new(la, Rc::new(move |p, b| { ga.borrow_mut().insert(p, b); }));
-        let sync_b = TreeSync::new(lb, Rc::new(move |p, b| { gb.borrow_mut().insert(p, b); }));
+        let sync_a = TreeSync::new(la, Rc::new(move |c| if let riftpipe_core::sync::Change::Write { path, bytes } = c { ga.borrow_mut().insert(path, bytes); }));
+        let sync_b = TreeSync::new(lb, Rc::new(move |c| if let riftpipe_core::sync::Change::Write { path, bytes } = c { gb.borrow_mut().insert(path, bytes); }));
 
         // A creates a doc's prose; B receives it (CRDT) — and a structural file (LWW).
         sync_a.push_text("notes/x/doc.md", "# Hello\n\nfrom A\n");

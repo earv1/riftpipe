@@ -1,10 +1,11 @@
 // The **file API** — a thin TS wrapper over riftpipe's generic wasm file exports
-// (`readFile`/`writeFile`/`listDir`). This is the whole surface the app uses to
-// talk to the synced tree: read a path, write a path (which persists to OPFS
-// *and* pushes to peers), list a directory, and watch for changes. Nothing here
+// (`readFile`/`writeFile`/`deleteFile`/`listDir`). This is the whole surface the
+// app uses to talk to the synced tree: read a path, write a path (which persists
+// to OPFS *and* pushes to peers), delete a path (removed from OPFS, the delete
+// synced to peers), list a directory, and watch for changes. Nothing here
 // knows what a "board" or "card" is — the kanban model is built on top in
 // `board.ts`, exactly as any other file-based app would build its own.
-import init, { readFile, writeFile as wasmWriteFile, listDir, activeBoard } from "../wasm/pkg/kanban_wasm.js";
+import init, { readFile, writeFile as wasmWriteFile, deleteFile as wasmDeleteFile, isDeleted as wasmIsDeleted, listDir, activeBoard } from "../wasm/pkg/kanban_wasm.js";
 
 // Initialize the wasm module once, lazily — every file op awaits it, so callers
 // (board.ts and up) never touch init.
@@ -34,6 +35,22 @@ export async function write(path: string, content: string): Promise<void> {
   await ready();
   await wasmWriteFile(path, content);
   fireChanged(path);
+}
+
+/** Delete `path` from the synced tree (removes it from OPFS, prunes emptied dirs, syncs the
+ *  delete to peers), then fire a local change event. `false` if no file was there. */
+export async function remove(path: string): Promise<boolean> {
+  await ready();
+  const ok = await wasmDeleteFile(path);
+  fireChanged(path);
+  return ok;
+}
+
+/** Whether `path` is known DELETED (a tombstone: someone deleted it), as opposed to merely absent
+ *  — never existed, or not synced here yet. */
+export async function isDeleted(path: string): Promise<boolean> {
+  await ready();
+  return await wasmIsDeleted(path);
 }
 
 /** Entry names directly under directory `path` (`""` = tree root); `[]` if absent. */
