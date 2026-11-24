@@ -270,7 +270,7 @@ use riftpipe_core::epoch::{AccessMode, EpochAnnounce, EpochBook, Ingested};
 use riftpipe_core::identity::{passkey_link_challenge, DeviceKey, Role, TrustEntry, TrustLog};
 use riftpipe_core::passkey::{PasskeyAssertion, PasskeyCredential};
 use riftpipe_core::onboard::JoinRequest;
-use riftpipe_core::sync::SyncMsg;
+use riftpipe_core::sync::{Applied, Change, SyncMsg};
 
 /// localStorage key prefix: `riftpipe:trust:v2:<hex topic>` = `hex(postcard(Vec<TrustEntry>))`.
 /// One entry per board, so opening another board never overwrites (or unlocks)
@@ -1028,10 +1028,13 @@ impl Drop for WindowListener {
 }
 
 /// Persist `path`'s durable record for board `topic` after a merge — call right
-/// after `on_merged` (which queues the file), so the record is written after it.
+/// after `on_merged` (which queues the file op), so the record is written after it.
+/// No state left for the path (the syncer holds nothing): its record is removed.
 fn save_record(topic: [u8; 32], sy: &std::cell::RefCell<riftpipe_core::sync::Syncer>, path: &str) {
-    if let Some(rec) = sy.borrow().durable(path) {
-        crate::opfs::queue_record(topic, &rec);
+    let rec = sy.borrow().durable(path);
+    match rec {
+        Some(rec) => crate::opfs::queue_record(topic, &rec),
+        None => crate::opfs::queue_record_removal(topic, path.to_string()),
     }
 }
 
@@ -1048,6 +1051,30 @@ fn save_local_record(
     }
 }
 
+/// Persist `path`'s tombstone record after a LOCAL delete (the app removed the file,
+/// then pushed) — before the broadcast.
+fn save_local_delete_record(topic: [u8; 32], sy: &std::cell::RefCell<riftpipe_core::sync::Syncer>, path: &str) {
+    if let Some(rec) = sy.borrow().durable(path) {
+        crate::opfs::queue_local_delete_record(topic, &rec);
+    }
+}
+
+/// Land what receive produced: the change first (queued file op), then its record.
+fn land(
+    topic: [u8; 32],
+    sy: &std::cell::RefCell<riftpipe_core::sync::Syncer>,
+    on_merged: &dyn Fn(Change),
+    a: Applied,
+) -> Vec<SyncMsg> {
+    if let Some(c) = a.change {
+        on_merged(c);
+    }
+    if let Some(p) = &a.save {
+        save_record(topic, sy, p);
+    }
+    a.replies
+}
+
 /// Act on auth output produced outside the receive loop: apply its content
 /// (firing `on_merged`), then queue its messages, the replies, and (if asked)
 /// our full state — all signed/sealed, in order.
@@ -1056,16 +1083,13 @@ fn apply_and_broadcast(
     acc: Accepted,
     sy: &std::cell::RefCell<riftpipe_core::sync::Syncer>,
     au: &std::cell::RefCell<Auth>,
-    on_merged: &dyn Fn(String, Vec<u8>),
+    on_merged: &dyn Fn(Change),
     out: &Out,
 ) {
     let mut msgs = acc.send;
     for msg in acc.apply {
-        let (persist, replies) = sy.borrow_mut().apply(msg);
-        if let Some((path, bytes)) = persist {
-            on_merged(path.clone(), bytes);
-            save_record(topic, sy, &path);
-        }
+        let a = sy.borrow_mut().receive(msg);
+        let replies = land(topic, sy, on_merged, a);
         let a = au.borrow();
         msgs.extend(replies.into_iter().filter_map(|r| a.sign(r)));
     }
@@ -1237,7 +1261,7 @@ impl GossipTreeSync {
     pub fn new(
         mesh: Mesh,
         syncer: riftpipe_core::sync::Syncer,
-        on_merged: std::rc::Rc<dyn Fn(String, Vec<u8>)>,
+        on_merged: crate::tree_sync::OnChange,
         auth: Auth,
     ) -> GossipTreeSync {
         use std::cell::RefCell;
@@ -1501,11 +1525,8 @@ impl GossipTreeSync {
                                     // Every reply goes swarm-wide — a Hello's too (see
                                     // `SyncMsg::Hello`: a neighbors-only reply can miss
                                     // a requester gossip holds as lazy).
-                                    let (persist, replies) = sy.borrow_mut().apply(msg);
-                                    if let Some((path, bytes)) = persist {
-                                        on_merged(path.clone(), bytes);
-                                        save_record(topic, &sy, &path);
-                                    }
+                                    let a = sy.borrow_mut().receive(msg);
+                                    let replies = land(topic, &sy, &*on_merged, a);
                                     // A reply `Lww` is keyed: the same current-state
                                     // reply to several Hellos collapses while queued.
                                     for r in replies {
@@ -1675,6 +1696,20 @@ impl GossipTreeSync {
         let mm = self.auth.borrow().sign(msg);
         if let Some(mm) = mm {
             self.out.push(Scope::Swarm, key, &mm);
+        }
+    }
+
+    /// Tombstone `path` (the app already removed the file) and broadcast its `Delete`
+    /// swarm-wide, like any local edit.
+    pub fn push_delete(&self, path: &str) {
+        let msg = self.syncer.borrow_mut().local_delete(path);
+        if let Some(msg) = msg {
+            save_local_delete_record(self.topic, &self.syncer, path);
+            let key = coalesce_key(&msg);
+            let mm = self.auth.borrow().sign(msg);
+            if let Some(mm) = mm {
+                self.out.push(Scope::Swarm, key, &mm);
+            }
         }
     }
 
@@ -1937,6 +1972,17 @@ pub(crate) fn try_push_lww(path: &str, bytes: &[u8]) -> bool {
     GOSSIP.with(|c| match c.borrow().as_ref() {
         Some(bs) => {
             bs.push_lww(path, bytes);
+            true
+        }
+        None => false,
+    })
+}
+
+/// Route a delete push to the mesh if active; `true` if it was handled.
+pub(crate) fn try_push_delete(path: &str) -> bool {
+    GOSSIP.with(|c| match c.borrow().as_ref() {
+        Some(bs) => {
+            bs.push_delete(path);
             true
         }
         None => false,
@@ -2268,6 +2314,43 @@ mod tests {
         assert!(c.accept(dup(&s2)).apply.is_empty(), "removed device can't open new content");
     }
 
+    /// Offline: a delete is content — on a claimed board an approved device's
+    /// `Delete` is sealed and lands; an ungranted device can't seal one, an unsealed
+    /// signed one is dropped, and a removed device's (sealed under the old epoch)
+    /// never lands.
+    #[wasm_bindgen_test]
+    fn claimed_board_gates_deletes() {
+        let topic = riftpipe_core::crypto::generate_secret;
+        let mut a = Auth::load(DeviceKey::from_seed(&[81; 32]), topic());
+        let claim = a.lock_as_author().expect("unclaimed board locks");
+        let mut b = Auth::load(DeviceKey::from_seed(&[82; 32]), topic());
+        let mut c = Auth::load(DeviceKey::from_seed(&[83; 32]), topic());
+        let mut d = Auth::load(DeviceKey::from_seed(&[84; 32]), topic());
+        for to in [&mut b, &mut c, &mut d] {
+            deliver(&claim, to);
+        }
+        a.accept(b.request_access().expect("b asks"));
+        a.accept(c.request_access().expect("c asks"));
+        let (b_id, c_id) = (b.my_id(), c.my_id());
+        for g in [a.make_grant(b_id).expect("grant b"), a.make_grant(c_id).expect("grant c")] {
+            deliver(&g, &mut b);
+            deliver(&g, &mut c);
+        }
+        assert!(b.can_read() && c.can_read() && !d.can_read());
+
+        let del = || SyncMsg::Delete { path: "x".into(), ids: vec![1], seen: vec![], origin: None, vv: vec![], version: 1 };
+        let s = b.sign(del()).expect("an approved device seals its delete");
+        assert!(matches!(s, MeshMsg::Sealed(_)), "a claimed-board delete is sealed");
+        assert!(matches!(a.accept(dup(&s)).apply.as_slice(), [SyncMsg::Delete { .. }]), "an approved device's delete lands");
+        assert!(d.sign(del()).is_none(), "an ungranted device can't seal a delete");
+        let unsealed = MeshMsg::SignedSync(b.identity.sign_write(postcard::to_allocvec(&del()).unwrap()));
+        assert!(a.accept(unsealed).apply.is_empty(), "an unsealed delete on a claimed board is dropped");
+
+        let _ = a.make_revoke(c_id).expect("owner removes c"); // not delivered to c
+        let s = c.sign(del()).expect("c still seals under epoch 1");
+        assert!(a.accept(dup(&s)).apply.is_empty(), "a removed device's delete never lands");
+    }
+
     /// A hold that lifts without a new key — the revoked device is re-granted
     /// before the rotation reaches us — still sends the held writes.
     #[wasm_bindgen_test]
@@ -2358,14 +2441,14 @@ mod tests {
             sleep_ms(50).await;
         }
         let host_addr = host_mesh.addr();
-        let host_bs = GossipTreeSync::new(host_mesh, riftpipe_core::sync::Syncer::new(gossip_agent()), Rc::new(|_, _| {}), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32]), riftpipe_core::crypto::topic_from_secret(&secret)));
+        let host_bs = GossipTreeSync::new(host_mesh, riftpipe_core::sync::Syncer::new(gossip_agent()), Rc::new(|_| {}), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32]), riftpipe_core::crypto::topic_from_secret(&secret)));
 
         let join_sk = SecretKey::generate();
         let joiner_mesh = Mesh::join(join_sk, secret, Some(host_addr)).await.expect("joiner");
         let got: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::new(RefCell::new(Vec::new()));
         let g = got.clone();
         let _joiner_bs =
-            GossipTreeSync::new(joiner_mesh, riftpipe_core::sync::Syncer::new(gossip_agent()), Rc::new(move |p, b| g.borrow_mut().push((p, b))), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32]), riftpipe_core::crypto::topic_from_secret(&secret)));
+            GossipTreeSync::new(joiner_mesh, riftpipe_core::sync::Syncer::new(gossip_agent()), Rc::new(move |c| if let Change::Write { path, bytes } = c { g.borrow_mut().push((path, bytes)) }), crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32]), riftpipe_core::crypto::topic_from_secret(&secret)));
 
         // Let the swarm form, then the host pushes a file.
         sleep_ms(2500).await;
@@ -2384,6 +2467,55 @@ mod tests {
             "joiner received the file over the gossip mesh: {:?}",
             got.borrow(),
         );
+    }
+
+    /// A file deleted on one peer is removed on another over the gossip mesh: the
+    /// joiner's handler gets `Change::Remove`. Needs network.
+    #[wasm_bindgen_test]
+    async fn gossip_delete_reaches_a_peer() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let secret = riftpipe_core::crypto::generate_secret();
+        let host_sk = SecretKey::generate();
+        let host_mesh = Mesh::join(host_sk, secret, None).await.expect("host");
+        for _ in 0..200 {
+            if !host_mesh.addr().addrs.is_empty() {
+                break;
+            }
+            sleep_ms(50).await;
+        }
+        let host_addr = host_mesh.addr();
+        let auth = || crate::gossip::Auth::load(riftpipe_core::identity::DeviceKey::from_seed(&[0u8; 32]), riftpipe_core::crypto::topic_from_secret(&secret));
+        let host_bs = GossipTreeSync::new(host_mesh, riftpipe_core::sync::Syncer::new(gossip_agent()), Rc::new(|_| {}), auth());
+
+        let join_sk = SecretKey::generate();
+        let joiner_mesh = Mesh::join(join_sk, secret, Some(host_addr)).await.expect("joiner");
+        let got: Rc<RefCell<Vec<Change>>> = Rc::new(RefCell::new(Vec::new()));
+        let g = got.clone();
+        let _joiner_bs =
+            GossipTreeSync::new(joiner_mesh, riftpipe_core::sync::Syncer::new(gossip_agent()), Rc::new(move |c| g.borrow_mut().push(c)), auth());
+
+        sleep_ms(2500).await;
+        host_bs.push_text("d.md", "# d\n");
+        let wrote = |c: &Change| matches!(c, Change::Write { path, .. } if path == "d.md");
+        for _ in 0..300 {
+            if got.borrow().iter().any(wrote) {
+                break;
+            }
+            sleep_ms(50).await;
+        }
+        assert!(got.borrow().iter().any(wrote), "joiner received d.md: {:?}", got.borrow());
+
+        host_bs.push_delete("d.md");
+        let removed = Change::Remove { path: "d.md".into() };
+        for _ in 0..300 {
+            if got.borrow().contains(&removed) {
+                break;
+            }
+            sleep_ms(50).await;
+        }
+        assert!(got.borrow().contains(&removed), "joiner removed d.md within 15 s: {:?}", got.borrow());
     }
 
     fn soft_passkey(seed: u8, rp: &str) -> (p256::ecdsa::SigningKey, PasskeyCredential) {
@@ -2556,7 +2688,7 @@ mod tests {
         let first = GossipTreeSync::new(
             m1,
             riftpipe_core::sync::Syncer::new(gossip_agent()),
-            Rc::new(|_, _| {}),
+            Rc::new(|_| {}),
             Auth::load(DeviceKey::from_seed(&[81; 32]), riftpipe_core::crypto::topic_from_secret(&s1)),
         );
         drop(first);
@@ -2566,7 +2698,7 @@ mod tests {
         let host = GossipTreeSync::new(
             m2,
             riftpipe_core::sync::Syncer::new(gossip_agent()),
-            Rc::new(|_, _| {}),
+            Rc::new(|_| {}),
             Auth::load(DeviceKey::from_seed(&[82; 32]), riftpipe_core::crypto::topic_from_secret(&s2)),
         );
         let addr = a.wait_for_addr().await;
@@ -2578,7 +2710,7 @@ mod tests {
         let _joiner = GossipTreeSync::new(
             mb,
             riftpipe_core::sync::Syncer::new(gossip_agent()),
-            Rc::new(move |p, b| g.borrow_mut().push((p, b))),
+            Rc::new(move |c| if let Change::Write { path, bytes } = c { g.borrow_mut().push((path, bytes)) }),
             Auth::load(DeviceKey::from_seed(&[83; 32]), riftpipe_core::crypto::topic_from_secret(&s2)),
         );
 
@@ -2609,7 +2741,7 @@ mod tests {
         let first = GossipTreeSync::new(
             m1,
             riftpipe_core::sync::Syncer::new(gossip_agent()),
-            Rc::new(|_, _| {}),
+            Rc::new(|_| {}),
             Auth::load(DeviceKey::from_seed(&[85; 32]), riftpipe_core::crypto::topic_from_secret(&s1)),
         );
         let addr = a.wait_for_addr().await;
@@ -2667,7 +2799,7 @@ mod tests {
         set_active(GossipTreeSync::new(
             mesh,
             riftpipe_core::sync::Syncer::new(gossip_agent()),
-            Rc::new(|_, _| {}),
+            Rc::new(|_| {}),
             Auth::load(DeviceKey::from_seed(&[84; 32]), riftpipe_core::crypto::topic_from_secret(&secret)),
         ));
         for _ in 0..100 {

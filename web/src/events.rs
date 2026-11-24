@@ -299,6 +299,13 @@ pub fn log_merge(path: &str) {
     }
 }
 
+/// Log a `mesh.delete` for `path` (a peer's delete removed it), skipping `events/` paths.
+pub fn log_delete(path: &str) {
+    if !path.starts_with("events/") {
+        log("mesh.delete", serde_json::json!({ "path": path }));
+    }
+}
+
 /// One queued append; `done` fires once its line is written (or dropped).
 struct Job {
     kind: String,
