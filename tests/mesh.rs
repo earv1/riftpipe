@@ -686,8 +686,10 @@ fn restricted_cli_host_restart_requires_new_board() {
 }
 
 /// A 120-version burst of one growing LWW file (~24 KB at the end, so chunked)
-/// reaches the joiner with NO settle write afterwards: whatever gossip drops in
-/// the burst, periodic anti-entropy Hellos repair it on their own.
+/// that the receiver loses ENTIRELY (it discards every gossip message during the
+/// burst), with no write afterwards: only anti-entropy can deliver it — the
+/// writer's periodic Hello reaches the receiver once it listens again, the
+/// receiver pulls back, and the writer answers with the final version.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mesh_lww_burst_converges_without_a_settle_write() {
     let da = dir("burst-host");
@@ -696,9 +698,10 @@ async fn mesh_lww_burst_converges_without_a_settle_write() {
 
     let host = MeshConn::join(secret, None).await.expect("host join");
     let host_addr = dialable_addr(&host).await;
+    let blackout = host.receive_blackout();
 
-    let (tx_a, mut rx_a) = push_file(&da, "seed.toml", b"s");
-    let (_tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let (_tx_a, mut rx_a) = push_file(&da, "seed.toml", b"s");
+    let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
 
     let da_task = da.clone();
     let a_task = tokio::spawn(async move {
@@ -712,28 +715,37 @@ async fn mesh_lww_burst_converges_without_a_settle_write() {
     });
 
     wait_for(&[db.join("seed.toml")], "joiner gets the host's seed file").await;
+    // Let the connect-time catch-up settle before the host goes deaf.
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    std::fs::create_dir_all(da.join("events")).unwrap();
-    let src = da.join("events/burst.jsonl");
+    blackout.store(true, std::sync::atomic::Ordering::Relaxed);
+    std::fs::create_dir_all(db.join("events")).unwrap();
+    let src = db.join("events/burst.jsonl");
     let mut content = String::new();
     for i in 0..120 {
         content.push_str(&format!("{i} {}\n", "x".repeat(200)));
         std::fs::write(&src, &content).unwrap();
-        tx_a.send(src.clone()).unwrap();
+        tx_b.send(src.clone()).unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let want = std::fs::read(&src).unwrap();
     assert!(want.len() > 20_000, "the final version is large enough to be chunked");
+    // The joiner's queue drains while the host still discards everything.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let dst = da.join("events/burst.jsonl");
+    assert!(!dst.exists(), "the host lost the whole burst");
+    blackout.store(false, std::sync::atomic::Ordering::Relaxed);
 
-    // No further writes: only anti-entropy can deliver a dropped tail.
-    let dst = db.join("events/burst.jsonl");
+    // No further writes: only anti-entropy can deliver it now.
+    let t0 = std::time::Instant::now();
     tokio::time::timeout(BUDGET, async {
         while std::fs::read(&dst).ok().as_deref() != Some(&want[..]) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("the joiner never converged on the burst's final version");
+    .expect("the host never converged on the lost burst's final version");
+    println!("anti-entropy delivered the lost burst {:.1} s after the blackout", t0.elapsed().as_secs_f64());
 
     a_task.abort();
     b_task.abort();

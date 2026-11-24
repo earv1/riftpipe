@@ -217,6 +217,8 @@ pub struct MeshConn {
     /// The board's topic bytes (`H(secret)`): binds passkey links and scopes
     /// the tree's durable records.
     board: [u8; 32],
+    /// See [`MeshConn::receive_blackout`].
+    blackout: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Inputs to [`MeshConn::join_with`].
@@ -287,6 +289,7 @@ impl MeshConn {
             peers,
             incoming,
             board: topic_from_secret(&secret),
+            blackout: Arc::default(),
         })
     }
 
@@ -306,6 +309,14 @@ impl MeshConn {
     /// The underlying endpoint (for `online()` / address sharing in tests).
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// Test hook (simulated loss): while the flag is set, `run` discards every
+    /// received gossip message unread — so a test can prove that a repair came
+    /// from anti-entropy, not from the original broadcast.
+    #[doc(hidden)]
+    pub fn receive_blackout(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.blackout.clone()
     }
 }
 
@@ -503,6 +514,7 @@ pub async fn run(
         peers: mut book,
         mut incoming,
         board,
+        blackout,
     } = conn;
     let cipher = Arc::new(cipher);
     let out = Out::new();
@@ -780,6 +792,9 @@ pub async fn run(
                 };
                 match ev {
                     Event::Received(m) => {
+                        if blackout.load(std::sync::atomic::Ordering::Relaxed) {
+                            continue;
+                        }
                         let from = *m.delivered_from.as_bytes();
                         // Open the sealed frame (an outsider's or a corrupt frame
                         // won't decrypt — drop it). Then plain frames pass through
