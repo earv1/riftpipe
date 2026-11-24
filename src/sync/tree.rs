@@ -1029,16 +1029,18 @@ impl TreePeer {
         for (path, bytes) in std::mem::take(&mut self.failed_writes) {
             self.write_merged(dir, path, bytes);
         }
+        let mut replies = Vec::new();
         for path in std::mem::take(&mut self.failed_removes) {
             if self.syncer.is_tombstoned(&path) {
-                self.remove_merged(dir, path);
+                // The file may have been saved again since (the watcher hasn't reported it yet):
+                // that edit re-creates it rather than being removed.
+                replies.extend(self.remove_merged_or_recreate(dir, path).unwrap_or_default());
             }
         }
         // A delete of a file we've edited but not pushed yet: record that edit FIRST, so it lands in
         // the same doc (a `local_change` after the delete would start a re-created doc under a new
         // origin, and the origin rule would then drop one side's concurrent edits). The delete
         // then finds a concurrent edit and loses to it.
-        let mut replies = Vec::new();
         if let SyncMsg::Delete { path, .. } = &msg {
             let full = dir.join(path);
             if !escapes(path) && !hidden(path) && self.seen.contains_key(path) {
@@ -2163,6 +2165,41 @@ mod tests {
         b.apply_and_persist(postcard::from_bytes(&del_bytes).unwrap(), &db); // any later message
         assert_eq!(std::fs::read(db.join("sub/x.toml")).unwrap(), b"v2 by b", "the retry never ran");
         assert!(!b.syncer.is_tombstoned("sub/x.toml"));
+        for d in [&da, &db] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A failed remove's retry spares an edit saved since that the watcher hasn't reported yet:
+    /// the changed file is re-created (and pushed), not removed.
+    #[test]
+    #[cfg(unix)]
+    fn failed_remove_retry_spares_an_unreported_edit() {
+        use std::os::unix::fs::PermissionsExt;
+        let (da, db) = (dir("rmfail-unreported-a"), dir("rmfail-unreported-b"));
+        let (mut a, mut b) = (TreePeer::new(), TreePeer::new());
+        std::fs::create_dir_all(da.join("sub")).unwrap();
+        std::fs::write(da.join("sub/x.toml"), "v1").unwrap();
+        let msg = a.local_change(&da.join("sub/x.toml"), &da).expect("a local write");
+        assert!(b.apply_and_persist(msg, &db).is_empty());
+        std::fs::remove_file(da.join("sub/x.toml")).unwrap();
+        assert!(a.detect_missing(&da).is_empty());
+        let del = a.detect_missing(&da).remove(0);
+        let del_bytes = postcard::to_allocvec(&del).unwrap();
+
+        std::fs::set_permissions(db.join("sub"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        b.apply_and_persist(del, &db);
+        assert!(db.join("sub/x.toml").exists(), "the remove failed and waits for a retry");
+        std::fs::write(db.join("sub/x.toml"), "v2 by b").unwrap(); // saved; no watcher event yet
+        std::fs::set_permissions(db.join("sub"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let replies = b.apply_and_persist(postcard::from_bytes(&del_bytes).unwrap(), &db);
+        assert_eq!(std::fs::read(db.join("sub/x.toml")).unwrap(), b"v2 by b", "the edit survives the retry");
+        assert!(!b.syncer.is_tombstoned("sub/x.toml"));
+        assert!(
+            replies.iter().any(|m| matches!(m, SyncMsg::Lww { path, .. } if path == "sub/x.toml")),
+            "the re-creation is pushed"
+        );
         for d in [&da, &db] {
             std::fs::remove_dir_all(d).ok();
         }
