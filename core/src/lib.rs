@@ -10,6 +10,7 @@ pub mod epoch;
 pub mod identity;
 pub mod keywrap;
 pub mod onboard;
+pub mod outqueue;
 pub mod passkey;
 pub mod reconnect;
 pub mod sync;
