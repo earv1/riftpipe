@@ -1336,7 +1336,9 @@ impl Syncer {
             for id in ids {
                 // An id this delete's own chain already overruled (`prior`) is an older round's
                 // deletion — merging it would let a stale re-creator's `Restore` cancel this one.
-                changed |= push_absent(&mut t.ids, id, TREE_DELETION_IDS_CAP);
+                if !t.prior.contains(&id) {
+                    changed |= push_absent(&mut t.ids, id, TREE_DELETION_IDS_CAP);
+                }
             }
             for fp in seen {
                 changed |= push_absent(&mut t.seen, fp, TREE_SEEN_CAP);
@@ -1359,7 +1361,7 @@ impl Syncer {
         // not enough — a tombstone merged with an older, already-overruled deletion still carries
         // a newer one.)
         let sup = self.superseded.get(&path).cloned().unwrap_or_default();
-        if ids.iter().any(|id| sup.contains(id)) {
+        if ids.iter().all(|id| sup.contains(id)) {
             let mut replies = vec![SyncMsg::Restore { path: path.clone(), ids: sup }];
             replies.extend(self.full_msg(&path));
             return Applied { replies, ..Default::default() };
@@ -1415,7 +1417,7 @@ impl Syncer {
     /// Drop `path`'s tombstone only if the restorer overrules EVERY deletion it stands for — a
     /// tombstone merged with a later deletion survives a `Restore` of just the earlier one.
     fn remote_restore(&mut self, path: String, ids: &[u64]) -> Applied {
-        let overruled = self.tombs.get(&path).is_some_and(|t| t.t.ids.iter().any(|id| ids.contains(id)));
+        let overruled = self.tombs.get(&path).is_some_and(|t| t.t.ids.iter().all(|id| ids.contains(id)));
         if !overruled {
             return Applied::default();
         }
@@ -3383,6 +3385,26 @@ mod tests {
         assert!(a.compare_hello(&src.hello()).unwrap().consistent(), "anti-entropy ignores it");
     }
 
+    /// `flood` restricted to the `online` peers (the rest are offline: they get nothing).
+    fn flood_among(peers: &mut [Syncer], online: &[usize], from: usize, msgs: Vec<SyncMsg>) -> usize {
+        let mut queue: std::collections::VecDeque<(usize, SyncMsg)> =
+            msgs.into_iter().map(|m| (from, m)).collect();
+        let mut n = 0;
+        while let Some((src, m)) = queue.pop_front() {
+            n += 1;
+            assert!(n < 500, "message storm");
+            for &i in online {
+                if i == src {
+                    continue;
+                }
+                for r in peers[i].receive(dup(&m)).replies {
+                    queue.push_back((i, r));
+                }
+            }
+        }
+        n
+    }
+
     /// A delta the deleter had already seen, arriving AFTER the (small) `Delete` at a peer that
     /// was behind — a chunked delta overtaken by its delete — must not revive the file; a
     /// genuinely newer edit still does.
@@ -3409,5 +3431,46 @@ mod tests {
         let r = p[1].receive(dup(&e));
         assert!(matches!(r.change, Some(Change::Write { .. })), "a newer edit beats the delete");
         assert_eq!(text_of(&p[1], "x.md").as_deref(), Some("v1\nv2\nv3 by c\n"));
+    }
+
+    /// Delete (id1) → re-create → delete (id2), with one peer offline holding the id1 tombstone
+    /// and another offline holding the re-created copy. When both come back, the old id1 must
+    /// not let the re-creator's `Restore` cancel id2: everyone ends deleted.
+    #[test]
+    fn stale_peers_from_different_delete_rounds_never_undo_the_latest_delete() {
+        let mut p: Vec<Syncer> = ["a", "b", "c", "d", "e"].into_iter().map(Syncer::new).collect();
+        let all = [0, 1, 2, 3, 4];
+        let t = p[0].local_text("x.md", "v1\n").unwrap();
+        flood_among(&mut p, &all, 0, vec![t]);
+        let d1 = p[0].local_delete("x.md").unwrap();
+        flood_among(&mut p, &all, 0, vec![d1]);
+        assert!(p.iter().all(|s| s.is_tombstoned("x.md")));
+
+        // d goes offline holding the id1 tombstone; b re-creates.
+        let rec = p[1].local_text("x.md", "v2\n").unwrap();
+        flood_among(&mut p, &[0, 1, 2, 4], 1, vec![rec]);
+        for i in [0, 1, 2, 4] {
+            assert_eq!(text_of(&p[i], "x.md").as_deref(), Some("v2\n"));
+        }
+
+        // e goes offline holding the re-created copy; c deletes it (id2).
+        let d2 = p[2].local_delete("x.md").unwrap();
+        flood_among(&mut p, &[0, 1, 2], 2, vec![d2]);
+        assert!([0, 1, 2].iter().all(|&i| p[i].is_tombstoned("x.md")));
+
+        // d returns (catch-up both ways), then e does.
+        let live = [0, 1, 2, 3];
+        let s = p[3].full_state();
+        flood_among(&mut p, &live, 3, s);
+        let s = p[0].full_state();
+        flood_among(&mut p, &live, 0, s);
+        let s = p[4].full_state();
+        flood_among(&mut p, &all, 4, s);
+        let s = p[0].full_state();
+        flood_among(&mut p, &all, 0, s);
+        for (i, s) in p.iter().enumerate() {
+            assert!(s.is_tombstoned("x.md"), "peer {i} brought the deleted file back");
+            assert!(text_of(s, "x.md").is_none());
+        }
     }
 }
