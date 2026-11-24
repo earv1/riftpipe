@@ -530,9 +530,7 @@ over riftpipe's wasm file API). What remains:
       `target`.
     - Sealed like content on claimed boards (`e2e/history.mjs`).
     - *Remaining:* old segments are never deleted (needs tree/mesh deletes);
-      sibling tabs of one profile can still race; a dropped push of the
-      active log stays stale on a live peer until the next append or a
-      reconnect (gossip has no periodic anti-entropy yet).
+      sibling tabs of one profile can still race.
 18. **Per-resource backing in the manifest** — `riftpipe.toml` rules gain an
     optional `backing = "memory" | "file"` per glob (today `--memory` is
     all-or-nothing); `--memory` stays as the global default override.
@@ -549,6 +547,54 @@ over riftpipe's wasm file API). What remains:
     failing full resync up to 2 times, then parks the path — exposed via
     `parked_paths()` (core stays no-I/O); the tree driver eprintlns once per
     newly-parked path, and any later successful merge un-parks it.
+21. **Mesh anti-entropy** — *done.* Gossip delivery is best-effort, and a
+    dropped broadcast used to be repaired only by the next `NeighborUp`. Now
+    each mesh driver (`src/sync/mesh.rs`, `web/src/gossip.rs`) periodically
+    sends its `Hello` (version vectors + LWW inventory — the digest) to direct
+    neighbors, scheduled by `core::antientropy::AntiEntropy` (Trickle-style,
+    seeded jitter): 2 s doubling to 128 s; a state change (the Syncer
+    `generation` moved) resets it once quiet for 1.5 s (or after 10 s of
+    continuous activity); nothing is sent while nothing changed and every
+    neighbor's last Hello matched ours (`Syncer::compare_hello`); a mismatched
+    Hello resets it at most every 8 s → 128 s; ≥ 1 s between Hellos. The side
+    that is ahead answers with exactly what the other lacks; the side that is
+    behind answers with its own Hello. Every reply goes **swarm-wide**:
+    iroh-gossip sends neighbors-only messages to plumtree-eager peers only, and
+    the requester may already be lazy on the replier's side (pruned right after
+    NeighborUp, or a stale one-sided entry after a same-key restart).
+    - One ordered outbound queue per driver (`core::outqueue`) drained by one
+      task: a message's chunk frames go out back-to-back (concurrent pushes used
+      to interleave frames and evict half-built messages at receivers); a
+      queued LWW update is replaced by a newer one for the same path; over
+      4 MiB the oldest content message is shed (auth messages never).
+    - `MeshAssembler` has 64 slots and counts evictions; an eviction, a shed
+      message or gossip `Lagged` forces an anti-entropy round.
+    - A merge that adds no ops persists nothing (duplicate deltas are common
+      once several neighbors answer one Hello).
+    - No wire change (`PROTOCOL_VERSION` stays 5); v5 peers without it still
+      answer Hellos. Browser diagnostics: `meshStats()`.
+    - Tests: `core/tests/anti_entropy_sim.rs` (5 peers, 30 %/50 % loss, a
+      120-op burst, lazy plumtree edges incl. a one-sided stale one, idle
+      silence; a control without anti-entropy never converges);
+      `tests/mesh.rs::mesh_lww_burst_converges_without_a_settle_write`;
+      `e2e/history.mjs` (120-append burst, no settle event; converges ~2 s
+      after the burst); mesh-n pass rate via `e2e/run-repeat.sh`, 10 runs
+      interleaved with a baseline at load ≤ 12: **10/10 vs 4/10** on the
+      pre-history-view base (63ff42e), and **10/10 vs 10/10** after merging
+      the batched event-log pushes (f849fce) — batching alone removed most of
+      the contention mesh-n hit, so mesh-n no longer separates the two there.
+      In every passing run `meshStats` showed 0 evictions, 0 `Lagged`, 0 shed.
+    - *Follow-ups:* a compact digest (`SyncMsg::Digest`, a protocol bump) if a
+      real board's Hello exceeds 16 KiB (250 paths measure ~9.5 KiB);
+      anti-entropy for the trust log and epoch announces (still repaired only
+      on NeighborUp, though never shed); dropping the NeighborUp `full_state`
+      flood; coalescing consecutive TextDeltas per path in the queue; removing
+      the event log's segment re-push (now redundant); per-peer exact version
+      vectors (a frontier-tip Hello still draws FULL docs for paths that
+      differ); older v5 peers don't originate anti-entropy; link-mode
+      `tree::run` and WebRTC `TreeSync` (reliable streams) are untouched; no
+      byte cap or expiry on `MeshAssembler`; a peer whose neighbors never
+      confirm it (lazy edges, v5 peers) still sends one Hello per 64–128 s.
 
 ## Deliberately NOT doing
 

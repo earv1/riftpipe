@@ -162,6 +162,12 @@ src/:
   (`meshStatus()` / `riftpipe:mesh-status`). Details: `docs/planned/roadmap.md`
   §Networking ("Live reconnection — done"); e2e `run-reconnect.sh`,
   `run-cli-host-restart.sh`.
+- **Mesh anti-entropy** (branch `mesh-anti-entropy`): periodic neighbor
+  `Hello`s repair any dropped gossip broadcast (Trickle-style backoff, silent
+  when neighbors agree), Hello replies go swarm-wide (plumtree lazy peers miss
+  neighbors-only ones), one ordered outbound queue per driver, `meshStats()`.
+  No wire change. Details + follow-ups: `docs/planned/roadmap.md` item 21; e2e
+  gate `projects/kanban/e2e/run-repeat.sh run-iroh-mesh-n.sh 10 9`.
 
 ## Planned (design docs)
 - **P2P kanban — files as the database** — see [`docs/planned/`](docs/planned/).
@@ -209,6 +215,9 @@ Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
    board-wide Activity panel and per-card History (branch `history-view`),
    verified end-to-end over the real sealed mesh by
    `projects/kanban/e2e/run-history.sh`.
+9. **Mesh anti-entropy follow-ups** — roadmap item 21 *Follow-ups* (compact
+   digest, trust-log/epoch anti-entropy, dropping the NeighborUp `full_state`
+   flood, removing the event log's segment re-push).
 Older/parallel: file-mirror reconnection;
 verify connect-anywhere on real networks (§14.1); verify reconnection on real
 networks (see roadmap, "Live reconnection — done"); domain + landing.
