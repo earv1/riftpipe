@@ -555,8 +555,11 @@ over riftpipe's wasm file API). What remains:
     seeded jitter): 2 s doubling to 128 s; a state change (the Syncer
     `generation` moved) resets it once quiet for 1.5 s (or after 10 s of
     continuous activity); nothing is sent while nothing changed and every
-    neighbor's last Hello matched ours (`Syncer::compare_hello`); a mismatched
-    Hello resets it at most every 8 s → 128 s; ≥ 1 s between Hellos. The side
+    neighbor's last Hello matched ours (`Syncer::compare_hello`), and a
+    neighbor that just became confirmed gets one Hello back so it can confirm
+    us too; a mismatched Hello resets it at most every 8 s → 128 s, and not at
+    all while our own state is still changing (two editing neighbors would
+    otherwise ping-pong at the 1 s floor); ≥ 1 s between Hellos. The side
     that is ahead answers with exactly what the other lacks; the side that is
     behind answers with its own Hello. Every reply goes **swarm-wide**:
     iroh-gossip sends neighbors-only messages to plumtree-eager peers only, and
@@ -565,18 +568,24 @@ over riftpipe's wasm file API). What remains:
     - One ordered outbound queue per driver (`core::outqueue`) drained by one
       task: a message's chunk frames go out back-to-back (concurrent pushes used
       to interleave frames and evict half-built messages at receivers); a
-      queued LWW update is replaced by a newer one for the same path; over
-      4 MiB the oldest content message is shed (auth messages never).
+      queued LWW update — a local push or a Hello reply — is replaced by a
+      newer one for the same path; over 4 MiB the oldest content message is
+      shed (auth messages and the `Version` announce never). A clean native
+      shutdown flushes the queue (≤ 2 s).
     - `MeshAssembler` has 64 slots and counts evictions; an eviction, a shed
-      message or gossip `Lagged` forces an anti-entropy round.
+      message or gossip `Lagged` forces an anti-entropy round, at most every
+      8 s → 128 s while losses keep coming.
     - A merge that adds no ops persists nothing (duplicate deltas are common
-      once several neighbors answer one Hello).
+      once several neighbors answer one Hello); a failed disk write is logged
+      and retried on the next message instead.
     - No wire change (`PROTOCOL_VERSION` stays 5); v5 peers without it still
       answer Hellos. Browser diagnostics: `meshStats()`.
     - Tests: `core/tests/anti_entropy_sim.rs` (5 peers, 30 %/50 % loss, a
-      120-op burst, lazy plumtree edges incl. a one-sided stale one, idle
-      silence; a control without anti-entropy never converges);
-      `tests/mesh.rs::mesh_lww_burst_converges_without_a_settle_write`;
+      120-op burst, lazy plumtree edges incl. a one-sided stale one, shedding
+      bandwidth-limited queues, Hellos during activity, idle silence; a control
+      without anti-entropy never converges);
+      `tests/mesh.rs::mesh_lww_burst_converges_without_a_settle_write` (the
+      receiver discards the whole burst, so only anti-entropy delivers it);
       `e2e/history.mjs` (120-append burst, no settle event; converges ~2 s
       after the burst); mesh-n pass rate via `e2e/run-repeat.sh`, 10 runs
       interleaved with a baseline at load ≤ 12: **10/10 vs 4/10** on the
