@@ -28,7 +28,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use riftpipe_core::epoch::{AccessMode, EpochBook, Ingested, OpenError};
 use riftpipe_core::identity::{DeviceKey, Role, TrustEntry, TrustLog};
 use riftpipe_core::onboard::JoinRequest;
-use riftpipe_core::sync::{record_name, DurablePath, HelloCmp, MeshMsg, Restored, SyncMsg, Syncer};
+use riftpipe_core::sync::{record_name, Applied, Change, DurablePath, HelloCmp, MeshMsg, Restored, SyncMsg, Syncer};
 
 use crate::net::{anyerr, Result, Sink, Source};
 use crate::sync::auth_store;
@@ -128,6 +128,17 @@ fn rel_of(full: &Path, dir: &Path) -> Option<String> {
     }
 }
 
+/// Remove now-empty directories from `removed`'s parent up to (not including) `root`.
+fn prune_empty_dirs(removed: &Path, root: &Path) {
+    let mut cur = removed.parent();
+    while let Some(d) = cur {
+        if d == root || !d.starts_with(root) || std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        cur = d.parent();
+    }
+}
+
 /// Create the dir if needed and canonicalize it so it matches the
 /// watcher's event paths (on macOS /var is a symlink to /private/var, which
 /// would otherwise break `strip_prefix`).
@@ -154,6 +165,13 @@ pub struct TreePeer {
     /// later apply. (A duplicate delivery used to rewrite the file; a merge that
     /// adds nothing now persists nothing, so this is what repairs a failed write.)
     failed_writes: HashMap<String, Vec<u8>>,
+    /// Rel paths whose `remove_file` failed (anything but `NotFound`), retried before every later
+    /// apply. `seen` and the old record are kept while a path is in here, so the retry doesn't
+    /// look like a re-creation.
+    failed_removes: HashSet<String>,
+    /// Paths found missing on the previous `detect_missing` check (a delete needs two in a row, so
+    /// an editor's atomic save — which briefly removes the file — isn't mistaken for a delete).
+    missing: HashSet<String>,
     // --- device-linking auth (protocol v3) ---
     /// This device's signing identity. `None` = open mode (writes unsigned).
     identity: Option<DeviceKey>,
@@ -249,6 +267,8 @@ impl TreePeer {
             seen: HashMap::new(),
             parked_reported: HashSet::new(),
             failed_writes: HashMap::new(),
+            failed_removes: HashSet::new(),
+            missing: HashSet::new(),
             identity: None,
             trust: TrustLog::new(),
             trust_entries: Vec::new(),
@@ -976,33 +996,55 @@ impl TreePeer {
 
     /// Write `rel`'s durable sync record under [`records_dir`](Self::records_dir), replacing any
     /// existing one for that path (tmp file + rename, so a crash never leaves a
-    /// half-written record). Call after every local change or persisted merge.
+    /// half-written record), or remove it when `rel` no longer has durable state (a
+    /// `Deleted` record with no tombstone doc is still a record — only a dropped
+    /// tombstone, which can't happen here, has none). Call after every local change or
+    /// persisted merge.
     fn save_record(&self, dir: &Path, rel: &str) {
-        let Some(rec) = self.syncer.durable(rel) else { return };
         let records = self.records_dir(dir);
-        let _ = std::fs::create_dir_all(&records);
         let path = record_path(&records, rel);
+        let Some(rec) = self.syncer.durable(rel) else {
+            let _ = std::fs::remove_file(&path);
+            return;
+        };
+        let _ = std::fs::create_dir_all(&records);
         let tmp = PathBuf::from(format!("{}.tmp", path.display()));
         if std::fs::write(&tmp, postcard::to_allocvec(&rec).unwrap_or_default()).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
     }
 
-    /// Apply one remote message: merge, report any newly-parked paths, and
-    /// persist the merged bytes under `dir` (refusing escaping paths AND
-    /// dot-paths from the wire — `.site` and friends are machine-local and must
-    /// not be overwritten). Prints the `SYNCED:{path}` breadcrumb on persist.
-    /// Returns the replies to send back out.
+    /// Apply one remote message: merge, report any newly-parked paths, and land the result on
+    /// disk under `dir` (refusing escaping paths AND dot-paths from the wire — `.site` and friends
+    /// are machine-local and must not be touched). Prints `SYNCED:{path}` on a persisted write and
+    /// `DELETED:{path}` on a persisted remove. A failed write or remove is retried before every
+    /// later apply. Returns the replies to send back out.
     pub(crate) fn apply_and_persist(&mut self, msg: SyncMsg, dir: &Path) -> Vec<SyncMsg> {
         for (path, bytes) in std::mem::take(&mut self.failed_writes) {
             self.write_merged(dir, path, bytes);
         }
-        let (persist, replies) = self.syncer.apply(msg);
+        for path in std::mem::take(&mut self.failed_removes) {
+            self.remove_merged(dir, path);
+        }
+        let Applied { change, mut replies, save } = self.syncer.receive(msg);
         self.report_parked();
-        if let Some((path, bytes)) = persist {
-            if !escapes(&path) && !hidden(&path) {
-                self.write_merged(dir, path, bytes);
+        let mut saved_by_change = None;
+        match change {
+            Some(Change::Write { path, bytes }) if !escapes(&path) && !hidden(&path) => {
+                self.failed_removes.remove(&path);
+                saved_by_change = Some(path.clone());
+                self.write_merged(dir, path, bytes); // saves the record only on success
             }
+            Some(Change::Remove { path }) if !escapes(&path) && !hidden(&path) => {
+                saved_by_change = Some(path.clone());
+                if let Some(r) = self.remove_merged_or_recreate(dir, path) {
+                    replies.extend(r);
+                }
+            }
+            _ => {}
+        }
+        if let Some(p) = save.filter(|p| !escapes(p) && !hidden(p) && saved_by_change.as_ref() != Some(p)) {
+            self.save_record(dir, &p);
         }
         replies
     }
@@ -1029,6 +1071,49 @@ impl TreePeer {
         }
     }
 
+    /// A remote `Remove`: if the file on disk differs from what we last synced, it holds an
+    /// unpushed local edit — that edit wins, so re-create it through `local_change` (which saves
+    /// its own record) and return its message as a reply. Otherwise delete it. `None` unless a
+    /// reply is produced.
+    fn remove_merged_or_recreate(&mut self, dir: &Path, path: String) -> Option<Vec<SyncMsg>> {
+        let full = dir.join(&path);
+        let on_disk = std::fs::read(&full).ok().map(|b| *blake3::hash(&b).as_bytes());
+        if on_disk.is_some() && on_disk.as_ref() != self.seen.get(&path) {
+            // Edited locally but not pushed yet: that edit beats the delete — re-create it.
+            self.seen.remove(&path);
+            return Some(self.local_change(&full, dir).into_iter().collect());
+        }
+        self.remove_merged(dir, path);
+        None
+    }
+
+    /// Delete `path`'s file, prune emptied parent directories, and save its now-`Deleted` record.
+    /// Any remove failure except `NotFound` is retried before every later apply instead (D10):
+    /// `seen` and the old record are kept, so the retry can't be mistaken for a re-creation.
+    fn remove_merged(&mut self, dir: &Path, path: String) -> bool {
+        self.failed_writes.remove(&path);
+        let full = dir.join(&path);
+        match std::fs::remove_file(&full) {
+            Ok(()) => {
+                self.seen.remove(&path);
+                prune_empty_dirs(&full, dir);
+                println!("DELETED:{path}");
+                self.save_record(dir, &path);
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.seen.remove(&path);
+                self.save_record(dir, &path);
+                true
+            }
+            Err(e) => {
+                eprintln!("[tree] could not delete {path} (a peer deleted it): {e} — retrying");
+                self.failed_removes.insert(path);
+                false
+            }
+        }
+    }
+
     /// The whole tree as self-contained messages — how a mesh driver catches a
     /// new neighbor up (the link driver's `hello()` handshake does it lazily).
     pub(crate) fn full_state(&self) -> Vec<SyncMsg> {
@@ -1045,6 +1130,25 @@ impl TreePeer {
     /// The syncer's change counter — the mesh driver feeds it to `AntiEntropy::poll`.
     pub(crate) fn generation(&self) -> u64 {
         self.syncer.generation()
+    }
+
+    /// Local deletes: memo paths missing on disk on TWO consecutive calls (an editor's atomic save
+    /// briefly removes a file) become tombstones; returns the `Delete`s to send. Call once a second.
+    pub(crate) fn detect_missing(&mut self, dir: &Path) -> Vec<SyncMsg> {
+        let now: HashSet<String> = self.seen.keys().filter(|r| !dir.join(r).exists()).cloned().collect();
+        let mut confirmed: Vec<String> = now.intersection(&self.missing).cloned().collect();
+        confirmed.sort();
+        self.missing = now.difference(&confirmed.iter().cloned().collect()).cloned().collect();
+        let mut out = Vec::new();
+        for rel in confirmed {
+            self.seen.remove(&rel);
+            self.failed_writes.remove(&rel);
+            if let Some(m) = self.syncer.local_delete(&rel) {
+                self.save_record(dir, &rel);
+                out.push(m);
+            }
+        }
+        out
     }
 
     /// Load every file already on disk into the syncer — the native mirror of
@@ -1078,8 +1182,23 @@ impl TreePeer {
                 }
             }
         }
-        for rel in recs.into_keys() {
-            let _ = std::fs::remove_file(record_path(&records, &rel));
+        let mut rest: Vec<(String, DurablePath)> = recs.into_iter().collect();
+        rest.sort_by(|a, b| a.0.cmp(&b.0));
+        for (rel, rec) in rest {
+            if dir.join(&rel).exists() {
+                continue; // on disk but unreadable: not a delete — keep the record
+            }
+            match self.syncer.restore(rec, None, now) {
+                Restored::Deleted(_) => {
+                    eprintln!("[tree] {rel}: deleted while offline — the delete will sync");
+                    self.save_record(dir, &rel);
+                }
+                Restored::Changed(_) => self.save_record(dir, &rel),
+                Restored::Clean => {} // a tombstone record: still deleted
+                Restored::Unusable => {
+                    let _ = std::fs::remove_file(record_path(&records, &rel));
+                }
+            }
         }
     }
 
@@ -1284,6 +1403,7 @@ mod tests {
     use super::*;
     use crate::net::mock_pair;
     use riftpipe_core::identity::DeviceKey;
+    use riftpipe_core::sync::DurableKind;
     use tokio::time::{sleep, timeout};
 
     fn dir(tag: &str) -> PathBuf {
@@ -1471,6 +1591,60 @@ mod tests {
             out.iter().any(|m| matches!(m, MeshMsg::Sealed(s) if s.seq == 1)),
             "the hold lifted (no new key): held state goes out sealed"
         );
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A tree delete is content, so it is gated like any write: a revoked device's sealed delete
+    /// is rejected, an unsealed signed delete is rejected, and an authorized member's sealed delete
+    /// (once it holds the current epoch key) lands.
+    #[test]
+    fn restricted_board_gates_deletes() {
+        let (mut founder, df, mut member, dm, mut revokee, dc) = restricted_board("del");
+        std::fs::write(df.join("x.bin"), b"v1").unwrap();
+        let msg = founder.local_change(&df.join("x.bin"), &df).unwrap();
+        let sealed = founder.sign_mesh(msg).unwrap();
+        for (p, d) in [(&mut member, &dm), (&mut revokee, &dc)] {
+            let copy: MeshMsg = postcard::from_bytes(&postcard::to_allocvec(&sealed).unwrap()).unwrap();
+            p.authorize_and_apply(copy, d);
+        }
+        assert!(dm.join("x.bin").exists());
+        assert!(dc.join("x.bin").exists());
+
+        let c_id = DeviceKey::from_seed(&[3u8; 32]).id();
+        for m in founder.revoke_device(c_id, &df) {
+            let copy: MeshMsg = postcard::from_bytes(&postcard::to_allocvec(&m).unwrap()).unwrap();
+            member.authorize_and_apply(copy, &dm);
+            revokee.authorize_and_apply(m, &dc);
+        }
+
+        // The revokee removes x.bin: whatever it can still seal (if anything, post-rotation)
+        // never lands — the founder rejects it on the trust-log author check.
+        std::fs::remove_file(dc.join("x.bin")).unwrap();
+        assert!(revokee.detect_missing(&dc).is_empty());
+        let del = revokee.detect_missing(&dc).remove(0);
+        let del_bytes = postcard::to_allocvec(&del).unwrap();
+        if let Some(sealed) = revokee.sign_mesh(del) {
+            founder.authorize_and_apply(sealed, &df);
+        }
+        assert!(df.join("x.bin").exists(), "a revoked device's delete never lands");
+
+        // An unsealed signed Delete (no epoch wrapper at all) is rejected too.
+        let member_key = DeviceKey::from_seed(&[2u8; 32]);
+        let unsealed = MeshMsg::SignedSync(member_key.sign_write(del_bytes));
+        founder.authorize_and_apply(unsealed, &df);
+        assert!(df.join("x.bin").exists(), "an unsealed signed Delete is rejected on a restricted board");
+
+        // The member removes x.bin; its delete is sealed under epoch 2 and lands.
+        std::fs::remove_file(dm.join("x.bin")).unwrap();
+        assert!(member.detect_missing(&dm).is_empty());
+        let del_m = member.detect_missing(&dm).remove(0);
+        let sealed_m = member.sign_local(del_m).expect("the member still holds epoch 2");
+        assert!(matches!(&sealed_m, MeshMsg::Sealed(s) if s.seq == 2));
+        founder.authorize_and_apply(sealed_m, &df);
+        assert!(!df.join("x.bin").exists(), "the member's delete lands");
+
         for d in [&df, &dm, &dc] {
             std::fs::remove_dir_all(d).ok();
         }
@@ -1805,6 +1979,32 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
+    /// A `Hello` naming a tombstoned path draws its `Delete` back, like any other reply: swarm-wide,
+    /// keyed so several neighbors' Hellos collapse to one re-assert in the outbound queue.
+    #[test]
+    fn hello_naming_a_tombstone_gets_the_delete_swarm_wide() {
+        let d = dir("hello-tomb");
+        std::fs::write(d.join("a.md"), "# a\n").unwrap();
+        let mut peer = TreePeer::new();
+        peer.seed(&d);
+        std::fs::remove_file(d.join("a.md")).unwrap();
+        assert!(peer.detect_missing(&d).is_empty(), "needs two checks");
+        assert_eq!(peer.detect_missing(&d).len(), 1);
+
+        let out = peer.authorize_and_apply(
+            MeshMsg::Sync(SyncMsg::Hello { versions: vec![("a.md".into(), vec![])], lww_versions: vec![] }),
+            &d,
+        );
+        assert_eq!(out.hello, Some(HelloCmp { we_ahead: true, they_ahead: false }));
+        let (key, msg) = out.keyed_swarm().next().expect("a reply");
+        match msg {
+            MeshMsg::Sync(SyncMsg::Delete { path, .. }) => assert_eq!(path, "a.md"),
+            _ => panic!("expected a Delete"),
+        }
+        assert!(key.unwrap().starts_with("del:a.md:"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     /// Anti-entropy input: an applied Hello reports which side is ahead, and the
     /// reply carries a write the other side never received.
     #[test]
@@ -1850,6 +2050,51 @@ mod tests {
         std::fs::remove_dir_all(db.join("x.toml")).unwrap();
         b.apply_and_persist(postcard::from_bytes(&bytes).unwrap(), &db); // a duplicate: merges nothing
         assert_eq!(std::fs::read(db.join("x.toml")).unwrap(), b"v1", "the failed write was retried");
+        for d in [&da, &db] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A `remove_file` failure (anything but `NotFound`) is retried before every later apply,
+    /// mirroring a failed merge write (D10): `seen` and the old (not yet `Deleted`) record are kept
+    /// in the meantime, so the still-present file is never mistaken for a local re-creation.
+    #[test]
+    #[cfg(unix)]
+    fn failed_remove_is_retried_and_never_recreates() {
+        use std::os::unix::fs::PermissionsExt;
+        let (da, db) = (dir("rmfail-a"), dir("rmfail-b"));
+        let (mut a, mut b) = (TreePeer::new(), TreePeer::new());
+        std::fs::create_dir_all(da.join("sub")).unwrap();
+        std::fs::write(da.join("sub/x.toml"), "v1").unwrap();
+        let msg = a.local_change(&da.join("sub/x.toml"), &da).expect("a local write");
+        assert!(b.apply_and_persist(msg, &db).is_empty());
+        assert!(db.join("sub/x.toml").exists());
+
+        std::fs::remove_file(da.join("sub/x.toml")).unwrap();
+        assert!(a.detect_missing(&da).is_empty());
+        let del = a.detect_missing(&da).remove(0);
+
+        std::fs::set_permissions(db.join("sub"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let del_bytes = postcard::to_allocvec(&del).unwrap();
+        b.apply_and_persist(del, &db);
+        assert!(db.join("sub/x.toml").exists(), "the remove failed (no write permission on the parent dir)");
+        let rec = std::fs::read(record_path(&db.join(SYNC_DIR), "sub/x.toml")).unwrap();
+        let decoded: DurablePath = postcard::from_bytes(&rec).unwrap();
+        assert!(matches!(decoded.kind, DurableKind::Lww { .. }), "the record is kept, not Deleted");
+        assert!(
+            b.local_change(&db.join("sub/x.toml"), &db).is_none(),
+            "seen was kept, so the still-present file doesn't look recreated"
+        );
+
+        std::fs::set_permissions(db.join("sub"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dup: SyncMsg = postcard::from_bytes(&del_bytes).unwrap(); // a duplicate Delete: a no-op by itself
+        b.apply_and_persist(dup, &db);
+        assert!(!db.join("sub/x.toml").exists(), "the retry removed the file");
+        assert!(!db.join("sub").exists(), "pruned");
+        let rec = std::fs::read(record_path(&db.join(SYNC_DIR), "sub/x.toml")).unwrap();
+        let decoded: DurablePath = postcard::from_bytes(&rec).unwrap();
+        assert!(matches!(decoded.kind, DurableKind::Deleted { .. }));
+
         for d in [&da, &db] {
             std::fs::remove_dir_all(d).ok();
         }
@@ -2166,21 +2411,187 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// A record for a path no longer on disk is dropped on the next seed,
-    /// instead of lingering forever in `.riftpipe-sync`.
+    /// A path deleted while a peer was down — its record exists but the file doesn't — becomes a
+    /// tombstone on the next seed, found and synced instead of lingering forever as a live record.
     #[test]
-    fn records_of_deleted_files_are_dropped() {
-        let d = dir("deleted-record");
+    fn files_deleted_while_down_become_tombstones() {
+        let d = dir("deleted-while-down");
         std::fs::write(d.join("a.md"), "# one\n").unwrap();
+        std::fs::write(d.join("m.toml"), "v1").unwrap();
         let mut p1 = TreePeer::new();
         p1.seed(&d);
-        assert!(record_path(&d.join(SYNC_DIR), "a.md").exists());
+        let stale = p1.full_state();
+        std::fs::remove_file(d.join("a.md")).unwrap();
 
+        let mut p2 = TreePeer::new();
+        p2.seed(&d);
+        let full2 = p2.full_state();
+        assert!(full2.iter().any(|m| matches!(m, SyncMsg::Delete { path, .. } if path == "a.md")));
+        assert!(!full2.iter().any(|m| matches!(m, SyncMsg::Delete { path, .. } if path == "m.toml")));
+        let rec = std::fs::read(record_path(&d.join(SYNC_DIR), "a.md")).unwrap();
+        let decoded: DurablePath = postcard::from_bytes(&rec).unwrap();
+        assert!(matches!(decoded.kind, DurableKind::Deleted { .. }));
+
+        let mut p3 = TreePeer::new();
+        p3.seed(&d);
+        assert!(
+            p3.full_state().iter().any(|m| matches!(m, SyncMsg::Delete { path, .. } if path == "a.md")),
+            "still a Delete after another restart"
+        );
+        for m in stale {
+            p3.apply_and_persist(m, &d);
+        }
+        assert!(!d.join("a.md").exists(), "the stale pre-delete state can't resurrect a tombstoned path");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A path re-created (written back) while a peer was down is a re-creation on the next seed,
+    /// not a delete: the tombstone is overruled and the text continues under a fresh agent.
+    #[test]
+    fn recreated_while_down_is_a_recreation() {
+        let d = dir("recreated-while-down");
+        std::fs::write(d.join("a.md"), "# one\n").unwrap();
+        std::fs::write(d.join("m.toml"), "v1").unwrap();
+        let mut p1 = TreePeer::new();
+        p1.seed(&d);
         std::fs::remove_file(d.join("a.md")).unwrap();
         let mut p2 = TreePeer::new();
         p2.seed(&d);
-        assert!(!record_path(&d.join(SYNC_DIR), "a.md").exists(), "record for a deleted file is dropped");
+
+        std::fs::write(d.join("a.md"), "# back\n").unwrap();
+        let mut p3 = TreePeer::new();
+        p3.seed(&d);
+        let full3 = p3.full_state();
+        assert!(full3.iter().any(|m| matches!(m, SyncMsg::TextDelta { path, .. } if path == "a.md")));
+        assert!(!full3.iter().any(|m| matches!(m, SyncMsg::Delete { path, .. } if path == "a.md")));
+        let rec = std::fs::read(record_path(&d.join(SYNC_DIR), "a.md")).unwrap();
+        let decoded: DurablePath = postcard::from_bytes(&rec).unwrap();
+        assert!(matches!(decoded.kind, DurableKind::TextReborn { .. }));
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A remote delete removes the file, prunes emptied parent dirs, never echoes a reply, and
+    /// never touches a dot-path — even one crafted to spoof a tree delete.
+    #[test]
+    fn remote_delete_removes_prunes_and_never_echoes() {
+        let (da, db) = (dir("rm-prune-a"), dir("rm-prune-b"));
+        let (mut a, mut b) = (TreePeer::new(), TreePeer::new());
+        std::fs::create_dir_all(da.join("tickets/tk_1")).unwrap();
+        std::fs::write(da.join("tickets/tk_1/card.md"), "# card\n").unwrap();
+        std::fs::write(da.join("tickets/tk_1/meta.toml"), "col=Todo").unwrap();
+        let mc = a.local_change(&da.join("tickets/tk_1/card.md"), &da).unwrap();
+        let mm = a.local_change(&da.join("tickets/tk_1/meta.toml"), &da).unwrap();
+        assert!(b.apply_and_persist(mc, &db).is_empty());
+        assert!(b.apply_and_persist(mm, &db).is_empty());
+        assert!(db.join("tickets/tk_1/card.md").exists());
+
+        std::fs::remove_dir_all(da.join("tickets/tk_1")).unwrap();
+        assert!(a.detect_missing(&da).is_empty(), "needs two checks");
+        let deletes = a.detect_missing(&da);
+        assert_eq!(deletes.len(), 2);
+
+        for m in deletes {
+            assert!(b.apply_and_persist(m, &db).is_empty(), "a delete never echoes a reply");
+        }
+        assert!(!db.join("tickets").exists());
+        assert!(b.detect_missing(&db).is_empty());
+        assert!(b.detect_missing(&db).is_empty());
+        let rec = std::fs::read(record_path(&db.join(SYNC_DIR), "tickets/tk_1/card.md")).unwrap();
+        let decoded: DurablePath = postcard::from_bytes(&rec).unwrap();
+        assert!(matches!(decoded.kind, DurableKind::Deleted { .. }));
+
+        let hostile = SyncMsg::Delete {
+            path: ".site".into(),
+            ids: vec![1],
+            seen: vec![],
+            origin: None,
+            vv: vec![],
+            version: u64::MAX,
+        };
+        std::fs::write(db.join(".site"), b"id").unwrap();
+        b.apply_and_persist(hostile, &db);
+        assert!(db.join(".site").exists(), "a dot-path delete never touches disk");
+
+        for d in [&da, &db] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A delete needs two consecutive 1-tick checks: a file missing for only one check (an editor's
+    /// atomic save) is not a delete.
+    #[test]
+    fn detect_missing_waits_one_check() {
+        let d = dir("detect-wait");
+        std::fs::write(d.join("x.md"), "# x\n").unwrap();
+        let mut p = TreePeer::new();
+        p.seed(&d);
+
+        std::fs::remove_file(d.join("x.md")).unwrap();
+        assert!(p.detect_missing(&d).is_empty(), "first check just notes it's missing");
+
+        std::fs::write(d.join("x.md"), "# x\n").unwrap();
+        assert!(p.detect_missing(&d).is_empty(), "back before a second check: not a delete");
+        assert!(!p.syncer.is_tombstoned("x.md"));
+
+        std::fs::remove_file(d.join("x.md")).unwrap();
+        assert!(p.detect_missing(&d).is_empty(), "missing again: first check");
+        assert_eq!(p.detect_missing(&d).len(), 1, "missing twice in a row: a delete");
+        assert!(p.syncer.is_tombstoned("x.md"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A `Delete` for a path we never held leaves the disk alone, but is still remembered (as a
+    /// tombstone record) so a later re-creation gets overruled.
+    #[test]
+    fn unknown_path_delete_leaves_disk_alone_and_is_recorded() {
+        let d = dir("unknown-delete");
+        std::fs::write(d.join("x.md"), "# mine\n").unwrap();
+        let mut p = TreePeer::new();
+
+        let mut other = Syncer::new("other");
+        other.local_text("x.md", "# theirs\n");
+        let del = other.local_delete("x.md").unwrap();
+
+        p.apply_and_persist(del, &d);
+        assert_eq!(std::fs::read_to_string(d.join("x.md")).unwrap(), "# mine\n");
+
+        let rec = std::fs::read(record_path(&d.join(SYNC_DIR), "x.md")).unwrap();
+        let decoded: DurablePath = postcard::from_bytes(&rec).unwrap();
+        assert!(matches!(decoded.kind, DurableKind::Deleted { .. }));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A remote `Remove` for a path we edited locally but haven't pushed yet loses to that edit:
+    /// the file is re-created (reasserted) and we never tombstone.
+    #[test]
+    fn remove_with_an_unpushed_local_edit_recreates() {
+        let (da, db) = (dir("recreate-a"), dir("recreate-b"));
+        let (mut a, mut b) = (TreePeer::new(), TreePeer::new());
+        std::fs::write(da.join("x.md"), "# from a\n").unwrap();
+        let msg = a.local_change(&da.join("x.md"), &da).unwrap();
+        assert!(b.apply_and_persist(msg, &db).is_empty());
+        assert!(db.join("x.md").exists());
+
+        std::fs::write(db.join("x.md"), "# mine\n").unwrap(); // not pushed
+
+        std::fs::remove_file(da.join("x.md")).unwrap();
+        assert!(a.detect_missing(&da).is_empty());
+        let del = a.detect_missing(&da).remove(0);
+
+        let replies = b.apply_and_persist(del, &db);
+        assert_eq!(std::fs::read_to_string(db.join("x.md")).unwrap(), "# mine\n");
+        assert!(
+            replies.iter().any(|m| matches!(m, SyncMsg::TextDelta { path, .. } if path == "x.md")),
+            "the unpushed edit is reasserted"
+        );
+        assert!(!b.syncer.is_tombstoned("x.md"));
+        assert!(
+            !b.full_state().iter().any(|m| matches!(m, SyncMsg::Delete { path, .. } if path == "x.md")),
+            "b never tombstones x.md"
+        );
+        for d in [&da, &db] {
+            std::fs::remove_dir_all(d).ok();
+        }
     }
 
     /// A dir reused for ANOTHER mesh board never restores the first board's
@@ -2279,6 +2690,75 @@ mod tests {
         let out = f2.revoke_device(b_id, &df);
         assert!(out.iter().any(|m| matches!(m, MeshMsg::Epoch(a) if a.seq == 3)), "the restarted host rotates");
         assert_eq!(f2.epoch_held(), Some(3));
+        for d in [&df, &dm, &dc] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// Tombstone records share `<dir>/.riftpipe-sync/<board>/` with `auth.state` (D9): record
+    /// writes and removals never touch it, and a restart restores both — the delete, and the
+    /// still-revoked device set that keeps rejecting its sealed writes.
+    #[test]
+    fn restricted_restart_keeps_tombstones_and_auth_state() {
+        let (mut founder, df, mut member, dm, revokee, dc) = restricted_board("del-persist");
+        founder.set_board(BOARD);
+        founder.save_auth(&df);
+        member.set_board(BOARD);
+        member.save_auth(&dm);
+
+        std::fs::write(df.join("x.bin"), b"v1").unwrap();
+        let xmsg = founder.local_change(&df.join("x.bin"), &df).unwrap();
+        let x_sealed = founder.sign_mesh(xmsg).unwrap();
+        let copy: MeshMsg = postcard::from_bytes(&postcard::to_allocvec(&x_sealed).unwrap()).unwrap();
+        member.authorize_and_apply(copy, &dm);
+        assert!(dm.join("x.bin").exists());
+
+        std::fs::write(dm.join("keep.bin"), b"v1").unwrap();
+        let keep_msg = member.local_change(&dm.join("keep.bin"), &dm).unwrap();
+        let keep_sealed = member.sign_mesh(keep_msg).unwrap();
+        founder.authorize_and_apply(keep_sealed, &df);
+        assert!(df.join("keep.bin").exists());
+
+        assert!(member.detect_missing(&dm).is_empty());
+        std::fs::remove_file(dm.join("x.bin")).unwrap();
+        assert!(member.detect_missing(&dm).is_empty());
+        let del_x = member.detect_missing(&dm).remove(0);
+        let del_x_sealed = member.sign_mesh(del_x).unwrap();
+        founder.authorize_and_apply(del_x_sealed, &df);
+        assert!(!df.join("x.bin").exists(), "the member's delete reached the founder");
+
+        drop(founder);
+        let mut f2 = restricted_peer(1);
+        f2.set_board(BOARD);
+        assert!(
+            matches!(f2.restore_auth(&df), AuthRestore::Restored { .. }),
+            "auth.state survived the record writes/removals in the same dir"
+        );
+        f2.add_trust(DeviceKey::from_seed(&[1u8; 32]).genesis());
+        f2.seed(&df);
+        assert!(
+            f2.full_state().iter().any(|m| matches!(m, SyncMsg::Delete { path, .. } if path == "x.bin")),
+            "the restarted host restores the tombstone"
+        );
+        assert!(!df.join("x.bin").exists());
+
+        let c_id = DeviceKey::from_seed(&[3u8; 32]).id();
+        for m in f2.revoke_device(c_id, &df) {
+            member.authorize_and_apply(m, &dm);
+        }
+        let evil = SyncMsg::Delete {
+            path: "keep.bin".into(),
+            ids: vec![1],
+            seen: vec![],
+            origin: None,
+            vv: vec![],
+            version: u64::MAX,
+        };
+        let evil_sealed =
+            revokee.sign_mesh(evil).expect("the revokee still holds epoch 1 (the rotation wasn't delivered to it)");
+        f2.authorize_and_apply(evil_sealed, &df);
+        assert!(df.join("keep.bin").exists(), "the revoked device's delete is rejected after the restart");
+
         for d in [&df, &dm, &dc] {
             std::fs::remove_dir_all(d).ok();
         }

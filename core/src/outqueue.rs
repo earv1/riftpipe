@@ -1,6 +1,7 @@
 //! The mesh drivers' single outbound queue: whole messages, FIFO, so one message's
 //! chunk frames go out back-to-back (no cross-message interleaving at receivers);
-//! a queued, not-yet-sent LWW update for a path is replaced by a newer one;
+//! a queued, not-yet-sent LWW update for a path is replaced by a newer one, and a
+//! queued re-assert of the same tombstone is replaced by a later one (it only grows);
 //! over a byte budget the oldest sheddable message is dropped (anti-entropy
 //! repairs it) — auth messages (Trust/Epoch/Request) and the tiny protocol
 //! `Version` announce are never shed.
@@ -15,11 +16,16 @@ pub enum Scope {
     Neighbors,
 }
 
-/// The coalescing key for a not-yet-wrapped sync message: `Some("lww:<path>")` for
-/// `Lww` (a newer version supersedes it for every receiver), else `None`.
+/// The coalescing key for a not-yet-wrapped sync message: `Some("lww:<path>")` for `Lww` (a newer
+/// version supersedes it for every receiver); `Some("del:<path>:<first id>")` for a `Delete` (a
+/// later re-assert of the same tombstone — same first id; `tomb_msg` only ever grows ids, `seen`,
+/// `vv` and `version` — supersedes a queued older one); `None` for everything else, including
+/// `Restore` (never moved or dropped by coalescing, so it can't be reordered after a `Delete` it
+/// overrules) and `TextDelta`.
 pub fn coalesce_key(msg: &SyncMsg) -> Option<String> {
     match msg {
         SyncMsg::Lww { path, .. } => Some(format!("lww:{path}")),
+        SyncMsg::Delete { path, ids, .. } => ids.first().map(|id| format!("del:{path}:{id:016x}")),
         _ => None,
     }
 }
