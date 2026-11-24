@@ -654,8 +654,38 @@ something else reads it.
   a peer whose state equals an old tombstone's mints that tombstone's id; a
   deliberate delete by it is rejected as stale and reverted once per chain
   step it lags (it resurrects, adopts the step, and its next delete applies).
-  Out of scope: `sync::tree`/`sync::mesh` (the
-  browser/kanban `Syncer`) have no delete notion yet — a separate plan.
+- **Tree/mesh deletes** (`sync::tree`/`sync::mesh` and the browser — the core
+  `Syncer`, `PROTOCOL_VERSION` 6) — the same tombstone idea, adapted to a
+  CRDT/LWW store instead of opaque strategies. `SyncMsg::Delete { path, ids,
+  seen, origin, vv, version }` (index 8) and `SyncMsg::Restore { path, ids }`
+  (index 9) are appended. Where folder mode compares fingerprints only, a
+  text delete is judged **causally** first: a holder deletes when its doc has
+  the tombstone's origin and no ops past the tombstone's frontier `vv`, with
+  `seen` fingerprints as the fallback; an LWW delete is a **version check**
+  (`my version ≤ tombstone version`, or fingerprint ∈ `seen`). Otherwise the
+  edit wins and the holder answers with its full state. A tombstoned peer
+  keeps the deleted text doc, merges incoming copies into it, and brings the
+  file back only if new ops arrived; else it re-asserts the `Delete` (with the
+  sender's tips added to `vv`, so a lagging sender proves itself stale next
+  round). Where folder mode answers a stale delete with a resurrecting delta,
+  a re-created path answers an old `Delete` with `Restore` plus its full
+  state, and the deleter drops the tombstone. A `Delete` for a path never held
+  is recorded as a tombstone (folder mode only tombstones what it
+  materialized), so a late copy can't bring it back. Re-creating text starts a
+  **fresh doc under a fresh agent** (`"{agent}~{n}"`) so op ids can't collide
+  with the deleted history; LWW re-creation starts past the tombstone's
+  version. Tombstones live in the per-path **durable records**
+  (`DurableKind::Deleted` / `TextReborn` / `LwwReborn`, native
+  `.riftpipe-sync/<board>/` and OPFS) instead of an index file: a record whose
+  file is missing at start is an offline delete, and a `Deleted` record never
+  brings a file back. Catch-up rides `full_state()` (which ends with every
+  tombstone's `Delete`) on `NeighborUp` (to neighbours) and `Resync`, plus
+  anti-entropy: a `Hello` naming a tombstoned path draws its `Delete`
+  (replies go swarm-wide; the catch-up goes to neighbours). Native peers
+  detect a delete after two consecutive 1 s checks (an editor's atomic save
+  isn't a delete) and print `DELETED:<path>`; the browser file API has
+  `deleteFile`. A delete is ordinary content: signed, sealed and trust-gated
+  like a write.
 - **Liveness** — a 15s recv-idle timeout (`folder::RECV_IDLE_TIMEOUT`) treats
   a peer that sends nothing for that long as dead and reconnects, even if the
   transport never reports a close; every heartbeat (5s) now starts with a

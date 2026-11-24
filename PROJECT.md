@@ -201,8 +201,8 @@ Folder sync (DESIGN.md §17) is CLI-wired with text-crdt + rsync. Next:
    reconstruction is rejected by hash + retried; consider basis-pinning).
    Folder deletes now sync (tombstones, edit-wins, `.riftpipe-folder-index`) —
    see `docs/planned/roadmap.md` §Smaller ("Folder deletes sync");
-   browser/kanban (`sync::tree`/`sync::mesh`) deletes are the remaining
-   follow-up there ("tree/mesh (browser) deletes").
+   browser/kanban (`sync::tree`/`sync::mesh`) deletes now sync too (protocol
+   v6; roadmap "tree/mesh (browser) deletes").
 6. **Architecture/hygiene backlog** — see `docs/planned/roadmap.md` §"Architecture
    / hygiene": all items done (kanban out of the riftpipe crates — and, since
    "filify", no kanban Rust at all; one wire protocol; `connect` over iroh +

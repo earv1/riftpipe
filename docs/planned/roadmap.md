@@ -136,7 +136,7 @@ sense to do it, not strict priority.
     and the pill can read "connected" that long; the legacy WebRTC/signaling
     `connectAndSync` path has no records or reconnection;
     the npm wrapper doesn't parse `[mesh] status=` lines. Pre-existing and
-    separate: tree/mesh deletes, out-of-order OPFS writes of rapid merges to one
+    separate: out-of-order OPFS writes of rapid merges to one
     file, the fresh joiner's `ensureSeed` `board.md` origin race.
   - *Needs real-network verification:* the host re-dialling remembered peers by id
     only (n0 pkarr publish/resolve across real NATs; else recovery waits for the
@@ -297,15 +297,71 @@ over riftpipe's wasm file API). What remains:
   deletes of one path merge their ids, so concurrent deletes followed by an
   identical restore can't lose the restored file. Tombstones + last-known live files
   persist in `<root>/.riftpipe-folder-index` (postcard, atomic write), so
-  deletes made or received while offline survive a restart. Out of scope,
-  tracked as the next bullet: `sync::tree`/`sync::mesh` (browser/kanban).
-- **tree/mesh (browser) deletes** — not built. The core `Syncer` (text CRDT +
-  whole-file LWW) that `sync::tree`/`sync::mesh` and the browser/kanban ride
-  has no delete notion; folder mode's tombstone design doesn't transfer
-  as-is because kanban already has its own "delete" (cards are archived via
-  a `meta.toml` field, never removed). Needs a `Syncer`-level tombstone (wire
-  + merge + browser OPFS removal) and a kanban decision on how archiving and
-  a real delete interact. Separate plan.
+  deletes made or received while offline survive a restart. The
+  `sync::tree`/`sync::mesh` (browser/kanban) counterpart is the next bullet.
+- **tree/mesh (browser) deletes** — *done* (`PROTOCOL_VERSION` 5 → 6). The
+  core `Syncer` that `sync::tree`/`sync::mesh` and the browser/kanban ride
+  gained two APPENDED `SyncMsg` variants: `Delete { path, ids, seen, origin,
+  vv, version }` (index 8, a tombstone: deterministic deletion ids, blake3
+  fingerprints of the deleted content, the deleted text doc's origin +
+  frontier, the deleted LWW version) and `Restore { path, ids }` (index 9, "I
+  re-created `path` after deletions `ids`"). A v5 peer can't decode them: it
+  keeps the file and shows the version-mismatch banner.
+  - *Stale-safe rule:* a live holder applies a `Delete` only if it provably
+    holds nothing the deleter hadn't seen — text: same origin and no ops past
+    the tombstone's `vv`, or its content fingerprint ∈ `seen`; LWW: its
+    version ≤ the tombstone's, or fingerprint ∈ `seen`. Otherwise the edit
+    wins and it answers with its full state. A tombstoned peer that receives
+    content merges it (text with the kept doc's origin) and brings the file
+    back only if it carries something the delete didn't see; else it
+    re-asserts the `Delete`. Re-creating a tombstoned path locally moves the
+    tombstone's id chain into `superseded` (a fresh text doc under agent
+    `"{agent}~{n}"`, an LWW version past the tombstone's), and an old
+    `Delete` of any of those ids draws `[Restore, full state]` instead.
+  - *Catch-up:* `full_state()` ends with every tombstone's `Delete`, so the
+    `NeighborUp` catch-up (neighbours only) and `Resync` carry deletes; a
+    `Hello` naming a tombstoned path is answered with its `Delete`, swarm-wide
+    like every reply. Anti-entropy (item 21) repairs a lost delete in both
+    directions: the holder's `Hello` draws the `Delete`, and the tombstoned
+    peer's `Hello` lacks the path, so the holder's full copy draws a re-assert.
+    `compare_hello` is tombstone-aware; `generation` moves only on a real
+    tombstone change; in the outbound queue a `Delete` coalesces per
+    tombstone (`del:<path>:<first id>`) and a `Restore` is never coalesced;
+    both are sheddable (a shed one is repaired by anti-entropy).
+  - *Durable records:* `DurableKind` gained `Deleted { tomb, ops }` (the
+    deleted text history is kept), `TextReborn` and `LwwReborn`. A record whose
+    file is missing at start is an offline delete; a `Deleted` record never
+    brings a file back (a file there was re-created while offline). Native
+    records sit in `.riftpipe-sync/<board>/` next to `auth.state`.
+  - *Detecting / applying:* native peers count a file as deleted after it is
+    missing on two consecutive 1 s checks (an editor's atomic save isn't a
+    delete); a remote delete removes the file (an unpushed local edit wins
+    instead), prunes emptied dirs, prints `DELETED:<path>` (npm
+    `TreeSession.onDeleted`), and a failed remove is retried. The browser
+    file API gained `deleteFile(path)` (OPFS removal, dir pruning, dot-paths
+    refused); a remote delete removes the OPFS file and fires
+    `riftpipe:file-changed`. Kanban deletes for real: `tickets/<id>/` with
+    `card.md` first and `meta.toml` last (a card without `card.md` never
+    renders), and comments can be deleted.
+  - *Proofs:* `core` sync tests;
+    `core/tests/anti_entropy_sim.rs::lossy_deletes_converge_and_go_silent`
+    (30 % loss through shedding queues: two deletes plus a delete racing an
+    edit, which wins; then a lossless run goes fully silent — no Hellos, no
+    messages — for the last 300 s);
+    `tests/mesh.rs::mesh_deletes_reach_live_and_restarted_peers` and
+    `::mesh_lost_delete_is_repaired_by_anti_entropy`;
+    `e2e/run-delete-sync.sh` (browser + browser + CLI, an offline-at-delete
+    late joiner with a stale OPFS copy, a CLI on-disk delete);
+    `e2e/delete-claimed.mjs` (claimed board: an authorized delete lands, a
+    removed device's doesn't); `run-restricted-mesh.sh` (CLI, restricted).
+  - *Known limits:* no tombstone GC (tombstones, kept deleted histories and the
+    `Delete`s in every `full_state` grow); a copy re-seeded without a record
+    whose content differs from every deleted fingerprint comes back;
+    `superseded` isn't shared with peers that never held the tombstone; the
+    legacy signaling WebRTC `TreeSync` has live deletes only (no records); a
+    v5 peer keeps a deleted file, and anti-entropy re-asserts the `Delete` to
+    it at its backed-off cadence (≤ one exchange per 128 s per peer pair),
+    bounded and harmless; moves/renames stay delete + create.
 
 - ~~Mesh messages over 4 KiB are silently lost~~ — *fixed, by chunking (no
   reload needed).* Rather than raising iroh-gossip's 4 KiB frame limit (it's
@@ -543,7 +599,8 @@ over riftpipe's wasm file API). What remains:
     - Event data can't overwrite `ts`/`device`/`kind`; grant/revoke log
       `target`.
     - Sealed like content on claimed boards (`e2e/history.mjs`).
-    - *Remaining:* old segments are never deleted (needs tree/mesh deletes);
+    - *Remaining:* old segments are never deleted (now buildable on
+      `deleteFile`);
       sibling tabs of one profile can still race.
 18. **Per-resource backing in the manifest** — `riftpipe.toml` rules gain an
     optional `backing = "memory" | "file"` per glob (today `--memory` is
@@ -594,6 +651,11 @@ over riftpipe's wasm file API). What remains:
       and retried on the next message instead.
     - No wire change (`PROTOCOL_VERSION` stays 5); v5 peers without it still
       answer Hellos. Browser diagnostics: `meshStats()`.
+    - Tree/mesh deletes (v6, the "tree/mesh (browser) deletes" bullet) ride it
+      unchanged: `Hello` stays wire-identical, `compare_hello` is
+      tombstone-aware (a tombstoned path they still hold counts as us ahead),
+      a lost `Delete` is repaired by the holder's `Hello` drawing it, a
+      `Delete` coalesces per tombstone and a `Restore` never does.
     - Tests: `core/tests/anti_entropy_sim.rs` (5 peers, 30 %/50 % loss, a
       120-op burst, lazy plumtree edges incl. a one-sided stale one, shedding
       bandwidth-limited queues, Hellos during activity, idle silence; a control

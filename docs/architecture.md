@@ -169,15 +169,19 @@ sequenceDiagram
 **2. Browser kanban (serverless)** — browser ↔ browser over the gossip mesh:
 the UI calls the board domain in `projects/kanban/src/board.ts` (TypeScript),
 which reads/writes plain files through `fs.ts` — a thin wrapper over
-riftpipe-web's generic file API (`readFile`/`writeFile`/`listDir`, over OPFS).
-Every `writeFile` is pushed through `core::sync::Syncer`
+riftpipe-web's generic file API (`readFile`/`writeFile`/`listDir`/`deleteFile`,
+over OPFS). Every `writeFile` is pushed through `core::sync::Syncer`
 (`card.md` → text-CRDT event, `meta.toml` → LWW) and broadcast on the
 iroh-gossip topic; receiving peers merge, land files back into OPFS, and fire a
 per-path `riftpipe:file-changed` event that `fs.ts`'s `watch` turns into a
-re-read. New neighbors are caught up with `full_state()` on `NeighborUp`. A
-native peer joins the same board with the generic `riftpipe connect`, whose
-`sync::tree`/`sync::mesh` drivers speak the identical protocol against a real
-directory — neither the binary nor the wasm library knows it's a kanban board.
+re-read. A `deleteFile` pushes a `Delete` tombstone the same way; a remote
+delete removes the OPFS file (pruning emptied dirs) and fires the same
+`riftpipe:file-changed` event. New neighbors are caught up with `full_state()`
+(tombstones included) on `NeighborUp`. A native peer joins the same board with
+the generic `riftpipe connect`, whose `sync::tree`/`sync::mesh` drivers speak
+the identical protocol against a real directory (a remote delete removes the
+file and prints `DELETED:<path>`) — neither the binary nor the wasm library
+knows it's a kanban board.
 
 ## One bridge pattern, two dialects (vim vs wasm)
 
