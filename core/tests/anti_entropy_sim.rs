@@ -655,6 +655,36 @@ fn lossy_deletes_converge_and_go_silent() {
     assert_eq!(sim.net.sent, sent_before, "messages kept flowing in the final 300 s after deletes");
 }
 
+/// Delete → re-create → delete again in quick succession under loss, so stale copies and
+/// tombstones from different rounds are in flight together: every peer must end deleted
+/// (an older, overruled deletion id must never let a `Restore` cancel the latest delete).
+#[test]
+fn lossy_delete_recreate_delete_ends_deleted() {
+    let mut max_ticks = 0;
+    for seed in 1..=24 {
+        let mut sim = Sim::new(seed, 0.30, true).with_queues(16 * 1024, 4 * 1024);
+        sim.run_workload(120);
+        sim.settle(480).unwrap_or_else(|| panic!("seed {seed}: the workload didn't converge"));
+        sim.step(|sim| vec![(2, sim.peers[2].syncer.local_delete("card-2.md").expect("p2 holds card-2.md"))]);
+        sim.step(|_| Vec::new());
+        sim.step(|sim| {
+            let m = sim.peers[3].syncer.local_text("card-2.md", "# card 2, again\n");
+            vec![(3, m.expect("a re-creation (or an edit) of card-2.md"))]
+        });
+        sim.step(|_| Vec::new());
+        sim.step(|sim| vec![(3, sim.peers[3].syncer.local_delete("card-2.md").expect("p3 holds card-2.md"))]);
+        let ticks = sim
+            .settle(480)
+            .unwrap_or_else(|| panic!("seed {seed}: delete/re-create/delete not converged"));
+        for (i, p) in sim.peers.iter().enumerate() {
+            assert!(p.syncer.is_tombstoned("card-2.md"), "seed {seed}: peer {i} brought card-2.md back");
+        }
+        assert_pairwise_consistent(&sim);
+        max_ticks = max_ticks.max(ticks);
+    }
+    println!("queued, 30% loss: delete/re-create/delete converged within {max_ticks} ticks");
+}
+
 #[test]
 fn control_without_anti_entropy_tail_loss_persists() {
     let unconverged: Vec<u64> = (1..=20)
