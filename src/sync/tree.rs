@@ -1034,7 +1034,22 @@ impl TreePeer {
                 self.remove_merged(dir, path);
             }
         }
-        let Applied { change, mut replies, save } = self.syncer.receive(msg);
+        // A delete of a file we've edited but not pushed yet: record that edit FIRST, so it lands in
+        // the same doc (a `local_change` after the delete would start a re-created doc under a new
+        // origin, and the origin rule would then drop one side's concurrent edits). The delete
+        // then finds a concurrent edit and loses to it.
+        let mut replies = Vec::new();
+        if let SyncMsg::Delete { path, .. } = &msg {
+            let full = dir.join(path);
+            if !escapes(path) && !hidden(path) && self.seen.contains_key(path) {
+                let on_disk = std::fs::read(&full).ok().map(|b| *blake3::hash(&b).as_bytes());
+                if on_disk.is_some() && on_disk.as_ref() != self.seen.get(path) {
+                    replies.extend(self.local_change(&full, dir));
+                }
+            }
+        }
+        let Applied { change, replies: merged, save } = self.syncer.receive(msg);
+        replies.extend(merged);
         self.report_parked();
         let mut saved_by_change = None;
         match change {
@@ -2712,6 +2727,42 @@ mod tests {
             !b.full_state().iter().any(|m| matches!(m, SyncMsg::Delete { path, .. } if path == "x.md")),
             "b never tombstones x.md"
         );
+        for d in [&da, &db] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// An unpushed local edit that beats a delete stays in the SAME doc (same origin): it isn't
+    /// turned into a re-creation, so it merges with the deleter's history and the deleter revives
+    /// the file with it.
+    #[test]
+    fn unpushed_local_edit_beats_a_delete_in_the_same_doc() {
+        let (da, db) = (dir("same-doc-a"), dir("same-doc-b"));
+        let (mut a, mut b) = (TreePeer::new(), TreePeer::new());
+        std::fs::write(da.join("x.md"), "# from a\n").unwrap();
+        let msg = a.local_change(&da.join("x.md"), &da).unwrap();
+        let origin = match &msg {
+            SyncMsg::TextDelta { origin, .. } => origin.clone(),
+            _ => panic!("a text delta"),
+        };
+        assert!(b.apply_and_persist(msg, &db).is_empty());
+        std::fs::write(db.join("x.md"), "# from a\n# mine\n").unwrap(); // not pushed
+
+        std::fs::remove_file(da.join("x.md")).unwrap();
+        assert!(a.detect_missing(&da).is_empty());
+        let del = a.detect_missing(&da).remove(0);
+        let replies = b.apply_and_persist(del, &db);
+        let deltas: Vec<&SyncMsg> =
+            replies.iter().filter(|m| matches!(m, SyncMsg::TextDelta { path, .. } if path == "x.md")).collect();
+        assert!(!deltas.is_empty(), "the unpushed edit is reasserted");
+        for m in deltas {
+            assert!(matches!(m, SyncMsg::TextDelta { origin: o, .. } if *o == origin), "same doc, not a re-creation");
+        }
+        for r in replies {
+            a.apply_and_persist(r, &da);
+        }
+        assert_eq!(std::fs::read_to_string(da.join("x.md")).unwrap(), "# from a\n# mine\n", "a revives it");
+        assert!(!a.syncer.is_tombstoned("x.md") && !b.syncer.is_tombstoned("x.md"));
         for d in [&da, &db] {
             std::fs::remove_dir_all(d).ok();
         }
