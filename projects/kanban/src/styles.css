@@ -656,3 +656,21 @@ body {
 .auth-bar.with-activity {
   padding-right: calc(340px + 1.25rem);
 }
+
+.leftovers {
+  border-bottom: 1px solid #f0d9b5;
+}
+.leftover {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.4rem 1.25rem;
+  background: #fff4e5;
+  color: #7a4d00;
+  font-size: 0.85rem;
+}
+.leftover-clean {
+  margin-left: auto;
+  font-size: 0.8rem;
+  cursor: pointer;
+}

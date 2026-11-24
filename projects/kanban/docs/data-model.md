@@ -95,8 +95,14 @@ is in flight. A single comment can be deleted the same way
 (`comments/<ts>__<author>.md`). A concurrent edit beats a delete: a peer that
 changed a file of the card without having seen that content keeps its copy
 and sends it back, so the edited file survives on every peer rather than the
-edit being lost (if only `meta.toml` was edited, the card still doesn't
-render — it has no `card.md`).
+edit being lost. If only `meta.toml` or a comment was edited, the card still
+doesn't render (it has no `card.md`), so the board lists that ticket as
+**leftovers** ("Deleted card … left files behind") with a **Remove leftovers**
+button, which deletes the rest of `tickets/<id>/` everywhere (a no-op if
+`card.md` has come back). This is never swept automatically: a card that is
+still arriving (its `card.md` not synced yet) looks the same, and an automatic
+cascade would also undo the concurrent edit that just won. Deleting a card or
+a comment asks for confirmation first.
 There is no archive lane or undo.
 
 ## Conflict semantics users will see

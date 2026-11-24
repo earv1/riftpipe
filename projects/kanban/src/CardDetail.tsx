@@ -209,6 +209,7 @@ export function CardDetail(props: {
                         type="button"
                         title="Delete comment"
                         onClick={() => void (async () => {
+                          if (!confirm("Delete this comment? This syncs to everyone.")) return;
                           await deleteComment(props.id, c.id);
                           void load();
                         })()}

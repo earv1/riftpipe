@@ -6,9 +6,11 @@
 //   3. B comes back as a late joiner with that stale copy: the card is removed
 //      there too and never comes back anywhere.
 //   4. The CLI deletes a card directory on disk → both browsers drop the card.
+//   5. Leftovers: a ticket dir with files but no card.md (a deleted card whose meta a
+//      concurrent edit kept) shows as a leftover; "Remove leftovers" clears it everywhere.
 import { chromium } from "playwright";
 import { spawn } from "child_process";
-import { readdirSync, existsSync, readFileSync, rmSync } from "fs";
+import { readdirSync, existsSync, readFileSync, rmSync, mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { setTimeout as sleep } from "timers/promises";
 
@@ -21,8 +23,9 @@ const DOOMED = `doomed-${rnd}`;
 const KEPT = `kept-${rnd}`;
 const COMMENT = `bye-${rnd}`;
 
+const dialogs = [];
 function wirePage(pg, tag) {
-  pg.on("dialog", (d) => d.accept());
+  pg.on("dialog", (d) => { dialogs.push(`${tag}:${d.type()}:${d.message()}`); d.accept(); });
   pg.on("pageerror", (e) => console.log(`[${tag}] pageerror:`, e.message));
   pg.on("console", (m) => { if (m.type() === "error") console.log(`[${tag}] console:`, m.text()); });
   return pg;
@@ -121,6 +124,9 @@ try {
   await b.waitForSelector(".drawer .comment-text", { timeout: 30000 });
   await b.locator(".drawer .comment-delete").click();
   await b.waitForSelector(".drawer .comments-empty", { timeout: 10000 });
+  if (!dialogs.some((d) => d.startsWith("B:confirm:") && /comment/i.test(d))) {
+    throw new Error(`deleting a comment didn't ask for confirmation (dialogs: ${JSON.stringify(dialogs)})`);
+  }
   await closeCard(b);
   await waitPath(() => commentFiles(doomedId).length === 0, "B's comment delete never reached the CLI's disk");
   await openCard(a, DOOMED);
@@ -159,6 +165,20 @@ try {
   await waitGone(a, KEPT);
   await waitGone(b2, KEPT);
   console.log("✓ the CLI's on-disk delete reached both browsers");
+
+  // 8. Leftovers: a ticket dir with a meta.toml but no card.md.
+  const ORPHAN = `tk_orphan${rnd}`;
+  mkdirSync(join(NDIR, "tickets", ORPHAN), { recursive: true });
+  writeFileSync(join(NDIR, "tickets", ORPHAN, "meta.toml"), 'column = "Todo"\n');
+  const leftover = (pg) => pg.locator(".leftover", { hasText: ORPHAN });
+  await leftover(a).waitFor({ timeout: 60000 });
+  await leftover(b2).waitFor({ timeout: 60000 });
+  console.log("✓ both browsers show the leftover ticket dir");
+  await leftover(a).locator(".leftover-clean").click();
+  await waitPath(() => !existsSync(join(NDIR, "tickets", ORPHAN, "meta.toml")), "Remove leftovers never reached the CLI's disk");
+  await leftover(b2).waitFor({ state: "detached", timeout: 60000 });
+  await leftover(a).waitFor({ state: "detached", timeout: 10000 });
+  console.log("✓ Remove leftovers cleared it on A, B and the CLI");
 
   console.log("PASS: deletes converge across browser+browser+CLI, incl. an offline-at-delete late joiner");
   code = 0;

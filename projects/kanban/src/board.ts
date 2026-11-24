@@ -32,6 +32,11 @@ export interface Board {
   title: string;
   columns: string[];
   cards: Card[];
+  /** Ids of `tickets/<id>/` dirs that hold files but no `card.md`: a deleted card whose other
+   *  files a concurrent edit kept (edit beats delete, per file). Shown for the user to clean up —
+   *  never swept automatically, since a card still arriving (its `card.md` not here yet) looks
+   *  the same. */
+  leftovers: string[];
 }
 export interface CardDetail extends Card {
   description: string;
@@ -227,21 +232,24 @@ async function readCardIfPresent(id: string, defaultCol: string): Promise<Card |
   return cardFromFiles(id, cardMdText, metaText, defaultCol);
 }
 
-async function allCards(columns: string[]): Promise<Card[]> {
+async function allCards(columns: string[]): Promise<{ cards: Card[]; leftovers: string[] }> {
   const defaultCol = columns[0] ?? "Todo";
   const ids = await list("tickets");
   const cards: Card[] = [];
+  const leftovers: string[] = [];
   for (const id of ids) {
+    if (id.startsWith(".")) continue;
     const card = await readCardIfPresent(id, defaultCol);
     if (card) cards.push(card);
+    else if ((await filesUnder(`tickets/${id}`)).length > 0) leftovers.push(id);
   }
-  return cards;
+  return { cards, leftovers: leftovers.sort() };
 }
 
 export async function getBoard(): Promise<Board> {
   const { title, columns } = parseBoardMd(await ensureSeed());
-  const cards = await allCards(columns);
-  return { title, columns, cards };
+  const { cards, leftovers } = await allCards(columns);
+  return { title, columns, cards, leftovers };
 }
 
 export async function getCard(id: string): Promise<Card | null> {
@@ -277,7 +285,7 @@ export async function addCard(column: string, title: string): Promise<Card> {
   const { columns } = parseBoardMd(await ensureSeed());
   const col = column && column.length ? column : (columns[0] ?? "Todo");
   const id = newId();
-  const existing = await allCards(columns);
+  const existing = (await allCards(columns)).cards;
   const maxPos = existing
     .filter((c) => c.column === col)
     .reduce((m, c) => Math.max(m, c.position), -1);
@@ -375,6 +383,15 @@ export async function deleteCard(id: string): Promise<void> {
   for (const p of (await filesUnder(dir)).filter((p) => p !== `${dir}/meta.toml`).sort()) await remove(p);
   await remove(`${dir}/meta.toml`);
   await logEvent("card.delete", { id, title });
+}
+
+/** Remove the leftover files of a deleted card (`Board.leftovers`): everything under
+ *  tickets/<id>/, meta.toml last. A no-op if the card came back (its card.md is here again). */
+export async function cleanLeftovers(id: string): Promise<void> {
+  const dir = `tickets/${id}`;
+  if ((await read(`${dir}/card.md`)) !== null) return;
+  for (const p of (await filesUnder(dir)).filter((p) => p !== `${dir}/meta.toml`).sort()) await remove(p);
+  await remove(`${dir}/meta.toml`);
 }
 
 /** Delete one comment of card `id`. */
