@@ -208,8 +208,12 @@ export function describe(
       return typeof e.target === "string" ? `removed ${who(e.target)}` : "removed a device";
     case "mesh.merge":
       return `received ${str(e.path)}`;
-    case "mesh.delete":
-      return `removed ${str(e.path)}`;
+    case "mesh.delete": {
+      // A batch (a peer deleted several files at once, e.g. a card): `paths` + common `dir`.
+      const n = Array.isArray(e.paths) ? e.paths.length : 1;
+      if (n <= 1) return `removed ${str(e.path)}`;
+      return typeof e.dir === "string" && e.dir !== "" ? `removed ${n} files under ${e.dir}` : `removed ${n} files`;
+    }
     default:
       return e.kind;
   }

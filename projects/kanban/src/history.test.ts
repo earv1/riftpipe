@@ -104,6 +104,15 @@ Deno.test("describe — board-wide (inCard=false)", () => {
     "deleted a comment on “alpha”",
   );
   assert.equal(describeEvent(e("mesh.delete", { path: "x.md" }), titleOf, v, false), "removed x.md");
+  const card = ["tickets/tk_1/card.md", "tickets/tk_1/meta.toml"];
+  assert.equal(
+    describeEvent(e("mesh.delete", { path: card[0], paths: card, dir: "tickets/tk_1" }), titleOf, v, false),
+    "removed 2 files under tickets/tk_1",
+  );
+  assert.equal(
+    describeEvent(e("mesh.delete", { path: "a.md", paths: ["a.md", "b/c.md"], dir: "" }), titleOf, v, false),
+    "removed 2 files",
+  );
   assert.equal(describeEvent(e("something.else"), titleOf, v, false), "something.else");
 });
 
