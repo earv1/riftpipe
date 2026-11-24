@@ -102,8 +102,9 @@ pub const MESH_CHUNK_PAYLOAD: usize = 3800;
 /// Reassembly cap: reject a `total` beyond this (~15 MiB) so a bogus header
 /// can't balloon memory.
 const MESH_MAX_CHUNKS: u32 = 4096;
-/// Concurrent in-flight reassemblies per peer; oldest is evicted beyond this.
-const MESH_ASSEMBLY_SLOTS: usize = 32;
+/// Concurrent in-flight reassemblies per receiver, shared by all senders;
+/// oldest is evicted beyond this.
+const MESH_ASSEMBLY_SLOTS: usize = 64;
 
 /// A compact per-document state vector: `(agent, seq)` tips (usually one or two).
 type Vv = Vec<(String, usize)>;
@@ -280,14 +281,17 @@ struct Assembly {
 /// Turns incoming gossip frames back into [`MeshMsg`]s: plain messages pass
 /// straight through; [`MeshMsg::Chunk`]s are buffered per content id and the
 /// whole message is returned when the last piece lands. Bounded: at most
-/// [`MESH_ASSEMBLY_SLOTS`] concurrent reassemblies (oldest evicted — gossip is
-/// best-effort, the catch-up paths repair a dropped message) and a `total` cap
-/// so a bogus header can't balloon memory.
+/// [`MESH_ASSEMBLY_SLOTS`] concurrent reassemblies — oldest evicted; the
+/// eviction count lets the driver run an anti-entropy round — and a `total`
+/// cap so a bogus header can't balloon memory.
 #[derive(Default)]
 pub struct MeshAssembler {
     slots: HashMap<u64, Assembly>,
     /// Insertion order for eviction (ids, oldest first).
     order: Vec<u64>,
+    /// Count of dropped partial messages (oldest evicted beyond
+    /// `MESH_ASSEMBLY_SLOTS`) — drivers trigger anti-entropy on change.
+    evicted: u64,
 }
 
 impl MeshAssembler {
@@ -309,6 +313,7 @@ impl MeshAssembler {
             if self.order.len() >= MESH_ASSEMBLY_SLOTS {
                 let evict = self.order.remove(0);
                 self.slots.remove(&evict);
+                self.evicted += 1;
             }
             self.order.push(id);
             self.slots
@@ -333,6 +338,11 @@ impl MeshAssembler {
             MeshMsg::Chunk { .. } => None,
             inner => Some(inner),
         }
+    }
+
+    /// A dropped partial message — drivers trigger anti-entropy on change.
+    pub fn evictions(&self) -> u64 {
+        self.evicted
     }
 }
 
@@ -1280,6 +1290,50 @@ mod chunking {
         assert!(asm.feed(&postcard::to_allocvec(&huge).unwrap()).is_none(), "total cap");
         let oob = MeshMsg::Chunk { id: 3, index: 5, total: 2, bytes: vec![1] };
         assert!(asm.feed(&postcard::to_allocvec(&oob).unwrap()).is_none(), "index >= total");
+    }
+
+    #[test]
+    fn eviction_is_counted() {
+        fn payload(i: usize) -> MeshMsg {
+            let mut bytes = vec![0u8; 10_000];
+            let mut x: u32 = 0x1234_5678 ^ i as u32;
+            for b in &mut bytes {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *b = (x >> 24) as u8;
+            }
+            MeshMsg::Sync(SyncMsg::Lww { path: format!("f{i}.bin"), version: 1, bytes })
+        }
+
+        let messages: Vec<Vec<Vec<u8>>> = (0..65).map(|i| encode_mesh_frames(&payload(i))).collect();
+        for frames in &messages {
+            assert!(frames.len() > 1, "a 10 KB payload must chunk");
+        }
+
+        let mut asm = MeshAssembler::new();
+        for frames in &messages {
+            asm.feed(&frames[0]);
+        }
+        assert_eq!(asm.evictions(), 1);
+
+        // Message #1 kept its slot — its remaining frames complete it. Checked
+        // FIRST: completing it removes its slot from tracking, so it can't be
+        // knocked out by the eviction that re-touching #0 below triggers.
+        let mut completed1 = false;
+        for f in &messages[1][1..] {
+            if asm.feed(f).is_some() {
+                completed1 = true;
+            }
+        }
+        assert!(completed1, "message #1 still had its slot and completes");
+
+        // Message #0's slot was evicted — its remaining frames can't complete it.
+        let mut completed0 = false;
+        for f in &messages[0][1..] {
+            if asm.feed(f).is_some() {
+                completed0 = true;
+            }
+        }
+        assert!(!completed0, "an evicted message cannot be completed by its remaining frames");
     }
 }
 
