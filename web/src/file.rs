@@ -34,3 +34,11 @@ pub async fn write_file(path: String, content: String) -> Result<(), JsValue> {
 pub async fn list_dir(path: String) -> Vec<String> {
     crate::opfs::list_path(&path).await
 }
+
+/// An opaque id (hex) of the board the file API currently addresses. It changes
+/// when the page switches boards, so a deferred write (e.g. a debounced history
+/// event) can tell it would now land on a different board.
+#[wasm_bindgen(js_name = activeBoard)]
+pub fn active_board() -> String {
+    crate::opfs::active_board().iter().map(|b| format!("{b:02x}")).collect()
+}

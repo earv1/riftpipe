@@ -514,8 +514,25 @@ over riftpipe's wasm file API). What remains:
     avoid a merge-about-merge loop) and `auth.claim`/`auth.request`/
     `auth.grant`; the kanban app logs its semantic events from `board.ts`
     (`card.create`/`move`/`check`/`edit`, `comment.add`) via `events.ts`.
-    Verified over the real mesh (`e2e/events.mjs`). Nothing renders it yet —
-    it's the substrate for a history view (and sync/auth debugging today).
+    Verified over the real mesh (`e2e/events.mjs`). It is now rendered: the
+    kanban Activity panel and per-card History, in TypeScript.
+    - Growth controls: the active log rotates into `<device>.NNNNNN.jsonl`
+      segments at 16 KiB (appends re-push segments rotated in the last 30 s,
+      ≤ once per 5 s each, so a dropped segment push can't wipe a live peer's
+      lines); one writer queue per tab; pushes are batched (500 ms trailing,
+      ≤ 2 s; `mesh.merge`-only changes ride along or go out after 15 s, so a
+      remote merge no longer makes every peer re-broadcast its log — 9→~5
+      event pushes per board write on 5 peers, far fewer under bursts);
+      `mesh.merge` is logged at most once per path per 10 s; `card.edit` is coalesced app-side, per board, and flushed
+      on board switch / tab hide. Malformed lines are skipped (`readEvents`
+      keeps objects; the app keeps string `ts`/`device`/`kind`).
+    - Event data can't overwrite `ts`/`device`/`kind`; grant/revoke log
+      `target`.
+    - Sealed like content on claimed boards (`e2e/history.mjs`).
+    - *Remaining:* old segments are never deleted (needs tree/mesh deletes);
+      sibling tabs of one profile can still race; a dropped push of the
+      active log stays stale on a live peer until the next append or a
+      reconnect (gossip has no periodic anti-entropy yet).
 18. **Per-resource backing in the manifest** — `riftpipe.toml` rules gain an
     optional `backing = "memory" | "file"` per glob (today `--memory` is
     all-or-nothing); `--memory` stays as the global default override.

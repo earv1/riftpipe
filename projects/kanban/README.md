@@ -45,11 +45,15 @@ board/
 Every mutation appends a line to `events/<device-id>.jsonl`. The trick: each
 device writes its **own** file (named by its signing device id), so two peers
 never touch the same file — the log merges across machines with **zero
-conflicts**. Board files stay the source of truth; this is a purely additive
-trail to build history/undo on later. The log is a generic riftpipe-web
+conflicts**. Past 16 KiB the active file rotates into immutable
+`events/<device-id>.NNNNNN.jsonl` segments. Board files stay the source of
+truth; this is a purely additive trail. The log is a generic riftpipe-web
 primitive (`logEvent`/`readEvents`, live `riftpipe:event`): the library records
 remote merges and auth transitions, and `board.ts` logs `card.create`/`move`/
-`check`/`edit` and `comment.add` via `src/events.ts`. Nothing renders it yet.
+`check`/`edit` (one per settled edit) and `comment.add` via `src/events.ts`.
+It's rendered as the **Activity** panel (topbar button) and each card's
+**History** in the detail drawer (`ActivityPanel.tsx`, `historyStore.ts`,
+pure helpers in `history.ts`); on a claimed board it's sealed like content.
 
 Why split prose (`card.md`) from structure (`meta.toml`): they sync differently
 under riftpipe — prose merges (text CRDT), scalars are last-writer-wins (rsync).
