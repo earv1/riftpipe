@@ -171,6 +171,12 @@ impl EgWalkerText {
     /// several reports) can name an op AND one of its ancestors. diamond-types'
     /// encoder requires a valid frontier (sorted, no entry in another's history),
     /// so dominated entries are dropped — the set of ops they name is unchanged.
+    ///
+    /// One containment walk per entry (k for k entries, not k²): an op's ancestors
+    /// have lower local times, so scanning newest-first, an entry is dominated iff
+    /// the entries kept so far (all newer) contain it — and a kept entry can never
+    /// contain a newer one. `theirs` grows with every agent ever reported for the
+    /// path (one per browser tab), and this runs on every `local_text`.
     fn frontier_of(&self, theirs: &[(String, usize)]) -> Vec<usize> {
         let mut times: Vec<usize> = theirs
             .iter()
@@ -182,17 +188,17 @@ impl EgWalkerText {
                 self.oplog.try_remote_to_local_time(&id).ok()
             })
             .collect();
-        times.sort_unstable();
+        times.sort_unstable_by(|a, b| b.cmp(a));
         times.dedup();
-        times
-            .iter()
-            .copied()
-            .filter(|&t| {
-                !times
-                    .iter()
-                    .any(|&other| other != t && self.oplog.version_contains_time(&[other], t))
-            })
-            .collect()
+        let mut kept: Vec<usize> = Vec::with_capacity(times.len());
+        for t in times {
+            // (`version_contains_time(&[], _)` is true — the empty version is ROOT.)
+            if kept.is_empty() || !self.oplog.version_contains_time(&kept, t) {
+                kept.push(t);
+            }
+        }
+        kept.reverse();
+        kept
     }
 
     pub fn ops_since(&self, theirs: &[(String, usize)]) -> Option<Vec<u8>> {
@@ -386,5 +392,49 @@ mod tests {
         assert!(c.merge(&delta));
         assert_eq!(c.content(), "one\ntwo\nthree\n");
         assert!(a.has_ops_since(&merged));
+    }
+
+    /// `frontier_of`'s one-walk-per-entry pruning equals the pairwise definition
+    /// (keep an entry iff no other entry contains it) on a branchy history.
+    #[test]
+    fn frontier_of_matches_pairwise_pruning() {
+        let mut docs: Vec<EgWalkerText> = (0..4).map(|i| EgWalkerText::new(&format!("g{i}"))).collect();
+        let mut seen: Vec<(String, usize)> = Vec::new();
+        for round in 0..12usize {
+            for i in 0..docs.len() {
+                let text = format!("{}{round}-{i}\n", docs[i].content());
+                docs[i].edit_to(&text);
+                seen.extend(docs[i].version_vector());
+            }
+            // Partial, uneven merging keeps the history branchy.
+            let (src, dst) = (round % 4, (round * 3 + 1) % 4);
+            if src != dst {
+                let full = docs[src].encode_full();
+                assert!(docs[dst].merge(&full));
+            }
+        }
+        let mut all = EgWalkerText::new("all");
+        for d in &docs {
+            assert!(all.merge(&d.encode_full()));
+        }
+        seen.sort();
+        seen.dedup();
+        for start in 0..seen.len() {
+            let theirs: Vec<(String, usize)> = seen.iter().skip(start).step_by(3).cloned().collect();
+            let mut times: Vec<usize> = theirs
+                .iter()
+                .filter_map(|(agent, seq)| {
+                    all.oplog.try_remote_to_local_time(&RemoteId { agent: agent.as_str().into(), seq: *seq }).ok()
+                })
+                .collect();
+            times.sort_unstable();
+            times.dedup();
+            let pairwise: Vec<usize> = times
+                .iter()
+                .copied()
+                .filter(|&t| !times.iter().any(|&o| o != t && all.oplog.version_contains_time(&[o], t)))
+                .collect();
+            assert_eq!(all.frontier_of(&theirs), pairwise, "subset starting at {start}");
+        }
     }
 }
