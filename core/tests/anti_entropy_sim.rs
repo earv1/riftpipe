@@ -5,13 +5,15 @@
 //! swarm-wide). Proves that periodic `Hello`s repair whatever the lossy broadcasts
 //! dropped, and that a converged idle mesh goes silent — and converges also when, as in
 //! iroh-gossip's plumtree, a neighbors-only message never crosses a LAZY edge
-//! (pruned cycle edges, or one side's stale view after a restart). Public API only.
+//! (pruned cycle edges, or one side's stale view after a restart), and when every
+//! send goes through a bandwidth-limited `OutQueue` that coalesces and sheds
+//! (shed → `on_loss`, as the drivers do). Public API only.
 
 use std::collections::BTreeMap;
 
 use riftpipe_core::antientropy::{AntiEntropy, AE_TICK_MS};
-use riftpipe_core::outqueue::Scope;
-use riftpipe_core::sync::{DurableKind, HelloCmp, SyncMsg, Syncer};
+use riftpipe_core::outqueue::{coalesce_key, OutQueue, Scope};
+use riftpipe_core::sync::{DurableKind, HelloCmp, MeshAssembler, MeshMsg, SyncMsg, Syncer};
 use riftpipe_core::EgWalkerText;
 
 const PEERS: usize = 5;
@@ -93,6 +95,14 @@ impl Net {
     }
 }
 
+/// Each peer's outbound queue, drained at a fixed byte rate — the drivers' one
+/// `OutQueue` + drain task, over a link of limited bandwidth.
+struct Queues {
+    qs: Vec<OutQueue>,
+    bytes_per_tick: usize,
+    seen_shed: Vec<u64>,
+}
+
 struct Peer {
     syncer: Syncer,
     ae: AntiEntropy,
@@ -127,6 +137,8 @@ struct Sim {
     p0_log: String,
     /// A peer that makes no local edits (see `PLUMTREE_LAZY_ASYMMETRIC`).
     read_only: Option<usize>,
+    /// `Some`: sends queue and drain at a byte rate; `None`: sent immediately.
+    queues: Option<Queues>,
 }
 
 /// `s.hello()` with its (HashMap-ordered) inventories sorted — same meaning,
@@ -206,6 +218,7 @@ impl Sim {
             tick: 0,
             p0_log: String::new(),
             read_only: None,
+            queues: None,
         }
     }
 
@@ -258,6 +271,58 @@ impl Sim {
         out
     }
 
+    /// Queue every send (keyed like the drivers key them) with `max_bytes` per
+    /// queue, draining `bytes_per_tick` per peer per tick.
+    fn with_queues(mut self, max_bytes: usize, bytes_per_tick: usize) -> Self {
+        self.queues = Some(Queues {
+            qs: (0..PEERS).map(|_| OutQueue::with_max_bytes(max_bytes)).collect(),
+            bytes_per_tick,
+            seen_shed: vec![0; PEERS],
+        });
+        self
+    }
+
+    /// Send (or queue) a batch from one peer, in canonical (byte) order.
+    fn send(&mut self, from: usize, scope: Scope, msgs: &[SyncMsg]) {
+        let Some(qs) = &mut self.queues else {
+            self.net.send_all(from, scope, msgs);
+            return;
+        };
+        let mut sorted: Vec<(Vec<u8>, &SyncMsg)> =
+            msgs.iter().map(|m| (postcard::to_allocvec(m).unwrap(), m)).collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        for (bytes, m) in sorted {
+            let wrapped = MeshMsg::Sync(postcard::from_bytes(&bytes).unwrap());
+            qs.qs[from].push(scope, coalesce_key(m), &wrapped);
+        }
+        let shed = qs.qs[from].shed();
+        if shed != qs.seen_shed[from] {
+            qs.seen_shed[from] = shed;
+            let now = self.tick * AE_TICK_MS;
+            self.peers[from].ae.on_loss(now);
+        }
+    }
+
+    /// Each queue sends up to its byte budget: whole messages, frames together.
+    fn drain(&mut self) {
+        let Some(qs) = &mut self.queues else { return };
+        for from in 0..PEERS {
+            let mut budget = qs.bytes_per_tick as i64;
+            while budget > 0 {
+                let Some((scope, frames)) = qs.qs[from].pop() else { break };
+                budget -= frames.iter().map(|f| f.len() as i64).sum::<i64>();
+                let mut asm = MeshAssembler::new();
+                let whole = frames.iter().find_map(|f| asm.feed(f));
+                let Some(MeshMsg::Sync(m)) = whole else { panic!("a queued message reassembles") };
+                self.net.send(from, scope, postcard::to_allocvec(&m).unwrap());
+            }
+        }
+    }
+
+    fn shed_total(&self) -> u64 {
+        self.queues.as_ref().map_or(0, |q| q.qs.iter().map(|q| q.shed()).sum())
+    }
+
     /// One tick of virtual time: deliver last tick's messages, run local ops, poll AE.
     fn step(&mut self, local: impl FnOnce(&mut Self) -> Vec<(usize, SyncMsg)>) {
         let now = self.now();
@@ -270,10 +335,10 @@ impl Sim {
                 peer.ae.on_hello(now, id(from), c.consistent());
             }
             let (_, replies) = peer.syncer.apply(msg);
-            self.net.send_all(to, Scope::Swarm, &replies);
+            self.send(to, Scope::Swarm, &replies);
         }
         for (from, msg) in local(self) {
-            self.net.send_all(from, Scope::Swarm, &[msg]);
+            self.send(from, Scope::Swarm, &[msg]);
         }
         if self.anti_entropy {
             for i in 0..PEERS {
@@ -282,10 +347,11 @@ impl Sim {
                 if peer.ae.poll(now, peer.syncer.generation(), &nbrs) {
                     peer.hellos.push(now);
                     let hello = canonical_hello(&peer.syncer);
-                    self.net.send_all(i, Scope::Neighbors, &[hello]);
+                    self.send(i, Scope::Neighbors, &[hello]);
                 }
             }
         }
+        self.drain();
         self.tick += 1;
     }
 
@@ -345,6 +411,46 @@ fn lossy_burst_converges_within_k_rounds() {
         "30% loss, W(120): converged within {max_ticks} ticks ({} ms) after the burst",
         max_ticks * AE_TICK_MS
     );
+}
+
+/// Through bandwidth-limited queues small enough to shed (each shed forces an
+/// anti-entropy round), the burst still converges — and the queues really shed.
+#[test]
+fn shedding_queues_still_converge() {
+    let (mut max_ticks, mut shed) = (0, 0);
+    for seed in 1..=10 {
+        let mut sim = Sim::new(seed, 0.30, true).with_queues(16 * 1024, 4 * 1024);
+        sim.run_workload(120);
+        let ticks = sim
+            .settle(480)
+            .unwrap_or_else(|| panic!("seed {seed}: not converged after 480 ticks"));
+        assert_pairwise_consistent(&sim);
+        max_ticks = max_ticks.max(ticks);
+        shed += sim.shed_total();
+    }
+    println!(
+        "queued (16 KiB, 4 KiB/tick), 30% loss, W(120): converged within {max_ticks} ticks ({} ms); {shed} messages shed",
+        max_ticks * AE_TICK_MS
+    );
+    assert!(shed > 0, "the queue budget never forced a shed — the test proves nothing about shedding");
+}
+
+/// Hellos while every peer keeps editing: the 30 s burst stays at the Trickle
+/// cadence — a max-defer round every 10 s, backing off 2 s → 8 s within it, so
+/// ~4 Hellos per 10 s — with no Hello ping-pong between editing neighbors on
+/// top (11 per peer at most; 14 when mismatches reset during activity).
+#[test]
+fn hellos_during_sustained_activity_are_bounded() {
+    let mut worst = 0;
+    for seed in 1..=10 {
+        let mut sim = Sim::new(seed, 0.30, true);
+        sim.run_workload(120);
+        for p in &sim.peers {
+            worst = worst.max(p.hellos.len());
+        }
+    }
+    println!("during a 30 s burst with 30% loss: at most {worst} Hellos per peer");
+    assert!(worst <= 12, "{worst} Hellos from one peer in 30 s of activity");
 }
 
 #[test]

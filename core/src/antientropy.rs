@@ -129,9 +129,11 @@ impl AntiEntropy {
 
     pub fn on_hello(&mut self, now: u64, from: [u8; 32], consistent: bool) {
         if consistent {
-            if self.confirmed.insert(from) {
-                // Unconfirmed → confirmed: one Hello back. On the other side we
-                // are then already confirmed, so the exchange ends there.
+            // Unconfirmed → confirmed: one Hello back. On the other side we are
+            // then already confirmed, so the exchange ends there. (While our own
+            // state is still changing, the round the activity timer schedules
+            // serves as that Hello — pulling it earlier only adds traffic.)
+            if self.confirmed.insert(from) && self.activity_first.is_none() {
                 self.ack = true;
                 let at = now + self.rand_in(AE_IMIN_MS / 4, AE_IMIN_MS / 2);
                 self.next_at = self.next_at.min(at);
