@@ -127,6 +127,10 @@ pub struct TreePeer {
     /// `Syncer`), so the stderr breadcrumb fires once per park — and again if a
     /// path recovers and later parks anew.
     parked_reported: HashSet<String>,
+    /// Merged bytes whose disk write failed, by rel path, retried before every
+    /// later apply. (A duplicate delivery used to rewrite the file; a merge that
+    /// adds nothing now persists nothing, so this is what repairs a failed write.)
+    failed_writes: HashMap<String, Vec<u8>>,
     // --- device-linking auth (protocol v3) ---
     /// This device's signing identity. `None` = open mode (writes unsigned).
     identity: Option<DeviceKey>,
@@ -208,6 +212,7 @@ impl TreePeer {
             syncer: Syncer::new(format!("n{:08x}", rand::random::<u32>())),
             seen: HashMap::new(),
             parked_reported: HashSet::new(),
+            failed_writes: HashMap::new(),
             identity: None,
             trust: TrustLog::new(),
             trust_entries: Vec::new(),
@@ -803,21 +808,39 @@ impl TreePeer {
     /// not be overwritten). Prints the `SYNCED:{path}` breadcrumb on persist.
     /// Returns the replies to send back out.
     pub(crate) fn apply_and_persist(&mut self, msg: SyncMsg, dir: &Path) -> Vec<SyncMsg> {
+        for (path, bytes) in std::mem::take(&mut self.failed_writes) {
+            self.write_merged(dir, path, bytes);
+        }
         let (persist, replies) = self.syncer.apply(msg);
         self.report_parked();
         if let Some((path, bytes)) = persist {
             if !escapes(&path) && !hidden(&path) {
-                self.seen.insert(path.clone(), *blake3::hash(&bytes).as_bytes());
-                let full = dir.join(&path);
-                if let Some(parent) = full.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::write(&full, &bytes);
-                self.save_record(dir, &path);
-                println!("SYNCED:{path}");
+                self.write_merged(dir, path, bytes);
             }
         }
         replies
+    }
+
+    /// Write merged bytes to disk, then their record. On failure the file keeps
+    /// its old bytes, so neither `seen` (the poll would push the old bytes back
+    /// as a local edit) nor the record (a restart would restore a state the
+    /// disk doesn't hold) moves; the bytes wait in `failed_writes` for a retry.
+    fn write_merged(&mut self, dir: &Path, path: String, bytes: Vec<u8>) {
+        let full = dir.join(&path);
+        if let Some(parent) = full.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&full, &bytes) {
+            Ok(()) => {
+                self.seen.insert(path.clone(), *blake3::hash(&bytes).as_bytes());
+                self.save_record(dir, &path);
+                println!("SYNCED:{path}");
+            }
+            Err(e) => {
+                eprintln!("[sync] writing {path} failed: {e} — retrying on the next message");
+                self.failed_writes.insert(path, bytes);
+            }
+        }
     }
 
     /// The whole tree as self-contained messages — how a mesh driver catches a
@@ -1620,6 +1643,26 @@ mod tests {
         let again = b.authorize_and_apply(a.sign_mesh(a.hello()).unwrap(), &db);
         assert!(again.hello.expect("a Hello is compared").consistent());
 
+        for d in [&da, &db] {
+            std::fs::remove_dir_all(d).ok();
+        }
+    }
+
+    /// A merged file whose disk write failed is written on a later message, even
+    /// a duplicate that merges nothing (and so persists nothing by itself).
+    #[test]
+    fn failed_merge_write_is_retried_on_a_later_message() {
+        let (da, db) = (dir("wfail-a"), dir("wfail-b"));
+        let (mut a, mut b) = (TreePeer::new(), TreePeer::new());
+        std::fs::write(da.join("x.toml"), "v1").unwrap();
+        let msg = a.local_change(&da.join("x.toml"), &da).expect("a local write");
+        let bytes = postcard::to_allocvec(&msg).unwrap();
+        std::fs::create_dir_all(db.join("x.toml")).unwrap(); // a dir in the way: the write fails
+        b.apply_and_persist(postcard::from_bytes(&bytes).unwrap(), &db);
+        assert!(db.join("x.toml").is_dir(), "the write failed");
+        std::fs::remove_dir_all(db.join("x.toml")).unwrap();
+        b.apply_and_persist(postcard::from_bytes(&bytes).unwrap(), &db); // a duplicate: merges nothing
+        assert_eq!(std::fs::read(db.join("x.toml")).unwrap(), b"v1", "the failed write was retried");
         for d in [&da, &db] {
             std::fs::remove_dir_all(d).ok();
         }
