@@ -3,6 +3,8 @@ import {
   getCardDetail,
   patchCard,
   addComment,
+  deleteCard,
+  deleteComment,
   cardHistory,
   historyEvents,
   startHistory,
@@ -113,6 +115,12 @@ export function CardDetail(props: {
     await patchCard(props.id, { done });
   };
 
+  const onDeleteCard = async () => {
+    if (!confirm("Delete this card and its comments? This syncs to everyone.")) return;
+    await deleteCard(props.id);
+    props.onClose();
+  };
+
   const submitComment = async (e: Event) => {
     e.preventDefault();
     const text = comment().trim();
@@ -168,6 +176,9 @@ export function CardDetail(props: {
                 Done
               </label>
               <span class="detail-column">{detail()?.column}</span>
+              <button class="card-delete" type="button" onClick={() => void onDeleteCard()}>
+                Delete card
+              </button>
             </div>
 
             <label class="detail-label">Description</label>
@@ -193,6 +204,17 @@ export function CardDetail(props: {
                     <div class="comment-head">
                       <span class="comment-author">{c.author}</span>
                       <span class="comment-ts">{formatTs(c.ts)}</span>
+                      <button
+                        class="comment-delete"
+                        type="button"
+                        title="Delete comment"
+                        onClick={() => void (async () => {
+                          await deleteComment(props.id, c.id);
+                          void load();
+                        })()}
+                      >
+                        Delete
+                      </button>
                     </div>
                     <div class="comment-text">{c.text}</div>
                   </div>

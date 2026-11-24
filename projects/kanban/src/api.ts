@@ -27,7 +27,7 @@ import {
   meshStatus as wasmMeshStatus,
   meshStats as wasmMeshStats,
 } from "../wasm/pkg/kanban_wasm.js";
-import { list, read, ready, watch, write } from "./fs.ts";
+import { list, read, ready, remove, watch, write } from "./fs.ts";
 import { logEvent, readEvents } from "./events.ts";
 
 // Domain model + types (Board, Card, Comment, CardDetail, getBoard, addCard,
@@ -35,7 +35,7 @@ import { logEvent, readEvents } from "./events.ts";
 export * from "./board.ts";
 // The file-tree change subscription: fires on local writes, remote merges, and
 // sibling-tab edits. The app calls `watch(() => refresh())` once.
-export { watch, read as readFile, write as writeFile, list as listDir } from "./fs.ts";
+export { watch, read as readFile, write as writeFile, list as listDir, remove as deleteFile } from "./fs.ts";
 // The synced, cross-peer event log (history + debugging).
 export { logEvent, readEvents, onEvent, type RiftEvent } from "./events.ts";
 // Live peer-to-peer connection status, for a status pill or similar UI.
@@ -76,6 +76,7 @@ export * from "./history.ts";
 //   riftpipe.listDir(path)           → entry names under a synced tree path
 //   riftpipe.readFile(path)          → a synced file's text (null if absent)
 //   riftpipe.writeFile(path, text)   → write + sync a file (debug / e2e)
+//   riftpipe.deleteFile(path)          → delete + sync a file (debug / e2e)
 export type AuthState = {
   locked: boolean;
   device: string;
@@ -126,6 +127,7 @@ export const auth = {
   listDir: (p: string) => list(p),
   readFile: (p: string) => read(p),
   writeFile: (p: string, text: string) => write(p, text),
+  deleteFile: (p: string) => remove(p),
 };
 
 // Build-time config (Vite env). Set these for a deployed/cross-network build:
