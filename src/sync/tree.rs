@@ -1069,7 +1069,7 @@ impl TreePeer {
                 Some(Restored::Clean) => {
                     self.seen.insert(rel, hash);
                 }
-                Some(Restored::Changed(_)) => {
+                Some(Restored::Changed(_)) | Some(Restored::Deleted(_)) => {
                     self.seen.insert(rel.clone(), hash);
                     self.save_record(dir, &rel);
                 }

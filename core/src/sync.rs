@@ -51,6 +51,14 @@ pub struct DurablePath {
 pub enum DurableKind {
     Text { ops: Vec<u8> },
     Lww { version: u64 },
+    /// APPENDED: the path is deleted — its tombstone, plus the deleted text doc's oplog (empty for LWW
+    /// or a tombstone learned for a never-held path), so a stale copy arriving after a restart is
+    /// still recognized and the delete is never undone by a restore.
+    Deleted { tomb: TreeTombstone, ops: Vec<u8> },
+    /// APPENDED: a text doc re-created after deletion(s) `superseded` (which it overrules).
+    TextReborn { ops: Vec<u8>, superseded: Vec<u64> },
+    /// APPENDED: an LWW file re-created after deletion(s) `superseded`.
+    LwwReborn { version: u64, superseded: Vec<u64> },
 }
 
 /// What [`Syncer::restore`] found.
@@ -60,8 +68,11 @@ pub enum Restored {
     /// The file changed while we were down: history restored + this local edit
     /// (already applied to our state; the driver re-saves the record).
     Changed(SyncMsg),
-    /// No file, a corrupt record, a kind/path mismatch, or the path already has
-    /// state: nothing restored — treat the file as new (or drop the record).
+    /// No file, but a live record: the file was deleted while we were down — now tombstoned; this
+    /// Delete (also in full_state) syncs it. The driver re-saves the record.
+    Deleted(SyncMsg),
+    /// A corrupt record, a kind/path mismatch, a dot-path, or the path already has state: nothing
+    /// restored — treat the file as new (or drop the record).
     Unusable,
 }
 
@@ -810,64 +821,159 @@ impl Syncer {
     /// The durable record for `path` (None if we hold no state for it). Call after
     /// every local change or persisted merge of `path`.
     pub fn durable(&self, path: &str) -> Option<DurablePath> {
+        let superseded = self.superseded.get(path).filter(|s| !s.is_empty()).cloned();
         if let Some(doc) = self.docs.get(path) {
             let content = doc.content();
+            let kind = match superseded {
+                Some(superseded) => DurableKind::TextReborn { ops: doc.encode_full(), superseded },
+                None => DurableKind::Text { ops: doc.encode_full() },
+            };
             return Some(DurablePath {
                 path: path.to_string(),
-                kind: DurableKind::Text { ops: doc.encode_full() },
+                kind,
                 disk: *blake3::hash(content.as_bytes()).as_bytes(),
             });
         }
-        let (version, bytes) = self.lww.get(path)?;
-        Some(DurablePath {
-            path: path.to_string(),
-            kind: DurableKind::Lww { version: *version },
-            disk: *blake3::hash(bytes).as_bytes(),
-        })
+        if let Some((version, bytes)) = self.lww.get(path) {
+            let kind = match superseded {
+                Some(superseded) => DurableKind::LwwReborn { version: *version, superseded },
+                None => DurableKind::Lww { version: *version },
+            };
+            return Some(DurablePath {
+                path: path.to_string(),
+                kind,
+                disk: *blake3::hash(bytes).as_bytes(),
+            });
+        }
+        if let Some(tomb) = self.tombs.get(path) {
+            let ops = tomb.doc.as_ref().map(|d| d.encode_full()).unwrap_or_default();
+            return Some(DurablePath {
+                path: path.to_string(),
+                kind: DurableKind::Deleted { tomb: tomb.t.clone(), ops },
+                disk: [0; 32],
+            });
+        }
+        None
     }
 
-    /// Restore `rec` given the file's current bytes. Call BEFORE any apply/local_* for
-    /// that path (drivers restore before the session starts). New local ops are authored
-    /// under THIS syncer's agent; the record's ops (and so the origin) are kept as history.
-    /// `peer_vv` is untouched.
+    /// Restore `rec` given the file's current bytes (`None` if it is gone — an offline delete).
+    /// Call BEFORE any apply/local_* for that path (drivers restore before the session starts).
+    /// New local ops are authored under THIS syncer's agent; the record's ops (and so the origin)
+    /// are kept as history. `peer_vv` is untouched. A missing file for a live record tombstones it
+    /// (the id matches what a live `local_delete` would have produced); a `Deleted` record is never
+    /// resurrected by a restore — only a file reappearing next to it counts as a re-creation.
     pub fn restore(&mut self, rec: DurablePath, file: Option<&[u8]>, now: u64) -> Restored {
-        let Some(file) = file else { return Restored::Unusable };
-        if self.docs.contains_key(&rec.path) || self.lww.contains_key(&rec.path) {
+        if !deletable_path(&rec.path)
+            || self.docs.contains_key(&rec.path)
+            || self.lww.contains_key(&rec.path)
+            || self.tombs.contains_key(&rec.path)
+        {
             return Restored::Unusable;
         }
-        let unchanged = *blake3::hash(file).as_bytes() == rec.disk;
         match rec.kind {
-            DurableKind::Text { ops } => {
-                if !is_text_path(&rec.path) {
-                    return Restored::Unusable;
-                }
-                let mut doc = EgWalkerText::new(&self.agent);
-                if !doc.merge(&ops) || doc.origin().is_none() {
-                    return Restored::Unusable;
-                }
-                self.docs.insert(rec.path.clone(), doc);
-                if unchanged {
+            DurableKind::Text { ops } => self.restore_text(rec.path, ops, Vec::new(), rec.disk, file),
+            DurableKind::TextReborn { ops, superseded } => {
+                self.restore_text(rec.path, ops, superseded, rec.disk, file)
+            }
+            DurableKind::Lww { version } => self.restore_lww(rec.path, version, Vec::new(), rec.disk, file, now),
+            DurableKind::LwwReborn { version, superseded } => {
+                self.restore_lww(rec.path, version, superseded, rec.disk, file, now)
+            }
+            DurableKind::Deleted { tomb, ops } => {
+                let doc = if ops.is_empty() {
+                    None
+                } else {
+                    let mut d = EgWalkerText::new(&self.agent);
+                    (d.merge(&ops) && d.origin().is_some()).then_some(d)
+                };
+                self.bury(&rec.path, tomb, doc);
+                let Some(file) = file else {
                     self.generation += 1;
                     return Restored::Clean;
-                }
-                match self.local_text(&rec.path, &String::from_utf8_lossy(file)) {
+                };
+                let msg = if is_text_path(&rec.path) {
+                    self.local_text(&rec.path, &String::from_utf8_lossy(file))
+                } else {
+                    Some(self.local_lww(&rec.path, file.to_vec(), now))
+                };
+                match msg {
                     Some(m) => Restored::Changed(m),
                     None => Restored::Clean,
                 }
             }
-            DurableKind::Lww { version } => {
-                if is_text_path(&rec.path) {
-                    return Restored::Unusable;
-                }
-                if unchanged {
-                    self.lww.insert(rec.path, (version, file.to_vec()));
-                    self.generation += 1;
-                    return Restored::Clean;
-                }
-                self.lww.insert(rec.path.clone(), (version, Vec::new()));
-                Restored::Changed(self.local_lww(&rec.path, file.to_vec(), now))
-            }
         }
+    }
+
+    /// A restored `Text`/`TextReborn` record: rebuild the document from `ops`, then reconcile it
+    /// with `file`. No file means the path was deleted while we were down: the document is
+    /// installed and immediately tombstoned, as a live `local_delete` would.
+    fn restore_text(
+        &mut self,
+        path: String,
+        ops: Vec<u8>,
+        superseded: Vec<u64>,
+        disk: [u8; 32],
+        file: Option<&[u8]>,
+    ) -> Restored {
+        if !is_text_path(&path) {
+            return Restored::Unusable;
+        }
+        let mut doc = EgWalkerText::new(&self.agent);
+        if !doc.merge(&ops) || doc.origin().is_none() {
+            return Restored::Unusable;
+        }
+        if !superseded.is_empty() {
+            self.superseded.insert(path.clone(), superseded);
+        }
+        self.docs.insert(path.clone(), doc);
+        let Some(file) = file else {
+            return match self.local_delete(&path) {
+                Some(m) => Restored::Deleted(m),
+                None => Restored::Unusable,
+            };
+        };
+        if *blake3::hash(file).as_bytes() == disk {
+            self.generation += 1;
+            return Restored::Clean;
+        }
+        match self.local_text(&path, &String::from_utf8_lossy(file)) {
+            Some(m) => Restored::Changed(m),
+            None => Restored::Clean,
+        }
+    }
+
+    /// A restored `Lww`/`LwwReborn` record: reconcile the cached version with `file`. No file means
+    /// the path was deleted while we were down: bury a tombstone directly (there's no live entry to
+    /// route through `local_delete`), with the same id a live delete would have produced.
+    fn restore_lww(
+        &mut self,
+        path: String,
+        version: u64,
+        superseded: Vec<u64>,
+        disk: [u8; 32],
+        file: Option<&[u8]>,
+        now: u64,
+    ) -> Restored {
+        if is_text_path(&path) {
+            return Restored::Unusable;
+        }
+        let Some(file) = file else {
+            let ids = vec![tree_deletion_id(&path, &disk, &superseded)];
+            let t = TreeTombstone { ids, seen: vec![disk], origin: None, vv: Vec::new(), version, prior: superseded };
+            self.bury(&path, t, None);
+            self.generation += 1;
+            return Restored::Deleted(self.tomb_msg(&path));
+        };
+        if !superseded.is_empty() {
+            self.superseded.insert(path.clone(), superseded);
+        }
+        if *blake3::hash(file).as_bytes() == disk {
+            self.lww.insert(path, (version, file.to_vec()));
+            self.generation += 1;
+            return Restored::Clean;
+        }
+        self.lww.insert(path.clone(), (version, Vec::new()));
+        Restored::Changed(self.local_lww(&path, file.to_vec(), now))
     }
 
     /// The live-state merge (no tombstones involved): returns `(bytes to persist, messages to send
@@ -2431,13 +2537,11 @@ mod tests {
     }
 
     #[test]
-    fn restore_refuses_missing_files_mismatched_kinds_and_corrupt_records() {
+    fn restore_refuses_mismatched_kinds_and_corrupt_records() {
         let mut a = Syncer::new("a");
         a.local_text("x.md", "hello\n");
         let rec = a.durable("x.md").unwrap();
         let mut b = Syncer::new("b");
-
-        assert!(matches!(b.restore(rec.clone(), None, 0), Restored::Unusable));
 
         let text_for_toml = DurablePath {
             path: "m.toml".into(),
@@ -2453,6 +2557,13 @@ mod tests {
         };
         assert!(matches!(b.restore(corrupt, Some(b"y"), 0), Restored::Unusable));
         assert!(b.durable("y.md").is_none(), "a corrupt record leaves no state");
+
+        let hidden = DurablePath {
+            path: ".hidden.md".into(),
+            kind: DurableKind::Text { ops: a.docs["x.md"].encode_full() },
+            disk: [0; 32],
+        };
+        assert!(matches!(b.restore(hidden, Some(b"x"), 0), Restored::Unusable));
 
         assert!(matches!(b.restore(rec.clone(), Some(b"hello\n"), 0), Restored::Clean));
         assert!(matches!(b.restore(rec, Some(b"hello\n"), 0), Restored::Unusable));
@@ -2513,6 +2624,30 @@ mod tests {
         let bytes = postcard::to_allocvec(&text).unwrap();
         assert!(bytes.starts_with(&[1, 97, 0, 1, 7]), "got {bytes:?}");
         assert_eq!(postcard::from_bytes::<DurablePath>(&bytes).unwrap(), text);
+
+        let tomb = TreeTombstone { ids: vec![], seen: vec![], origin: None, vv: vec![], version: 0, prior: vec![] };
+        let deleted = DurablePath { path: "a".into(), kind: DurableKind::Deleted { tomb, ops: vec![] }, disk: [0; 32] };
+        let bytes = postcard::to_allocvec(&deleted).unwrap();
+        assert_eq!(&bytes[..3], [1, 97, 2]);
+        assert_eq!(postcard::from_bytes::<DurablePath>(&bytes).unwrap(), deleted);
+
+        let reborn = DurablePath {
+            path: "a".into(),
+            kind: DurableKind::TextReborn { ops: vec![7], superseded: vec![1] },
+            disk: [0; 32],
+        };
+        let bytes = postcard::to_allocvec(&reborn).unwrap();
+        assert_eq!(&bytes[..3], [1, 97, 3]);
+        assert_eq!(postcard::from_bytes::<DurablePath>(&bytes).unwrap(), reborn);
+
+        let lww_reborn = DurablePath {
+            path: "a".into(),
+            kind: DurableKind::LwwReborn { version: 1, superseded: vec![1] },
+            disk: [0; 32],
+        };
+        let bytes = postcard::to_allocvec(&lww_reborn).unwrap();
+        assert_eq!(&bytes[..3], [1, 97, 4]);
+        assert_eq!(postcard::from_bytes::<DurablePath>(&bytes).unwrap(), lww_reborn);
     }
 
     #[test]
@@ -2522,6 +2657,119 @@ mod tests {
         assert!(n.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_eq!(n, record_name("tickets/tk_1/card.md"));
         assert_ne!(record_name("a"), record_name("b"));
+    }
+
+    #[test]
+    fn durable_tombstone_never_resurrects() {
+        let mut a = Syncer::new("a");
+        let t = a.local_text("x.md", "hello\n").unwrap();
+        let l = a.local_lww("m.toml", b"col=Todo".to_vec(), 1000);
+        let mut c = Syncer::new("c");
+        c.apply(t);
+        c.apply(l);
+
+        a.local_delete("x.md").unwrap();
+        a.local_delete("m.toml").unwrap();
+
+        let rx = a.durable("x.md").unwrap();
+        let rm = a.durable("m.toml").unwrap();
+        assert!(matches!(&rx.kind, DurableKind::Deleted { ops, .. } if !ops.is_empty()));
+        assert!(matches!(&rm.kind, DurableKind::Deleted { ops, .. } if ops.is_empty()));
+
+        let mut a2 = Syncer::new("a");
+        assert!(matches!(a2.restore(rx, None, 0), Restored::Clean));
+        assert!(matches!(a2.restore(rm, None, 0), Restored::Clean));
+        assert!(a2.is_tombstoned("x.md") && a2.is_tombstoned("m.toml"));
+
+        for m in c.full_state() {
+            let applied = a2.receive(m);
+            assert!(applied.change.is_none());
+            assert!(matches!(applied.replies.as_slice(), [SyncMsg::Delete { .. }]));
+        }
+    }
+
+    #[test]
+    fn restore_of_a_missing_file_is_an_offline_delete() {
+        let mut s1 = Syncer::new("s1");
+        s1.local_text("x.md", "hi\n");
+        s1.local_lww("m.toml", b"col=Todo".to_vec(), 100);
+        let rx = s1.durable("x.md").unwrap();
+        let rm = s1.durable("m.toml").unwrap();
+
+        let live_x = s1.local_delete("x.md").unwrap();
+        let live_m = s1.local_delete("m.toml").unwrap();
+
+        let mut s2 = Syncer::new("s2");
+        let Restored::Deleted(dx) = s2.restore(rx, None, 0) else { panic!("expected Deleted") };
+        match (&dx, &live_x) {
+            (SyncMsg::Delete { ids: a, version: 0, origin, .. }, SyncMsg::Delete { ids: b, .. }) => {
+                assert_eq!(a, b);
+                assert!(origin.is_some());
+            }
+            _ => panic!("expected matching Delete messages"),
+        }
+        assert!(matches!(s2.durable("x.md").unwrap().kind, DurableKind::Deleted { .. }));
+
+        let Restored::Deleted(dm) = s2.restore(rm, None, 0) else { panic!("expected Deleted") };
+        match (&dm, &live_m) {
+            (SyncMsg::Delete { ids: a, version: 100, .. }, SyncMsg::Delete { ids: b, .. }) => {
+                assert_eq!(a, b);
+            }
+            _ => panic!("expected matching Delete messages"),
+        }
+        assert!(matches!(s2.durable("m.toml").unwrap().kind, DurableKind::Deleted { .. }));
+    }
+
+    #[test]
+    fn restore_of_a_tombstone_with_a_file_is_a_recreation() {
+        let mut s1 = Syncer::new("s1");
+        s1.local_text("x.md", "gone\n");
+        let old = s1.local_delete("x.md").unwrap();
+        let old_origin = msg_origin(&old);
+        let old_ids = delete_ids(&old);
+        let rec = s1.durable("x.md").unwrap();
+        assert!(matches!(rec.kind, DurableKind::Deleted { .. }));
+
+        let mut s2 = Syncer::new("s2");
+        let Restored::Changed(m) = s2.restore(rec, Some(b"# back\n"), 0) else { panic!("expected Changed") };
+        match &m {
+            SyncMsg::TextDelta { origin, .. } => assert_ne!(*origin, old_origin),
+            _ => panic!("expected a TextDelta"),
+        }
+        assert!(!s2.is_tombstoned("x.md"));
+        match s2.durable("x.md").unwrap().kind {
+            DurableKind::TextReborn { superseded, .. } => assert_eq!(superseded, old_ids),
+            other => panic!("expected TextReborn, got {other:?}"),
+        }
+
+        let a = s2.receive(dup(&old));
+        assert!(a.change.is_none());
+        match a.replies.as_slice() {
+            [SyncMsg::Restore { ids, .. }, SyncMsg::TextDelta { .. }] => assert_eq!(ids, &old_ids),
+            _ => panic!("expected [Restore, TextDelta]"),
+        }
+
+        let mut s3 = Syncer::new("s3");
+        assert!(matches!(s3.restore(s2.durable("x.md").unwrap(), Some(b"# back\n"), 0), Restored::Clean));
+        let a3 = s3.receive(dup(&old));
+        assert!(matches!(a3.replies.first(), Some(SyncMsg::Restore { .. })));
+
+        // Same for LWW.
+        let mut l1 = Syncer::new("l1");
+        l1.local_lww("m.toml", b"col=Todo".to_vec(), 1000);
+        let old_l = l1.local_delete("m.toml").unwrap();
+        let old_l_version = match &old_l {
+            SyncMsg::Delete { version, .. } => *version,
+            _ => panic!("expected a Delete"),
+        };
+        let rec_l = l1.durable("m.toml").unwrap();
+        let mut l2 = Syncer::new("l2");
+        let Restored::Changed(ml) = l2.restore(rec_l, Some(b"col=Done"), 0) else { panic!("expected Changed") };
+        match &ml {
+            SyncMsg::Lww { version, .. } => assert!(*version > old_l_version),
+            _ => panic!("expected an Lww"),
+        }
+        assert!(matches!(l2.durable("m.toml").unwrap().kind, DurableKind::LwwReborn { .. }));
     }
 
     #[test]

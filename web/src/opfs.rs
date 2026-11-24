@@ -373,7 +373,7 @@ pub async fn restore_syncer(topic: [u8; 32], agent: String) -> Syncer {
     for (path, text) in tree_files(root).await {
         match recs.remove(&path).map(|rec| syncer.restore(rec, Some(text.as_bytes()), now)) {
             Some(Restored::Clean) => {}
-            Some(Restored::Changed(_)) => {
+            Some(Restored::Changed(_)) | Some(Restored::Deleted(_)) => {
                 if let Some(r) = syncer.durable(&path) {
                     queue_record(topic, &r);
                 }
