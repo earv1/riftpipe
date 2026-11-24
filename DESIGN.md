@@ -686,6 +686,23 @@ something else reads it.
   isn't a delete) and print `DELETED:<path>`; the browser file API has
   `deleteFile`. A delete is ordinary content: signed, sealed and trust-gated
   like a write.
+  Repeated rounds (delete → re-create → delete) are guarded three ways. A
+  `Delete` is overruled only if **every** id is one this peer's re-creation
+  superseded, a `Restore` drops a tombstone only if it covers **all** its ids,
+  and an id from a tombstone's own `prior` chain is never merged into it — so
+  a stale peer from round 1 can't let a round-2 delete be cancelled. And a
+  re-created path remembers its earlier **text** tombstones (`past`, up to 4,
+  with the deleted doc's oplog when this peer held it; persisted in the
+  `Deleted`/`TextReborn` records): a copy that the latest tombstone (a
+  different doc) can't judge — a peer away since before round 1 — is answered
+  with that round's own `Delete` (its `vv` plus the holder's tips), which the
+  holder's stale check accepts. Matching is causal only (same origin, no ops
+  past that round), so a revived or re-created copy is never covered and this
+  can't ping-pong with a `Restore`. A merged delta that brings a tombstone's
+  kept doc no further than the delete's frontier (a delta overtaken by its
+  small `Delete`) keeps the path deleted. Known limit: a peer that never held
+  a round's doc recognizes only copies at exactly that round's frontier, and
+  rounds beyond the last 4 are forgotten.
 - **Liveness** — a 15s recv-idle timeout (`folder::RECV_IDLE_TIMEOUT`) treats
   a peer that sends nothing for that long as dead and reconnects, even if the
   transport never reports a close; every heartbeat (5s) now starts with a

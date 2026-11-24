@@ -342,12 +342,20 @@ over riftpipe's wasm file API). What remains:
     refused); a remote delete removes the OPFS file and fires
     `riftpipe:file-changed`. Kanban deletes for real: `tickets/<id>/` with
     `card.md` first and `meta.toml` last (a card without `card.md` never
-    renders), and comments can be deleted.
+    renders; files a concurrent edit kept are listed as leftovers with a
+    "Remove leftovers" button), and comments can be deleted (both confirm).
+    Repeated delete/re-create/delete rounds: a `Delete` is overruled only if
+    every id is superseded, a `Restore` drops a tombstone only if it covers
+    all its ids, and re-created paths remember up to 4 earlier text
+    tombstones (persisted) so a copy from before an earlier round is answered
+    with that round's `Delete` (DESIGN §17.7). A remote delete burst is one
+    `mesh.delete` history event per peer.
   - *Proofs:* `core` sync tests;
     `core/tests/anti_entropy_sim.rs::lossy_deletes_converge_and_go_silent`
     (30 % loss through shedding queues: two deletes plus a delete racing an
     edit, which wins; then a lossless run goes fully silent — no Hellos, no
-    messages — for the last 300 s);
+    messages — for the last 300 s) and `::lossy_delete_recreate_delete_ends_deleted`
+    (24 seeds, a delete/re-create/delete burst under loss ends deleted);
     `tests/mesh.rs::mesh_deletes_reach_live_and_restarted_peers` and
     `::mesh_lost_delete_is_repaired_by_anti_entropy`;
     `e2e/run-delete-sync.sh` (browser + browser + CLI, an offline-at-delete
@@ -361,7 +369,9 @@ over riftpipe's wasm file API). What remains:
     legacy signaling WebRTC `TreeSync` has live deletes only (no records); a
     v5 peer keeps a deleted file, and anti-entropy re-asserts the `Delete` to
     it at its backed-off cadence (≤ one exchange per 128 s per peer pair),
-    bounded and harmless; moves/renames stay delete + create.
+    bounded and harmless; moves/renames stay delete + create; a peer that never
+    held an earlier round's doc recognizes only copies at exactly that round's
+    frontier, and rounds beyond the last 4 are forgotten.
 
 - ~~Mesh messages over 4 KiB are silently lost~~ — *fixed, by chunking (no
   reload needed).* Rather than raising iroh-gossip's 4 KiB frame limit (it's
