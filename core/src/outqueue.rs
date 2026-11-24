@@ -2,7 +2,8 @@
 //! chunk frames go out back-to-back (no cross-message interleaving at receivers);
 //! a queued, not-yet-sent LWW update for a path is replaced by a newer one;
 //! over a byte budget the oldest sheddable message is dropped (anti-entropy
-//! repairs it) — auth messages (Trust/Epoch/Request) are never shed.
+//! repairs it) — auth messages (Trust/Epoch/Request) and the tiny protocol
+//! `Version` announce are never shed.
 use crate::sync::{encode_mesh_frames, MeshMsg, SyncMsg};
 use std::collections::VecDeque;
 
@@ -59,13 +60,11 @@ impl OutQueue {
         if frames.is_empty() {
             return;
         }
+        // Not `Version`: shedding it while the `Presence` pushed right after it
+        // survives makes peers report a pre-versioning peer (`theirs=0`).
         let sheddable = matches!(
             msg,
-            MeshMsg::Sync(_)
-                | MeshMsg::SignedSync(_)
-                | MeshMsg::Sealed(_)
-                | MeshMsg::Presence { .. }
-                | MeshMsg::Version { .. }
+            MeshMsg::Sync(_) | MeshMsg::SignedSync(_) | MeshMsg::Sealed(_) | MeshMsg::Presence { .. }
         );
         if let Some(k) = &key {
             let mut removed_bytes = 0usize;
@@ -226,6 +225,23 @@ mod tests {
                     }))),
             "the last-pushed item must survive shedding"
         );
+    }
+
+    #[test]
+    fn version_is_never_shed() {
+        let mut q = OutQueue::with_max_bytes(5_000);
+        let version = MeshMsg::Version { id: [7; 32], proto: 5 };
+        q.push(Scope::Swarm, None, &version);
+        q.push(Scope::Swarm, None, &MeshMsg::Presence { id: [7; 32], neighbors: vec![] });
+        for i in 0..4 {
+            q.push(
+                Scope::Swarm,
+                None,
+                &MeshMsg::Sync(SyncMsg::Lww { path: format!("f{i}"), version: 1, bytes: vec![0; 3_000] }),
+            );
+        }
+        assert!(q.shed() >= 1, "over budget, something went");
+        assert_eq!(q.pop().unwrap().1, encode_mesh_frames(&version), "the Version announce survives, first");
     }
 
     #[test]
