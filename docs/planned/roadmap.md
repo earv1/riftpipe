@@ -343,7 +343,12 @@ over riftpipe's wasm file API). What remains:
     `riftpipe:file-changed`. Kanban deletes for real: `tickets/<id>/` with
     `card.md` first and `meta.toml` last (a card without `card.md` never
     renders; files a concurrent edit kept are listed as leftovers with a
-    "Remove leftovers" button), and comments can be deleted (both confirm).
+    "Remove leftovers" button — listed only when `card.md` is tombstoned, via
+    the file API's new `isDeleted(path)`, so a card still arriving is never
+    offered for removal), and comments can be deleted (both confirm). A text
+    delete's "seen by the deleter" check is also per agent (each tip dominated
+    in the tombstone's `vv`), so a late delta short of the deleter's frontier
+    never revives a file.
     Repeated delete/re-create/delete rounds: a `Delete` is overruled only if
     every id is superseded, a `Restore` drops a tombstone only if it covers
     all its ids, and re-created paths remember up to 4 earlier text
@@ -371,7 +376,11 @@ over riftpipe's wasm file API). What remains:
     it at its backed-off cadence (≤ one exchange per 128 s per peer pair),
     bounded and harmless; moves/renames stay delete + create; a peer that never
     held an earlier round's doc recognizes only copies at exactly that round's
-    frontier, and rounds beyond the last 4 are forgotten.
+    frontier, and rounds beyond the last 4 are forgotten; a re-created text
+    path's record re-serializes its `past` oplogs on every save (a separate
+    record would avoid it); under clock skew, two concurrent LWW deletes plus a
+    re-creator that knew only one of their ids can delete the LWW re-creation
+    (DESIGN §17.7).
 
 - ~~Mesh messages over 4 KiB are silently lost~~ — *fixed, by chunking (no
   reload needed).* Rather than raising iroh-gossip's 4 KiB frame limit (it's

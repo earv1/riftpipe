@@ -660,8 +660,11 @@ something else reads it.
   seen, origin, vv, version }` (index 8) and `SyncMsg::Restore { path, ids }`
   (index 9) are appended. Where folder mode compares fingerprints only, a
   text delete is judged **causally** first: a holder deletes when its doc has
-  the tombstone's origin and no ops past the tombstone's frontier `vv`, with
-  `seen` fingerprints as the fallback; an LWW delete is a **version check**
+  the tombstone's origin and no ops past the tombstone's frontier `vv` — either
+  `ops_since(vv)` is empty, or every tip `(agent, seq)` of the doc has some
+  `(agent, s ≥ seq)` in `vv` (an agent's ops form a causal chain; this half
+  judges a copy that is *behind* tips it doesn't know, which `ops_since` drops)
+  — with `seen` fingerprints as the fallback; an LWW delete is a **version check**
   (`my version ≤ tombstone version`, or fingerprint ∈ `seen`). Otherwise the
   edit wins and the holder answers with its full state. A tombstoned peer
   keeps the deleted text doc, merges incoming copies into it, and brings the
@@ -700,9 +703,18 @@ something else reads it.
   past that round), so a revived or re-created copy is never covered and this
   can't ping-pong with a `Restore`. A merged delta that brings a tombstone's
   kept doc no further than the delete's frontier (a delta overtaken by its
-  small `Delete`) keeps the path deleted. Known limit: a peer that never held
+  small `Delete`) keeps the path deleted. Known limits: a peer that never held
   a round's doc recognizes only copies at exactly that round's frontier, and
-  rounds beyond the last 4 are forgotten.
+  rounds beyond the last 4 are forgotten; every save of a re-created text path
+  re-serializes its `past` oplogs (up to 4 deleted histories) along with the
+  live doc's, so a long-history file that was deleted and re-created costs
+  more per keystroke; and under clock skew the every-id rule can delete an LWW
+  re-creation — two concurrent LWW deletes mint different ids, a re-creator
+  that knew only one of them is not overruling the merged tombstone, and if
+  the other deleter's clock ran ahead of the re-creator's, the re-creation's
+  version is `≤` the tombstone's (text is unaffected: a re-created doc has a
+  new origin). The file API's `isDeleted(path)` tells a tombstoned path from a
+  merely absent one (the kanban leftovers list uses it).
 - **Liveness** — a 15s recv-idle timeout (`folder::RECV_IDLE_TIMEOUT`) treats
   a peer that sends nothing for that long as dead and reconnects, even if the
   transport never reports a close; every heartbeat (5s) now starts with a
