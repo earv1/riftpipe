@@ -88,7 +88,8 @@ pub enum Restored {
 /// by an assertion from it), carried in `MeshMsg::Trust`. A v4 peer fails to decode
 /// those frames and skips them, so it never authorizes a passkey-linked device (and
 /// drops its writes) — the bump surfaces that.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// v6: tree/mesh deletes — two APPENDED SyncMsg variants, Delete (8, a tombstone) and Restore (9). A v5 peer fails to decode either and skips it, so it keeps deleted files and re-offers them on catch-up (v6 peers re-assert the delete) — the bump surfaces that.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Per-chunk payload budget for [`encode_mesh_frames`]. iroh-gossip's message
 /// limit defaults to 4096 bytes and is enforced on SEND AND RECEIVE — so
@@ -165,6 +166,18 @@ pub enum SyncMsg {
     /// `StratDelta` and the deleter resurrects the file). [`Syncer`] ignores it.
     /// APPENDED (wire index 7): peers that predate it skip it cleanly.
     StratDelete { path: String, ids: Vec<u64>, seen: Vec<[u8; 32]> },
+    /// Tree-dialect **tombstone** (text CRDT or LWW file): "I deleted `path`". `ids`: deterministic
+    /// deletion ids it stands for (oldest first; merged across independent deletes) — a peer that
+    /// re-created the path after any of them answers `Restore`. `seen`: blake3 fingerprints of the
+    /// content the deleters removed. `origin`/`vv`: the deleted text doc's origin + frontier (empty for
+    /// LWW). `version`: the deleted LWW version (0 for text). A receiver deletes only if it provably
+    /// holds nothing the deleter hadn't seen; otherwise its concurrent edit wins and it answers with
+    /// its full state. APPENDED (wire index 8, v6). Folder sessions ignore it.
+    Delete { path: String, ids: Vec<u64>, seen: Vec<[u8; 32]>, origin: Origin, vv: Vv, version: u64 },
+    /// "My copy of `path` re-creates it after deletion(s) `ids` — they are overruled." Sent with the
+    /// full state by a peer refusing a stale `Delete`; a peer whose tombstone shares an id drops it.
+    /// APPENDED (wire index 9, v6).
+    Restore { path: String, ids: Vec<u64> },
 }
 
 /// How a peer's `Hello` compares to our state (anti-entropy).
@@ -851,7 +864,9 @@ impl Syncer {
             SyncMsg::StratAdvert { .. }
             | SyncMsg::StratDelta { .. }
             | SyncMsg::StratDelete { .. }
-            | SyncMsg::Version { .. } => {
+            | SyncMsg::Version { .. }
+            | SyncMsg::Delete { .. }
+            | SyncMsg::Restore { .. } => {
                 (None, Vec::new())
             }
         }
@@ -863,7 +878,7 @@ mod wire_compat {
     use super::*;
 
     /// Postcard encodes an enum as a varint of its variant index, so the FIRST
-    /// byte of every encoded `SyncMsg` is its wire index (all eight fit in one
+    /// byte of every encoded `SyncMsg` is its wire index (all ten fit in one
     /// varint byte). Deployed peers already speak indexes 0–3 — this pins the
     /// full table so a reorder/insertion fails loudly, not on live browsers.
     #[test]
@@ -877,6 +892,8 @@ mod wire_compat {
             (SyncMsg::StratDelta { path: "p".into(), bytes: vec![] }, 5),
             (SyncMsg::Version { proto: 1 }, 6),
             (SyncMsg::StratDelete { path: "p".into(), ids: vec![1], seen: vec![] }, 7),
+            (SyncMsg::Delete { path: "p".into(), ids: vec![1], seen: vec![], origin: None, vv: vec![], version: 0 }, 8),
+            (SyncMsg::Restore { path: "p".into(), ids: vec![1] }, 9),
         ];
         for (msg, index) in cases {
             let bytes = postcard::to_allocvec(&msg).unwrap();
@@ -936,6 +953,87 @@ mod wire_compat {
                 assert_eq!(seen, vec![[1; 32], [2; 32]]);
             }
             _ => panic!("expected StratDelete"),
+        }
+    }
+
+    /// A v5 peer (built before tree/mesh deletes) decodes `Delete`/`Restore` as an
+    /// ERROR, not as garbage, so it skips them and keeps the deleted file instead of
+    /// misreading the bytes as something else; `Hello` still decodes fine.
+    #[test]
+    fn v5_peers_skip_tree_deletes() {
+        /// The wire enum exactly as a v5 peer knows it (indexes 0–7).
+        #[derive(serde::Deserialize)]
+        enum LegacyV5SyncMsg {
+            #[allow(dead_code)]
+            Hello { versions: Vec<(String, Vv)>, lww_versions: Vec<(String, u64)> },
+            #[allow(dead_code)]
+            TextDelta { path: String, ops: Vec<u8>, vv: Vv, origin: Origin },
+            #[allow(dead_code)]
+            Resync { path: String },
+            #[allow(dead_code)]
+            Lww { path: String, version: u64, bytes: Vec<u8> },
+            #[allow(dead_code)]
+            StratAdvert { path: String, sv: Vec<u8>, reply: bool },
+            #[allow(dead_code)]
+            StratDelta { path: String, bytes: Vec<u8> },
+            #[allow(dead_code)]
+            Version { proto: u32 },
+            #[allow(dead_code)]
+            StratDelete { path: String, ids: Vec<u64>, seen: Vec<[u8; 32]> },
+        }
+
+        let del = SyncMsg::Delete {
+            path: "p".into(),
+            ids: vec![1],
+            seen: vec![],
+            origin: None,
+            vv: vec![],
+            version: 0,
+        };
+        let restore = SyncMsg::Restore { path: "p".into(), ids: vec![1] };
+        for msg in [del, restore] {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            assert!(
+                postcard::from_bytes::<LegacyV5SyncMsg>(&bytes).is_err(),
+                "a v5 peer must reject (and thus skip) tree/mesh deletes",
+            );
+        }
+        let hello = postcard::to_allocvec(&SyncMsg::Hello { versions: vec![], lww_versions: vec![] }).unwrap();
+        assert!(postcard::from_bytes::<LegacyV5SyncMsg>(&hello).is_ok());
+    }
+
+    /// `Delete` and `Restore` round-trip every field.
+    #[test]
+    fn tree_delete_round_trips() {
+        let msg = SyncMsg::Delete {
+            path: "d/x.bin".into(),
+            ids: vec![u64::MAX, 3],
+            seen: vec![[1; 32]],
+            origin: Some(("a".into(), 0)),
+            vv: vec![("a".into(), 3)],
+            version: 7,
+        };
+        let bytes = postcard::to_allocvec(&msg).unwrap();
+        match postcard::from_bytes::<SyncMsg>(&bytes).unwrap() {
+            SyncMsg::Delete { path, ids, seen, origin, vv, version } => {
+                assert_eq!(path, "d/x.bin");
+                assert_eq!(ids, vec![u64::MAX, 3]);
+                assert_eq!(seen, vec![[1; 32]]);
+                assert_eq!(origin, Some(("a".into(), 0)));
+                assert_eq!(vv, vec![("a".into(), 3)]);
+                assert_eq!(version, 7);
+            }
+            _ => panic!("expected Delete"),
+        }
+
+        let restore = SyncMsg::Restore { path: "d/x.bin".into(), ids: vec![u64::MAX, 3] };
+        let bytes = postcard::to_allocvec(&restore).unwrap();
+        match postcard::from_bytes::<SyncMsg>(&bytes).unwrap() {
+            SyncMsg::Restore { path, ids } => {
+                assert_eq!(path, "d/x.bin");
+                assert_eq!(ids, vec![u64::MAX, 3]);
+            }
+            _ => panic!("expected Restore"),
         }
     }
 
