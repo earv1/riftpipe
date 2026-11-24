@@ -2,6 +2,7 @@
 //!
 //!   strategy  the `SyncStrategy` adapter trait + `Kind` (the Strategy seam, §17)
 //!   algo      concrete algorithms behind it (text CRDT, rsync, wal*, image*)
+//!   auth_store persisted trust log + epoch announces of a restricted board (.riftpipe-sync/<board>/auth.state)
 //!   backing   where a resource's bytes live: file vs. in-memory (§17.5)
 //!   control   live admin commands (revoke/grant) for a running mesh peer, via <dir>/.riftpipe-control
 //!   manifest  riftpipe.toml: glob -> algorithm (§17)
@@ -22,6 +23,7 @@
 //! strategy-channel dialect (`StratAdvert`/`StratDelta`).
 
 pub mod algo;
+pub mod auth_store;
 pub mod backing;
 pub mod control;
 pub mod folder;

@@ -98,14 +98,14 @@ pub fn load_or_create_host(dir: &Path, fresh: bool) -> Result<(SecretKey, [u8; 3
     }
     let sk = SecretKey::generate();
     let secret = riftpipe_core::crypto::generate_secret();
-    write_owner_only(&path, &format!("{}\n{}\n", hex32(&sk.to_bytes()), hex32(&secret))).map_err(anyerr)?;
+    write_owner_only(&path, format!("{}\n{}\n", hex32(&sk.to_bytes()), hex32(&secret)).as_bytes()).map_err(anyerr)?;
     Ok((sk, secret))
 }
 
 /// Write `contents` to `path` so it is NEVER readable by others, not even
 /// briefly: a fresh tmp file created with mode 0600 (unix), then renamed over
 /// `path` (which replaces any looser-permissioned file there).
-fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+pub(crate) fn write_owner_only(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
     let _ = std::fs::remove_file(&tmp);
@@ -117,7 +117,7 @@ fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
         opts.mode(0o600);
     }
     let mut f = opts.open(&tmp)?;
-    f.write_all(contents.as_bytes())?;
+    f.write_all(contents)?;
     f.sync_all()?;
     drop(f);
     std::fs::rename(&tmp, path)
