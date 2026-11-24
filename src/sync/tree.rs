@@ -94,6 +94,9 @@ fn hidden(rel: &str) -> bool {
 /// directly inside it for link sync, under `<hex topic>/` for a mesh board (see
 /// [`TreePeer::set_board`]).
 pub(crate) const SYNC_DIR: &str = ".riftpipe-sync";
+/// How often [`TreePeer::detect_missing`] checks for local deletes. A delete needs two checks in
+/// a row, so this is also the grace window that protects an editor's atomic save.
+pub(crate) const DELETE_CHECK: Duration = Duration::from_secs(1);
 fn record_path(records: &Path, rel: &str) -> PathBuf {
     records.join(format!("{}.rec", record_name(rel)))
 }
@@ -1298,6 +1301,8 @@ pub async fn run(
 ) -> Result<()> {
     let mut rescan = interval(Duration::from_secs(2));
     rescan.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut delete_tick = interval(DELETE_CHECK);
+    delete_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut rx_open = true;
 
     // Files that predate the session must be in the syncer BEFORE the
@@ -1341,6 +1346,14 @@ pub async fn run(
                 scan_files(dir, &mut files);
                 for p in files {
                     push_local(peer, &p, dir, sink).await?;
+                }
+            }
+            // Local deletes: a path missing on disk on two consecutive checks.
+            _ = delete_tick.tick() => {
+                for msg in peer.detect_missing(dir) {
+                    if let Ok(b) = postcard::to_allocvec(&msg) {
+                        sink.send(b).await?;
+                    }
                 }
             }
             // Remote edits → disk (+ any handshake replies go back out).
@@ -2267,6 +2280,79 @@ mod tests {
             b"column = \"Todo\"\nposition = 0\n",
             "structural file arrives via LWW",
         );
+        std::fs::remove_dir_all(&da).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// A local delete detected by `detect_missing` (the 1 s tick in `run`) propagates over the
+    /// link: the file is removed, the emptied directory pruned, and nothing comes back.
+    #[tokio::test]
+    async fn delete_propagates_over_a_link() {
+        let da = dir("delete-link-a");
+        let db = dir("delete-link-b");
+        std::fs::create_dir_all(da.join("tickets/tk_1")).unwrap();
+        std::fs::write(da.join("tickets/tk_1/card.md"), "# doomed\n").unwrap();
+        std::fs::write(da.join("tickets/tk_1/meta.toml"), "column = \"Todo\"\n").unwrap();
+        std::fs::write(da.join("keep.md"), "# keep\n").unwrap();
+
+        let (la, lb) = mock_pair();
+        let (mut sink_a, mut source_a) = la.into_halves();
+        let (mut sink_b, mut source_b) = lb.into_halves();
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+        for f in ["tickets/tk_1/card.md", "tickets/tk_1/meta.toml", "keep.md"] {
+            tx_a.send(da.join(f)).unwrap();
+        }
+        let (_tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+
+        let db_owned = db.to_path_buf();
+        let b_task = tokio::spawn(async move {
+            let mut pb = TreePeer::new();
+            run(&mut pb, &mut rx_b, false, &mut sink_b, &mut source_b, &db_owned)
+                .await
+                .expect("B's session ends cleanly when A hangs up");
+        });
+
+        let (cb, mb, kb) = (db.join("tickets/tk_1/card.md"), db.join("tickets/tk_1/meta.toml"), db.join("keep.md"));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        {
+            let mut pa = TreePeer::new();
+            let run_a = run(&mut pa, &mut rx_a, false, &mut sink_a, &mut source_a, &da);
+            tokio::pin!(run_a);
+            loop {
+                assert!(tokio::time::Instant::now() < deadline, "tree sync timed out waiting for the files");
+                tokio::select! {
+                    r = &mut run_a => panic!("A's session ended early: {r:?}"),
+                    _ = sleep(Duration::from_millis(20)) => {
+                        if cb.is_file() && mb.is_file() && kb.is_file() {
+                            break;
+                        }
+                    }
+                }
+            }
+            std::fs::remove_dir_all(da.join("tickets/tk_1")).unwrap();
+            loop {
+                assert!(tokio::time::Instant::now() < deadline, "the delete never synced");
+                tokio::select! {
+                    r = &mut run_a => panic!("A's session ended early: {r:?}"),
+                    _ = sleep(Duration::from_millis(20)) => {
+                        if !cb.exists() && !mb.exists() {
+                            break;
+                        }
+                    }
+                }
+            }
+            // Settled — keep pumping a little longer so anything still in flight would land.
+            tokio::select! {
+                r = &mut run_a => panic!("A's session ended early: {r:?}"),
+                _ = sleep(Duration::from_millis(300)) => {}
+            }
+        } // run_a dropped here, releasing the borrow on sink_a
+        drop(sink_a); // close B's source → B's run() returns
+        b_task.await.unwrap();
+
+        assert!(kb.exists(), "an unrelated file is untouched");
+        assert!(!db.join("tickets/tk_1").exists(), "the emptied directory is pruned");
+        assert!(!da.join("tickets/tk_1/card.md").exists(), "nothing came back to A");
         std::fs::remove_dir_all(&da).ok();
         std::fs::remove_dir_all(&db).ok();
     }
