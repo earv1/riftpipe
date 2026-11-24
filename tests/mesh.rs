@@ -684,3 +684,59 @@ fn restricted_cli_host_restart_requires_new_board() {
     assert_eq!(sk2.to_bytes(), sk.to_bytes(), "the persisted identity is untouched");
     std::fs::remove_dir_all(&d).ok();
 }
+
+/// A 120-version burst of one growing LWW file (~24 KB at the end, so chunked)
+/// reaches the joiner with NO settle write afterwards: whatever gossip drops in
+/// the burst, periodic anti-entropy Hellos repair it on their own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mesh_lww_burst_converges_without_a_settle_write() {
+    let da = dir("burst-host");
+    let db = dir("burst-joiner");
+    let secret = riftpipe_core::crypto::generate_secret();
+
+    let host = MeshConn::join(secret, None).await.expect("host join");
+    let host_addr = dialable_addr(&host).await;
+
+    let (tx_a, mut rx_a) = push_file(&da, "seed.toml", b"s");
+    let (_tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+
+    let da_task = da.clone();
+    let a_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        let _ = riftpipe::sync::mesh::run(host, &da_task, &mut peer, &mut rx_a, false).await;
+    });
+    let (db_task, addr) = (db.clone(), host_addr.clone());
+    let b_task = tokio::spawn(async move {
+        let mut peer = TreePeer::new();
+        let _ = riftpipe::sync::mesh::join_and_run(secret, addr, &db_task, &mut peer, &mut rx_b, false).await;
+    });
+
+    wait_for(&[db.join("seed.toml")], "joiner gets the host's seed file").await;
+
+    std::fs::create_dir_all(da.join("events")).unwrap();
+    let src = da.join("events/burst.jsonl");
+    let mut content = String::new();
+    for i in 0..120 {
+        content.push_str(&format!("{i} {}\n", "x".repeat(200)));
+        std::fs::write(&src, &content).unwrap();
+        tx_a.send(src.clone()).unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let want = std::fs::read(&src).unwrap();
+    assert!(want.len() > 20_000, "the final version is large enough to be chunked");
+
+    // No further writes: only anti-entropy can deliver a dropped tail.
+    let dst = db.join("events/burst.jsonl");
+    tokio::time::timeout(BUDGET, async {
+        while std::fs::read(&dst).ok().as_deref() != Some(&want[..]) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the joiner never converged on the burst's final version");
+
+    a_task.abort();
+    b_task.abort();
+    std::fs::remove_dir_all(&da).ok();
+    std::fs::remove_dir_all(&db).ok();
+}
