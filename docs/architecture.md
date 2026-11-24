@@ -242,7 +242,9 @@ iroh-gossip topic. When one of them reloads or restarts, it comes back as the
 *same* peer on the *same* board: its key and board secret persist (localStorage,
 or `<dir>/.riftpipe-host`), and its per-path sync history persists in the
 never-synced `.riftpipe-sync/` dir and is restored before the mesh starts. A
-`Hello` on every `NeighborUp` makes a one-sided reconnect pull what the other
+restricted peer likewise restores its trust log and verified epoch announces
+(`auth.state`) first, so a revoked device stays revoked. A `Hello` on every
+`NeighborUp` makes a one-sided reconnect pull what the other
 side has and we lack; a neighbor that re-dials us after a same-key restart is
 re-Joined, because iroh-gossip would otherwise leave the restarted side without
 a NeighborUp (`core::reconnect::SwapRejoin` documents the hyparview cause).

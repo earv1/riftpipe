@@ -161,7 +161,9 @@ src/:
   host identity (`<dir>/.riftpipe-host`, `--new-board`), and a status pill
   (`meshStatus()` / `riftpipe:mesh-status`). Details: `docs/planned/roadmap.md`
   §Networking ("Live reconnection — done"); e2e `run-reconnect.sh`,
-  `run-cli-host-restart.sh`.
+  `run-cli-host-restart.sh`. A restricted CLI host/joiner persists its trust
+  log + epoch announces (`.riftpipe-sync/<board>/auth.state`, MAC'd, 0600) and
+  resumes without `--new-board`; e2e `run-cli-host-restart-restricted.sh`.
 
 ## Planned (design docs)
 - **P2P kanban — files as the database** — see [`docs/planned/`](docs/planned/).

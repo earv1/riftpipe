@@ -665,10 +665,11 @@ async fn mesh_host_crash_restart_resyncs_gap_edits() {
 }
 
 /// `connect --accept --restricted` on a dir that already hosted a board stops
-/// before going online and keeps the old identity file untouched: resuming would
-/// replay `--grant`s and could re-authorize a live-revoked device.
+/// before going online and keeps the old identity file untouched: a dir hosted by
+/// an older build or hosted open has no auth state, so a restricted host refuses
+/// to resume it.
 #[test]
-fn restricted_cli_host_restart_requires_new_board() {
+fn restricted_cli_host_without_persisted_auth_refuses_to_resume() {
     let d = dir("restricted-restart");
     let (sk, _) = load_or_create_host(&d, false).unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_riftpipe"))
@@ -683,4 +684,226 @@ fn restricted_cli_host_restart_requires_new_board() {
     let (sk2, _) = load_or_create_host(&d, false).unwrap();
     assert_eq!(sk2.to_bytes(), sk.to_bytes(), "the persisted identity is untouched");
     std::fs::remove_dir_all(&d).ok();
+}
+
+/// A spawned `riftpipe` CLI process, killed (SIGKILL) and reaped when dropped — so
+/// a failed assertion or timeout never leaves it running.
+struct KillOnDrop(std::process::Child);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Run `riftpipe <args>` in the background, stderr to `log`.
+fn spawn_cli(args: &[&std::ffi::OsStr], log: &std::path::Path) -> KillOnDrop {
+    use std::process::{Command, Stdio};
+    let child = Command::new(env!("CARGO_BIN_EXE_riftpipe"))
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(log).unwrap()))
+        .spawn()
+        .unwrap();
+    KillOnDrop(child)
+}
+
+/// A per-test CLI log path, outside the synced dirs.
+fn cli_log(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("riftpipe-mesh-{}-{tag}.log", std::process::id()))
+}
+
+/// Poll `ok` every `every` until it holds; panic after [`BUDGET`].
+fn wait_until(what: &str, every: Duration, mut ok: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !ok() {
+        assert!(start.elapsed() < BUDGET, "timed out waiting until {what}");
+        std::thread::sleep(every);
+    }
+}
+
+/// The device key a CLI peer persisted in `<dir>/.device` (a hex seed).
+fn device_of(dir: &std::path::Path) -> riftpipe_core::identity::DeviceKey {
+    let hex = std::fs::read_to_string(dir.join(".device")).unwrap();
+    let mut seed = [0u8; 32];
+    for (i, b) in seed.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex.trim()[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    riftpipe_core::identity::DeviceKey::from_seed(&seed)
+}
+
+const POLL: Duration = Duration::from_millis(100);
+
+/// A `--restricted` CLI host restarted after a live revoke resumes the SAME board
+/// from its persisted trust log + epochs: the revoke sticks (its replayed `--grant`
+/// is skipped), and nothing is re-minted. Run 1 is SIGKILLed — there's no save at
+/// exit, so the state on disk is what was saved when the revoke happened.
+#[test]
+fn restricted_cli_host_restart_resumes_and_keeps_a_live_revoke() {
+    use riftpipe_core::identity::DeviceKey;
+
+    let d = dir("restricted-resume");
+    let x = hex(&DeviceKey::from_seed(&[77u8; 32]).id());
+    let spawn = |log: &PathBuf| {
+        spawn_cli(&["connect".as_ref(), "--accept".as_ref(), d.as_os_str(), "--restricted".as_ref(), "--grant".as_ref(), x.as_ref()], log)
+    };
+    let has_member = |id: &str| {
+        riftpipe::sync::control::read_state(&d).is_some_and(|state| {
+            state["members"].as_array().is_some_and(|a| a.iter().any(|m| m["device"].as_str() == Some(id)))
+        })
+    };
+
+    let (log1, log2) = (cli_log("rr-run1"), cli_log("rr-run2"));
+    let run1 = spawn(&log1);
+    wait_until("the --grant is applied", POLL, || has_member(&x));
+    // x never sent a join request, so it isn't wrapped into epoch 1: the revoke
+    // needs no rotation. The control file is tailed from its length when the run
+    // loop opens it (just after the first state write), so re-append until seen.
+    let mut last_append: Option<std::time::Instant> = None;
+    wait_until("the live revoke is applied", POLL, || {
+        if last_append.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
+            riftpipe::sync::control::append(&d, "revoke", &x).unwrap();
+            last_append = Some(std::time::Instant::now());
+        }
+        riftpipe::sync::control::read_state(&d).is_some() && !has_member(&x)
+    });
+
+    let (_, secret) = load_or_create_host(&d, false).unwrap();
+    let p = riftpipe::sync::auth_store::auth_path(&d, &riftpipe_core::crypto::topic_from_secret(&secret));
+    assert!(p.is_file(), "the host persisted its trust log + epochs");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "auth.state is owner-only");
+    }
+    drop(run1);
+    riftpipe::sync::control::remove_state(&d);
+
+    let run2 = spawn(&log2);
+    wait_until("the restarted host is running", POLL, || riftpipe::sync::control::read_state(&d).is_some());
+    let out2 = std::fs::read_to_string(&log2).unwrap();
+    assert!(out2.contains("[auth] restored"), "restored its trust log + epochs: {out2}");
+    assert!(out2.contains(&format!("--grant {x} skipped")), "the replayed --grant is skipped: {out2}");
+    assert!(!out2.contains("rerun with --new-board"), "resumed, not refused: {out2}");
+    assert!(!out2.contains("rotated to epoch"), "no re-mint: {out2}");
+    assert!(!has_member(&x), "the live revoke sticks across the restart");
+    let state = riftpipe::sync::control::read_state(&d).unwrap();
+    assert_eq!(state["epoch"], 1, "still epoch 1: {state}");
+
+    drop(run2);
+    std::fs::remove_dir_all(&d).ok();
+    std::fs::remove_file(&log1).ok();
+    std::fs::remove_file(&log2).ok();
+}
+
+/// A first `--restricted` host run killed while going online (its `.riftpipe-host`
+/// already written, the mesh loop not started) has saved its genesis, so the next
+/// start resumes instead of refusing with `rerun with --new-board`.
+#[test]
+fn restricted_cli_host_killed_before_its_mesh_loop_still_resumes() {
+    let d = dir("restricted-firstrun");
+    let args = ["connect".as_ref(), "--accept".as_ref(), d.as_os_str(), "--restricted".as_ref()];
+    let (log1, log2) = (cli_log("fr-run1"), cli_log("fr-run2"));
+
+    let run1 = spawn_cli(&args, &log1);
+    // Printed right after the auth setup (and its save), before going online.
+    wait_until("the auth setup ran", Duration::from_millis(10), || {
+        std::fs::read_to_string(&log1).is_ok_and(|l| l.contains("[auth] restricted mode"))
+    });
+    drop(run1);
+    let out1 = std::fs::read_to_string(&log1).unwrap();
+    assert!(!out1.contains("rotated to epoch"), "killed before the mesh loop's startup: {out1}");
+
+    let (_, secret) = load_or_create_host(&d, false).unwrap();
+    let board = riftpipe_core::crypto::topic_from_secret(&secret);
+    let p = riftpipe::sync::auth_store::auth_path(&d, &board);
+    match riftpipe::sync::auth_store::load(&p, &board, &device_of(&d)) {
+        riftpipe::sync::auth_store::Loaded::Found(s) => {
+            assert_eq!((s.trust.len(), s.epochs.len()), (1, 0), "the genesis, saved before going online")
+        }
+        other => panic!("no auth state after the first run: {other:?}"),
+    }
+
+    let _run2 = spawn_cli(&args, &log2);
+    wait_until("the restarted host is running", POLL, || riftpipe::sync::control::read_state(&d).is_some());
+    let out2 = std::fs::read_to_string(&log2).unwrap();
+    assert!(!out2.contains("rerun with --new-board"), "resumed, not refused: {out2}");
+    assert!(out2.contains("[auth] restored 1 trust entries and 0 epoch announces"), "{out2}");
+    assert!(out2.contains("rotated to epoch 1"), "epoch 1 is minted on the resumed run: {out2}");
+
+    drop(_run2);
+    std::fs::remove_dir_all(&d).ok();
+    std::fs::remove_file(&log1).ok();
+    std::fs::remove_file(&log2).ok();
+}
+
+/// The CLI joiner path: a granted `--restricted` joiner persists the board's trust
+/// log + epochs, restores them on restart, and on a corrupt `auth.state` warns,
+/// relearns from the board, and overwrites the bad file with its next save.
+#[test]
+fn restricted_cli_joiner_restores_and_replaces_a_corrupt_state() {
+    use riftpipe::sync::auth_store::{auth_path, load, Loaded};
+    use riftpipe_core::identity::DeviceKey;
+
+    let (dh, dj) = (dir("rj-host"), dir("rj-joiner"));
+    let seed = [88u8; 32];
+    std::fs::write(dj.join(".device"), hex(&seed)).unwrap();
+    let j_key = DeviceKey::from_seed(&seed);
+    let j_id = hex(&j_key.id());
+    std::fs::write(dh.join("secret.txt"), "members only").unwrap();
+
+    let ticket_file = PathBuf::from(format!("{}.ticket", dh.display()));
+    let _ = std::fs::remove_file(&ticket_file);
+    let logs = [cli_log("rj-host"), cli_log("rj-j1"), cli_log("rj-j2"), cli_log("rj-j3")];
+    let _host = spawn_cli(
+        &["connect".as_ref(), "--accept".as_ref(), dh.as_os_str(), "--restricted".as_ref(), "--grant".as_ref(), j_id.as_ref()],
+        &logs[0],
+    );
+    wait_until("the host printed its ticket", POLL, || ticket_file.is_file());
+    let ticket = std::fs::read_to_string(&ticket_file).unwrap();
+    let (_, secret) = load_or_create_host(&dh, false).unwrap();
+    let board = riftpipe_core::crypto::topic_from_secret(&secret);
+    let path = auth_path(&dj, &board);
+    let joiner = |log: &PathBuf| {
+        spawn_cli(&["connect".as_ref(), ticket.trim().as_ref(), dj.as_os_str(), "--restricted".as_ref()], log)
+    };
+    let can_read = || {
+        riftpipe::sync::control::read_state(&dj).is_some_and(|s| s["canRead"] == true && s["epoch"].as_u64() >= Some(1))
+    };
+
+    let j1 = joiner(&logs[1]);
+    wait_until("the granted joiner reads the board", POLL, || dj.join("secret.txt").is_file());
+    assert!(matches!(load(&path, &board, &j_key), Loaded::Found(s) if !s.epochs.is_empty()), "the joiner persisted");
+    drop(j1);
+    riftpipe::sync::control::remove_state(&dj);
+
+    let j2 = joiner(&logs[2]);
+    wait_until("the restarted joiner can read", POLL, can_read);
+    let out2 = std::fs::read_to_string(&logs[2]).unwrap();
+    assert!(out2.contains("[auth] restored"), "restored on restart: {out2}");
+    assert!(!out2.contains("and 0 epoch announces"), "its epochs came back too: {out2}");
+    drop(j2);
+    riftpipe::sync::control::remove_state(&dj);
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[5] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(matches!(load(&path, &board, &j_key), Loaded::Corrupt(_)));
+    let j3 = joiner(&logs[3]);
+    wait_until("the corrupt auth.state is replaced by a valid save", POLL, || {
+        matches!(load(&path, &board, &j_key), Loaded::Found(s) if !s.epochs.is_empty())
+    });
+    wait_until("the joiner relearned the board", POLL, can_read);
+    let out3 = std::fs::read_to_string(&logs[3]).unwrap();
+    assert!(out3.contains("[auth] ignoring the persisted trust log/epochs"), "warned: {out3}");
+    assert!(!out3.contains("[auth] restored"), "nothing restored from the bad file: {out3}");
+
+    drop(j3);
+    drop(_host);
+    std::fs::remove_dir_all(&dh).ok();
+    std::fs::remove_dir_all(&dj).ok();
+    let _ = std::fs::remove_file(&ticket_file);
+    for l in &logs {
+        std::fs::remove_file(l).ok();
+    }
 }

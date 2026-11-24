@@ -97,7 +97,9 @@ sense to do it, not strict priority.
     with the old file (which would author a revert of the merge).
   - *CLI host identity (D5):* `connect --accept <dir>` persists its iroh key + board
     secret in `<dir>/.riftpipe-host` (restart = same board); `--new-board` mints a
-    new link.
+    new link. A `--restricted` host also persists its trust log + epoch
+    announces (`auth.state`) and resumes; a startup `--grant` skips devices the
+    log already knows; e2e `run-cli-host-restart-restricted.sh`.
   - *Status (D6):* `waiting | connected | reconnecting | offline` (`idle` with no
     session) as the `riftpipe:mesh-status` event + `meshStatus()` in the browser
     (kanban renders a pill), `[mesh] status=<s> peers=<n>` lines natively.
@@ -115,12 +117,8 @@ sense to do it, not strict priority.
     its record landing can duplicate that one merged edit on the next start (fails
     toward duplication, never loss); no app-level heartbeat or `pagehide` →
     Disconnect, so a joiner notices a vanished host only via QUIC idle (~15–30 s)
-    and the pill can read "connected" that long; a `--restricted` CLI host doesn't
-    persist its trust log/epochs, and a restart would replay its `--grant`s under
-    fresh nonces (re-authorizing a device revoked live, on peers that saw the
-    revoke first) and re-mint epoch 1 — so `connect --accept --restricted` refuses
-    to resume a dir that already hosts a board; restart it with `--new-board`; the
-    legacy WebRTC/signaling `connectAndSync` path has no records or reconnection;
+    and the pill can read "connected" that long; the legacy WebRTC/signaling
+    `connectAndSync` path has no records or reconnection;
     the npm wrapper doesn't parse `[mesh] status=` lines. Pre-existing and
     separate: tree/mesh deletes, out-of-order OPFS writes of rapid merges to one
     file, the fresh joiner's `ensureSeed` `board.md` origin race.
