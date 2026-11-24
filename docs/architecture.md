@@ -251,6 +251,16 @@ a NeighborUp (`core::reconnect::SwapRejoin` documents the hyparview cause).
 Policy (backoff, peer book, swap re-Join, link state) lives in
 `core::reconnect`; both drivers (`src/sync/mesh.rs`, `web/src/gossip.rs`) apply it.
 
+**Anti-entropy.** Between reconnects, any broadcast gossip drops is repaired
+by periodic `Hello`s to direct neighbors (`core::antientropy`: jittered, 2 s
+backing off to 128 s, reset by local changes and mismatched Hellos, silent
+once every neighbor's Hello matches ours). A peer that is ahead replies with
+exactly what the requester lacks — swarm-wide, because iroh-gossip sends
+neighbors-only messages to plumtree-eager peers only and the requester may be
+lazy on the replier's side. All sends go through one ordered outbound queue
+(`core::outqueue`), so a chunked message's frames stay contiguous; gossip
+`Lagged`, an evicted partial message or a shed queued message force a round.
+
 ```mermaid
 sequenceDiagram
     autonumber

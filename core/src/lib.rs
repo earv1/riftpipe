@@ -4,11 +4,13 @@
 //! async, no OS deps — so it builds for native and `wasm32` alike, and both the
 //! CLI (`riftpipe`) and the browser crate (`riftpipe-web`) share one document model.
 
+pub mod antientropy;
 pub mod crypto;
 pub mod epoch;
 pub mod identity;
 pub mod keywrap;
 pub mod onboard;
+pub mod outqueue;
 pub mod passkey;
 pub mod reconnect;
 pub mod sync;

@@ -35,10 +35,11 @@ async function diagnose(name, pg, missing) {
   const opfs = await opfsTitles(pg);
   const inOpfs = opfs ? opfs.includes(missing) : "unknown";
   const peers = await pg.evaluate(() => globalThis.riftpipe.connectedPeers()).catch(() => "n/a");
+  const stats = await pg.evaluate(() => globalThis.riftpipe.meshStats()).catch(() => "n/a");
   console.log(
     `DIAG ${name}: missing "${missing}" in DOM · in OPFS: ${inOpfs} ` +
     `(${inOpfs === true ? "STALE-UI BUG" : inOpfs === false ? "SYNC BUG" : "?"}) · ` +
-    `connectedPeers: ${JSON.stringify(peers)}`,
+    `connectedPeers: ${JSON.stringify(peers)} · meshStats: ${JSON.stringify(stats)}`,
   );
 }
 
@@ -165,6 +166,10 @@ try {
 
   const rm = await a.evaluate(() => globalThis.riftpipe.routingMap()).catch(() => null);
   console.log("routing map (A's view):", JSON.stringify(rm));
+  for (const [nm, pg] of [...pages, ["A2", a2]]) {
+    const stats = await pg.evaluate(() => globalThis.riftpipe.meshStats()).catch(() => "n/a");
+    console.log(`meshStats ${nm}: ${JSON.stringify(stats)}`);
+  }
 
   if (failures === 0) {
     console.log(`PASS: ${N}-peer mesh — staged joins AND live edits all converge, zero reloads`);

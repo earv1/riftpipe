@@ -21,13 +21,22 @@
 //! - a NEW incoming connection from a current neighbor (it restarted under the
 //!   same key) → re-Join it (`SwapRejoin`: hyparview stale-pending workaround)
 //!
+//! - periodic anti-entropy: a jittered, backing-off `Hello` to direct neighbors
+//!   (`core::antientropy`) repairs any dropped broadcast; gossip `Lagged`, a
+//!   dropped partial chunked message, or a shed queued message force a round.
+//!   Replies to a `Hello` go swarm-wide (see `SyncMsg::Hello`)
+//! - one outbound queue (`core::outqueue`): whole messages in order, so a
+//!   message's chunk frames go out back-to-back; a queued LWW update is replaced
+//!   by a newer one for the same path
+//!
 //! Shape mirrors `sync/tree.rs`'s [`run`](super::tree::run): the caller owns
-//! the [`TreePeer`] and the watcher channel; one `select!` loop, no spawned
-//! sync tasks. The push-decision and persist logic are the shared `TreePeer`
-//! methods, so link-sync and mesh-sync can't drift.
+//! the [`TreePeer`] and the watcher channel; one `select!` loop plus one
+//! outbound drain task. The push-decision and persist logic are the shared
+//! `TreePeer` methods, so link-sync and mesh-sync can't drift.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -41,11 +50,11 @@ use iroh_gossip::proto::TopicId;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{interval, MissedTickBehavior};
 
+use riftpipe_core::antientropy::{AntiEntropy, AE_TICK_MS};
 use riftpipe_core::crypto::{topic_from_secret, MeshCipher};
+use riftpipe_core::outqueue::{coalesce_key, OutQueue, Scope};
 use riftpipe_core::reconnect::{link_state, rejoin_targets, LinkState, PeerBook, Rejoin, SwapRejoin};
-use riftpipe_core::sync::{
-    encode_mesh_frames, MeshAssembler, MeshMsg, PeerVersion, VersionMonitor, PROTOCOL_VERSION,
-};
+use riftpipe_core::sync::{MeshAssembler, MeshMsg, PeerVersion, VersionMonitor, PROTOCOL_VERSION};
 
 use crate::net::{anyerr, Result};
 use crate::sync::tree::{scan_files, AuthRestore, TreePeer};
@@ -286,6 +295,8 @@ pub struct MeshConn {
     /// The board's topic bytes (`H(secret)`): binds passkey links and scopes
     /// the tree's durable records.
     board: [u8; 32],
+    /// See [`MeshConn::receive_blackout`].
+    blackout: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Inputs to [`MeshConn::join_with`].
@@ -356,6 +367,7 @@ impl MeshConn {
             peers,
             incoming,
             board: topic_from_secret(&secret),
+            blackout: Arc::default(),
         })
     }
 
@@ -375,6 +387,14 @@ impl MeshConn {
     /// The underlying endpoint (for `online()` / address sharing in tests).
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// Test hook (simulated loss): while the flag is set, `run` discards every
+    /// received gossip message unread — so a test can prove that a repair came
+    /// from anti-entropy, not from the original broadcast.
+    #[doc(hidden)]
+    pub fn receive_blackout(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.blackout.clone()
     }
 }
 
@@ -442,6 +462,113 @@ async fn shutdown_signal() {
     }
 }
 
+/// The driver's one outbound queue (see `core::outqueue`) + its wakeup.
+#[derive(Clone)]
+struct Out {
+    q: Arc<std::sync::Mutex<OutQueue>>,
+    wake: Arc<tokio::sync::Notify>,
+    /// The drain is sending a popped message. Set while holding `q`'s lock, so
+    /// "queue empty and not sending" read under that lock means all sent.
+    sending: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// How long a clean shutdown waits for queued messages (e.g. a revoke or grant
+/// issued in the last tick) to go out before the drain is aborted.
+const SHUTDOWN_FLUSH: Duration = Duration::from_secs(2);
+
+impl Out {
+    fn new() -> Self {
+        Out {
+            q: Arc::new(std::sync::Mutex::new(OutQueue::new())),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            sending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+    /// The next message to send, marking the drain busy while it sends it.
+    fn take(&self) -> Option<(Scope, Vec<Vec<u8>>)> {
+        let mut q = self.q.lock().unwrap();
+        let next = q.pop();
+        self.sending.store(next.is_some(), std::sync::atomic::Ordering::SeqCst);
+        next
+    }
+    fn drained(&self) -> bool {
+        let q = self.q.lock().unwrap();
+        q.is_empty() && !self.sending.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Wait (up to `limit`) until the drain has sent everything queued.
+    async fn flush(&self, limit: Duration) -> bool {
+        tokio::time::timeout(limit, async {
+            while !self.drained() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+    fn push(&self, scope: Scope, key: Option<String>, m: &MeshMsg) {
+        self.q.lock().unwrap().push(scope, key, m);
+        self.wake.notify_one();
+    }
+    fn swarm(&self, m: &MeshMsg) {
+        self.push(Scope::Swarm, None, m)
+    }
+    /// Direct neighbors only (plumtree-eager ones — iroh-gossip skips lazy peers):
+    /// the `NeighborUp` catch-up and anti-entropy Hellos.
+    fn neighbors(&self, m: &MeshMsg) {
+        self.push(Scope::Neighbors, None, m)
+    }
+}
+
+/// Aborts the drain task when `run` ends, however it ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Seal and send queued messages one at a time, frames back-to-back, off the
+/// receive loop. Every frame is AEAD-sealed so only link-holders can
+/// read/inject. A failed send must not kill the session (anti-entropy repairs
+/// it), but it must be VISIBLE — a silently dropped broadcast reads as
+/// "synced" when it isn't.
+fn spawn_drain(sender: GossipSender, cipher: Arc<MeshCipher>, out: Out) -> AbortOnDrop {
+    spawn_drain_with(out, move |scope, b| {
+        let (sender, cipher) = (sender.clone(), cipher.clone());
+        async move {
+            let sealed = cipher.seal(&b);
+            let n = sealed.len();
+            let r = match scope {
+                Scope::Swarm => sender.broadcast(sealed.into()).await,
+                Scope::Neighbors => sender.broadcast_neighbors(sealed.into()).await,
+            };
+            if let Err(e) = r {
+                eprintln!("[mesh] broadcast of {n} bytes failed: {e}");
+            }
+        }
+    })
+}
+
+/// The drain loop over any frame sender (the gossip one, or a test's).
+fn spawn_drain_with<F, Fut>(out: Out, send: F) -> AbortOnDrop
+where
+    F: Fn(Scope, Vec<u8>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    AbortOnDrop(tokio::spawn(async move {
+        loop {
+            let Some((scope, frames)) = out.take() else {
+                out.wake.notified().await;
+                continue;
+            };
+            for b in frames {
+                send(scope, b).await;
+            }
+        }
+    }))
+}
+
 /// Drive an already-joined [`MeshConn`] (joiner OR host role) over `dir`.
 pub async fn run(
     conn: MeshConn,
@@ -465,7 +592,11 @@ pub async fn run(
         peers: mut book,
         mut incoming,
         board,
+        blackout,
     } = conn;
+    let cipher = Arc::new(cipher);
+    let out = Out::new();
+    let _drain = spawn_drain(sender.clone(), cipher.clone(), out.clone());
     peer.set_board(board);
     let my_id_bytes = *my_id.as_bytes();
     // The gossiped routing map `id -> [neighbors]` (kept for parity with the
@@ -521,36 +652,19 @@ pub async fn run(
     // Neighbors that restarted and re-dialed us: re-Join them (see `SwapRejoin`).
     let mut swap = SwapRejoin::new();
 
-    // A failed send must not kill the session (convergence is repaired by the
-    // next catch-up), but it must be VISIBLE — a silently dropped broadcast
-    // reads as "synced" when it isn't. Big messages go out as chunk frames,
-    // and every frame is AEAD-sealed so only link-holders can read/inject.
-    async fn broadcast(sender: &GossipSender, cipher: &MeshCipher, gm: &MeshMsg) {
-        for b in encode_mesh_frames(gm) {
-            let sealed = cipher.seal(&b);
-            let n = sealed.len();
-            if let Err(e) = sender.broadcast(sealed.into()).await {
-                eprintln!("[mesh] broadcast of {n} bytes failed: {e}");
-            }
-        }
-    }
-
-    /// Direct-neighbor-only send for the `NeighborUp` catch-up: the newcomer is
-    /// (or is about to be) a direct neighbor, so flooding the whole swarm with
-    /// our full tree on every join is pure waste — the epidemic layer spreads
-    /// anything the rest actually lacks via the normal reply path.
-    async fn broadcast_neighbors(sender: &GossipSender, cipher: &MeshCipher, gm: &MeshMsg) {
-        for b in encode_mesh_frames(gm) {
-            let sealed = cipher.seal(&b);
-            let n = sealed.len();
-            if let Err(e) = sender.broadcast_neighbors(sealed.into()).await {
-                eprintln!("[mesh] neighbor broadcast of {n} bytes failed: {e}");
-            }
-        }
-    }
-
     // Reassembles incoming chunk frames into whole messages.
     let mut assembler = MeshAssembler::new();
+
+    // Anti-entropy: when to send our `Hello` digest to direct neighbors (see
+    // `core::antientropy`). Losses we can see (gossip `Lagged`, an evicted
+    // partial message, a shed queued message) force a round.
+    let ae_t0 = std::time::Instant::now();
+    let ae_now = move || ae_t0.elapsed().as_millis() as u64;
+    let mut ae = AntiEntropy::new(ae_now(), rand::random::<u64>());
+    let mut ae_tick = interval(Duration::from_millis(AE_TICK_MS));
+    ae_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let (mut seen_evictions, mut seen_shed) = (0u64, 0u64);
+    let mut last_lag_log: Option<std::time::Instant> = None;
     // Flags peers whose announced protocol version differs (or who never
     // announce — pre-versioning peers). One stable stderr line per peer, so
     // scripts (and the npm wrapper) can parse it.
@@ -616,6 +730,9 @@ pub async fn run(
         tokio::select! {
             _ = &mut shutdown => {
                 eprintln!("[mesh] shutting down");
+                if !out.flush(SHUTDOWN_FLUSH).await {
+                    eprintln!("[mesh] shutdown: queued messages not all sent within {SHUTDOWN_FLUSH:?}");
+                }
                 return Ok(());
             }
             // Local edits → broadcast (the watcher feeds paths into `rx`).
@@ -633,10 +750,13 @@ pub async fn run(
                 }
                 for p in batch {
                     if let Some(msg) = peer.local_change(&p, dir) {
+                        // A queued, unsent LWW update for this path is
+                        // superseded by this one (`coalesce_key`).
+                        let key = coalesce_key(&msg);
                         // Signed when this peer has an identity, else a plain Sync;
                         // sealed on a restricted board (`None` until we hold a key).
                         if let Some(mm) = peer.sign_local(msg) {
-                            broadcast(&sender, &cipher, &mm).await;
+                            out.push(Scope::Swarm, key, &mm);
                         }
                     }
                 }
@@ -647,8 +767,9 @@ pub async fn run(
                 scan_files(dir, &mut files);
                 for p in files {
                     if let Some(msg) = peer.local_change(&p, dir) {
+                        let key = coalesce_key(&msg);
                         if let Some(mm) = peer.sign_local(msg) {
-                            broadcast(&sender, &cipher, &mm).await;
+                            out.push(Scope::Swarm, key, &mm);
                         }
                     }
                 }
@@ -663,19 +784,19 @@ pub async fn run(
             // later, or isn't a direct neighbor, still sees the request.
             _ = request_tick.tick() => {
                 if let Some(r) = peer.read_request() {
-                    broadcast(&sender, &cipher, &r).await;
+                    out.swarm(&r);
                 }
             }
             // Live admin commands from `riftpipe revoke|grant|approve <dir> <id>`.
             _ = control_tick.tick() => {
                 for cmd in control.poll() {
-                    let out = match cmd {
+                    let msgs = match cmd {
                         crate::sync::control::Command::Revoke(id) => peer.revoke_device(id, dir),
                         crate::sync::control::Command::Grant(id) => peer.grant_device(id, dir),
                         crate::sync::control::Command::Approve(id) => peer.approve_request(id, dir),
                     };
-                    for m in out {
-                        broadcast(&sender, &cipher, &m).await;
+                    for m in &msgs {
+                        out.swarm(m);
                     }
                 }
                 // Retry a failed auth.state save (cheap no-op when nothing changed).
@@ -716,6 +837,32 @@ pub async fn run(
                 let is_neighbor = receiver.neighbors().any(|n| n == id);
                 swap.on_incoming(*id.as_bytes(), is_neighbor, now_ms());
             }
+            // Anti-entropy: note losses, then maybe send our Hello digest to
+            // direct neighbors (they reply with what we lack, or pull back).
+            _ = ae_tick.tick() => {
+                let now = ae_now();
+                let ev = assembler.evictions();
+                if ev != seen_evictions {
+                    eprintln!("[mesh] dropped {} partial message(s) — anti-entropy will repair", ev - seen_evictions);
+                    seen_evictions = ev;
+                    ae.on_loss(now);
+                }
+                let shed = out.q.lock().unwrap().shed();
+                if shed != seen_shed {
+                    eprintln!(
+                        "[mesh] outbound queue over budget — shed {} message(s); anti-entropy will repair",
+                        shed - seen_shed
+                    );
+                    seen_shed = shed;
+                    ae.on_loss(now);
+                }
+                let neighbors: Vec<[u8; 32]> = receiver.neighbors().map(|n| *n.as_bytes()).collect();
+                if ae.poll(now, peer.generation(), &neighbors) {
+                    if let Some(mm) = peer.sign_mesh(peer.hello()) {
+                        out.neighbors(&mm);
+                    }
+                }
+            }
             // Mesh events: remote edits → disk, membership → catch-up + presence.
             ev = receiver.next() => {
                 let ev = match ev {
@@ -727,6 +874,10 @@ pub async fn run(
                 };
                 match ev {
                     Event::Received(m) => {
+                        if blackout.load(std::sync::atomic::Ordering::Relaxed) {
+                            continue;
+                        }
+                        let from = *m.delivered_from.as_bytes();
                         // Open the sealed frame (an outsider's or a corrupt frame
                         // won't decrypt — drop it). Then plain frames pass through
                         // and chunk frames buffer until whole.
@@ -761,15 +912,18 @@ pub async fn run(
                             other => {
                                 let auth_msg =
                                     matches!(other, MeshMsg::Trust(_) | MeshMsg::Request(_) | MeshMsg::Epoch(_));
-                                let out = peer.authorize_and_apply(other, dir);
+                                let ob = peer.authorize_and_apply(other, dir);
                                 // A trust/request/epoch change shows in
                                 // `.riftpipe-auth.json` right away (no-op when the
                                 // snapshot didn't change), not on the next tick.
                                 if auth_msg {
                                     sync_state(peer, dir, &mut last_state);
                                 }
-                                for reply in out.all() {
-                                    broadcast(&sender, &cipher, &reply).await;
+                                if let Some(c) = ob.hello {
+                                    ae.on_hello(ae_now(), from, c.consistent());
+                                }
+                                for (key, r) in ob.keyed_swarm() {
+                                    out.push(Scope::Swarm, key, &r);
                                 }
                             }
                         }
@@ -779,41 +933,38 @@ pub async fn run(
                         // Announce our protocol version BEFORE the Presence —
                         // that ordering is what lets peers deduce "Presence
                         // but no Version = pre-versioning peer".
-                        broadcast(
-                            &sender,
-                            &cipher,
-                            &MeshMsg::Version { id: my_id_bytes, proto: PROTOCOL_VERSION },
-                        )
-                        .await;
+                        out.swarm(&MeshMsg::Version { id: my_id_bytes, proto: PROTOCOL_VERSION });
                         // Catch the new neighbor up: first the trust log and the
                         // epoch announces (so it learns the authorized set and
                         // any wrapped keys — gossip is ephemeral), then our whole
                         // tree. Direct neighbors only.
                         for m in peer.auth_catchup() {
-                            broadcast_neighbors(&sender, &cipher, &m).await;
+                            out.neighbors(&m);
                         }
                         // A restricted peer without the current key asks the
                         // WHOLE swarm: the Admin who can wrap it may not be a
                         // direct neighbor.
                         if let Some(r) = peer.read_request() {
-                            broadcast(&sender, &cipher, &r).await;
+                            out.swarm(&r);
                         }
                         // A Hello makes a one-sided reconnect bidirectional: the
                         // peer replies with what WE lack (e.g. its gap edits
                         // while we were down). iroh-gossip emits NeighborUp only
                         // on the side that sees a new active peer.
                         if let Some(mm) = peer.sign_mesh(peer.hello()) {
-                            broadcast_neighbors(&sender, &cipher, &mm).await;
+                            out.neighbors(&mm);
                         }
+                        ae.on_sent(ae_now());
                         for msg in peer.full_state() {
+                            let key = coalesce_key(&msg);
                             if let Some(mm) = peer.sign_mesh(msg) {
-                                broadcast_neighbors(&sender, &cipher, &mm).await;
+                                out.push(Scope::Neighbors, key, &mm);
                             }
                         }
                         let list: Vec<[u8; 32]> =
                             receiver.neighbors().map(|n| *n.as_bytes()).collect();
                         routing.insert(my_id_bytes, list.clone());
-                        broadcast(&sender, &cipher, &MeshMsg::Presence { id: my_id_bytes, neighbors: list.clone() }).await;
+                        out.swarm(&MeshMsg::Presence { id: my_id_bytes, neighbors: list.clone() });
                         if book.note(*id.as_bytes(), my_id_bytes) {
                             save_peer_book(dir, &book);
                         }
@@ -826,17 +977,18 @@ pub async fn run(
                         let list: Vec<[u8; 32]> =
                             receiver.neighbors().map(|n| *n.as_bytes()).collect();
                         routing.insert(my_id_bytes, list.clone());
-                        broadcast(
-                            &sender,
-                            &cipher,
-                            &MeshMsg::Version { id: my_id_bytes, proto: PROTOCOL_VERSION },
-                        )
-                        .await;
-                        broadcast(&sender, &cipher, &MeshMsg::Presence { id: my_id_bytes, neighbors: list.clone() }).await;
+                        out.swarm(&MeshMsg::Version { id: my_id_bytes, proto: PROTOCOL_VERSION });
+                        out.swarm(&MeshMsg::Presence { id: my_id_bytes, neighbors: list.clone() });
                         rejoin.on_neighbors(list.len(), now_ms());
                         report_status(&mut last_status, list.len(), ever);
                     }
-                    Event::Lagged => {}
+                    Event::Lagged => {
+                        if last_lag_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+                            eprintln!("[mesh] receiver lagged — gossip dropped messages; anti-entropy will repair");
+                            last_lag_log = Some(std::time::Instant::now());
+                        }
+                        ae.on_loss(ae_now());
+                    }
                 }
             }
         }
@@ -1021,5 +1173,35 @@ mod tests {
         assert!(other.ids().is_empty(), "a different topic's book is empty");
 
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A clean shutdown's flush waits for everything queued — including a
+    /// message pushed in the last tick — and gives up after its limit when the
+    /// sender stalls.
+    #[tokio::test]
+    async fn shutdown_flush_sends_everything_queued() {
+        let out = Out::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let _drain = spawn_drain_with(out.clone(), move |_, b| {
+            let tx = tx.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let _ = tx.send(b);
+            }
+        });
+        for i in 0..5u8 {
+            out.swarm(&MeshMsg::Version { id: [i; 32], proto: PROTOCOL_VERSION });
+        }
+        assert!(out.flush(Duration::from_secs(5)).await, "flushed within the limit");
+        let mut got = 0;
+        while rx.try_recv().is_ok() {
+            got += 1;
+        }
+        assert_eq!(got, 5, "every queued message went out before flush returned");
+
+        let stalled = Out::new();
+        let _stuck = spawn_drain_with(stalled.clone(), |_, _| std::future::pending::<()>());
+        stalled.swarm(&MeshMsg::Version { id: [9; 32], proto: PROTOCOL_VERSION });
+        assert!(!stalled.flush(Duration::from_millis(100)).await, "a stalled sender can't hold shutdown");
     }
 }
