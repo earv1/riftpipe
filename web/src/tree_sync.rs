@@ -511,6 +511,19 @@ pub(crate) fn delete(path: &str) {
     });
 }
 
+/// Whether the live sync for the active board holds a tombstone for `path` (`None` if no session
+/// is up — then the durable record decides, see [`crate::file::is_deleted`]).
+pub(crate) fn is_tombstoned(path: &str) -> Option<bool> {
+    let topic = crate::opfs::active_board();
+    if let Some(t) = crate::gossip::try_is_tombstoned(topic, path) {
+        return Some(t);
+    }
+    if topic != page_board_topic() {
+        return None;
+    }
+    SYNC.with(|c| c.borrow().as_ref().map(|s| s.syncer.borrow().is_tombstoned(path)))
+}
+
 /// A unique per-peer agent id (a shared id would corrupt the CRDT).
 fn make_agent() -> String {
     format!("p{:08x}", (js_sys::Math::random() * 4_294_967_296.0) as u32)

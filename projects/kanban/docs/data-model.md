@@ -96,12 +96,14 @@ is in flight. A single comment can be deleted the same way
 changed a file of the card without having seen that content keeps its copy
 and sends it back, so the edited file survives on every peer rather than the
 edit being lost. If only `meta.toml` or a comment was edited, the card still
-doesn't render (it has no `card.md`), so the board lists that ticket as
-**leftovers** ("Deleted card … left files behind") with a **Remove leftovers**
-button, which deletes the rest of `tickets/<id>/` everywhere (a no-op if
-`card.md` has come back). This is never swept automatically: a card that is
-still arriving (its `card.md` not synced yet) looks the same, and an automatic
-cascade would also undo the concurrent edit that just won. Deleting a card or
+doesn't render (it has no `card.md`). When that `card.md` is **tombstoned**
+(the file API's `isDeleted`), the board lists the ticket as **leftovers**
+("Deleted card … left files behind") with a **Remove leftovers** button, which
+deletes the rest of `tickets/<id>/` everywhere (a no-op unless `card.md` is
+still deleted). A `card.md` that is merely missing — not tombstoned — is a card
+still arriving (its other files synced first) and is never listed. Nothing is
+swept automatically: an automatic cascade would undo the concurrent edit that
+just won. Deleting a card or
 a comment asks for confirmation first.
 There is no archive lane or undo.
 

@@ -1989,6 +1989,14 @@ pub(crate) fn try_push_delete(path: &str) -> bool {
     })
 }
 
+/// Whether the active mesh sync holds a tombstone for `path` on board `topic`; `None` if no mesh
+/// sync is active for that board.
+pub(crate) fn try_is_tombstoned(topic: [u8; 32], path: &str) -> Option<bool> {
+    GOSSIP.with(|c| {
+        c.borrow().as_ref().filter(|bs| bs.topic == topic).map(|bs| bs.syncer.borrow().is_tombstoned(path))
+    })
+}
+
 /// Lock the active board (become its author) — the login/auth surface.
 pub(crate) fn active_lock() -> bool {
     GOSSIP.with(|c| c.borrow().as_ref().map(|bs| bs.lock()).unwrap_or(false))

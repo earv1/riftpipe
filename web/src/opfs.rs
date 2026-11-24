@@ -176,6 +176,22 @@ pub async fn remove_path(path: &str) -> Result<bool, JsValue> {
     remove_path_in(&topic, path).await
 }
 
+/// Whether `path`'s durable record on the active board is a tombstone (`DurableKind::Deleted`),
+/// once any queued write for it has landed.
+pub async fn record_is_deleted(path: &str) -> bool {
+    let topic = active_board();
+    writes_settled(topic, Some(path)).await;
+    let Ok(root) = board_root(&topic).await else { return false };
+    let Ok(dir) = subdir(&root, SYNC_DIR, false).await else { return false };
+    let Some(bytes) = read_bytes(&dir, &format!("{}.rec", riftpipe_core::sync::record_name(path))).await else {
+        return false;
+    };
+    matches!(
+        postcard::from_bytes::<DurablePath>(&bytes).map(|r| r.kind),
+        Ok(riftpipe_core::sync::DurableKind::Deleted { .. })
+    )
+}
+
 /// Is there (still) a file at `path` on board `topic`'s tree?
 async fn file_still_there(topic: &[u8; 32], path: &str) -> bool {
     match board_root(topic).await {
@@ -1015,6 +1031,24 @@ mod tests {
         assert_eq!(read_in(&topic, "a.md").await.as_deref(), Some("# doomed\n"), "the file is still there");
         assert_eq!(record_in(&topic, "a.md").await, Some(live), "so its live record stays");
         let _ = JsFuture::from(lock.abort()).await;
+    }
+
+    /// `record_is_deleted` (and so `isDeleted` with no live session) is true only for a tombstone
+    /// record: an absent path or a live record is not deleted.
+    #[wasm_bindgen_test]
+    async fn is_deleted_only_for_a_tombstone() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        set_active_board(topic);
+        assert!(!record_is_deleted("a.md").await, "absent (still arriving, or never existed)");
+        let mut s = Syncer::new("t1");
+        s.local_text("a.md", "# a\n");
+        queue_record(topic, &s.durable("a.md").unwrap());
+        flush_records().await;
+        assert!(!record_is_deleted("a.md").await, "live");
+        queue_record(topic, &deleted_record("a.md"));
+        flush_records().await;
+        assert!(record_is_deleted("a.md").await, "tombstoned");
+        assert!(crate::file::is_deleted("a.md".into()).await, "no live session: the record decides");
     }
 
     /// `queue_record_removal` deletes a path's record.

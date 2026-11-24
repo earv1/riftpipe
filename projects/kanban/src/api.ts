@@ -27,7 +27,7 @@ import {
   meshStatus as wasmMeshStatus,
   meshStats as wasmMeshStats,
 } from "../wasm/pkg/kanban_wasm.js";
-import { list, read, ready, remove, watch, write } from "./fs.ts";
+import { isDeleted, list, read, ready, remove, watch, write } from "./fs.ts";
 import { logEvent, readEvents } from "./events.ts";
 
 // Domain model + types (Board, Card, Comment, CardDetail, getBoard, addCard,
@@ -77,6 +77,7 @@ export * from "./history.ts";
 //   riftpipe.readFile(path)          → a synced file's text (null if absent)
 //   riftpipe.writeFile(path, text)   → write + sync a file (debug / e2e)
 //   riftpipe.deleteFile(path)          → delete + sync a file (debug / e2e)
+//   riftpipe.isDeleted(path)           → is the path tombstoned (deleted), not merely absent?
 export type AuthState = {
   locked: boolean;
   device: string;
@@ -128,6 +129,7 @@ export const auth = {
   readFile: (p: string) => read(p),
   writeFile: (p: string, text: string) => write(p, text),
   deleteFile: (p: string) => remove(p),
+  isDeleted: (p: string) => isDeleted(p),
 };
 
 // Build-time config (Vite env). Set these for a deployed/cross-network build:

@@ -38,6 +38,17 @@ pub async fn delete_file(path: String) -> Result<bool, JsValue> {
     Ok(removed)
 }
 
+/// Whether `path` is known DELETED on the synced tree (a tombstone — this peer or a peer deleted
+/// it), as opposed to merely absent (never existed, or not synced here yet). Asks the live sync
+/// when one is up for the active board, else the path's durable record.
+#[wasm_bindgen(js_name = isDeleted)]
+pub async fn is_deleted(path: String) -> bool {
+    match crate::tree_sync::is_tombstoned(&path) {
+        Some(t) => t,
+        None => crate::opfs::record_is_deleted(&path).await,
+    }
+}
+
 /// Entry names directly under directory `path` (`""` = the tree root), as a JS
 /// array of strings. Empty if the directory doesn't exist.
 #[wasm_bindgen(js_name = listDir)]

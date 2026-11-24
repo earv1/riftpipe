@@ -11,7 +11,7 @@
 // (This was previously Rust — `kanban-wasm`'s handler.rs/format.rs. It moved here
 // so the wasm bundle stays a generic file-sync library with nothing kanban-
 // specific baked in.)
-import { read, write, list, remove, boardId } from "./fs.ts";
+import { read, write, list, remove, isDeleted, boardId } from "./fs.ts";
 import { logEvent } from "./events.ts";
 import { createEditSettler, EDIT_SETTLE_MS } from "./editSettle.ts";
 
@@ -32,10 +32,10 @@ export interface Board {
   title: string;
   columns: string[];
   cards: Card[];
-  /** Ids of `tickets/<id>/` dirs that hold files but no `card.md`: a deleted card whose other
-   *  files a concurrent edit kept (edit beats delete, per file). Shown for the user to clean up —
-   *  never swept automatically, since a card still arriving (its `card.md` not here yet) looks
-   *  the same. */
+  /** Ids of `tickets/<id>/` dirs that hold files but whose `card.md` is DELETED (tombstoned): a
+   *  deleted card whose other files a concurrent edit kept (edit beats delete, per file). Shown
+   *  for the user to clean up, never swept automatically. A dir whose `card.md` is merely
+   *  missing (not tombstoned) is a card still arriving and is not listed. */
   leftovers: string[];
 }
 export interface CardDetail extends Card {
@@ -241,7 +241,9 @@ async function allCards(columns: string[]): Promise<{ cards: Card[]; leftovers: 
     if (id.startsWith(".")) continue;
     const card = await readCardIfPresent(id, defaultCol);
     if (card) cards.push(card);
-    else if ((await filesUnder(`tickets/${id}`)).length > 0) leftovers.push(id);
+    else if ((await isDeleted(`tickets/${id}/card.md`)) && (await filesUnder(`tickets/${id}`)).length > 0) {
+      leftovers.push(id);
+    }
   }
   return { cards, leftovers: leftovers.sort() };
 }
@@ -386,10 +388,11 @@ export async function deleteCard(id: string): Promise<void> {
 }
 
 /** Remove the leftover files of a deleted card (`Board.leftovers`): everything under
- *  tickets/<id>/, meta.toml last. A no-op if the card came back (its card.md is here again). */
+ *  tickets/<id>/, meta.toml last. A no-op unless its card.md is (still) deleted — a card that came
+ *  back, or one still arriving, is never touched. */
 export async function cleanLeftovers(id: string): Promise<void> {
   const dir = `tickets/${id}`;
-  if ((await read(`${dir}/card.md`)) !== null) return;
+  if ((await read(`${dir}/card.md`)) !== null || !(await isDeleted(`${dir}/card.md`))) return;
   for (const p of (await filesUnder(dir)).filter((p) => p !== `${dir}/meta.toml`).sort()) await remove(p);
   await remove(`${dir}/meta.toml`);
 }

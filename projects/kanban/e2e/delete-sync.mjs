@@ -6,8 +6,9 @@
 //   3. B comes back as a late joiner with that stale copy: the card is removed
 //      there too and never comes back anywhere.
 //   4. The CLI deletes a card directory on disk → both browsers drop the card.
-//   5. Leftovers: a ticket dir with files but no card.md (a deleted card whose meta a
-//      concurrent edit kept) shows as a leftover; "Remove leftovers" clears it everywhere.
+//   5. Leftovers: a ticket dir whose card.md is DELETED but whose meta.toml survives (as a
+//      concurrent edit would keep it) is listed, and "Remove leftovers" clears it everywhere; a
+//      dir whose card.md is merely missing (still arriving) is never listed.
 import { chromium } from "playwright";
 import { spawn } from "child_process";
 import { readdirSync, existsSync, readFileSync, rmSync, mkdirSync, writeFileSync } from "fs";
@@ -166,18 +167,39 @@ try {
   await waitGone(b2, KEPT);
   console.log("✓ the CLI's on-disk delete reached both browsers");
 
-  // 8. Leftovers: a ticket dir with a meta.toml but no card.md.
+  // 8a. A ticket dir whose card.md is merely MISSING (still arriving — never deleted) is not a
+  //     leftover: nothing offers to remove it.
+  const ARRIVING = `tk_arriving${rnd}`;
+  mkdirSync(join(NDIR, "tickets", ARRIVING), { recursive: true });
+  writeFileSync(join(NDIR, "tickets", ARRIVING, "meta.toml"), 'column = "Todo"\n');
+  const synced = (pg, p) => pg.waitForFunction((p) => globalThis.riftpipe.readFile(p).then((t) => t !== null), p, { timeout: 60000, polling: 300 });
+  await synced(a, `tickets/${ARRIVING}/meta.toml`);
+  await synced(b2, `tickets/${ARRIVING}/meta.toml`);
+  await sleep(1500);
+  for (const [tag, pg] of [["A", a], ["B", b2]]) {
+    if (await pg.locator(".leftover", { hasText: ARRIVING }).count()) {
+      throw new Error(`${tag} lists a still-arriving card (card.md missing, not deleted) as leftovers`);
+    }
+  }
+  console.log("✓ a card whose card.md is merely missing is not listed as leftovers");
+
+  // 8b. A real leftover: card.md DELETED (the CLI removes just it), meta.toml kept.
   const ORPHAN = `tk_orphan${rnd}`;
   mkdirSync(join(NDIR, "tickets", ORPHAN), { recursive: true });
+  writeFileSync(join(NDIR, "tickets", ORPHAN, "card.md"), `# orphan ${rnd}\n`);
   writeFileSync(join(NDIR, "tickets", ORPHAN, "meta.toml"), 'column = "Todo"\n');
+  await waitCard(a, `orphan ${rnd}`);
+  await waitCard(b2, `orphan ${rnd}`);
+  rmSync(join(NDIR, "tickets", ORPHAN, "card.md"));
   const leftover = (pg) => pg.locator(".leftover", { hasText: ORPHAN });
   await leftover(a).waitFor({ timeout: 60000 });
   await leftover(b2).waitFor({ timeout: 60000 });
-  console.log("✓ both browsers show the leftover ticket dir");
+  console.log("✓ both browsers list the ticket whose card.md was deleted as leftovers");
   await leftover(a).locator(".leftover-clean").click();
   await waitPath(() => !existsSync(join(NDIR, "tickets", ORPHAN, "meta.toml")), "Remove leftovers never reached the CLI's disk");
   await leftover(b2).waitFor({ state: "detached", timeout: 60000 });
   await leftover(a).waitFor({ state: "detached", timeout: 10000 });
+  if (!existsSync(join(NDIR, "tickets", ARRIVING, "meta.toml"))) throw new Error("the still-arriving card's meta.toml was removed");
   console.log("✓ Remove leftovers cleared it on A, B and the CLI");
 
   console.log("PASS: deletes converge across browser+browser+CLI, incl. an offline-at-delete late joiner");

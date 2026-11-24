@@ -5,7 +5,7 @@
 // synced to peers), list a directory, and watch for changes. Nothing here
 // knows what a "board" or "card" is — the kanban model is built on top in
 // `board.ts`, exactly as any other file-based app would build its own.
-import init, { readFile, writeFile as wasmWriteFile, deleteFile as wasmDeleteFile, listDir, activeBoard } from "../wasm/pkg/kanban_wasm.js";
+import init, { readFile, writeFile as wasmWriteFile, deleteFile as wasmDeleteFile, isDeleted as wasmIsDeleted, listDir, activeBoard } from "../wasm/pkg/kanban_wasm.js";
 
 // Initialize the wasm module once, lazily — every file op awaits it, so callers
 // (board.ts and up) never touch init.
@@ -44,6 +44,13 @@ export async function remove(path: string): Promise<boolean> {
   const ok = await wasmDeleteFile(path);
   fireChanged(path);
   return ok;
+}
+
+/** Whether `path` is known DELETED (a tombstone: someone deleted it), as opposed to merely absent
+ *  — never existed, or not synced here yet. */
+export async function isDeleted(path: string): Promise<boolean> {
+  await ready();
+  return await wasmIsDeleted(path);
 }
 
 /** Entry names directly under directory `path` (`""` = tree root); `[]` if absent. */
