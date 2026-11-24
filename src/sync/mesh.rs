@@ -378,11 +378,43 @@ async fn shutdown_signal() {
 struct Out {
     q: Arc<std::sync::Mutex<OutQueue>>,
     wake: Arc<tokio::sync::Notify>,
+    /// The drain is sending a popped message. Set while holding `q`'s lock, so
+    /// "queue empty and not sending" read under that lock means all sent.
+    sending: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// How long a clean shutdown waits for queued messages (e.g. a revoke or grant
+/// issued in the last tick) to go out before the drain is aborted.
+const SHUTDOWN_FLUSH: Duration = Duration::from_secs(2);
 
 impl Out {
     fn new() -> Self {
-        Out { q: Arc::new(std::sync::Mutex::new(OutQueue::new())), wake: Arc::new(tokio::sync::Notify::new()) }
+        Out {
+            q: Arc::new(std::sync::Mutex::new(OutQueue::new())),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            sending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+    /// The next message to send, marking the drain busy while it sends it.
+    fn take(&self) -> Option<(Scope, Vec<Vec<u8>>)> {
+        let mut q = self.q.lock().unwrap();
+        let next = q.pop();
+        self.sending.store(next.is_some(), std::sync::atomic::Ordering::SeqCst);
+        next
+    }
+    fn drained(&self) -> bool {
+        let q = self.q.lock().unwrap();
+        q.is_empty() && !self.sending.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Wait (up to `limit`) until the drain has sent everything queued.
+    async fn flush(&self, limit: Duration) -> bool {
+        tokio::time::timeout(limit, async {
+            while !self.drained() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
     }
     fn push(&self, scope: Scope, key: Option<String>, m: &MeshMsg) {
         self.q.lock().unwrap().push(scope, key, m);
@@ -413,23 +445,36 @@ impl Drop for AbortOnDrop {
 /// it), but it must be VISIBLE — a silently dropped broadcast reads as
 /// "synced" when it isn't.
 fn spawn_drain(sender: GossipSender, cipher: Arc<MeshCipher>, out: Out) -> AbortOnDrop {
+    spawn_drain_with(out, move |scope, b| {
+        let (sender, cipher) = (sender.clone(), cipher.clone());
+        async move {
+            let sealed = cipher.seal(&b);
+            let n = sealed.len();
+            let r = match scope {
+                Scope::Swarm => sender.broadcast(sealed.into()).await,
+                Scope::Neighbors => sender.broadcast_neighbors(sealed.into()).await,
+            };
+            if let Err(e) = r {
+                eprintln!("[mesh] broadcast of {n} bytes failed: {e}");
+            }
+        }
+    })
+}
+
+/// The drain loop over any frame sender (the gossip one, or a test's).
+fn spawn_drain_with<F, Fut>(out: Out, send: F) -> AbortOnDrop
+where
+    F: Fn(Scope, Vec<u8>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
     AbortOnDrop(tokio::spawn(async move {
         loop {
-            let next = out.q.lock().unwrap().pop();
-            let Some((scope, frames)) = next else {
+            let Some((scope, frames)) = out.take() else {
                 out.wake.notified().await;
                 continue;
             };
             for b in frames {
-                let sealed = cipher.seal(&b);
-                let n = sealed.len();
-                let r = match scope {
-                    Scope::Swarm => sender.broadcast(sealed.into()).await,
-                    Scope::Neighbors => sender.broadcast_neighbors(sealed.into()).await,
-                };
-                if let Err(e) = r {
-                    eprintln!("[mesh] broadcast of {n} bytes failed: {e}");
-                }
+                send(scope, b).await;
             }
         }
     }))
@@ -593,6 +638,9 @@ pub async fn run(
         tokio::select! {
             _ = &mut shutdown => {
                 eprintln!("[mesh] shutting down");
+                if !out.flush(SHUTDOWN_FLUSH).await {
+                    eprintln!("[mesh] shutdown: queued messages not all sent within {SHUTDOWN_FLUSH:?}");
+                }
                 return Ok(());
             }
             // Local edits → broadcast (the watcher feeds paths into `rx`).
@@ -936,5 +984,35 @@ mod tests {
         assert!(other.ids().is_empty(), "a different topic's book is empty");
 
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A clean shutdown's flush waits for everything queued — including a
+    /// message pushed in the last tick — and gives up after its limit when the
+    /// sender stalls.
+    #[tokio::test]
+    async fn shutdown_flush_sends_everything_queued() {
+        let out = Out::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let _drain = spawn_drain_with(out.clone(), move |_, b| {
+            let tx = tx.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let _ = tx.send(b);
+            }
+        });
+        for i in 0..5u8 {
+            out.swarm(&MeshMsg::Version { id: [i; 32], proto: PROTOCOL_VERSION });
+        }
+        assert!(out.flush(Duration::from_secs(5)).await, "flushed within the limit");
+        let mut got = 0;
+        while rx.try_recv().is_ok() {
+            got += 1;
+        }
+        assert_eq!(got, 5, "every queued message went out before flush returned");
+
+        let stalled = Out::new();
+        let _stuck = spawn_drain_with(stalled.clone(), |_, _| std::future::pending::<()>());
+        stalled.swarm(&MeshMsg::Version { id: [9; 32], proto: PROTOCOL_VERSION });
+        assert!(!stalled.flush(Duration::from_millis(100)).await, "a stalled sender can't hold shutdown");
     }
 }
