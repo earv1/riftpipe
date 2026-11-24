@@ -176,6 +176,14 @@ pub async fn remove_path(path: &str) -> Result<bool, JsValue> {
     remove_path_in(&topic, path).await
 }
 
+/// Is there (still) a file at `path` on board `topic`'s tree?
+async fn file_still_there(topic: &[u8; 32], path: &str) -> bool {
+    match board_root(topic).await {
+        Ok(root) => file_exists_in(&root, path).await,
+        Err(_) => false,
+    }
+}
+
 /// Is there a file at `path` under `root`?
 async fn file_exists_in(root: &FileSystemDirectoryHandle, path: &str) -> bool {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -395,12 +403,19 @@ async fn drain_writes() {
             next
         });
         let Some(((topic, path), w)) = next else { break };
+        let mut record = w.record;
         match &w.file {
             Some(FileOp::Write(bytes)) => {
                 let _ = write_path_in(&topic, &path, bytes).await;
             }
             Some(FileOp::Remove) => {
-                let _ = remove_path_in(&topic, &path).await;
+                if !matches!(remove_path_in(&topic, &path).await, Ok(true)) && file_still_there(&topic, &path).await {
+                    // The file couldn't be removed: keep its live record (a `Deleted` record next
+                    // to a present file would restore as a re-creation, overruling the delete for
+                    // every peer). A restart re-learns the delete from peers.
+                    web_sys::console::warn_1(&format!("[opfs] could not delete {path}; keeping its record").into());
+                    record = None;
+                }
             }
             None => {}
         }
@@ -408,7 +423,7 @@ async fn drain_writes() {
             f();
         }
         let name = format!("{}.rec", riftpipe_core::sync::record_name(&path));
-        match &w.record {
+        match &record {
             Some(RecordOp::Write(rec)) => {
                 if let Ok(root) = board_root(&topic).await {
                     if let Ok(dir) = subdir(&root, SYNC_DIR, true).await {
@@ -973,6 +988,33 @@ mod tests {
         flush_records().await;
         assert!(read_in(&topic, "a.md").await.is_none(), "the file is removed");
         assert_eq!(record_in(&topic, "a.md").await, Some(rec));
+    }
+
+    /// A queued removal that fails (the file is locked by an open writable) keeps the file's
+    /// live record: a `Deleted` record next to a present file would restore as a re-creation.
+    #[wasm_bindgen_test]
+    async fn failed_remove_keeps_the_live_record() {
+        let topic = riftpipe_core::crypto::generate_secret();
+        write_path_in(&topic, "a.md", b"# doomed\n").await.unwrap();
+        let mut s = Syncer::new("k1");
+        s.local_text("a.md", "# doomed\n");
+        let live = s.durable("a.md").unwrap();
+        queue_record(topic, &live);
+        flush_records().await;
+
+        let root = board_root(&topic).await.unwrap();
+        let handle: FileSystemFileHandle = JsFuture::from(root.get_file_handle("a.md")).await.unwrap().unchecked_into();
+        let lock: FileSystemWritableFileStream = JsFuture::from(handle.create_writable()).await.unwrap().unchecked_into();
+        assert!(
+            JsFuture::from(root.remove_entry("a.md")).await.is_err(),
+            "precondition: an open writable blocks removal"
+        );
+        queue_removed_file(topic, "a.md".into(), || {});
+        queue_record(topic, &deleted_record("a.md"));
+        flush_records().await;
+        assert_eq!(read_in(&topic, "a.md").await.as_deref(), Some("# doomed\n"), "the file is still there");
+        assert_eq!(record_in(&topic, "a.md").await, Some(live), "so its live record stays");
+        let _ = JsFuture::from(lock.abort()).await;
     }
 
     /// `queue_record_removal` deletes a path's record.
