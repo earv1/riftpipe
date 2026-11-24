@@ -759,7 +759,15 @@ pub async fn run(
                             // SYNCED:{path}, and runs epoch housekeeping). Replies
                             // come back already wrapped for the wire.
                             other => {
+                                let auth_msg =
+                                    matches!(other, MeshMsg::Trust(_) | MeshMsg::Request(_) | MeshMsg::Epoch(_));
                                 let out = peer.authorize_and_apply(other, dir);
+                                // A trust/request/epoch change shows in
+                                // `.riftpipe-auth.json` right away (no-op when the
+                                // snapshot didn't change), not on the next tick.
+                                if auth_msg {
+                                    sync_state(peer, dir, &mut last_state);
+                                }
                                 for reply in out.all() {
                                     broadcast(&sender, &cipher, &reply).await;
                                 }
