@@ -66,6 +66,20 @@ try {
   }
   console.log("✓ library auth events logged on A:", JSON.stringify(kinds(aEvents).filter((k) => k.startsWith("auth"))));
 
+  // Authorship: grant is authored by the approver (A) and names the approved
+  // device (B) as `target` — event data can't overwrite `device`.
+  const aId = await a.evaluate(() => window.riftpipe.deviceId());
+  const bId = await b.evaluate(() => window.riftpipe.deviceId());
+  const grant = aEvents.find((e) => e.kind === "auth.grant");
+  if (grant.device !== aId || grant.target !== bId) {
+    fail(`auth.grant should be {device: A, target: B}, got ${JSON.stringify(grant)} (A ${aId.slice(0, 8)}, B ${bId.slice(0, 8)})`);
+  }
+  const claim = aEvents.find((e) => e.kind === "auth.claim");
+  if (claim.device !== aId) fail(`auth.claim should be authored by A, got ${JSON.stringify(claim)}`);
+  const req = (await events(b)).find((e) => e.kind === "auth.request" && e.device === bId);
+  if (!req) fail("B's auth.request should be authored by B");
+  console.log("✓ grant names the right devices: device=A (approver), target=B");
+
   // Cross-peer merge: B's history should include A's card + auth events, plus
   // B's own auth.request, plus mesh.merge (B received A's files).
   const bEvents = await events(b);
@@ -80,6 +94,19 @@ try {
   const ts = bEvents.map((e) => e.ts);
   if (ts.join("|") !== [...ts].sort().join("|")) fail("events not time-sorted");
   console.log("✓ B's merged cross-peer history:", JSON.stringify(bk), `from ${devices.size} devices`);
+
+  // Revoke: authored by A, `target` = the removed device B.
+  const revokeBtn = a.locator(".member", { hasText: bId.slice(0, 8) }).locator(".revoke-btn");
+  await revokeBtn.waitFor({ timeout: 8000 });
+  await revokeBtn.click();
+  let revoke = null;
+  for (let k = 0; k < 25 && !revoke; k++) {
+    revoke = (await events(a)).find((e) => e.kind === "auth.revoke") ?? null;
+    if (!revoke) await wait(200);
+  }
+  if (!revoke) fail("A should log auth.revoke after removing B");
+  if (revoke.device !== aId || revoke.target !== bId) fail(`auth.revoke should be {device: A, target: B}, got ${JSON.stringify(revoke)}`);
+  console.log("✓ revoke names the right devices: device=A (remover), target=B");
 
   console.log("\nPASS — library event log records app + auth + merge events and merges across peers");
 } finally {

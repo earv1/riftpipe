@@ -26,8 +26,8 @@ import {
   linkWithPasskey,
   meshStatus as wasmMeshStatus,
 } from "../wasm/pkg/kanban_wasm.js";
-import { ready, watch, read, write, list } from "./fs.ts";
-import { readEvents } from "./events.ts";
+import { list, read, ready, watch, write } from "./fs.ts";
+import { logEvent, readEvents } from "./events.ts";
 
 // Domain model + types (Board, Card, Comment, CardDetail, getBoard, addCard,
 // patchCard, getCardDetail, addComment, …) — over the file API.
@@ -53,6 +53,10 @@ export function onMeshStatus(cb: (s: MeshStatus) => void): void {
     }
   });
 }
+// The shared, live history store (Activity panel + per-card History) and the
+// pure history helpers (labels, relative time, describe, filters) it's built on.
+export { events as historyEvents, now as historyNow, startHistory } from "./historyStore.ts";
+export * from "./history.ts";
 
 // The auth surface, backed entirely by the lib (wasm). Also on window.riftpipe
 // for console use:
@@ -67,6 +71,10 @@ export function onMeshStatus(cb: (s: MeshStatus) => void): void {
 //   riftpipe.passkeySupported()  → can this page use passkey device-linking (secure domain origin)?
 //   riftpipe.claimWithPasskey()  → claim the board (if unclaimed) and register a passkey — no approve click for other devices
 //   riftpipe.linkWithPasskey()   → join a claimed board by asserting its registered passkey — no approve click
+//   riftpipe.logEvent(kind, data)    → append a debug event to this device's log
+//   riftpipe.listDir(path)           → entry names under a synced tree path
+//   riftpipe.readFile(path)          → a synced file's text (null if absent)
+//   riftpipe.writeFile(path, text)   → write + sync a file (debug / e2e)
 export type AuthState = {
   locked: boolean;
   device: string;
@@ -111,9 +119,10 @@ export const auth = {
   claimWithPasskey: () => claimWithPasskey(),
   linkWithPasskey: () => linkWithPasskey(),
   meshStatus: () => meshStatus(),
-  readFile: (p: string) => read(p),
-  writeFile: (p: string, c: string) => write(p, c),
+  logEvent: (kind: string, data: Record<string, unknown> = {}) => logEvent(kind, data),
   listDir: (p: string) => list(p),
+  readFile: (p: string) => read(p),
+  writeFile: (p: string, text: string) => write(p, text),
 };
 
 // Build-time config (Vite env). Set these for a deployed/cross-network build:

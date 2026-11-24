@@ -11,8 +11,9 @@
 // (This was previously Rust — `kanban-wasm`'s handler.rs/format.rs. It moved here
 // so the wasm bundle stays a generic file-sync library with nothing kanban-
 // specific baked in.)
-import { read, write, list } from "./fs.ts";
+import { read, write, list, boardId } from "./fs.ts";
 import { logEvent } from "./events.ts";
+import { createEditSettler, EDIT_SETTLE_MS } from "./editSettle.ts";
 
 export interface Card {
   id: string;
@@ -276,6 +277,28 @@ export async function addCard(column: string, title: string): Promise<Card> {
   return { id, title: finalTitle, column: col, position: maxPos + 1, done: false };
 }
 
+/** Live saves fire per keystroke; history records ONE card.edit per field once
+*  typing settles (`editSettle.ts`) — on the board it was typed on, or not at all. */
+export { EDIT_SETTLE_MS };
+const editSettler = createEditSettler({
+  settleMs: EDIT_SETTLE_MS,
+  board: boardId,
+  log: (data) => logEvent("card.edit", data),
+});
+
+/** Write pending (unsettled) card.edit events now, before the page switches
+ *  boards or goes away. */
+export function flushPendingEdits(): Promise<void> {
+  return editSettler.flush();
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", () => void flushPendingEdits());
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") void flushPendingEdits();
+  });
+}
+
 export async function patchCard(
   id: string,
   patch: Partial<Card> & { description?: string },
@@ -302,9 +325,9 @@ export async function patchCard(
   // Record semantic history — the same events the old server logged.
   if (card.column !== before.column) await logEvent("card.move", { id, from: before.column, to: card.column });
   if (card.done !== before.done) await logEvent("card.check", { id, done: card.done });
-  if (card.title !== before.title) await logEvent("card.edit", { id, field: "title", value: card.title });
+  if (card.title !== before.title) editSettler.queue(id, "title", before.title, card.title);
   if (patch.description !== undefined && description !== oldDescription) {
-    await logEvent("card.edit", { id, field: "description" });
+    editSettler.queue(id, "description", oldDescription, description);
   }
   return card;
 }

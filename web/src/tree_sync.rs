@@ -53,11 +53,10 @@ fn opfs_on_merged(on_change: js_sys::Function, board: [u8; 32]) -> Rc<dyn Fn(Str
         // Queued (not spawned) so the path's record, queued right after by the
         // mesh driver, is written AFTER this file — see `opfs::queue_merged_file`.
         crate::opfs::queue_merged_file(board, path, bytes, move || {
-            // Record the merge for history/debugging — but NOT for the event
-            // files themselves, or logging a merged log would recurse forever.
-            if !p.starts_with("events/") {
-                crate::events::log("mesh.merge", serde_json::json!({ "path": p }));
-            }
+            // Record the merge for history/debugging (coalesced) — but events/
+            // paths are skipped inside log_merge, or logging a merged log
+            // would recurse forever.
+            crate::events::log_merge(&p);
             dispatch_file_changed(&p);
             let _ = cb.call0(&JsValue::NULL);
         });
@@ -299,8 +298,7 @@ pub fn device_id() -> String {
 pub fn lock_board() -> bool {
     let ok = crate::gossip::active_lock();
     if ok {
-        let device = load_or_create_device().id().iter().map(|b| format!("{b:02x}")).collect::<String>();
-        crate::events::log("auth.claim", serde_json::json!({ "device": device }));
+        crate::events::log("auth.claim", serde_json::json!({}));
     }
     ok
 }
@@ -314,7 +312,7 @@ pub fn grant_device(hex_id: String) -> bool {
         Some(id) => {
             let ok = crate::gossip::active_grant(id);
             if ok {
-                crate::events::log("auth.grant", serde_json::json!({ "device": hex_id }));
+                crate::events::log("auth.grant", serde_json::json!({ "target": hex_id }));
             }
             ok
         }
@@ -331,7 +329,7 @@ pub fn revoke_device(hex_id: String) -> bool {
         Some(id) => {
             let ok = crate::gossip::active_revoke(id);
             if ok {
-                crate::events::log("auth.revoke", serde_json::json!({ "device": hex_id }));
+                crate::events::log("auth.revoke", serde_json::json!({ "target": hex_id }));
             }
             ok
         }
@@ -353,8 +351,7 @@ pub fn board_members() -> String {
 pub fn request_access() -> bool {
     let ok = crate::gossip::active_request_access();
     if ok {
-        let device = load_or_create_device().id().iter().map(|b| format!("{b:02x}")).collect::<String>();
-        crate::events::log("auth.request", serde_json::json!({ "device": device }));
+        crate::events::log("auth.request", serde_json::json!({}));
     }
     ok
 }
