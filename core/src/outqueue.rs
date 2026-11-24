@@ -233,6 +233,75 @@ mod tests {
         );
     }
 
+    fn delete(path: &str, ids: &[u64]) -> SyncMsg {
+        SyncMsg::Delete { path: path.into(), ids: ids.to_vec(), seen: vec![], origin: None, vv: vec![], version: 1 }
+    }
+
+    /// Push `msg` keyed by [`coalesce_key`], as the drivers do.
+    fn push_keyed(q: &mut OutQueue, msg: SyncMsg) {
+        let key = coalesce_key(&msg);
+        q.push(Scope::Swarm, key, &MeshMsg::Sync(msg));
+    }
+
+    #[test]
+    fn newer_delete_replaces_queued_one_but_never_crosses_kinds() {
+        let text = SyncMsg::TextDelta { path: "a".into(), ops: vec![1, 2, 3], vv: vec![], origin: None };
+        let mut q = OutQueue::new();
+        push_keyed(&mut q, SyncMsg::Lww { path: "a".into(), version: 1, bytes: vec![0; 10] });
+        push_keyed(&mut q, delete("a", &[7]));
+        push_keyed(&mut q, SyncMsg::TextDelta { path: "a".into(), ops: vec![1, 2, 3], vv: vec![], origin: None });
+        push_keyed(&mut q, delete("a", &[7, 9]));
+
+        let popped: Vec<_> = std::iter::from_fn(|| q.pop().map(|(_, f)| f)).collect();
+        assert_eq!(
+            popped,
+            vec![
+                encode_mesh_frames(&lww("a", 1)),
+                encode_mesh_frames(&MeshMsg::Sync(text)),
+                encode_mesh_frames(&MeshMsg::Sync(delete("a", &[7, 9]))),
+            ],
+            "the re-assert replaced the older Delete; the Lww and TextDelta stay, in order"
+        );
+        assert_eq!(q.coalesced(), 1);
+    }
+
+    #[test]
+    fn restore_is_never_coalesced_or_reordered() {
+        let mut q = OutQueue::new();
+        push_keyed(&mut q, delete("p", &[1]));
+        push_keyed(&mut q, SyncMsg::Restore { path: "p".into(), ids: vec![1] });
+        push_keyed(&mut q, delete("p", &[2]));
+
+        let popped: Vec<_> = std::iter::from_fn(|| q.pop().map(|(_, f)| f)).collect();
+        assert_eq!(
+            popped,
+            vec![
+                encode_mesh_frames(&MeshMsg::Sync(delete("p", &[1]))),
+                encode_mesh_frames(&MeshMsg::Sync(SyncMsg::Restore { path: "p".into(), ids: vec![1] })),
+                encode_mesh_frames(&MeshMsg::Sync(delete("p", &[2]))),
+            ],
+        );
+        assert_eq!(q.coalesced(), 0, "a fresh deletion (new first id) never coalesces with the old one");
+    }
+
+    #[test]
+    fn deletes_are_sheddable() {
+        let mut q = OutQueue::with_max_bytes(3_000);
+        let big_delete = |i: u64| SyncMsg::Delete {
+            path: format!("f{i}"),
+            ids: vec![i],
+            seen: vec![[0; 32]; 16],
+            origin: None,
+            vv: (0..40).map(|n| (format!("agent-{n:04}"), n)).collect(),
+            version: 1,
+        };
+        for i in 0..6 {
+            push_keyed(&mut q, big_delete(i));
+        }
+        assert!(q.shed() >= 1, "over budget, a queued Delete is shed like any content");
+        assert!(q.bytes() <= 3_000);
+    }
+
     #[test]
     fn version_is_never_shed() {
         let mut q = OutQueue::with_max_bytes(5_000);
