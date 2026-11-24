@@ -21,10 +21,13 @@ WORK="$(mktemp -d)"
 FOUNDER="$WORK/founder"; MEMBER="$WORK/member"; VICTIM="$WORK/victim"
 mkdir -p "$FOUNDER" "$MEMBER" "$VICTIM"
 PIDS=()
-cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; rm -rf "$WORK"; }
-trap cleanup EXIT
-
 fail=0
+# On failure the work dir (dirs + full logs) is kept for inspection.
+cleanup() {
+  for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+  if [ "$fail" = 0 ]; then rm -rf "$WORK"; else echo "kept $WORK (full logs: $WORK/*.log)"; fi
+}
+trap cleanup EXIT
 
 B_ID="$("$BIN" device-id "$MEMBER")"
 C_ID="$("$BIN" device-id "$VICTIM")"

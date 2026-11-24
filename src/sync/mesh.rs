@@ -10,6 +10,9 @@
 //!   (on a restricted board content travels as epoch-`Sealed`; see `TreePeer`)
 //! - `NeighborUp` → trust log + epoch announces, our whole tree (`full_state`), a
 //!   `Hello` (so a one-sided reconnect also pulls what WE lack), and a `Presence`
+//! - a `Hello`'s replies go to the whole swarm (the browser still sends them
+//!   neighbors-only): iroh-gossip's neighbors scope misses a peer plumtree holds as
+//!   lazy — see `tree::Outbound`
 //! - `NeighborDown` → drop the neighbor + re-broadcast `Presence`; total neighbor
 //!   loss starts a backoff `Rejoin` (re-dials the bootstrap + persisted `PeerBook`)
 //! - local file change → `.md` as text CRDT, else LWW with a ms timestamp
@@ -757,11 +760,8 @@ pub async fn run(
                             // come back already wrapped for the wire.
                             other => {
                                 let out = peer.authorize_and_apply(other, dir);
-                                for reply in out.swarm {
+                                for reply in out.all() {
                                     broadcast(&sender, &cipher, &reply).await;
-                                }
-                                for reply in out.neighbors {
-                                    broadcast_neighbors(&sender, &cipher, &reply).await;
                                 }
                             }
                         }
