@@ -162,6 +162,18 @@ pub enum SyncMsg {
     StratDelete { path: String, ids: Vec<u64>, seen: Vec<[u8; 32]> },
 }
 
+/// How a peer's `Hello` compares to our state (anti-entropy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HelloCmp {
+    pub we_ahead: bool,
+    pub they_ahead: bool,
+}
+impl HelloCmp {
+    pub fn consistent(&self) -> bool {
+        !self.we_ahead && !self.they_ahead
+    }
+}
+
 impl SyncMsg {
     /// Replies to this message only matter to its sender's neighborhood: a `Hello`
     /// is sent to direct neighbors only, so drivers send its replies (up to the
@@ -464,6 +476,9 @@ pub struct Syncer {
     /// Per structural path: the LWW `(version, bytes)` — bytes cached so a new mesh
     /// neighbor can be caught up with them (`full_state`).
     lww: HashMap<String, (u64, Vec<u8>)>,
+    /// Bumped whenever held state actually changes — drivers feed it to
+    /// `AntiEntropy::poll`.
+    generation: u64,
 }
 
 impl Syncer {
@@ -475,7 +490,12 @@ impl Syncer {
             resync: HashMap::new(),
             parked: HashSet::new(),
             lww: HashMap::new(),
+            generation: 0,
         }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn doc(&mut self, path: &str) -> &mut EgWalkerText {
@@ -510,6 +530,54 @@ impl Syncer {
         SyncMsg::Hello { versions, lww_versions }
     }
 
+    /// How `msg` (expected to be a `Hello`) compares to our own state —
+    /// `None` unless `msg` is a `Hello`.
+    pub fn compare_hello(&self, msg: &SyncMsg) -> Option<HelloCmp> {
+        let SyncMsg::Hello { versions, lww_versions } = msg else { return None };
+        let mut cmp = HelloCmp::default();
+        let their: HashMap<String, Vv> = versions.iter().cloned().collect();
+
+        // Text, their side.
+        for (path, vv) in &their {
+            if self.parked.contains(path) {
+                continue;
+            }
+            match self.docs.get(path) {
+                None => {
+                    if !vv.is_empty() {
+                        cmp.they_ahead = true;
+                    }
+                }
+                Some(doc) => {
+                    if vv.iter().any(|(a, s)| !doc.knows(a, *s)) {
+                        cmp.they_ahead = true;
+                    }
+                }
+            }
+        }
+        // Text, our side.
+        for (path, doc) in &self.docs {
+            let their_vv = their.get(path).cloned().unwrap_or_default();
+            if doc.has_ops_since(&their_vv) {
+                cmp.we_ahead = true;
+            }
+        }
+        // LWW, their side.
+        let their_lww: HashMap<String, u64> = lww_versions.iter().cloned().collect();
+        for (path, v) in &their_lww {
+            if self.lww.get(path).is_none_or(|(mine, _)| v > mine) {
+                cmp.they_ahead = true;
+            }
+        }
+        // LWW, our side.
+        for (path, (mine, _)) in &self.lww {
+            if their_lww.get(path).is_none_or(|t| mine > t) {
+                cmp.we_ahead = true;
+            }
+        }
+        Some(cmp)
+    }
+
     /// The cached LWW entries a peer with inventory `their` (path → version)
     /// needs: every entry it lacks or holds an older version of. LWW-safe by
     /// construction — the receiver's `apply(Lww)` still drops anything that
@@ -530,8 +598,16 @@ impl Syncer {
     /// new ops to send, or `None` if the peer already has everything.
     pub fn local_text(&mut self, path: &str, content: &str) -> Option<SyncMsg> {
         let peer = self.peer_vv.get(path).cloned().unwrap_or_default();
-        let doc = self.doc(path);
-        doc.edit_to(content);
+        let changed = {
+            let doc = self.doc(path);
+            let before = doc.version();
+            doc.edit_to(content);
+            doc.version() != before
+        };
+        if changed {
+            self.generation += 1;
+        }
+        let doc = self.docs.get(path).expect("doc() just ensured it");
         let ops = doc.ops_since(&peer)?;
         let vv = doc.version_vector();
         let origin = doc.origin();
@@ -573,6 +649,7 @@ impl Syncer {
         let entry = self.lww.entry(path.to_string()).or_insert((0, Vec::new()));
         entry.0 = now.max(entry.0 + 1);
         entry.1 = bytes.clone();
+        self.generation += 1;
         SyncMsg::Lww { path: path.to_string(), version: entry.0, bytes }
     }
 
@@ -616,6 +693,7 @@ impl Syncer {
                 }
                 self.docs.insert(rec.path.clone(), doc);
                 if unchanged {
+                    self.generation += 1;
                     return Restored::Clean;
                 }
                 match self.local_text(&rec.path, &String::from_utf8_lossy(file)) {
@@ -629,6 +707,7 @@ impl Syncer {
                 }
                 if unchanged {
                     self.lww.insert(rec.path, (version, file.to_vec()));
+                    self.generation += 1;
                     return Restored::Clean;
                 }
                 self.lww.insert(rec.path.clone(), (version, Vec::new()));
@@ -684,6 +763,7 @@ impl Syncer {
                             if fresh.merge(&ops) {
                                 let content = fresh.content().into_bytes();
                                 self.docs.insert(path.clone(), fresh);
+                                self.generation += 1;
                                 self.advance_peer_vv(&path, &vv);
                                 return (Some((path, content)), Vec::new());
                             }
@@ -694,6 +774,7 @@ impl Syncer {
                         return (None, Vec::new());
                     }
                 }
+                let before = self.docs.get(&path).map(|d| d.version());
                 if !self.doc(&path).merge(&ops) {
                     // Missing a causal ancestor (or corrupt bytes). Ask for a full
                     // self-contained resync; suppress repeats while it's pending so
@@ -725,6 +806,10 @@ impl Syncer {
                 }
                 self.resync.remove(&path);
                 self.parked.remove(&path); // any successful merge un-parks
+                let after = self.docs.get(&path).map(|d| d.version());
+                if after != before {
+                    self.generation += 1;
+                }
                 let content = self.doc(&path).content().into_bytes();
                 self.advance_peer_vv(&path, &vv);
                 (Some((path, content)), Vec::new())
@@ -746,6 +831,7 @@ impl Syncer {
                 if version > entry.0 {
                     entry.0 = version;
                     entry.1 = bytes.clone();
+                    self.generation += 1;
                     (Some((path, bytes)), Vec::new())
                 } else {
                     (None, Vec::new())
@@ -1785,5 +1871,135 @@ mod tests {
         assert!(n.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_eq!(n, record_name("tickets/tk_1/card.md"));
         assert_ne!(record_name("a"), record_name("b"));
+    }
+
+    #[test]
+    fn compare_hello_detects_each_direction() {
+        let mut a = Syncer::new("a");
+        let mut b = Syncer::new("b");
+        sync(&mut a, &mut b);
+        assert!(a.compare_hello(&b.hello()).unwrap().consistent());
+        assert!(b.compare_hello(&a.hello()).unwrap().consistent());
+
+        a.local_text("n.md", "x\ny");
+        assert_eq!(
+            b.compare_hello(&a.hello()),
+            Some(HelloCmp { we_ahead: false, they_ahead: true })
+        );
+        assert_eq!(
+            a.compare_hello(&b.hello()),
+            Some(HelloCmp { we_ahead: true, they_ahead: false })
+        );
+
+        a.local_lww("m.toml", b"x".to_vec(), 100);
+        assert_eq!(
+            b.compare_hello(&a.hello()),
+            Some(HelloCmp { we_ahead: false, they_ahead: true })
+        );
+        assert_eq!(
+            a.compare_hello(&b.hello()),
+            Some(HelloCmp { we_ahead: true, they_ahead: false })
+        );
+
+        sync(&mut a, &mut b);
+        assert!(a.compare_hello(&b.hello()).unwrap().consistent());
+        assert!(b.compare_hello(&a.hello()).unwrap().consistent());
+
+        assert!(a.compare_hello(&SyncMsg::Resync { path: "x".into() }).is_none());
+    }
+
+    #[test]
+    fn compare_hello_ignores_parked_paths() {
+        let mut probe = EgWalkerText::new("s");
+        probe.edit_to("one\n");
+        let v1 = probe.version();
+        probe.edit_to("one\ntwo\n");
+        let bad = |probe: &EgWalkerText| SyncMsg::TextDelta {
+            path: "note.md".into(),
+            ops: probe.encode_delta(&v1),
+            vv: probe.version_vector(),
+            origin: probe.origin(),
+        };
+
+        let mut dst = Syncer::new("d");
+        let (_, first) = dst.apply(bad(&probe));
+        assert!(matches!(first.as_slice(), [SyncMsg::Resync { .. }]));
+        let mut fed = 0;
+        while dst.parked_paths().is_empty() {
+            dst.apply(bad(&probe));
+            fed += 1;
+            assert!(fed < 32, "must park after the cap, not loop forever");
+        }
+        assert_eq!(dst.parked_paths(), vec!["note.md".to_string()]);
+
+        let mut src = Syncer::new("s");
+        src.local_text("note.md", "one\n");
+        src.local_text("note.md", "one\ntwo\n");
+
+        let cmp = dst.compare_hello(&src.hello()).unwrap();
+        assert!(!cmp.they_ahead, "a parked path is ignored by compare_hello");
+    }
+
+    #[test]
+    fn independent_same_path_docs_are_inconsistent_both_ways() {
+        let mut a = Syncer::new("a");
+        let mut b = Syncer::new("b");
+        a.local_text("index.md", "# A\n");
+        b.local_text("index.md", "# B\n");
+        let ab = a.compare_hello(&b.hello()).unwrap();
+        assert!(ab.we_ahead && ab.they_ahead);
+        let ba = b.compare_hello(&a.hello()).unwrap();
+        assert!(ba.we_ahead && ba.they_ahead);
+    }
+
+    #[test]
+    fn generation_moves_only_on_real_change() {
+        let mut a = Syncer::new("a");
+        let g0 = a.generation();
+        a.local_text("n.md", "hello");
+        assert!(a.generation() > g0, "new content bumps generation");
+        let g1 = a.generation();
+        a.local_text("n.md", "hello");
+        assert_eq!(a.generation(), g1, "same content does not bump");
+
+        let mut b = Syncer::new("b");
+        let gb0 = b.generation();
+        b.local_lww("m.toml", b"x".to_vec(), 100);
+        assert!(b.generation() > gb0, "local_lww always bumps");
+
+        let lww = || SyncMsg::Lww { path: "m.toml".into(), version: 100, bytes: b"x".to_vec() };
+        let mut c = Syncer::new("c");
+        let gc0 = c.generation();
+        c.apply(lww());
+        assert!(c.generation() > gc0, "a newer Lww bumps on apply");
+        let gc1 = c.generation();
+        c.apply(lww());
+        assert_eq!(c.generation(), gc1, "applying the same Lww twice bumps only once");
+        let stale = SyncMsg::Lww { path: "m.toml".into(), version: 1, bytes: b"y".to_vec() };
+        c.apply(stale);
+        assert_eq!(c.generation(), gc1, "a stale Lww does not bump");
+
+        let mut src = Syncer::new("s");
+        let mut dst = Syncer::new("t");
+        src.local_text("doc.md", "one").unwrap();
+        let ops = src.docs["doc.md"].encode_full();
+        let delta = |ops: &[u8]| SyncMsg::TextDelta {
+            path: "doc.md".into(),
+            ops: ops.to_vec(),
+            vv: Vec::new(),
+            origin: None,
+        };
+        let gd0 = dst.generation();
+        dst.apply(delta(&ops));
+        assert!(dst.generation() > gd0, "a TextDelta with new ops bumps");
+        let gd1 = dst.generation();
+        dst.apply(delta(&ops));
+        assert_eq!(dst.generation(), gd1, "applying it a second time does not bump");
+
+        let g_before_hello = dst.generation();
+        let _ = dst.hello();
+        assert_eq!(dst.generation(), g_before_hello, "hello() never bumps");
+        dst.apply(src.hello());
+        assert_eq!(dst.generation(), g_before_hello, "apply(Hello) never bumps");
     }
 }

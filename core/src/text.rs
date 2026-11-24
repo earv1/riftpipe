@@ -166,7 +166,7 @@ impl EgWalkerText {
     /// everything after it. `None` when they're already caught up (so we send
     /// nothing); the full history when their vector is empty (a fresh peer). This
     /// is what makes reconciliation recover from any missed delta.
-    pub fn ops_since(&self, theirs: &[(String, usize)]) -> Option<Vec<u8>> {
+    fn frontier_of(&self, theirs: &[(String, usize)]) -> Vec<usize> {
         let mut frontier: Vec<usize> = Vec::new();
         for (agent, seq) in theirs {
             let id = RemoteId {
@@ -177,6 +177,11 @@ impl EgWalkerText {
                 frontier.push(t);
             }
         }
+        frontier
+    }
+
+    pub fn ops_since(&self, theirs: &[(String, usize)]) -> Option<Vec<u8>> {
+        let frontier = self.frontier_of(theirs);
         // An encode always carries header bytes even with zero ops, so check for
         // actual ops rather than byte-emptiness.
         if self.oplog.iter_range_since(&frontier).next().is_none() {
@@ -192,6 +197,22 @@ impl EgWalkerText {
         } else {
             Some(self.oplog.encode_from(ENCODE_PATCH, &frontier))
         }
+    }
+
+    /// `ops_since(theirs).is_some()` without encoding.
+    pub fn has_ops_since(&self, theirs: &[(String, usize)]) -> bool {
+        let f = self.frontier_of(theirs);
+        self.oplog.iter_range_since(&f).next().is_some()
+    }
+
+    /// Whether we hold the op `(agent, seq)` in our local history.
+    pub fn knows(&self, agent: &str, seq: usize) -> bool {
+        self.oplog
+            .try_remote_to_local_time(&RemoteId {
+                agent: agent.into(),
+                seq,
+            })
+            .is_ok()
     }
 
     /// Merge encoded ops from a peer. diamond-types dedupes by global op id, so
@@ -299,5 +320,32 @@ mod tests {
         // A full, self-contained encode recovers.
         assert!(dst.merge(&src.encode_full()));
         assert_eq!(dst.content(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn knows_own_ops_not_foreign() {
+        let mut a = EgWalkerText::new("a");
+        a.edit_to("ab");
+        assert!(a.knows("a", 0));
+        assert!(!a.knows("zz", 0));
+        assert!(!a.knows("a", 999));
+    }
+
+    #[test]
+    fn has_ops_since_matches_ops_since() {
+        let mut a = EgWalkerText::new("a");
+        a.edit_to("hello world");
+        let seed = a.encode_full();
+        let mut b = EgWalkerText::new("b");
+        assert!(b.merge(&seed));
+        a.edit_to("hello brave world");
+
+        for theirs in [Vec::new(), a.version_vector(), b.version_vector()] {
+            assert_eq!(
+                a.has_ops_since(&theirs),
+                a.ops_since(&theirs).is_some(),
+                "mismatch for {theirs:?}"
+            );
+        }
     }
 }
