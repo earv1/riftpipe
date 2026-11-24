@@ -176,24 +176,19 @@ pub struct TreePeer {
     board: Option<[u8; 32]>,
 }
 
-/// What an apply sends back out, by scope.
+/// What an apply sends back out.
 #[derive(Default)]
 pub(crate) struct Outbound {
-    /// To the whole swarm (e.g. a Resync answer, epoch housekeeping).
+    /// To the whole swarm — every reply, including a `Hello`'s (see `SyncMsg::Hello`
+    /// for why those can't go neighbors-only), a Resync answer, epoch housekeeping.
     pub(crate) swarm: Vec<MeshMsg>,
-    /// To direct neighbors only: replies to a (neighbors-only) `Hello`.
-    pub(crate) neighbors: Vec<MeshMsg>,
     /// How an applied Hello compared to our state (anti-entropy).
     pub(crate) hello: Option<HelloCmp>,
 }
 
 impl Outbound {
     fn swarm(swarm: Vec<MeshMsg>) -> Self {
-        Outbound { swarm, neighbors: Vec::new(), hello: None }
-    }
-    /// Every message, regardless of scope.
-    pub(crate) fn all(self) -> Vec<MeshMsg> {
-        self.swarm.into_iter().chain(self.neighbors).collect()
+        Outbound { swarm, hello: None }
     }
 }
 
@@ -408,17 +403,10 @@ impl TreePeer {
             }
             _ => return Outbound::default(),
         };
-        // A Hello arrives neighbors-only, so its replies (up to our whole tree, for
-        // a fresh joiner) go back neighbors-only too — not flooded to the swarm.
-        let to_neighbors = inner.replies_go_to_neighbors();
         let hello = self.syncer.compare_hello(&inner);
-        let replies: Vec<MeshMsg> =
+        let swarm: Vec<MeshMsg> =
             self.apply_and_persist(inner, dir).into_iter().filter_map(|r| self.sign_mesh(r)).collect();
-        if to_neighbors {
-            Outbound { swarm: Vec::new(), neighbors: replies, hello }
-        } else {
-            Outbound { swarm: replies, neighbors: Vec::new(), hello }
-        }
+        Outbound { swarm, hello }
     }
 
     /// Auth-aware receive for every mesh message the driver doesn't handle itself
@@ -573,7 +561,7 @@ impl TreePeer {
             eprintln!("[epoch] holding epoch {seq} — new content is sealed under it");
         }
         for m in ing.released {
-            out.extend(self.apply_content(m, dir).all());
+            out.extend(self.apply_content(m, dir).swarm);
         }
         if ing.gained_first_key {
             let n = self.epoch_held().unwrap_or(0);
@@ -1226,7 +1214,7 @@ mod tests {
         assert!(member.sign_local(edit).is_none(), "epoch 1 still wraps the revoked device");
         let mut released = Vec::new();
         for m in epochs {
-            released.extend(member.authorize_and_apply(m, &dm).all());
+            released.extend(member.authorize_and_apply(m, &dm).swarm);
         }
         assert!(
             released.iter().any(|m| matches!(m, MeshMsg::Sealed(s) if s.seq == 2)),
@@ -1253,7 +1241,7 @@ mod tests {
         assert!(member.sign_local(edit).is_none(), "held: epoch 1 wraps the revoked device");
 
         let regrant = founder.grant_device(c_id, &df).into_iter().find(|m| matches!(m, MeshMsg::Trust(_))).unwrap();
-        let out = member.authorize_and_apply(regrant, &dm).all();
+        let out = member.authorize_and_apply(regrant, &dm).swarm;
         assert!(
             out.iter().any(|m| matches!(m, MeshMsg::Sealed(s) if s.seq == 1)),
             "the hold lifted (no new key): held state goes out sealed"
@@ -1573,28 +1561,26 @@ mod tests {
         std::fs::remove_dir_all(&df).ok();
     }
 
-    /// A Hello's replies (our whole tree, to a fresh joiner) go to direct
-    /// neighbors only; a Resync answer still goes swarm-wide.
+    /// A Hello's replies (our whole tree, to a fresh joiner) go swarm-wide, like a
+    /// Resync answer: a neighbors-only reply can miss a requester gossip holds as lazy.
     #[test]
-    fn hello_replies_are_neighbors_only() {
+    fn hello_replies_go_swarm_wide() {
         let d = dir("hello-scope");
         std::fs::write(d.join("a.md"), "# a\n").unwrap();
         let mut peer = TreePeer::new();
         peer.seed(&d);
         let out = peer.authorize_and_apply(MeshMsg::Sync(SyncMsg::Hello { versions: vec![], lww_versions: vec![] }), &d);
-        assert!(out.swarm.is_empty(), "nothing flooded to the swarm");
         assert!(
-            out.neighbors.iter().any(|m| matches!(m, MeshMsg::Sync(SyncMsg::TextDelta { path, .. }) if path == "a.md")),
-            "the joiner's missing doc goes to the neighbors"
+            out.swarm.iter().any(|m| matches!(m, MeshMsg::Sync(SyncMsg::TextDelta { path, .. }) if path == "a.md")),
+            "the joiner's missing doc goes to the swarm"
         );
         let out = peer.authorize_and_apply(MeshMsg::Sync(SyncMsg::Resync { path: "a.md".into() }), &d);
-        assert!(out.neighbors.is_empty());
         assert!(!out.swarm.is_empty(), "a Resync answer reaches whoever asked, anywhere in the swarm");
         std::fs::remove_dir_all(&d).ok();
     }
 
     /// Anti-entropy input: an applied Hello reports which side is ahead, and the
-    /// neighbors-only reply carries a write the other side never received.
+    /// reply carries a write the other side never received.
     #[test]
     fn ae_hello_reports_divergence_and_pulls_the_missing_write() {
         let (da, db) = (dir("ae-open-a"), dir("ae-open-b"));
@@ -1604,14 +1590,13 @@ mod tests {
 
         let out = a.authorize_and_apply(b.sign_mesh(b.hello()).unwrap(), &da);
         assert_eq!(out.hello, Some(HelloCmp { we_ahead: true, they_ahead: false }));
-        assert!(out.swarm.is_empty());
-        assert_eq!(out.neighbors.len(), 1, "a answers b's Hello with the missed write");
+        assert_eq!(out.swarm.len(), 1, "a answers b's Hello with the missed write");
 
         let at_b = b.authorize_and_apply(a.sign_mesh(a.hello()).unwrap(), &db);
         assert_eq!(at_b.hello, Some(HelloCmp { we_ahead: false, they_ahead: true }));
 
         let generation = b.generation();
-        for m in out.neighbors {
+        for m in out.swarm {
             b.authorize_and_apply(m, &db);
         }
         assert_eq!(std::fs::read(db.join("x.toml")).unwrap(), b"v1");
@@ -1642,9 +1627,9 @@ mod tests {
         let founder_hello = founder.sign_mesh(founder.hello()).expect("the founder seals");
         let at_member = member.authorize_and_apply(founder_hello, &dm);
         assert!(at_member.hello.expect("a sealed Hello is compared").we_ahead);
-        assert!(at_member.neighbors.iter().any(|m| matches!(m, MeshMsg::Sealed(_))), "the repair goes out sealed");
+        assert!(at_member.swarm.iter().any(|m| matches!(m, MeshMsg::Sealed(_))), "the repair goes out sealed");
 
-        for m in at_member.neighbors {
+        for m in at_member.swarm {
             founder.authorize_and_apply(m, &df);
         }
         assert_eq!(std::fs::read(df.join("m.bin")).unwrap(), b"v2", "the missed write reaches the founder");
@@ -1664,7 +1649,7 @@ mod tests {
         let d = dir("open-sealed");
         let mut peer = TreePeer::new();
         let out = peer.authorize_and_apply(MeshMsg::Sealed(SealedMsg { seq: 1, id: [0; 8], body: vec![1] }), &d);
-        assert!(out.all().is_empty());
+        assert!(out.swarm.is_empty());
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "nothing persisted");
         std::fs::remove_dir_all(&d).ok();
     }
@@ -1949,7 +1934,7 @@ mod tests {
     }
 
     /// The NeighborUp Hello on a restricted board: it goes out sealed, a wrapped
-    /// member answers it (sealed, neighbors-only) with its gap edit, and the
+    /// member answers it (sealed) with its gap edit, and the
     /// founder persists it. An unsealed Hello is dropped, and a device revoked
     /// since can't read the new-epoch Hello, so it answers nothing.
     #[test]
@@ -1961,19 +1946,18 @@ mod tests {
         let hello = founder.sign_mesh(founder.hello()).expect("a key holder can send its Hello");
         assert!(matches!(hello, MeshMsg::Sealed(_)), "the Hello is sealed on a restricted board");
         let out = member.authorize_and_apply(hello, &dm);
-        assert!(out.swarm.is_empty(), "Hello replies stay with the neighbors");
-        assert!(!out.neighbors.is_empty() && out.neighbors.iter().all(|m| matches!(m, MeshMsg::Sealed(_))));
-        for m in out.neighbors {
+        assert!(!out.swarm.is_empty() && out.swarm.iter().all(|m| matches!(m, MeshMsg::Sealed(_))));
+        for m in out.swarm {
             founder.authorize_and_apply(m, &df);
         }
         assert_eq!(std::fs::read(df.join("gap.md")).unwrap(), b"# made while apart\n");
 
         let plain = MeshMsg::Sync(SyncMsg::Hello { versions: vec![], lww_versions: vec![] });
-        assert!(member.authorize_and_apply(plain, &dm).all().is_empty(), "an unsealed Hello is dropped");
+        assert!(member.authorize_and_apply(plain, &dm).swarm.is_empty(), "an unsealed Hello is dropped");
 
         founder.revoke_device(DeviceKey::from_seed(&[3u8; 32]).id(), &df);
         let hello2 = founder.sign_mesh(founder.hello()).expect("sealed under the new epoch");
-        assert!(revokee.authorize_and_apply(hello2, &dc).all().is_empty(), "a revoked device can't answer it");
+        assert!(revokee.authorize_and_apply(hello2, &dc).swarm.is_empty(), "a revoked device can't answer it");
         for d in [&df, &dm, &dc] {
             std::fs::remove_dir_all(d).ok();
         }

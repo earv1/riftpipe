@@ -19,7 +19,8 @@
 //!
 //! Periodic anti-entropy (`core::antientropy`): a jittered, backing-off `Hello`
 //! to direct neighbors repairs any dropped broadcast; gossip `Lagged`, a dropped
-//! partial chunked message, or a shed queued message force a round. Every send
+//! partial chunked message, or a shed queued message force a round. Replies to a
+//! `Hello` go swarm-wide (see `SyncMsg::Hello`). Every send
 //! goes through ONE ordered outbound queue (`core::outqueue`) drained by one
 //! task, so a message's chunk frames go out back-to-back and a queued LWW update
 //! is replaced by a newer one for the same path. `meshStats()` reports both.
@@ -1091,8 +1092,8 @@ impl Out {
     fn swarm(&self, m: &MeshMsg) {
         self.push(Scope::Swarm, None, m)
     }
-    /// Direct neighbors only: the `NeighborUp` catch-up, Hello replies and
-    /// anti-entropy Hellos — flooding the swarm with them is pure waste.
+    /// Direct neighbors only (plumtree-eager ones — iroh-gossip skips lazy peers):
+    /// the `NeighborUp` catch-up and anti-entropy Hellos.
     fn neighbors(&self, m: &MeshMsg) {
         self.push(Scope::Neighbors, None, m)
     }
@@ -1497,9 +1498,9 @@ impl GossipTreeSync {
                                     if let Some(c) = cmp {
                                         ae.on_hello(js_sys::Date::now() as u64, from, c.consistent());
                                     }
-                                    // A Hello's replies (up to our whole tree, for a
-                                    // fresh joiner) go back neighbors-only, like it came.
-                                    let to_neighbors = msg.replies_go_to_neighbors();
+                                    // Every reply goes swarm-wide — a Hello's too (see
+                                    // `SyncMsg::Hello`: a neighbors-only reply can miss
+                                    // a requester gossip holds as lazy).
                                     let (persist, replies) = sy.borrow_mut().apply(msg);
                                     if let Some((path, bytes)) = persist {
                                         on_merged(path.clone(), bytes);
@@ -1508,7 +1509,7 @@ impl GossipTreeSync {
                                     for r in replies {
                                         let mm = au.borrow().sign(r);
                                         if let Some(mm) = mm {
-                                            out.push(if to_neighbors { Scope::Neighbors } else { Scope::Swarm }, None, &mm);
+                                            out.swarm(&mm);
                                         }
                                     }
                                 }

@@ -121,7 +121,11 @@ pub enum SyncMsg {
     /// Connect handshake: "here are the version vectors of the text docs I have,
     /// and the LWW versions of my structural files — reply with anything I'm
     /// missing or stale on." Sent by both peers on connect (empty lists are valid
-    /// and still solicit the other's files).
+    /// and still solicit the other's files). On the gossip mesh a `Hello` goes to
+    /// direct neighbors only, but its replies go swarm-wide: iroh-gossip delivers a
+    /// neighbors-only message to plumtree-EAGER peers only, and the requester may
+    /// already be lazy on the replier's side (pruned right after NeighborUp, or a
+    /// stale entry after a same-key restart), so a neighbors-only reply can miss it.
     Hello { versions: Vec<(String, Vv)>, lww_versions: Vec<(String, u64)> },
     /// A text delta: the ops the recipient lacks for `path`, the sender's version
     /// vector (so the recipient learns what the sender has), and the doc's origin
@@ -172,16 +176,6 @@ pub struct HelloCmp {
 impl HelloCmp {
     pub fn consistent(&self) -> bool {
         !self.we_ahead && !self.they_ahead
-    }
-}
-
-impl SyncMsg {
-    /// Replies to this message only matter to its sender's neighborhood: a `Hello`
-    /// is sent to direct neighbors only, so drivers send its replies (up to the
-    /// whole tree, for a fresh joiner) neighbors-only too instead of flooding the
-    /// swarm on every join. Everything else replies swarm-wide.
-    pub fn replies_go_to_neighbors(&self) -> bool {
-        matches!(self, SyncMsg::Hello { .. })
     }
 }
 
@@ -1340,16 +1334,6 @@ mod chunking {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Only a Hello's replies stay with the neighborhood it came from.
-    #[test]
-    fn only_hello_replies_go_to_neighbors() {
-        assert!(SyncMsg::Hello { versions: vec![], lww_versions: vec![] }.replies_go_to_neighbors());
-        assert!(!SyncMsg::Resync { path: "a.md".into() }.replies_go_to_neighbors());
-        assert!(!SyncMsg::Lww { path: "m.toml".into(), version: 1, bytes: vec![] }.replies_go_to_neighbors());
-        let mut s = Syncer::new("r");
-        assert!(!s.local_text("a.md", "x").unwrap().replies_go_to_neighbors());
-    }
 
     /// Drive a message into `dst`, persisting + forwarding replies until quiescent.
     /// Returns the last persisted bytes for `path`, if any.

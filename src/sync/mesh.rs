@@ -20,7 +20,8 @@
 //!
 //! - periodic anti-entropy: a jittered, backing-off `Hello` to direct neighbors
 //!   (`core::antientropy`) repairs any dropped broadcast; gossip `Lagged`, a
-//!   dropped partial chunked message, or a shed queued message force a round
+//!   dropped partial chunked message, or a shed queued message force a round.
+//!   Replies to a `Hello` go swarm-wide (see `SyncMsg::Hello`)
 //! - one outbound queue (`core::outqueue`): whole messages in order, so a
 //!   message's chunk frames go out back-to-back; a queued LWW update is replaced
 //!   by a newer one for the same path
@@ -390,8 +391,8 @@ impl Out {
     fn swarm(&self, m: &MeshMsg) {
         self.push(Scope::Swarm, None, m)
     }
-    /// Direct neighbors only: the `NeighborUp` catch-up, Hello replies and
-    /// anti-entropy Hellos — flooding the swarm with them is pure waste.
+    /// Direct neighbors only (plumtree-eager ones — iroh-gossip skips lazy peers):
+    /// the `NeighborUp` catch-up and anti-entropy Hellos.
     fn neighbors(&self, m: &MeshMsg) {
         self.push(Scope::Neighbors, None, m)
     }
@@ -770,9 +771,6 @@ pub async fn run(
                                 }
                                 for r in &ob.swarm {
                                     out.swarm(r);
-                                }
-                                for r in &ob.neighbors {
-                                    out.neighbors(r);
                                 }
                             }
                         }

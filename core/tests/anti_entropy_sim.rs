@@ -1,10 +1,11 @@
 //! Deterministic lossy-mesh simulation: five `Syncer`s on a fixed gossip graph,
 //! every delivery dropped independently with probability `p_drop`, driven by the
 //! anti-entropy scheduler exactly as the mesh drivers drive it (`poll` every
-//! `AE_TICK_MS`, neighbors-only `Hello`, `compare_hello` → `on_hello`, replies to a
-//! `Hello` neighbors-only, everything else swarm-wide). Proves that periodic
-//! `Hello`s repair whatever the lossy broadcasts dropped, and that a converged
-//! idle mesh goes nearly silent. Public API only.
+//! `AE_TICK_MS`, neighbors-only `Hello`, `compare_hello` → `on_hello`, every reply
+//! swarm-wide). Proves that periodic `Hello`s repair whatever the lossy broadcasts
+//! dropped, and that a converged idle mesh goes nearly silent — also when, as in
+//! iroh-gossip's plumtree, a neighbors-only message never crosses a LAZY edge
+//! (pruned cycle edges, or one side's stale view after a restart). Public API only.
 
 use std::collections::BTreeMap;
 
@@ -53,6 +54,10 @@ impl Rng {
 /// are delivered sorted.
 struct Net {
     p_drop: f64,
+    /// Directed `(from, to)` graph edges a neighbors-only message never crosses:
+    /// `to` is lazy in `from`'s plumtree view (iroh-gossip sends Scope::Neighbors
+    /// to eager peers only). Swarm messages still reach everyone.
+    lazy: &'static [(usize, usize)],
     rng: Rng,
     /// `(to, from, encoded SyncMsg)`.
     inflight: Vec<(usize, usize, Vec<u8>)>,
@@ -74,7 +79,11 @@ impl Net {
     fn send(&mut self, from: usize, scope: Scope, bytes: Vec<u8>) {
         let targets: Vec<usize> = match scope {
             Scope::Swarm => (0..PEERS).filter(|&p| p != from).collect(),
-            Scope::Neighbors => GRAPH[from].to_vec(),
+            Scope::Neighbors => GRAPH[from]
+                .iter()
+                .copied()
+                .filter(|&to| !self.lazy.contains(&(from, to)))
+                .collect(),
         };
         for to in targets {
             if !self.rng.chance(self.p_drop) {
@@ -171,6 +180,10 @@ fn state(s: &Syncer) -> BTreeMap<String, [u8; 32]> {
 
 impl Sim {
     fn new(seed: u64, p_drop: f64, anti_entropy: bool) -> Self {
+        Self::with_lazy(seed, p_drop, anti_entropy, &[])
+    }
+
+    fn with_lazy(seed: u64, p_drop: f64, anti_entropy: bool, lazy: &'static [(usize, usize)]) -> Self {
         let peers = (0..PEERS)
             .map(|i| Peer {
                 syncer: Syncer::new(format!("p{i}")),
@@ -183,6 +196,7 @@ impl Sim {
             peers,
             net: Net {
                 p_drop,
+                lazy,
                 rng: Rng::new(seed),
                 inflight: Vec::new(),
             },
@@ -249,14 +263,8 @@ impl Sim {
             if let Some(c) = peer.syncer.compare_hello(&msg) {
                 peer.ae.on_hello(now, id(from), c.consistent());
             }
-            let to_nb = msg.replies_go_to_neighbors();
             let (_, replies) = peer.syncer.apply(msg);
-            let scope = if to_nb {
-                Scope::Neighbors
-            } else {
-                Scope::Swarm
-            };
-            self.net.send_all(to, scope, &replies);
+            self.net.send_all(to, Scope::Swarm, &replies);
         }
         for (from, msg) in local(self) {
             self.net.send_all(from, Scope::Swarm, &[msg]);
@@ -349,6 +357,55 @@ fn half_loss_converges() {
         "50% loss, W(40): converged within {max_ticks} ticks ({} ms) after the burst",
         max_ticks * AE_TICK_MS
     );
+}
+
+/// Plumtree's steady state: the cycle edges 0–4 and 0–2 pruned to lazy both
+/// ways (the eager edges form the spanning tree 0–1–2–3–4). Hellos only cross
+/// eager edges; the swarm-wide replies still reach the requester.
+const PLUMTREE_LAZY: &[(usize, usize)] = &[(0, 4), (4, 0), (0, 2), (2, 0)];
+/// 0–4 lazy both ways, and a stale one-sided view: 3 holds 4 as lazy while 4
+/// still holds 3 as eager (as after 4 restarted under the same key, or a prune
+/// racing 4's Hello). 4's Hellos reach only 3, and only a swarm-wide reply gets
+/// back to 4 — with neighbors-only replies this case never converges.
+const PLUMTREE_LAZY_ASYMMETRIC: &[(usize, usize)] = &[(0, 4), (4, 0), (3, 4)];
+
+#[test]
+fn lazy_edges_still_converge() {
+    for (name, lazy) in [("spanning tree", PLUMTREE_LAZY), ("one-sided stale", PLUMTREE_LAZY_ASYMMETRIC)] {
+        let mut max_ticks = 0;
+        for seed in 1..=20 {
+            let mut sim = Sim::with_lazy(seed, 0.30, true, lazy);
+            sim.run_workload(120);
+            let ticks = sim
+                .settle(240)
+                .unwrap_or_else(|| panic!("{name}, seed {seed}: not converged after 240 ticks"));
+            assert_pairwise_consistent(&sim);
+            max_ticks = max_ticks.max(ticks);
+        }
+        println!(
+            "lazy edges ({name}), 30% loss, W(120): converged within {max_ticks} ticks ({} ms)",
+            max_ticks * AE_TICK_MS
+        );
+    }
+}
+
+/// A peer never hears a lazy neighbor's Hello, so never confirms it: it keeps
+/// probing that neighbor at the backed-off interval, which stays cheap.
+#[test]
+fn lazy_edges_idle_cost_is_bounded() {
+    let mut sim = Sim::with_lazy(1, 0.0, true, PLUMTREE_LAZY);
+    sim.run_workload(40);
+    sim.settle(480).expect("lossless mesh converges");
+    for _ in 0..600_000 / AE_TICK_MS {
+        sim.step(|_| Vec::new());
+    }
+    assert!(sim.converged());
+    let window_start = sim.now() - 300_000;
+    for (i, p) in sim.peers.iter().enumerate() {
+        let late = p.hellos.iter().filter(|&&t| t >= window_start).count();
+        println!("lazy edges, peer {i}: {late} Hello(s) in the final 300 s");
+        assert!(late <= 5, "peer {i} sent {late} Hellos in the final 300 s of idle");
+    }
 }
 
 #[test]
