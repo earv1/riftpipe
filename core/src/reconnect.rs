@@ -87,6 +87,9 @@ pub fn link_state(neighbors: usize, ever_connected: bool, online: bool) -> LinkS
 pub const SWAP_REJOIN_DELAY_MS: u64 = 500;
 /// At most one swap re-Join per peer per this window (a flapping peer can't storm).
 pub const SWAP_REJOIN_MIN_MS: u64 = 5_000;
+/// How long after a swapped connection arrives we answer that peer's `Hello`
+/// swarm-wide instead of neighbors-only (see [`SwapRejoin::reply_to_swarm`]).
+pub const SWAP_REPLY_WINDOW_MS: u64 = 30_000;
 
 /// Re-Join a peer that opened a NEW connection to us while we still count it as a
 /// neighbor — it restarted under the same key (a reloaded tab, a restarted CLI host).
@@ -100,18 +103,52 @@ pub const SWAP_REJOIN_MIN_MS: u64 = 5_000;
 /// sit "connected"/"waiting" forever. Our own `Join` makes the restarted peer add us
 /// (NeighborUp there) and answer with a `Neighbor` that clears the stale entry.
 ///
+/// Second effect of the silent swap: plumtree's eager/lazy split. iroh-gossip sends a
+/// `broadcast_neighbors` (Scope::Neighbors) message to EAGER peers only — lazy peers
+/// get nothing, not even an `IHave` (`plumtree::broadcast` → `eager_push`). In a mesh
+/// with a cycle, plumtree prunes one edge to lazy. The restarted peer starts fresh
+/// (everyone eager), but we never see NeighborDown/Up for it, so our lazy entry for it
+/// survives: its NeighborUp `Hello` reaches us, and our neighbors-only reply (our gap
+/// edits) is never sent to it. So for [`SWAP_REPLY_WINDOW_MS`] after a swap we answer
+/// that peer's `Hello` swarm-wide ([`reply_to_swarm`](Self::reply_to_swarm)): swarm
+/// scope reaches a lazy peer via `IHave` → `Graft`.
+///
 /// Pure: callers feed the remote id of every accepted gossip connection
-/// (`on_incoming`) and poll `due` from their 1 s tick.
+/// (`on_incoming`) BEFORE any message on it is handled, poll `due` from their 1 s
+/// tick, and call `on_neighbor_event` on every NeighborUp/Down.
 #[derive(Debug, Clone, Default)]
-pub struct SwapRejoin { pending: Vec<([u8; 32], u64)>, last: Vec<([u8; 32], u64)> }
+pub struct SwapRejoin {
+    pending: Vec<([u8; 32], u64)>,
+    last: Vec<([u8; 32], u64)>,
+    /// Peers that swapped in a new connection, and until when their `Hello` gets a
+    /// swarm-wide reply.
+    restarted: Vec<([u8; 32], u64)>,
+}
 impl SwapRejoin {
     pub fn new() -> Self { Self::default() }
     /// An incoming connection from `id`; queued only if it's already a neighbor (a
     /// first-time joiner isn't one yet and needs nothing).
     pub fn on_incoming(&mut self, id: [u8; 32], is_neighbor: bool, now: u64) {
-        if is_neighbor && !self.pending.iter().any(|(x, _)| *x == id) {
+        if !is_neighbor {
+            return;
+        }
+        if !self.pending.iter().any(|(x, _)| *x == id) {
             self.pending.push((id, now + SWAP_REJOIN_DELAY_MS));
         }
+        self.restarted.retain(|(x, _)| *x != id);
+        self.restarted.push((id, now + SWAP_REPLY_WINDOW_MS));
+    }
+    /// A NeighborUp/Down for `id`: gossip's view of it is fresh again (eager on Up,
+    /// gone on Down), so its replies go back neighbors-only.
+    pub fn on_neighbor_event(&mut self, id: [u8; 32]) {
+        self.restarted.retain(|(x, _)| *x != id);
+    }
+    /// Should our replies to a `Hello` that `from` sent go swarm-wide? Yes within
+    /// [`SWAP_REPLY_WINDOW_MS`] of `from` swapping in a new connection: we may still
+    /// hold it as a lazy peer, which a neighbors-only reply never reaches.
+    pub fn reply_to_swarm(&mut self, from: [u8; 32], now: u64) -> bool {
+        self.restarted.retain(|(_, until)| now < *until);
+        self.restarted.iter().any(|(x, _)| *x == from)
     }
     /// The peers to re-Join now: queued at least SWAP_REJOIN_DELAY_MS ago and still a
     /// neighbor (else dropped), at most once per SWAP_REJOIN_MIN_MS per peer.
@@ -248,5 +285,24 @@ mod tests {
         g.on_incoming(b, true, 20_000);
         assert!(g.due(30_000, &[a]).is_empty());
         assert!(g.due(40_000, &[a, b]).is_empty(), "the dropped entry doesn't resurface");
+    }
+
+    #[test]
+    fn a_restarted_neighbors_hello_is_answered_swarm_wide_for_a_window() {
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let mut g = SwapRejoin::new();
+        assert!(!g.reply_to_swarm(a, 0), "no swap: neighbors-only");
+        g.on_incoming(b, false, 0);
+        assert!(!g.reply_to_swarm(b, 1), "a first-time joiner is a fresh (eager) neighbor");
+        g.on_incoming(a, true, 1_000);
+        assert!(g.reply_to_swarm(a, 1_000), "a restarted neighbor may be lazy on our side");
+        assert!(!g.reply_to_swarm(b, 1_000), "only the restarted peer");
+        assert!(g.reply_to_swarm(a, 1_000 + SWAP_REPLY_WINDOW_MS - 1));
+        assert!(!g.reply_to_swarm(a, 1_000 + SWAP_REPLY_WINDOW_MS), "the window closes");
+        // A second swap reopens it; a NeighborUp/Down closes it early.
+        g.on_incoming(a, true, 50_000);
+        assert!(g.reply_to_swarm(a, 50_001));
+        g.on_neighbor_event(a);
+        assert!(!g.reply_to_swarm(a, 50_002), "gossip's view of it is fresh again");
     }
 }

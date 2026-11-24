@@ -51,7 +51,10 @@ type IncomingSink =
 
 /// The gossip protocol handler, wrapped to report each accepted connection's
 /// remote id (a current neighbor dialing us anew has restarted — see
-/// [`SwapRejoin`]). The connection itself goes to gossip unchanged.
+/// [`SwapRejoin`]). The connection itself goes to gossip unchanged. The id is
+/// reported BEFORE gossip gets the connection, so the driver (which drains these
+/// before handling each received message) knows of the swap before it answers
+/// anything that arrived on it.
 #[derive(Debug, Clone)]
 struct GossipAccept {
     gossip: Gossip,
@@ -64,13 +67,13 @@ impl iroh::protocol::ProtocolHandler for GossipAccept {
         conn: iroh::endpoint::Connection,
     ) -> Result<(), iroh::protocol::AcceptError> {
         let id = conn.remote_id();
+        if let Some(tx) = self.incoming.lock().ok().and_then(|g| g.clone()) {
+            let _ = tx.unbounded_send(id);
+        }
         self.gossip
             .handle_connection(conn)
             .await
             .map_err(iroh::protocol::AcceptError::from_err)?;
-        if let Some(tx) = self.incoming.lock().ok().and_then(|g| g.clone()) {
-            let _ = tx.unbounded_send(id);
-        }
         Ok(())
     }
 }
@@ -1449,6 +1452,11 @@ impl GossipTreeSync {
                 };
                 match ev {
                     Event::Received(m) => {
+                        // Swaps reported before this message: see `GossipAccept`.
+                        while let Ok(id) = incoming.try_recv() {
+                            let is_neighbor = snapshot(&receiver).contains(id.as_bytes());
+                            swap.on_incoming(*id.as_bytes(), is_neighbor, js_sys::Date::now() as u64);
+                        }
                         let from = *m.delivered_from.as_bytes();
                         // Open the sealed frame (an outsider's or a corrupt frame
                         // won't decrypt — drop it). Then plain frames pass through
@@ -1498,8 +1506,13 @@ impl GossipTreeSync {
                                         ae.on_hello(js_sys::Date::now() as u64, from, c.consistent());
                                     }
                                     // A Hello's replies (up to our whole tree, for a
-                                    // fresh joiner) go back neighbors-only, like it came.
-                                    let to_neighbors = msg.replies_go_to_neighbors();
+                                    // fresh joiner) go back neighbors-only, like it came
+                                    // — swarm-wide to a neighbor that just restarted:
+                                    // gossip sends neighbors-only messages to EAGER peers
+                                    // only, and we may still hold it as lazy (see
+                                    // `SwapRejoin`).
+                                    let to_neighbors = msg.replies_go_to_neighbors()
+                                        && !swap.reply_to_swarm(from, js_sys::Date::now() as u64);
                                     let (persist, replies) = sy.borrow_mut().apply(msg);
                                     if let Some((path, bytes)) = persist {
                                         on_merged(path.clone(), bytes);
@@ -1526,6 +1539,7 @@ impl GossipTreeSync {
                         }
                     }
                     Event::NeighborUp(id) => {
+                        swap.on_neighbor_event(*id.as_bytes());
                         // Announce our protocol version BEFORE the Presence —
                         // that ordering is what lets peers deduce "Presence
                         // but no Version = pre-versioning peer".
@@ -1575,7 +1589,8 @@ impl GossipTreeSync {
                         ever = true;
                         emit_status(&st, link_state(n, ever, online), n);
                     }
-                    Event::NeighborDown(_) => {
+                    Event::NeighborDown(id) => {
+                        swap.on_neighbor_event(*id.as_bytes());
                         let ours = riftpipe_core::sync::PROTOCOL_VERSION;
                         out.swarm(&MeshMsg::Version { id: my_id, proto: ours });
                         let list = snapshot(&receiver);
