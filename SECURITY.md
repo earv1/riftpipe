@@ -273,17 +273,31 @@ same board. None of it ever syncs (dot-paths are machine-local):
   like `<dir>/.device`; it is written mode `0600`. `--new-board` deletes it and
   mints a new board/link. A `--restricted` host resumes only together with the
   board's persisted trust log + epochs (next bullet) founded by this `.device`.
-  Otherwise (a dir hosted by an older build or hosted open, or a missing or
-  rejected state file) it refuses with a hint to use `--new-board`. On resume a
-  `--grant` for a device the log already knows is skipped, so a device revoked
-  live stays revoked; re-authorize it live with `riftpipe grant`.
+  Otherwise (a dir hosted by an older build or hosted open, or a missing,
+  rejected or rolled-back state file) it refuses with a hint to use
+  `--new-board`. On resume a `--grant` for a device the log already knows is
+  skipped, so a device revoked live stays revoked; re-authorize it live with
+  `riftpipe grant`. A restricted host also keeps a high-water mark on line 3:
+  the item count of its last `auth.state` save (next bullet).
 - **`<dir>/.riftpipe-sync/<hex topic>/auth.state`** (restricted CLI host or joiner):
   - It holds the trust log and the epoch announces this peer accepted, **never
     a raw epoch key**. Wraps are ciphertext to each recipient, and this device
     re-opens its own with its `.device` seed, the same as the browser's
     `riftpipe:epochs:<topic>`.
-  - It is mode `0600`, written atomically and read-union-write, and saved
-    before the change is broadcast.
+  - It is mode `0600`, written atomically (tmp file, fsync, rename, then
+    fsync of the dir) and read-union-write, and saved before the change is
+    broadcast. A revoke is written to it **before** it is applied: if that
+    write fails the revoke is aborted (nothing applied or sent) and reported,
+    and other failed saves are retried every second. A restricted host saves
+    its genesis and `--grant`s before going online, so a first run killed
+    while going online can still be resumed.
+  - Rollback: the item count only grows, and a restricted host records it in
+    `.riftpipe-host` after each save. On resume a state with fewer items than
+    that mark (an older copy of `auth.state`, e.g. restored to undo a live
+    revoke) is refused. Residual risk: someone who can write the dir can roll
+    back `.riftpipe-host` together with it (or restore a whole-dir backup);
+    this check doesn't stop that, and a joiner has no mark at all. A rolled-back
+    joiner trusts the old log until the board's catch-up reaches it.
   - A keyed-BLAKE3 tag (key from the `.device` seed) and the board id guard
     it. A corrupt, edited or foreign file is rejected whole: a restricted
     host refuses to resume; a joiner ignores it and relearns from the board.
