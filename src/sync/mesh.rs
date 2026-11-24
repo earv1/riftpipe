@@ -413,6 +413,8 @@ pub async fn run(
     // A restricted founder mints epoch 1 here. The announces stay in the book
     // and reach peers through the `NeighborUp` catch-up.
     let _ = peer.startup();
+    // Persist the (restored or freshly minted) trust log + epochs before anything goes out.
+    peer.save_auth(dir);
     // Prime the auth state snapshot — or, when this session has no identity
     // (not `--restricted`), clear a stale one an earlier restricted session on
     // this dir left behind (e.g. after a crash).
