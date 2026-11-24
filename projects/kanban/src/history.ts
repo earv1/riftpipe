@@ -10,7 +10,8 @@ export type HistoryEvent = { ts: string; device: string; kind: string; [field: s
 export type Viewer = { me: string; owner: string };
 
 /** Event kinds that belong to a single card (have a card `id` field). */
-export const CARD_KINDS = ["card.create", "card.move", "card.check", "card.edit", "comment.add"];
+export const CARD_KINDS = ["card.create", "card.move", "card.check", "card.edit", "comment.add",
+  "card.delete", "comment.delete"];
 
 export const ADJECTIVES = [
   "amber", "brisk", "calm", "dusky", "eager", "fern", "gilded", "hazy",
@@ -191,6 +192,12 @@ export function describe(
       return inCard ? "edited the description" : `edited the description of ${T}`;
     case "comment.add":
       return inCard ? "commented" : `commented on ${T}`;
+    case "card.delete": {
+      if (inCard) return "deleted the card";
+      return `deleted ${q(typeof e.title === "string" ? e.title : titleOf(id))}`;
+    }
+    case "comment.delete":
+      return inCard ? "deleted a comment" : `deleted a comment on ${T}`;
     case "auth.claim":
       return "claimed the board";
     case "auth.request":
@@ -201,6 +208,12 @@ export function describe(
       return typeof e.target === "string" ? `removed ${who(e.target)}` : "removed a device";
     case "mesh.merge":
       return `received ${str(e.path)}`;
+    case "mesh.delete": {
+      // A batch (a peer deleted several files at once, e.g. a card): `paths` + common `dir`.
+      const n = Array.isArray(e.paths) ? e.paths.length : 1;
+      if (n <= 1) return `removed ${str(e.path)}`;
+      return typeof e.dir === "string" && e.dir !== "" ? `removed ${n} files under ${e.dir}` : `removed ${n} files`;
+    }
     default:
       return e.kind;
   }

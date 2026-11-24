@@ -11,7 +11,7 @@
 // (This was previously Rust — `kanban-wasm`'s handler.rs/format.rs. It moved here
 // so the wasm bundle stays a generic file-sync library with nothing kanban-
 // specific baked in.)
-import { read, write, list, boardId } from "./fs.ts";
+import { read, write, list, remove, isDeleted, boardId } from "./fs.ts";
 import { logEvent } from "./events.ts";
 import { createEditSettler, EDIT_SETTLE_MS } from "./editSettle.ts";
 
@@ -32,6 +32,11 @@ export interface Board {
   title: string;
   columns: string[];
   cards: Card[];
+  /** Ids of `tickets/<id>/` dirs that hold files but whose `card.md` is DELETED (tombstoned): a
+   *  deleted card whose other files a concurrent edit kept (edit beats delete, per file). Shown
+   *  for the user to clean up, never swept automatically. A dir whose `card.md` is merely
+   *  missing (not tombstoned) is a card still arriving and is not listed. */
+  leftovers: string[];
 }
 export interface CardDetail extends Card {
   description: string;
@@ -218,30 +223,46 @@ async function readCard(id: string, defaultCol: string): Promise<Card> {
   return cardFromFiles(id, cardMdText, metaText, defaultCol);
 }
 
-async function allCards(columns: string[]): Promise<Card[]> {
+/** `readCard`, or `null` when `card.md` is absent — being deleted (card.md goes first) — or
+ *  not a card. */
+async function readCardIfPresent(id: string, defaultCol: string): Promise<Card | null> {
+  const cardMdText = await read(`tickets/${id}/card.md`);
+  if (cardMdText === null) return null;
+  const metaText = (await read(`tickets/${id}/meta.toml`)) ?? "";
+  return cardFromFiles(id, cardMdText, metaText, defaultCol);
+}
+
+async function allCards(columns: string[]): Promise<{ cards: Card[]; leftovers: string[] }> {
   const defaultCol = columns[0] ?? "Todo";
   const ids = await list("tickets");
   const cards: Card[] = [];
-  for (const id of ids) cards.push(await readCard(id, defaultCol));
-  return cards;
+  const leftovers: string[] = [];
+  for (const id of ids) {
+    if (id.startsWith(".")) continue;
+    const card = await readCardIfPresent(id, defaultCol);
+    if (card) cards.push(card);
+    else if ((await isDeleted(`tickets/${id}/card.md`)) && (await filesUnder(`tickets/${id}`)).length > 0) {
+      leftovers.push(id);
+    }
+  }
+  return { cards, leftovers: leftovers.sort() };
 }
 
 export async function getBoard(): Promise<Board> {
   const { title, columns } = parseBoardMd(await ensureSeed());
-  const cards = await allCards(columns);
-  return { title, columns, cards };
+  const { cards, leftovers } = await allCards(columns);
+  return { title, columns, cards, leftovers };
 }
 
 export async function getCard(id: string): Promise<Card | null> {
-  if (!(await list("tickets")).includes(id)) return null;
   const { columns } = parseBoardMd(await ensureSeed());
-  return readCard(id, columns[0] ?? "Todo");
+  return readCardIfPresent(id, columns[0] ?? "Todo");
 }
 
 export async function getCardDetail(id: string): Promise<CardDetail | null> {
-  if (!(await list("tickets")).includes(id)) return null;
   const { columns } = parseBoardMd(await ensureSeed());
-  const card = await readCard(id, columns[0] ?? "Todo");
+  const card = await readCardIfPresent(id, columns[0] ?? "Todo");
+  if (!card) return null;
   const { description } = splitCardMd((await read(`tickets/${id}/card.md`)) ?? "");
   const comments = await readComments(id);
   return { ...card, description, comments };
@@ -266,7 +287,7 @@ export async function addCard(column: string, title: string): Promise<Card> {
   const { columns } = parseBoardMd(await ensureSeed());
   const col = column && column.length ? column : (columns[0] ?? "Todo");
   const id = newId();
-  const existing = await allCards(columns);
+  const existing = (await allCards(columns)).cards;
   const maxPos = existing
     .filter((c) => c.column === col)
     .reduce((m, c) => Math.max(m, c.position), -1);
@@ -340,4 +361,44 @@ export async function addComment(id: string, text: string, author?: string): Pro
   await write(`tickets/${id}/comments/${name}.md`, clean);
   await logEvent("comment.add", { id, comment: name });
   return { id: name, author: auth, ts, text: clean };
+}
+
+/** Every file under `dir` (recursively), skipping dot-entries. */
+async function filesUnder(dir: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const name of await list(dir)) {
+    if (name.startsWith(".")) continue;
+    const p = `${dir}/${name}`;
+    if ((await read(p)) !== null) out.push(p);
+    else out.push(...(await filesUnder(p)));
+  }
+  return out;
+}
+
+/** Delete a card: card.md FIRST (so no peer renders a half-deleted card), then every other file
+ *  under tickets/<id>/, meta.toml last. */
+export async function deleteCard(id: string): Promise<void> {
+  const { columns } = parseBoardMd(await ensureSeed());
+  const title = (await readCardIfPresent(id, columns[0] ?? "Todo"))?.title ?? id;
+  const dir = `tickets/${id}`;
+  await remove(`${dir}/card.md`);
+  for (const p of (await filesUnder(dir)).filter((p) => p !== `${dir}/meta.toml`).sort()) await remove(p);
+  await remove(`${dir}/meta.toml`);
+  await logEvent("card.delete", { id, title });
+}
+
+/** Remove the leftover files of a deleted card (`Board.leftovers`): everything under
+ *  tickets/<id>/, meta.toml last. A no-op unless its card.md is (still) deleted — a card that came
+ *  back, or one still arriving, is never touched. */
+export async function cleanLeftovers(id: string): Promise<void> {
+  const dir = `tickets/${id}`;
+  if ((await read(`${dir}/card.md`)) !== null || !(await isDeleted(`${dir}/card.md`))) return;
+  for (const p of (await filesUnder(dir)).filter((p) => p !== `${dir}/meta.toml`).sort()) await remove(p);
+  await remove(`${dir}/meta.toml`);
+}
+
+/** Delete one comment of card `id`. */
+export async function deleteComment(id: string, commentId: string): Promise<void> {
+  await remove(`tickets/${id}/comments/${commentId}.md`);
+  await logEvent("comment.delete", { id, comment: commentId });
 }

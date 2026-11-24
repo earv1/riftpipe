@@ -95,6 +95,24 @@ Deno.test("describe — board-wide (inCard=false)", () => {
     describeEvent(e("mesh.merge", { path: "board.md" }), titleOf, v, false),
     "received board.md",
   );
+  assert.equal(
+    describeEvent(e("card.delete", { id: "tk_1", title: "gone" }), titleOf, v, false),
+    "deleted “gone”",
+  );
+  assert.equal(
+    describeEvent(e("comment.delete", { id: "tk_1" }), titleOf, v, false),
+    "deleted a comment on “alpha”",
+  );
+  assert.equal(describeEvent(e("mesh.delete", { path: "x.md" }), titleOf, v, false), "removed x.md");
+  const card = ["tickets/tk_1/card.md", "tickets/tk_1/meta.toml"];
+  assert.equal(
+    describeEvent(e("mesh.delete", { path: card[0], paths: card, dir: "tickets/tk_1" }), titleOf, v, false),
+    "removed 2 files under tickets/tk_1",
+  );
+  assert.equal(
+    describeEvent(e("mesh.delete", { path: "a.md", paths: ["a.md", "b/c.md"], dir: "" }), titleOf, v, false),
+    "removed 2 files",
+  );
   assert.equal(describeEvent(e("something.else"), titleOf, v, false), "something.else");
 });
 
@@ -128,6 +146,11 @@ Deno.test("describe — in card (inCard=true)", () => {
     "edited the description",
   );
   assert.equal(describeEvent(e("comment.add", { id: "tk_1" }), titleOf, v, true), "commented");
+  assert.equal(
+    describeEvent(e("card.delete", { id: "tk_1", title: "gone" }), titleOf, v, true),
+    "deleted the card",
+  );
+  assert.equal(describeEvent(e("comment.delete", { id: "tk_1" }), titleOf, v, true), "deleted a comment");
 });
 
 Deno.test("cardHistory — filters, drops non-card events, newest first, no mutation", () => {

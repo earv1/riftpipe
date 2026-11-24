@@ -84,12 +84,28 @@ cards are in each column. A column's cards = "every ticket whose `meta.toml`
 `column ==` this one, ordered by `position`." This keeps moves isolated to one
 small file and keeps `board.md` quiet (low-conflict).
 
-## Deletes → archive (deletes aren't synced yet)
+## Deletes
 
-riftpipe doesn't sync file/folder deletes yet (DESIGN §17 TODO). So "delete a
-card" = set `column = "archived"` in `meta.toml` (a hidden lane), not `rm` the
-folder. Sidesteps the gap and gives undo for free. Real deletion + tombstone GC
-lands when folder-delete sync does.
+"Delete card" is a real delete of `tickets/<id>/` through the file API's
+`deleteFile`, which syncs a tombstone to every peer (riftpipe tree/mesh deletes,
+protocol v6). Order matters: `card.md` goes **first**, then every other file
+(comments and anything else under the ticket), `meta.toml` **last**. A ticket without `card.md` never
+renders, so no peer ever shows a half-deleted card while the rest of the delete
+is in flight. A single comment can be deleted the same way
+(`comments/<ts>__<author>.md`). A concurrent edit beats a delete: a peer that
+changed a file of the card without having seen that content keeps its copy
+and sends it back, so the edited file survives on every peer rather than the
+edit being lost. If only `meta.toml` or a comment was edited, the card still
+doesn't render (it has no `card.md`). When that `card.md` is **tombstoned**
+(the file API's `isDeleted`), the board lists the ticket as **leftovers**
+("Deleted card … left files behind") with a **Remove leftovers** button, which
+deletes the rest of `tickets/<id>/` everywhere (a no-op unless `card.md` is
+still deleted). A `card.md` that is merely missing — not tombstoned — is a card
+still arriving (its other files synced first) and is never listed. Nothing is
+swept automatically: an automatic cascade would undo the concurrent edit that
+just won. Deleting a card or
+a comment asks for confirmation first.
+There is no archive lane or undo.
 
 ## Conflict semantics users will see
 

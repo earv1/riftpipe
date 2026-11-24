@@ -1,6 +1,7 @@
 //! The mesh drivers' single outbound queue: whole messages, FIFO, so one message's
 //! chunk frames go out back-to-back (no cross-message interleaving at receivers);
-//! a queued, not-yet-sent LWW update for a path is replaced by a newer one;
+//! a queued, not-yet-sent LWW update for a path is replaced by a newer one, and a
+//! queued re-assert of the same tombstone is replaced by a later one (it only grows);
 //! over a byte budget the oldest sheddable message is dropped (anti-entropy
 //! repairs it) — auth messages (Trust/Epoch/Request) and the tiny protocol
 //! `Version` announce are never shed.
@@ -15,11 +16,16 @@ pub enum Scope {
     Neighbors,
 }
 
-/// The coalescing key for a not-yet-wrapped sync message: `Some("lww:<path>")` for
-/// `Lww` (a newer version supersedes it for every receiver), else `None`.
+/// The coalescing key for a not-yet-wrapped sync message: `Some("lww:<path>")` for `Lww` (a newer
+/// version supersedes it for every receiver); `Some("del:<path>:<first id>")` for a `Delete` (a
+/// later re-assert of the same tombstone — same first id; `tomb_msg` only ever grows ids, `seen`,
+/// `vv` and `version` — supersedes a queued older one); `None` for everything else, including
+/// `Restore` (never moved or dropped by coalescing, so it can't be reordered after a `Delete` it
+/// overrules) and `TextDelta`.
 pub fn coalesce_key(msg: &SyncMsg) -> Option<String> {
     match msg {
         SyncMsg::Lww { path, .. } => Some(format!("lww:{path}")),
+        SyncMsg::Delete { path, ids, .. } => ids.first().map(|id| format!("del:{path}:{id:016x}")),
         _ => None,
     }
 }
@@ -225,6 +231,75 @@ mod tests {
                     }))),
             "the last-pushed item must survive shedding"
         );
+    }
+
+    fn delete(path: &str, ids: &[u64]) -> SyncMsg {
+        SyncMsg::Delete { path: path.into(), ids: ids.to_vec(), seen: vec![], origin: None, vv: vec![], version: 1 }
+    }
+
+    /// Push `msg` keyed by [`coalesce_key`], as the drivers do.
+    fn push_keyed(q: &mut OutQueue, msg: SyncMsg) {
+        let key = coalesce_key(&msg);
+        q.push(Scope::Swarm, key, &MeshMsg::Sync(msg));
+    }
+
+    #[test]
+    fn newer_delete_replaces_queued_one_but_never_crosses_kinds() {
+        let text = SyncMsg::TextDelta { path: "a".into(), ops: vec![1, 2, 3], vv: vec![], origin: None };
+        let mut q = OutQueue::new();
+        push_keyed(&mut q, SyncMsg::Lww { path: "a".into(), version: 1, bytes: vec![0; 10] });
+        push_keyed(&mut q, delete("a", &[7]));
+        push_keyed(&mut q, SyncMsg::TextDelta { path: "a".into(), ops: vec![1, 2, 3], vv: vec![], origin: None });
+        push_keyed(&mut q, delete("a", &[7, 9]));
+
+        let popped: Vec<_> = std::iter::from_fn(|| q.pop().map(|(_, f)| f)).collect();
+        assert_eq!(
+            popped,
+            vec![
+                encode_mesh_frames(&lww("a", 1)),
+                encode_mesh_frames(&MeshMsg::Sync(text)),
+                encode_mesh_frames(&MeshMsg::Sync(delete("a", &[7, 9]))),
+            ],
+            "the re-assert replaced the older Delete; the Lww and TextDelta stay, in order"
+        );
+        assert_eq!(q.coalesced(), 1);
+    }
+
+    #[test]
+    fn restore_is_never_coalesced_or_reordered() {
+        let mut q = OutQueue::new();
+        push_keyed(&mut q, delete("p", &[1]));
+        push_keyed(&mut q, SyncMsg::Restore { path: "p".into(), ids: vec![1] });
+        push_keyed(&mut q, delete("p", &[2]));
+
+        let popped: Vec<_> = std::iter::from_fn(|| q.pop().map(|(_, f)| f)).collect();
+        assert_eq!(
+            popped,
+            vec![
+                encode_mesh_frames(&MeshMsg::Sync(delete("p", &[1]))),
+                encode_mesh_frames(&MeshMsg::Sync(SyncMsg::Restore { path: "p".into(), ids: vec![1] })),
+                encode_mesh_frames(&MeshMsg::Sync(delete("p", &[2]))),
+            ],
+        );
+        assert_eq!(q.coalesced(), 0, "a fresh deletion (new first id) never coalesces with the old one");
+    }
+
+    #[test]
+    fn deletes_are_sheddable() {
+        let mut q = OutQueue::with_max_bytes(3_000);
+        let big_delete = |i: u64| SyncMsg::Delete {
+            path: format!("f{i}"),
+            ids: vec![i],
+            seen: vec![[0; 32]; 16],
+            origin: None,
+            vv: (0..40).map(|n| (format!("agent-{n:04}"), n)).collect(),
+            version: 1,
+        };
+        for i in 0..6 {
+            push_keyed(&mut q, big_delete(i));
+        }
+        assert!(q.shed() >= 1, "over budget, a queued Delete is shed like any content");
+        assert!(q.bytes() <= 3_000);
     }
 
     #[test]

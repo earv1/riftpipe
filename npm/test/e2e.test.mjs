@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -120,6 +120,28 @@ test("tree: mesh host + joiner converge, SYNCED breadcrumbs fire", async (t) => 
   writeFileSync(join(dirB, "reply.md"), "# from the joiner\n");
   await within(90_000, hostSaw, "reply.md syncing back to host");
   assert.equal(readFileSync(join(dirA, "reply.md"), "utf8"), "# from the joiner\n");
+});
+
+test("tree: a host delete reaches the joiner, DELETED breadcrumb fires", async (t) => {
+  const dirA = mkdtempSync(join(tmpdir(), "riftpipe-npm-del-a-"));
+  const dirB = mkdtempSync(join(tmpdir(), "riftpipe-npm-del-b-"));
+  writeFileSync(join(dirA, "note.md"), "# keep me\n");
+  writeFileSync(join(dirA, "gone.md"), "# delete me\n");
+
+  const host = TreeSession.host(dirA);
+  t.after(() => host.close());
+  const ticket = await within(30_000, host.ticket(), "mesh ticket");
+
+  const joiner = TreeSession.join(ticket, dirB);
+  t.after(() => joiner.close());
+  await within(90_000, joiner.synced("gone.md"), "gone.md syncing to joiner");
+
+  const d = joiner.deleted("gone.md");
+  rmSync(join(dirA, "gone.md"));
+  await within(90_000, d, "gone.md deleted on joiner");
+
+  assert.ok(!existsSync(join(dirB, "gone.md")), "the delete removed gone.md on the joiner");
+  assert.ok(existsSync(join(dirB, "note.md")), "note.md is untouched");
 });
 
 test("tree: restricted request → approve by safety code → joiner reads", async (t) => {

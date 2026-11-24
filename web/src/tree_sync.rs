@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_util::StreamExt;
-use riftpipe_core::sync::{SyncMsg, Syncer};
+use riftpipe_core::sync::{Change, SyncMsg, Syncer};
 use wasm_bindgen::prelude::*;
 
 use crate::WebrtcLink;
@@ -41,25 +41,42 @@ pub async fn connect_and_sync(
     Ok(())
 }
 
-/// A merge handler that lands the file in board `board`'s OPFS tree (the board
-/// the link syncs — even if the page has switched since), fires a per-path
-/// `riftpipe:file-changed` event (the file API's `watch`), and nudges the UI to
-/// refetch via the legacy `on_change` callback.
-fn opfs_on_merged(on_change: js_sys::Function, board: [u8; 32]) -> Rc<dyn Fn(String, Vec<u8>)> {
+/// A merge handler: lands a peer's [`Change`] (a merged write or a delete).
+pub type OnChange = Rc<dyn Fn(Change)>;
+
+/// A merge handler that lands the change in board `board`'s OPFS tree (the board
+/// the link syncs — even if the page has switched since): writes the merged file or
+/// removes the peer-deleted one, fires a per-path `riftpipe:file-changed` event (the
+/// file API's `watch`), and nudges the UI to refetch via the legacy `on_change`
+/// callback.
+fn opfs_on_merged(on_change: js_sys::Function, board: [u8; 32]) -> OnChange {
     let on_change = Rc::new(on_change);
-    Rc::new(move |path: String, bytes: Vec<u8>| {
+    Rc::new(move |change: Change| {
         let cb = on_change.clone();
-        let p = path.clone();
-        // Queued (not spawned) so the path's record, queued right after by the
-        // mesh driver, is written AFTER this file — see `opfs::queue_merged_file`.
-        crate::opfs::queue_merged_file(board, path, bytes, move || {
-            // Record the merge for history/debugging (coalesced) — but events/
-            // paths are skipped inside log_merge, or logging a merged log
-            // would recurse forever.
-            crate::events::log_merge(&p);
-            dispatch_file_changed(&p);
-            let _ = cb.call0(&JsValue::NULL);
-        });
+        match change {
+            Change::Write { path, bytes } => {
+                let p = path.clone();
+                // Queued (not spawned) so the path's record, queued right after by the
+                // mesh driver, is written AFTER this file — see `opfs::queue_merged_file`.
+                crate::opfs::queue_merged_file(board, path, bytes, move || {
+                    // Record the merge for history/debugging (coalesced) — but events/
+                    // paths are skipped inside log_merge, or logging a merged log
+                    // would recurse forever.
+                    crate::events::log_merge(&p);
+                    dispatch_file_changed(&p);
+                    let _ = cb.call0(&JsValue::NULL);
+                });
+            }
+            Change::Remove { path } => {
+                let p = path.clone();
+                // Queued like a write: the file goes before its tombstone record.
+                crate::opfs::queue_removed_file(board, path, move || {
+                    crate::events::log_delete(&p);
+                    dispatch_file_changed(&p);
+                    let _ = cb.call0(&JsValue::NULL);
+                });
+            }
+        }
     })
 }
 
@@ -481,6 +498,32 @@ pub(crate) fn push_lww(path: &str, bytes: &[u8]) {
     });
 }
 
+/// Delete push (mesh if active, else link): tombstone `path` and sync the `Delete`.
+/// The caller ([`crate::file::delete_file`]) has already removed the file.
+pub(crate) fn delete(path: &str) {
+    if crate::gossip::try_push_delete(path) {
+        return;
+    }
+    SYNC.with(|c| {
+        if let Some(s) = c.borrow().as_ref() {
+            s.push_delete(path);
+        }
+    });
+}
+
+/// Whether the live sync for the active board holds a tombstone for `path` (`None` if no session
+/// is up — then the durable record decides, see [`crate::file::is_deleted`]).
+pub(crate) fn is_tombstoned(path: &str) -> Option<bool> {
+    let topic = crate::opfs::active_board();
+    if let Some(t) = crate::gossip::try_is_tombstoned(topic, path) {
+        return Some(t);
+    }
+    if topic != page_board_topic() {
+        return None;
+    }
+    SYNC.with(|c| c.borrow().as_ref().map(|s| s.syncer.borrow().is_tombstoned(path)))
+}
+
 /// A unique per-peer agent id (a shared id would corrupt the CRDT).
 fn make_agent() -> String {
     format!("p{:08x}", (js_sys::Math::random() * 4_294_967_296.0) as u32)
@@ -488,7 +531,7 @@ fn make_agent() -> String {
 
 /// Syncs a file tree over *either* transport. Local pushes are serialized to
 /// an outbound channel that a transport-specific send loop drains; a recv loop
-/// applies remote messages and fires `on_merged(path, bytes)` (the app writes OPFS
+/// applies remote messages and fires `on_merged(change)` (the app writes/removes OPFS
 /// + refreshes; a test captures bytes). Same protocol regardless of transport.
 pub struct TreeSync {
     outbound: UnboundedSender<Vec<u8>>,
@@ -497,7 +540,7 @@ pub struct TreeSync {
 
 impl TreeSync {
     /// Over a WebRTC link.
-    pub fn new(link: WebrtcLink, on_merged: Rc<dyn Fn(String, Vec<u8>)>) -> TreeSync {
+    pub fn new(link: WebrtcLink, on_merged: OnChange) -> TreeSync {
         let syncer = Rc::new(RefCell::new(Syncer::new(make_agent())));
         let (outbound, mut rx) = unbounded::<Vec<u8>>();
         let sender = link.sender();
@@ -521,7 +564,7 @@ impl TreeSync {
     /// Over a relay-brokered iroh link (no signaling server, no host).
     pub fn over_iroh(
         link: crate::iroh_link::IrohLink,
-        on_merged: Rc<dyn Fn(String, Vec<u8>)>,
+        on_merged: OnChange,
     ) -> TreeSync {
         let syncer = Rc::new(RefCell::new(Syncer::new(make_agent())));
         let (outbound, mut rx) = unbounded::<Vec<u8>>();
@@ -554,17 +597,17 @@ impl TreeSync {
     fn apply_inbound(
         syncer: &Rc<RefCell<Syncer>>,
         bytes: &[u8],
-        on_merged: &Rc<dyn Fn(String, Vec<u8>)>,
+        on_merged: &OnChange,
         outbound: &UnboundedSender<Vec<u8>>,
     ) {
         let Ok(msg) = postcard::from_bytes::<SyncMsg>(bytes) else {
             return;
         };
-        let (persist, replies) = syncer.borrow_mut().apply(msg);
-        if let Some((path, merged)) = persist {
-            on_merged(path, merged);
+        let a = syncer.borrow_mut().receive(msg);
+        if let Some(c) = a.change {
+            on_merged(c);
         }
-        for reply in replies {
+        for reply in a.replies {
             if let Ok(bytes) = postcard::to_allocvec(&reply) {
                 let _ = outbound.unbounded_send(bytes);
             }
@@ -581,6 +624,13 @@ impl TreeSync {
         let now = js_sys::Date::now() as u64;
         let msg = self.syncer.borrow_mut().local_lww(path, bytes.to_vec(), now);
         self.send(&msg);
+    }
+
+    pub fn push_delete(&self, path: &str) {
+        let msg = self.syncer.borrow_mut().local_delete(path);
+        if let Some(msg) = msg {
+            self.send(&msg);
+        }
     }
 
     fn send(&self, msg: &SyncMsg) {

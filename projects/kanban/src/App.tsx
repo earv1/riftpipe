@@ -1,6 +1,6 @@
 import { createMemo, createSignal, onMount, For, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { getBoard, addCard, patchCard, flushPendingEdits, connectPeer, newBoard, watch, storageSupported, auth, meshStatus, onMeshStatus, historyEvents, knownTitles, type AuthState, type PendingRequest, type Member, type Card, type MeshStatus, type Viewer } from "./api.ts";
+import { getBoard, cleanLeftovers, addCard, patchCard, flushPendingEdits, connectPeer, newBoard, watch, storageSupported, auth, meshStatus, onMeshStatus, historyEvents, knownTitles, type AuthState, type PendingRequest, type Member, type Card, type MeshStatus, type Viewer } from "./api.ts";
 import { CardDetail } from "./CardDetail.tsx";
 import { ActivityPanel } from "./ActivityPanel.tsx";
 
@@ -9,8 +9,9 @@ export function App() {
     title: string;
     columns: string[];
     cards: Card[];
+    leftovers: string[];
     loaded: boolean;
-  }>({ title: "", columns: [], cards: [], loaded: false });
+  }>({ title: "", columns: [], cards: [], leftovers: [], loaded: false });
 
   const [openId, setOpenId] = createSignal<string | null>(null);
   const [detailTick, setDetailTick] = createSignal(0);
@@ -87,6 +88,7 @@ export function App() {
       setBoard("title", b.title);
       setBoard("columns", reconcile(b.columns));
       setBoard("cards", reconcile(b.cards, { key: "id" }));
+      setBoard("leftovers", reconcile(b.leftovers));
       setBoard("loaded", true);
       if (openId()) setDetailTick((n) => n + 1);
     } catch (_e) {
@@ -323,6 +325,31 @@ export function App() {
           id: {authState().device.slice(0, 10)}…
         </span>
       </div>
+      <Show when={board.leftovers.length > 0}>
+        <div class="leftovers">
+          <For each={board.leftovers}>
+            {(id) => (
+              <div class="leftover">
+                <span>
+                  Deleted card <code>{id}</code> left files behind (someone edited them while it was
+                  being deleted).
+                </span>
+                <button
+                  class="leftover-clean"
+                  type="button"
+                  onClick={() => void (async () => {
+                    if (!confirm(`Remove the leftover files of deleted card ${id}? This syncs to everyone.`)) return;
+                    await cleanLeftovers(id);
+                    void refresh();
+                  })()}
+                >
+                  Remove leftovers
+                </button>
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
       <main classList={{ columns: true, "with-activity": showActivity() }}>
         <For each={board.columns}>
           {(col) => (
