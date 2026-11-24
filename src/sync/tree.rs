@@ -1645,22 +1645,25 @@ mod tests {
         assert!(dm.join("x.bin").exists());
         assert!(dc.join("x.bin").exists());
 
+        // The revokee removes x.bin and seals its delete under epoch 1 while still a member...
+        std::fs::remove_file(dc.join("x.bin")).unwrap();
+        assert!(revokee.detect_missing(&dc).is_empty());
+        let del = revokee.detect_missing(&dc).remove(0);
+        let del_bytes = postcard::to_allocvec(&del).unwrap();
+        let sealed_old = revokee.sign_mesh(del).expect("still a member: it seals");
+        assert!(matches!(&sealed_old, MeshMsg::Sealed(s) if s.seq == 1));
+
+        // ...then is revoked (epoch 2 excludes it).
         let c_id = DeviceKey::from_seed(&[3u8; 32]).id();
         for m in founder.revoke_device(c_id, &df) {
             let copy: MeshMsg = postcard::from_bytes(&postcard::to_allocvec(&m).unwrap()).unwrap();
             member.authorize_and_apply(copy, &dm);
             revokee.authorize_and_apply(m, &dc);
         }
-
-        // The revokee removes x.bin: whatever it can still seal (if anything, post-rotation)
-        // never lands — the founder rejects it on the trust-log author check.
-        std::fs::remove_file(dc.join("x.bin")).unwrap();
-        assert!(revokee.detect_missing(&dc).is_empty());
-        let del = revokee.detect_missing(&dc).remove(0);
-        let del_bytes = postcard::to_allocvec(&del).unwrap();
-        if let Some(sealed) = revokee.sign_mesh(del) {
-            founder.authorize_and_apply(sealed, &df);
-        }
+        // Post-rotation it can't seal at all: its delete is held, never sent.
+        assert!(revokee.sign_mesh(postcard::from_bytes(&del_bytes).unwrap()).is_none(), "held: no epoch-2 key");
+        // And the delete it sealed under epoch 1 is rejected on the trust-log author check.
+        founder.authorize_and_apply(sealed_old, &df);
         assert!(df.join("x.bin").exists(), "a revoked device's delete never lands");
 
         // An unsealed signed Delete (no epoch wrapper at all) is rejected too.
