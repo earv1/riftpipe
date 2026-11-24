@@ -807,11 +807,15 @@ impl Syncer {
                 self.resync.remove(&path);
                 self.parked.remove(&path); // any successful merge un-parks
                 let after = self.docs.get(&path).map(|d| d.version());
-                if after != before {
-                    self.generation += 1;
-                }
-                let content = self.doc(&path).content().into_bytes();
                 self.advance_peer_vv(&path, &vv);
+                if after == before {
+                    // A duplicate delta (common once anti-entropy makes several
+                    // neighbours answer the same Hello): no new ops landed, so
+                    // there's nothing to persist, log, or re-render.
+                    return (None, Vec::new());
+                }
+                self.generation += 1;
+                let content = self.doc(&path).content().into_bytes();
                 (Some((path, content)), Vec::new())
             }
             SyncMsg::Resync { path } => match self.docs.get(&path) {
@@ -1336,6 +1340,24 @@ mod tests {
             "steady-state edit should be a small delta: {second_len} vs first {first_len}",
         );
         assert_eq!(b.apply(m2).0.unwrap().1, (big + "Y").into_bytes());
+    }
+
+    #[test]
+    fn duplicate_delta_persists_nothing() {
+        let mut a = Syncer::new("a");
+        let mut b = Syncer::new("b");
+        let m = a.local_text("note.md", "hello").unwrap();
+        let bytes = postcard::to_allocvec(&m).unwrap();
+        let dup: SyncMsg = postcard::from_bytes(&bytes).unwrap();
+
+        let (persisted, _) = b.apply(m);
+        assert!(persisted.is_some());
+        let g = b.generation();
+
+        let (persisted, replies) = b.apply(dup);
+        assert_eq!(persisted, None);
+        assert!(replies.is_empty());
+        assert_eq!(b.generation(), g, "a duplicate delta does not bump generation");
     }
 
     #[test]
