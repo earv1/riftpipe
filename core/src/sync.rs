@@ -1334,6 +1334,8 @@ impl Syncer {
             let t = &mut tomb.t;
             let mut changed = false;
             for id in ids {
+                // An id this delete's own chain already overruled (`prior`) is an older round's
+                // deletion — merging it would let a stale re-creator's `Restore` cancel this one.
                 changed |= push_absent(&mut t.ids, id, TREE_DELETION_IDS_CAP);
             }
             for fp in seen {
@@ -1353,7 +1355,9 @@ impl Syncer {
             return Applied { save: changed.then_some(path), ..Default::default() };
         }
 
-        // We re-created the path after (one of) these deletions: they're overruled.
+        // We re-created the path after ALL of these deletions: they're overruled. (Any overlap is
+        // not enough — a tombstone merged with an older, already-overruled deletion still carries
+        // a newer one.)
         let sup = self.superseded.get(&path).cloned().unwrap_or_default();
         if ids.iter().any(|id| sup.contains(id)) {
             let mut replies = vec![SyncMsg::Restore { path: path.clone(), ids: sup }];
@@ -1408,6 +1412,8 @@ impl Syncer {
         Applied { change: Some(Change::Remove { path: path.clone() }), replies: Vec::new(), save: Some(path) }
     }
 
+    /// Drop `path`'s tombstone only if the restorer overrules EVERY deletion it stands for — a
+    /// tombstone merged with a later deletion survives a `Restore` of just the earlier one.
     fn remote_restore(&mut self, path: String, ids: &[u64]) -> Applied {
         let overruled = self.tombs.get(&path).is_some_and(|t| t.t.ids.iter().any(|id| ids.contains(id)));
         if !overruled {
@@ -1435,6 +1441,19 @@ impl Syncer {
                 self.parked.remove(&path);
                 let mut a = self.reassert(&path);
                 a.save = changed.then_some(path);
+                return a;
+            }
+            // New ops for us — but maybe not past the delete: our kept doc can be behind `t.vv`
+            // (we accepted a re-asserted `Delete`, or merged another deleter's tips), so a late or
+            // reordered delta the deleter had already seen must not undo it.
+            if doc.ops_since(&tomb.t.vv).is_none()
+                || tomb.t.seen.contains(&fingerprint(doc.content().as_bytes()))
+            {
+                union_tips(&mut tomb.t.vv, &vv);
+                self.resync.remove(&path);
+                self.parked.remove(&path);
+                let mut a = self.reassert(&path);
+                a.save = Some(path); // the kept doc grew
                 return a;
             }
             let doc = self.untomb(&path).and_then(|t| t.doc).expect("the tomb's doc just merged");
@@ -3362,5 +3381,33 @@ mod tests {
         src.local_text("note.md", "one\n");
         src.local_text("note.md", "one\ntwo\n");
         assert!(a.compare_hello(&src.hello()).unwrap().consistent(), "anti-entropy ignores it");
+    }
+
+    /// A delta the deleter had already seen, arriving AFTER the (small) `Delete` at a peer that
+    /// was behind — a chunked delta overtaken by its delete — must not revive the file; a
+    /// genuinely newer edit still does.
+    #[test]
+    fn late_delta_the_deleter_saw_never_revives() {
+        let mut p = vec![Syncer::new("a"), Syncer::new("b")];
+        let mut c = Syncer::new("c");
+        let t = p[0].local_text("x.md", "v1\n").unwrap();
+        c.receive(dup(&t));
+        flood(&mut p, 0, vec![t]);
+        let d2 = p[0].local_text("x.md", "v1\nv2\n").unwrap(); // overtaken by the delete
+        c.receive(dup(&d2));
+        let d = p[0].local_delete("x.md").unwrap();
+        flood(&mut p, 0, vec![d]);
+        assert!(p[1].is_tombstoned("x.md"), "b was behind, proved stale, deleted");
+
+        let r = p[1].receive(dup(&d2));
+        assert!(r.change.is_none(), "the deleter saw this delta: no revival");
+        assert!(p[1].is_tombstoned("x.md"));
+        assert!(matches!(r.replies.as_slice(), [SyncMsg::Delete { .. }]), "re-asserts the delete");
+        assert!(r.save.is_some(), "the kept doc grew: its record changes");
+
+        let e = c.local_text("x.md", "v1\nv2\nv3 by c\n").unwrap();
+        let r = p[1].receive(dup(&e));
+        assert!(matches!(r.change, Some(Change::Write { .. })), "a newer edit beats the delete");
+        assert_eq!(text_of(&p[1], "x.md").as_deref(), Some("v1\nv2\nv3 by c\n"));
     }
 }
